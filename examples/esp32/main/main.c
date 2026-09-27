@@ -206,14 +206,15 @@ static esp_err_t updater_start(void)
         .layout_id = EXAMPLE_LAYOUT_ID,
         .device_id = NULL,              /* the port serves the base MAC as F18C */
         /* Security is off: key_pubkey and key_label are NULL, so 0x27 answers 0x11 and any tester on the bus
-         * may program the unit. To turn it on, prefer the ECDSA mode: run `udsota keygen --out keys`, keep
-         * keys/udsota_private.pem in the signing service (never in the repository or the image), include
-         * keys/udsota_pubkey.h and set .key_pubkey = udsota_pubkey and .key_pubkey_len = sizeof udsota_pubkey.
-         * The image then holds only the public key, which unlocks nothing. The HMAC mode instead sets
-         * .key_label (for example "udsota-example") and points .key_master and .key_master_len at a master
-         * key the app embeds from a git-ignored file at build time; every image then carries the fleet's
-         * secret. Never commit either secret. Also turn on signed updates (CONFIG_SECURE_SIGNED_ON_UPDATE),
-         * so FF01 checks a signature and not only a SHA-256. */
+         * may program the unit. To turn it on, prefer the ECDSA mode: run `udsota keygen --out keys` (keys/ is
+         * git-ignored), move keys/udsota_private.pem into the signing service (never into the repository or
+         * the image), copy the public keys/udsota_pubkey.h next to this file, include it and set
+         * .key_pubkey = udsota_pubkey and .key_pubkey_len = sizeof udsota_pubkey. The image then holds only
+         * the public key, which unlocks nothing, and the client's profile sets [security] mode = "ecdsa".
+         * The HMAC mode instead sets .key_label (for example "udsota-example") and points .key_master and
+         * .key_master_len at a master key the app embeds from a git-ignored file at build time; every image
+         * then carries the fleet's secret. Never commit either secret. Also turn on signed updates
+         * (CONFIG_SECURE_SIGNED_ON_UPDATE), so FF01 checks a signature and not only a SHA-256. */
         .key_pubkey = NULL,
         .key_label = NULL,
     };
