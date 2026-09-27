@@ -1,8 +1,8 @@
 /* udsota's ESP32 port: the task and the app API (udsota_esp32.h). One diag task owns the ISO-TP adapter
  * and the UDS server. The app hands it request frames from its CAN task and the port sends through the
- * app's can_send, so the port never touches TWAI. The task does ISO-TP and HMAC only and never flash (the
- * engine's worker makes every esp_ota_* call), which is why its stack may live in PSRAM. Phase,
- * end-session and the hook wrappers are the pure udsota_esp32_ctl.c. */
+ * app's can_send, so the port never touches TWAI. The task does ISO-TP and the 0x27 HMAC or ECDSA verify
+ * only and never flash (the engine's worker makes every esp_ota_* call), which is why its stack may live in
+ * PSRAM. Phase, end-session and the hook wrappers are the pure udsota_esp32_ctl.c. */
 #include <inttypes.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -24,6 +24,7 @@
 #include "udsota_esp32_ctl.h"
 #include "udsota_esp32_devid.h"
 #include "udsota_esp32_priv.h"
+#include "udsota_esp32_sa.h"
 #include "udsota_isotp.h"
 
 static const char *TAG = "udsota";
@@ -230,9 +231,18 @@ esp_err_t udsota_esp32_start(const udsota_config_t *cfg, const udsota_hooks_t *h
         return ESP_ERR_NO_MEM;
     }
     udsota_esp32_psa_lock_init();                /* before the first PSA user, security on or off */
-    const udsota_security_t *sec = (s_cfg.key_label != NULL)
-        ? udsota_esp32_security(s_cfg.key_label, s_cfg.key_master, s_cfg.key_master_len,
-                                s_cfg.device_id, s_cfg.device_id_len) : NULL;
+    bool master_ignored = false;
+    const udsota_esp32_sa_mode_t mode = udsota_esp32_sa_mode(&s_cfg, &master_ignored);
+    if (master_ignored) {
+        ESP_LOGW(TAG, "cfg.key_master ignored: cfg.key_pubkey selects the ECDSA mode; leave the master out");
+    }
+    const udsota_security_t *sec =
+        (mode == UDSOTA_ESP32_SA_ECDSA) ? udsota_esp32_security_ecdsa(s_cfg.key_pubkey, s_cfg.key_pubkey_len,
+                                                                      s_cfg.device_id, s_cfg.device_id_len)
+        : (mode == UDSOTA_ESP32_SA_HMAC) ? udsota_esp32_security(s_cfg.key_label, s_cfg.key_master,
+                                                                 s_cfg.key_master_len, s_cfg.device_id,
+                                                                 s_cfg.device_id_len)
+        : NULL;
     udsota_esp32_devid_serve(dev, &s_cfg);       /* F18C serves the stored bytes the key hashes */
     udsota_esp32_engine_start(&s_cfg);           /* logs its own failures; the engine then refuses downloads */
     udsota_init(&s_srv, &s_cfg, udsota_esp32_engine(), sec, &s_hooks);   /* once per boot */

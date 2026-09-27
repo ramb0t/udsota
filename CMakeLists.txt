@@ -137,6 +137,13 @@ udsota_test(test_udsota_esp32_devid
     SOURCES  test/test_udsota_esp32_devid.c ${ESP32_DIR}/udsota_esp32_devid.c ${CORE_DIR}/udsota_keys.c ${SERVER_SRCS}
     INCLUDES ${CORE_INC} ${CORE_PRIV} ${ESP32_DIR}/include ${ESP32_DIR}/priv)
 
+# The 0x27 mode the port's config selects and the ECDSA key check over the device ID, with the real server, key
+# messages and device ID, and a stand-in verify on the host SHA-256.
+udsota_test(test_udsota_esp32_sa
+    SOURCES  test/test_udsota_esp32_sa.c ${ESP32_DIR}/udsota_esp32_sa.c ${ESP32_DIR}/udsota_esp32_devid.c
+             ${CORE_DIR}/udsota_keys.c ${CORE_DIR}/test/sha256_host.c ${SERVER_SRCS}
+    INCLUDES ${CORE_INC} ${CORE_PRIV} ${CORE_DIR}/test ${ESP32_DIR}/include ${ESP32_DIR}/priv)
+
 # ---- Host fake of a two-slot OTA engine (file-backed, POSIX), kept for a future SocketCAN demo
 # server. Its test checks the fake and its SHA-256 against known answers.
 if(UNIX)
