@@ -1,0 +1,79 @@
+menu "udsota ESP32 port"
+
+    config UDSOTA_ESP32_WORKER_CORE
+        int "Flash worker core"
+        range 0 0 if FREERTOS_UNICORE
+        range 0 1
+        default 0
+
+    config UDSOTA_ESP32_WORKER_PRIO
+        int "Flash worker priority"
+        range 1 24
+        default 3
+        help
+            The worker runs every erase and write, busy-waiting through an erase of up to about 43 s.
+            Keep it below the app's own tasks (a UI, say) so they keep running.
+
+    config UDSOTA_ESP32_WORKER_STACK
+        int "Flash worker stack (bytes)"
+        range 4096 32768
+        default 8192
+        help
+            Always internal RAM, since the worker writes flash. 8192 fits the RSA-3072 signature check
+            inside esp_ota_end().
+
+    config UDSOTA_ESP32_DEBUG_MEASURE
+        bool "Log update timings, stack headroom and internal heap"
+        default n
+        help
+            Bench measurement only. Logs at INFO: the erase time (esp_ota_begin), the FF01 verify and
+            ActivateImage times with the worker's unused stack and the internal heap around them, the
+            diag task's stack headroom and internal-heap low-water mark, the heap the start took, and a
+            warning when flash writes run with the cache off.
+
+    config UDSOTA_ESP32_TASK_CORE
+        int "Diag task core"
+        range 0 0 if FREERTOS_UNICORE
+        range 0 1
+        default 0
+        help
+            Core of the task that owns the ISO-TP link and the UDS server. Put it on the core
+            of the app's CAN task.
+
+    config UDSOTA_ESP32_TASK_PRIO
+        int "Diag task priority"
+        range 1 24
+        default 5
+        help
+            Below the app's CAN task and above its other tasks and the flash worker, so flow control,
+            0x78 and TesterPresent answers keep flowing during an erase.
+
+    config UDSOTA_ESP32_TASK_STACK
+        int "Diag task stack (bytes)"
+        range 4096 16384
+        default 6144
+
+    config UDSOTA_ESP32_TASK_STACK_PSRAM
+        bool "Diag task stack in PSRAM"
+        depends on SPIRAM && FREERTOS_TASK_CREATE_ALLOW_EXT_MEM
+        default y
+        help
+            Safe because the diag task never touches flash: the engine's worker makes every
+            esp_ota_* call.
+
+    config UDSOTA_ESP32_BUFS_PSRAM
+        bool "ISO-TP, request and response buffers in PSRAM"
+        depends on SPIRAM
+        default y
+        help
+            9,214 B, touched only by the diag task with the cache on.
+
+    config UDSOTA_ESP32_RX_QUEUE_LEN
+        int "Request frame queue depth"
+        range 8 256
+        default 32
+        help
+            Frames udsota_esp32_on_frame() holds for the diag task, in internal RAM:
+            32 is 64 ms of consecutive frames at STmin 2 ms.
+
+endmenu

@@ -1,0 +1,127 @@
+/* udsota ESP32 port (ESP-IDF v6.1): the diag task that owns the ISO-TP link and the UDS server
+ * (udsota_esp32_start), the update engine on esp_ota_* (flash worker and OTA state cache), 0x27 security
+ * on PSA HMAC-SHA256 and the hardware RNG, the PSA lock they share with the app, the boot-loop counter in
+ * RTC memory and the image descriptor placement. Host code may include it: it needs only the core
+ * headers and esp_err.h (test/stubs has one). */
+#pragma once
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include "esp_err.h"
+#include "udsota.h"
+#include "udsota_image_desc.h"
+
+#define UDSOTA_ESP32_DEVICE_ID_LEN     6u           /* the base MAC: F18C and the key derivation's device ID */
+#define UDSOTA_ESP32_PSA_WAIT_FOREVER  UINT32_MAX   /* udsota_esp32_psa_lock(): no time limit */
+
+/* ---- Engine (udsota_esp32_engine.c) ---- */
+
+/* The engine for udsota_init() or another front end. Its jobs run on the worker: the ops queue them and
+ * return UDSOTA_PENDING, and poll() reports the result. One task (the server's) calls its ops. Before the
+ * port has started the engine (or when it has no worker or inactive slot), check_first answers
+ * UDSOTA_DL_FLASH_ERROR and begin, write, verify, activate and abort refuse with a negative error, as does
+ * confirm with rollback on; without rollback confirm returns 0 as always. poll reads 0 (nothing queued),
+ * status reads UDSOTA_SLOT_NONE and slot_size 0 (UDSOTA_SLOT_SIZE_DEFAULT). The core never calls confirm
+ * then: it refuses ConfirmImage while the running slot reads UDSOTA_SLOT_NONE. */
+const udsota_engine_t *udsota_esp32_engine(void);
+/* The status DID (0xF1F0) from the RAM cache, never otadata: slots and states, the other slot's version and
+ * SHA prefix, flag 0x01 (IDF checks update signatures) and 0x02 (this boot ignored config). Any task, not
+ * from an ISR, and safe before the engine starts: the slots read UDSOTA_SLOT_NONE until the boot read has
+ * finished. With rollback off the running state is never PENDING_VERIFY. */
+void udsota_esp32_status(udsota_status_t *out);
+/* True when the running image is PENDING_VERIFY and is the boot slot; from the cache, any task. */
+bool udsota_esp32_image_unconfirmed(void);
+/* True while an engine job or the boot-time cache read is queued or running. Any task. */
+bool udsota_esp32_engine_busy(void);
+
+/* ---- Security (udsota_esp32_keys.c) ---- */
+
+/* 0x27 security with the core's default derivation (udsota_keys.h): seeds from the hardware RNG, and keys
+ * from K_dev = HMAC-SHA256(master, label || device ID), derived once here, computed under the PSA lock.
+ * The first call switches the SAR-ADC entropy source on for good, reads the device ID, self-tests PSA HMAC
+ * and derives K_dev. Later calls return the same struct and ignore their arguments. label NULL: returns
+ * NULL (no security). master NULL or master_len 0, or a failed self-test: security is on and no key matches.
+ * Call it from start code, before the server's task runs. */
+const udsota_security_t *udsota_esp32_security(const char *label, const uint8_t *master, size_t master_len);
+/* The base MAC (UDSOTA_ESP32_DEVICE_ID_LEN bytes), read on the first call: exactly the bytes the key
+ * derivation hashes, for cfg.device_id (F18C). All-zero if the read failed. First call from start code. */
+const uint8_t *udsota_esp32_device_id(void);
+
+/* ---- PSA lock (udsota_esp32_psa.c) ---- */
+
+/* Takes the mutex that serialises PSA crypto between the port (0x27 HMAC, the worker's esp_ota_end and
+ * set_boot) and the app's own PSA users. IDF v6.1's PSA is thread-safe for key management only, not for
+ * one-shot or multi-part operations. Waits up to wait_ms (UDSOTA_ESP32_PSA_WAIT_FOREVER: no limit);
+ * true when held. Before the port has created the lock, returns true without locking. */
+bool udsota_esp32_psa_lock(uint32_t wait_ms);
+/* Releases the mutex udsota_esp32_psa_lock() took on the same task. */
+void udsota_esp32_psa_unlock(void);
+
+/* ---- Boot-loop counter (udsota_esp32_bootloop.c): state in RTC_NOINIT memory, safe from any task ---- */
+
+/* Runs the boot step once per boot; call it first in app_main, before anything reads stored config. */
+void udsota_esp32_bootloop_init(void);
+/* True when this boot ignores stored config after repeated crash resets; latched for the whole boot. The
+ * app checks it before it reads any stored config (NVS or otherwise) and runs on its defaults while set. */
+bool udsota_esp32_bootloop_config_ignored(void);
+/* Clears the crash count once the app is healthy; this boot's ignore flag stays latched. */
+void udsota_esp32_bootloop_mark_healthy(void);
+
+/* ---- Image descriptor ---- */
+
+/* The running image's descriptor, which the app defines with UDSOTA_ESP32_IMAGE_DESC. */
+extern const udsota_image_desc_t udsota_image_desc;
+
+#ifndef UDSOTA_ESP32_IMG_RELEASE
+#define UDSOTA_ESP32_IMG_RELEASE 0   /* udsota_esp32_image_desc() defines it: 1 for a clean-tag PROJECT_VER */
+#endif
+
+/* Defines udsota_image_desc in IDF's .rodata_custom_desc section, which sections.ld.in places right after
+ * esp_app_desc, at image offset UDSOTA_IMG_DESC_OFFSET (288). Use it once, at file scope and followed by
+ * ';', in a source of the component whose CMakeLists.txt calls udsota_esp32_image_desc(${COMPONENT_LIB}). */
+#define UDSOTA_ESP32_IMAGE_DESC(hw, layout, req_id, resp_id)                                         \
+    const __attribute__((section(".rodata_custom_desc"))) udsota_image_desc_t udsota_image_desc = { \
+        .magic               = UDSOTA_IMG_DESC_MAGIC,                                                \
+        .desc_version        = UDSOTA_IMG_DESC_VERSION,                                              \
+        .hw_id               = (uint8_t)(hw),                                                        \
+        .partition_layout_id = (uint8_t)(layout),                                                    \
+        .diag_request_id     = (uint16_t)(req_id),                                                   \
+        .diag_response_id    = (uint16_t)(resp_id),                                                  \
+        .flags               = UDSOTA_ESP32_IMG_RELEASE ? UDSOTA_IMG_FLAG_RELEASE : 0u,              \
+        .reserved            = {0},                                                                  \
+    }
+
+/* ---- Task and app API (udsota_esp32.c) ---- */
+
+/* The app's CAN transport; every member runs on the diag task. can_send queues one frame and never
+ * blocks: ESP_OK queued, ESP_ERR_NO_MEM no room now (the port keeps the frame and retries), anything else
+ * dropped. tx_pending (nullable) counts frames still in the app's driver, so a restart waits for its
+ * answer to leave. tx_dropped (nullable) counts response-ID frames the driver dropped after it queued them;
+ * the status counters report it (resp_frames_dropped). */
+typedef struct {
+    esp_err_t (*can_send)(void *ctx, uint16_t id, const uint8_t data[8], uint8_t len);
+    uint32_t  (*tx_pending)(void *ctx);
+    uint32_t  (*tx_dropped)(void *ctx);
+    void      *ctx;
+} udsota_esp32_can_t;
+
+/* Starts udsota once. It copies *cfg (the strings and arrays cfg points to must outlive the port), sets
+ * device_id to udsota_esp32_device_id() when it is NULL, turns security on when cfg->key_label is set,
+ * starts the engine, and creates the buffers, the frame queue and the diag task (Kconfig UDSOTA_ESP32_*).
+ * hooks may be NULL; a NULL hooks->reset restarts with esp_restart(). Returns ESP_ERR_INVALID_ARG for a
+ * NULL cfg, can or can_send, ESP_ERR_INVALID_STATE on a second call, and ESP_ERR_NO_MEM when an
+ * allocation or the task fails. Only a bad-argument failure may be retried: after ESP_ERR_NO_MEM the updater
+ * stays off for this boot, and a second call returns ESP_ERR_INVALID_STATE. When the buffers
+ * or frame queue cannot be allocated nothing else was started; when the diag task cannot be created, what
+ * start already set up stays behind: the flash worker with its buffer and queue and, with key_label set,
+ * the derived key in RAM and the SAR-ADC entropy source, left on. */
+esp_err_t udsota_esp32_start(const udsota_config_t *cfg, const udsota_hooks_t *hooks, const udsota_esp32_can_t *can);
+/* Any task: queues one frame on cfg->req_id with its receive time in microseconds; never blocks.
+ * Other IDs, frames before start and frames past a full queue are dropped (the last counted). */
+void udsota_esp32_on_frame(uint16_t id, const uint8_t *data, uint8_t dlc, uint32_t rx_us);
+/* Any task, an app hook included: asks the diag task to end the session (udsota_end_session) after the
+ * request it is serving, or after a running job's answer; requests before it runs count once. No-op
+ * before start. */
+void udsota_esp32_end_session(void);
+/* Any task, an app hook included: the phase as of the server's last change; one atomic read, IDLE before start. */
+udsota_phase_t udsota_esp32_phase(void);

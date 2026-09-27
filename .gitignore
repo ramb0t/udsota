@@ -1,0 +1,13 @@
+build/
+examples/*/build/
+examples/*/sdkconfig
+examples/*/sdkconfig.old
+examples/*/managed_components/
+examples/*/dependencies.lock
+__pycache__/
+*.egg-info/
+.pytest_cache/
+dist/
+*.pem
+keys/
+*.bin

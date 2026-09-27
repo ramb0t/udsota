@@ -1,0 +1,44 @@
+# Example udsota profile: a starting point for your own product, and the reference for the profile format.
+# Copy it, set your IDs and image identity, and pass the copy with --profile path/to/yours.toml.
+# Every table but [can] is optional; an absent table turns its feature off.
+
+[can]
+interface = "can0"                    # your SocketCAN interface; set it for your system, or pass --interface
+req_id = 0x710                        # the server's request ID: the only ID the tool transmits on
+resp_id = 0x718                       # the server's response ID
+deny_tx = []                          # IDs the tool must never transmit on, e.g. other nodes' diagnostic IDs
+
+[image]
+product = "example"                   # esp_app_desc_t project name the image must carry
+hw_ids = [1]                          # hw_id values in the udsota descriptor that this profile accepts
+layout_id = 1                         # partition layout ID the image must carry
+slot_size = 0x1E0000                  # largest image in bytes: examples/esp32's OTA slot (default 0x400000)
+
+[board]
+did = 0xF191                          # a DID the server answers with its board name (ASCII)
+names = { 1 = "devkit" }              # board name for each hw_id; flash refuses an image for another board
+
+# [security] turns on SecurityAccess (0x27): without it the tool never unlocks. The key for each seed is
+# derived from a 32-byte master key file, the label and the device ID, as udsota_keys.c does.
+# [security]
+# label = "udsota-example"            # the key-derivation label the server was built with (ASCII)
+# master_file = "master.bin"          # 32 raw bytes; relative to the current directory, or pass --master
+# device_id_did = 0xF18C              # the DID holding the device ID (default 0xF18C)
+# level_extended = 0x01               # requestSeed level for the extended session (odd, 0x01 to 0x7D)
+# level_programming = 0x03            # requestSeed level for the programming session (odd, 0x01 to 0x7D)
+
+# [busy] stops the tool before it sends when the application broadcasts that another tester holds a session.
+# [busy]
+# id = 0x100                          # the status frame's CAN ID
+# byte = 1                            # the byte within it holding the application's state
+# values = [2, 3]                     # the states meaning another tester holds a session
+
+# [preroll] wakes a server whose CAN driver waits to hear traffic before it transmits.
+# [preroll]
+# tester_present_frames = 5           # TesterPresent frames sent first when the bus is quiet (0 to 64)
+
+# [dids] lists extra DIDs `info` reads after the server's own, decoded as hex, ascii or version3.
+# A range stops at its first absent DID.
+[dids]
+"0xF191" = { name = "board", decode = "ascii" }       # the board name, shown by info
+# "0x0200-0x02FF" = { name = "calibration", decode = "hex" }   # a range: read until the first absent DID

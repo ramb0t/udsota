@@ -1,0 +1,86 @@
+/* The ESP32 port's control block (priv/udsota_esp32_ctl.h). Pure C11: host-tested. */
+#include "udsota_esp32_ctl.h"
+#include <stddef.h>
+
+/* phase hook: stores p for every task first, so an app hook that reads the phase sees p, then runs
+ * the app's hook with no lock held. */
+static void w_phase(void *ctx, udsota_phase_t p)
+{
+    udsota_esp32_ctl_t *ctl = ctx;
+    atomic_store_explicit(&ctl->phase, (unsigned)p, memory_order_release);
+    if (ctl->app.phase != NULL) {
+        ctl->app.phase(ctl->app.ctx, p);
+    }
+}
+
+/* gate hook: the app's gate with the app's ctx (installed only when the app has one). */
+static uint8_t w_gate(void *ctx, udsota_op_t op)
+{
+    const udsota_esp32_ctl_t *ctl = ctx;
+    return ctl->app.gate(ctl->app.ctx, op);
+}
+
+/* did_read hook: the app's did_read with the app's ctx (installed only when the app has one). */
+static size_t w_did_read(void *ctx, uint16_t did, uint8_t *buf, size_t max)
+{
+    const udsota_esp32_ctl_t *ctl = ctx;
+    return ctl->app.did_read(ctl->app.ctx, did, buf, max);
+}
+
+/* stmin_us hook: the app's stmin_us with the app's ctx (installed only when the app has one). */
+static uint32_t w_stmin_us(void *ctx)
+{
+    const udsota_esp32_ctl_t *ctl = ctx;
+    return ctl->app.stmin_us(ctl->app.ctx);
+}
+
+/* reset hook: the app's reset, else the port's default; both get the app's ctx and return only on failure. */
+static bool w_reset(void *ctx)
+{
+    const udsota_esp32_ctl_t *ctl = ctx;
+    if (ctl->app.reset != NULL) {
+        return ctl->app.reset(ctl->app.ctx);
+    }
+    return ctl->default_reset(ctl->app.ctx);
+}
+
+/* Copies the app's hooks and builds the wrapped set (see the header). */
+void udsota_esp32_ctl_init(udsota_esp32_ctl_t *ctl, const udsota_hooks_t *app,
+                           bool (*default_reset)(void *ctx), udsota_hooks_t *out)
+{
+    const udsota_hooks_t none = {0};
+    ctl->app = (app != NULL) ? *app : none;
+    ctl->default_reset = default_reset;
+    atomic_store_explicit(&ctl->phase, (unsigned)UDSOTA_PHASE_IDLE, memory_order_release);
+    atomic_store_explicit(&ctl->end_req, false, memory_order_release);
+    *out = (udsota_hooks_t){
+        .gate     = (ctl->app.gate != NULL) ? w_gate : NULL,
+        .phase    = w_phase,
+        .did_read = (ctl->app.did_read != NULL) ? w_did_read : NULL,
+        .stmin_us = (ctl->app.stmin_us != NULL) ? w_stmin_us : NULL,
+        .reset    = (ctl->app.reset != NULL || default_reset != NULL) ? w_reset : NULL,
+        .ctx      = ctl,
+    };
+}
+
+/* One atomic load. */
+udsota_phase_t udsota_esp32_ctl_phase(udsota_esp32_ctl_t *ctl)
+{
+    return (udsota_phase_t)atomic_load_explicit(&ctl->phase, memory_order_acquire);
+}
+
+/* One atomic store: the request never runs on the caller. */
+void udsota_esp32_ctl_request_end(udsota_esp32_ctl_t *ctl)
+{
+    atomic_store_explicit(&ctl->end_req, true, memory_order_release);
+}
+
+/* Takes the request with one exchange and hands it to the core on the caller (the diag task). */
+bool udsota_esp32_ctl_run_end(udsota_esp32_ctl_t *ctl, udsota_server_t *s, uint32_t now_ms)
+{
+    if (!atomic_exchange_explicit(&ctl->end_req, false, memory_order_acq_rel)) {
+        return false;
+    }
+    udsota_end_session(s, now_ms);
+    return true;
+}

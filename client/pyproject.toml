@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "udsota"
+dynamic = ["version"]
+description = "Firmware update client for a udsota server: UDS over ISO-TP, product specifics in a TOML profile"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Ramb0t" }]
+requires-python = ">=3.11"
+# Exact pins: transport.RxResilientIsoTPConnection copies udsoncan 1.26.1's receive loop.
+dependencies = ["python-can==4.6.1", "can-isotp==2.0.7", "udsoncan==1.26.1"]
+
+[project.scripts]
+udsota = "udsota.cli:main"
+
+[tool.setuptools]
+packages = ["udsota", "udsota.profiles"]
+
+[tool.setuptools.dynamic]
+version = { attr = "udsota.__version__" }
+
+[tool.setuptools.package-data]
+udsota = ["profiles/*.toml"]

@@ -1,0 +1,8 @@
+# Name,   Type, SubType, Offset,  Size
+# Two OTA slots and otadata on 4 MB flash; no factory app, so a serial flash boots ota_0.
+# Offsets are left to the tool. Moving any partition means bumping EXAMPLE_LAYOUT_ID in main/main.c.
+nvs,      data, nvs,     ,        0x4000
+otadata,  data, ota,     ,        0x2000
+phy_init, data, phy,     ,        0x1000
+ota_0,    app,  ota_0,   ,        0x1E0000
+ota_1,    app,  ota_1,   ,        0x1E0000

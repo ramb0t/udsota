@@ -1,0 +1,1247 @@
+/* UDS request-parser fuzz harness. Feeds arbitrary bytes to
+ * udsota_on_request from nine server states and fails unless the server never reads past
+ * req_len, never writes past resp_max or into the request, and always answers with a well-formed
+ * positive response, a known NRC, or nothing.
+ *
+ * This host has no libasan or clang, so guard pages (mmap + PROT_NONE) stand in for ASan: every
+ * request sits flush against a guard page on one side, and every response buffer ends at one. UBSan
+ * runs in trap mode (the top-level CMakeLists.txt), which needs no runtime library. A fork()ed self-test
+ * proves each detector really kills the process before any replay counts as a pass.
+ *
+ * Inputs: built-in seeds, deterministic mutations of them, then every file named on the command line
+ * (for example iso14229's libFuzzer corpus, used here only as arbitrary bytes). Sequence mode borrows
+ * iso14229's fuzz_server.cc idea (MIT, Nick James Kirkby & Co-Operators): a stream of requests with
+ * fuzzed waits between them. No iso14229 code is copied.
+ *
+ * libFuzzer, on a machine with clang:
+ *   clang -g -O1 -fsanitize=fuzzer,address,undefined -DUDSOTA_LIBFUZZER <includes> fuzz_udsota.c
+ *         udsota_server.c udsota_codec.c -o fuzz_udsota_lf && ./fuzz_udsota_lf -max_len=8192 <corpus>
+ */
+#define _DEFAULT_SOURCE   /* MAP_ANONYMOUS, sigaction, fork, prctl under -std=c11 */
+#include <dirent.h>
+#include <limits.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/prctl.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include "udsota.h"
+
+/* Every engine and hook callback is mocked; these trip if the API structs gain a callback. */
+_Static_assert(offsetof(udsota_engine_t, slot_size) == 12u * sizeof(void (*)(void)),
+               "udsota_engine_t gained a callback: mock it in FUZZ_ENGINE and update this count");
+_Static_assert(offsetof(udsota_hooks_t, ctx) == 5u * sizeof(void (*)(void)),
+               "udsota_hooks_t gained a callback: mock it in FUZZ_HOOKS and update this count");
+
+#define REQ_MAX          UDSOTA_DL_MAX_BLOCK_LEN  /* the ISO-TP link never delivers a longer request */
+#define RESP_FULL        256u                  /* UDSOTA_ISOTP_RESP_MAX: the transport's response buffer */
+#define CANARY_LEN       64u                   /* bytes just before resp that must survive every call */
+#define CANARY           0xA5u
+#define SEQ_MAX_BYTES    65536u                /* a longer input is truncated for sequence mode */
+#define SEQ_MAX_RECORDS  64u
+#define SEQ_DT_UNIT_MS   25u                   /* a record's dt byte x 25 ms: up to 6.4 s, past S3 */
+#define T0               60000u                /* 60 s after boot: past 0x27's post-boot delay */
+#define JOB_MS           60u                   /* async mock: each queued op takes 60 ms, past the 40 ms 0x78 */
+#define DL_SIZE          64u                   /* preamble download: two 32-byte blocks */
+#define MUTATIONS_DEFAULT 400u                 /* mutants per built-in seed */
+#define RANDOM_INPUTS    512u                  /* pure random inputs after the mutants */
+#define VARIANT_COUNT    5u
+
+typedef enum {                                 /* server states a replay starts from */
+    ST_DEFAULT, ST_EXTENDED, ST_PROG, ST_EXT_UNLOCKED, ST_PROG_UNLOCKED,
+    ST_DOWNLOAD, ST_TRANSFER, ST_EXITED, ST_VERIFIED, ST_COUNT
+} state_t;
+static const char *const STATE_NAME[ST_COUNT] = {
+    "default", "extended", "programming", "extended+01", "programming+03",
+    "download-open", "mid-transfer", "transfer-exited", "image-verified",
+};
+
+typedef enum { LAYOUT_END, LAYOUT_START } layout_t;   /* request flush against the guard after / before it */
+
+/* resp_max values a mutated or file input is answered into: each answer size (77 = 1, 7E/51/76 = 2, NRC = 3,
+ * 74/71 = 4, 71+status = 5, 50 = 6, 67+seed = 18, 62+32 B = 35) both exactly and one byte short. */
+static const size_t RESP_MAXES[] = {RESP_FULL, 64u, 35u, 34u, 19u, 18u, 17u, 6u, 5u, 4u, 3u, 2u, 1u, 0u};
+#define RESP_MAX_COUNT (sizeof RESP_MAXES / sizeof RESP_MAXES[0])
+
+typedef struct {
+    uint8_t *page;                             /* first usable byte; PROT_NONE pages sit before and after */
+    size_t   size;                             /* usable bytes, >= REQ_MAX + 1 */
+} arena_t;
+
+typedef struct {                               /* the mock platform behind the engine and hooks */
+    bool     async;                            /* queued ops return UDSOTA_PENDING and finish JOB_MS later */
+    uint32_t now;                              /* harness clock, for the async worker */
+    bool     busy;
+    uint32_t busy_until;
+    unsigned rng_calls;
+    unsigned resets;
+    unsigned variant;                          /* this run's variant (VARIANT_COUNT of them) */
+    bool     live;                             /* the preamble is done, so the variant applies */
+    int      last_phase;                       /* the last phase the hook saw */
+} mock_t;
+
+typedef enum {                                 /* platform ops whose fuzz-phase calls the coverage floor counts */
+    OP_BEGIN, OP_WRITE, OP_END, OP_ABORT, OP_ACTIVATE, OP_CONFIRM, OP_IMAGE_CHECK, OP_RESET, OP_UNVERIFY,
+    OP_COUNT
+} op_id_t;
+
+typedef struct {                               /* counted outside the preamble only, so coverage is the fuzz's own */
+    unsigned long inputs, runs, requests, positive, nrc, silent, poll_answers;
+    unsigned long op_calls[OP_COUNT];
+    bool pos_sid[256], nrc_sid[256], nrc_code[256], reached[ST_COUNT];
+} stats_t;
+
+static arena_t      g_req, g_resp;
+static mock_t       M;
+static udsota_server_t S;
+static stats_t      g_stats;
+static uint8_t      g_staged[UDSOTA_DL_MAX_DATA]; /* ota_write copies its block here (engine.write contract) */
+static uint8_t      g_pre_resp[RESP_FULL];     /* preamble answers (plain buffer) */
+static char         g_label[256];              /* what is being replayed, for failure and crash reports */
+static volatile unsigned g_rec;                /* sequence-mode record index, for crash reports */
+static volatile uint8_t  g_sink;               /* every byte an op is handed is folded in here */
+static bool         g_in_preamble;             /* reach() is running: answers are checked but not counted */
+
+/* Counts one fuzz-phase call of op for the coverage floor; preamble calls do not count. */
+static void count_op(op_id_t op)
+{
+    if (!g_in_preamble) {
+        g_stats.op_calls[op]++;
+    }
+}
+
+/* Prints a harness error (not a server defect) and exits 2. */
+static void die(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    fputs("fuzz_udsota: HARNESS ERROR: ", stderr);
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+    va_end(ap);
+    exit(2);
+}
+
+/* Prints up to 48 bytes of b as hex after a tag. */
+static void dump(const char *tag, const uint8_t *b, size_t n)
+{
+    fprintf(stderr, "  %s (%zu B):", tag, n);
+    for (size_t i = 0; i < n && i < 48u; i++) {
+        fprintf(stderr, " %02X", b[i]);
+    }
+    fputs(n > 48u ? " ...\n" : "\n", stderr);
+}
+
+/* Reports a server defect with the input that caused it, then exits 1. */
+static void fail(const char *what, const uint8_t *req, size_t rl, const uint8_t *resp, size_t n)
+{
+    fprintf(stderr, "fuzz_udsota: FAIL: %s\n  while replaying %s, record %u\n", what, g_label, g_rec);
+    if (req != NULL) {
+        dump("request", req, rl);
+    }
+    if (resp != NULL) {
+        dump("response", resp, n);
+    }
+    exit(1);
+}
+
+/* Maps a usable region of at least REQ_MAX + 1 bytes between two PROT_NONE guard pages. */
+static void arena_init(arena_t *a)
+{
+    const long ps_l = sysconf(_SC_PAGESIZE);
+    if (ps_l <= 0) {
+        die("sysconf(_SC_PAGESIZE) failed");
+    }
+    const size_t ps = (size_t)ps_l;
+    const size_t size = ((REQ_MAX + 1u + ps - 1u) / ps) * ps;
+    uint8_t *base = mmap(NULL, size + 2u * ps, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED || mprotect(base, ps, PROT_NONE) != 0 ||
+        mprotect(base + ps + size, ps, PROT_NONE) != 0) {
+        die("mmap/mprotect of a guard arena failed");
+    }
+    a->page = base + ps;
+    a->size = size;
+}
+
+/* Makes an arena's usable bytes read-only (the server gets a const request) or writable again. */
+static void arena_protect(const arena_t *a, bool read_only)
+{
+    if (mprotect(a->page, a->size, read_only ? PROT_READ : (PROT_READ | PROT_WRITE)) != 0) {
+        die("mprotect failed");
+    }
+}
+
+/* Reads every byte of p[0..n), so a pointer or length past the request faults on the guard page. */
+static void touch(const uint8_t *p, size_t n)
+{
+    uint8_t x = 0;
+    for (size_t i = 0; i < n; i++) {
+        x ^= p[i];
+    }
+    g_sink ^= x;
+}
+
+/* Models the flash worker: sync mode finishes at once with 0; async mode queues FIFO work of JOB_MS. */
+static int queue_job(void)
+{
+    if (!M.async) {
+        return 0;
+    }
+    const uint32_t start = M.busy ? M.busy_until : M.now;
+    M.busy_until = start + JOB_MS;
+    M.busy = true;
+    return UDSOTA_PENDING;
+}
+
+/* The seed mock_rng16 hands out on its call-th call in a run: deterministic, never all zero. */
+static void mock_seed(unsigned call, uint8_t out[16])
+{
+    for (unsigned i = 0; i < 16u; i++) {
+        out[i] = (uint8_t)(0x11u * (i + 1u) + call);
+    }
+    out[0] |= 0x01u;
+}
+
+/* The 0x27 seed a real RNG would give: mock_seed of this run's call count. */
+static bool mock_rng16(void *ctx, uint8_t out[16])
+{
+    mock_seed(M.rng_calls++, out);
+    return true;
+}
+
+/* The key the server expects: seed[i] ^ level ^ 0xA5, the stand-in the server tests use for HMAC. */
+static void fake_key(const uint8_t *seed, uint8_t level, uint8_t out[16])
+{
+    for (unsigned i = 0; i < 16u; i++) {
+        out[i] = (uint8_t)(seed[i] ^ level ^ 0xA5u);
+    }
+}
+
+/* Mock security.key: reads all 16 seed bytes and returns fake_key. */
+static bool mock_key(void *ctx, const uint8_t seed[16], uint8_t level, uint8_t out[16])
+{
+    touch(seed, UDSOTA_SEED_LEN);
+    fake_key(seed, level, out);
+    return true;
+}
+
+/* Mock ota_begin: queued like the ESP op. */
+static int mock_ota_begin(void *ctx, uint32_t size)
+{
+    count_op(OP_BEGIN);
+    return queue_job();
+}
+
+/* Mock engine.write: copies the block before returning (engine.write contract), reading every byte it was handed. */
+static int mock_ota_write(void *ctx, uint32_t off, const uint8_t *data, size_t len)
+{
+    count_op(OP_WRITE);
+    if (len > sizeof g_staged) {
+        fail("ota_write handed more than UDSOTA_DL_MAX_DATA bytes", NULL, 0, NULL, 0);
+    }
+    memcpy(g_staged, data, len);
+    return queue_job();
+}
+
+/* Mock ota_end (FF01's verify): queued; the job result is UDSOTA_DL_OK (0). */
+static int mock_ota_end(void *ctx)
+{
+    count_op(OP_END);
+    return queue_job();
+}
+
+/* Mock engine.abort: queued; the server never waits on it. */
+static void mock_ota_abort(void *ctx) { count_op(OP_ABORT); (void)queue_job(); }
+
+/* Mock ota_activate (F001's set_boot): queued; the job result is 0. */
+static int mock_ota_activate(void *ctx)
+{
+    count_op(OP_ACTIVATE);
+    return queue_job();
+}
+
+/* Mock ota_confirm (F002): queued; the job result is 0. */
+static int mock_ota_confirm(void *ctx)
+{
+    count_op(OP_CONFIRM);
+    return queue_job();
+}
+
+/* Mock ota_unverify: synchronous, like the ESP op; only counted. */
+static void mock_ota_unverify(void *ctx)
+{
+    count_op(OP_UNVERIFY);
+}
+
+/* Mock image_check: reads every byte; a first byte of 0x00 fails as UDSOTA_DL_BAD_HEADER, anything else passes. */
+static int mock_image_check(void *ctx, const uint8_t *first, size_t len, udsota_reason_t *reason)
+{
+    count_op(OP_IMAGE_CHECK);
+    touch(first, len);
+    if (len == 0 || first[0] == 0x00u) {
+        *reason = UDSOTA_DL_BAD_HEADER;
+        return 1;
+    }
+    *reason = UDSOTA_DL_OK;
+    return 0;
+}
+
+/* The app's DIDs the mock serves through hooks.did_read, with fixed lengths; F189, F18C, F1F0 and F1F3 are
+ * the server's own (engine and config). */
+static const struct { uint16_t did; uint8_t len; uint8_t fill; } DIDS[] = {
+    {0xF191u, 4u, 'w'}, {0xF1B0u, UDSOTA_SHA256_LEN, 0x8Cu}, {0xF1B1u, 3u, 0x01u},
+    {0x0200u, 1u, 0x00u}, {0x0201u, 1u, 0x01u}, {0x0202u, 2u, 0x09u}, {0x0203u, 2u, 0x09u}, {0x0204u, 2u, 0x0Eu},
+};
+
+/* Mock hooks.did_read: first writes all max bytes it was offered (so an oversized max faults on the guard page), then the DID. */
+static size_t mock_did_read(void *ctx, uint16_t did, uint8_t *out, size_t max)
+{
+    memset(out, 0xDD, max);
+    for (size_t i = 0; i < sizeof DIDS / sizeof DIDS[0]; i++) {
+        if (DIDS[i].did == did) {
+            if (DIDS[i].len > max) {
+                return 0;
+            }
+            memset(out, DIDS[i].fill, DIDS[i].len);
+            return DIDS[i].len;
+        }
+    }
+    return 0;
+}
+
+/* Mock hooks.reset: counts it; the chip would restart here. */
+static bool mock_reset(void *ctx)
+{
+    count_op(OP_RESET);
+    M.resets++;
+    return true;
+}
+
+/* Mock tx_pending: the bus is always drained. */
+static uint32_t mock_tx_pending(void *ctx)
+{
+    return 0;
+}
+
+/* Mock engine.poll: UDSOTA_PENDING until the async worker's queue drains, then 0. */
+static int mock_job_poll(void *ctx)
+{
+    if (M.busy && (int32_t)(M.now - M.busy_until) < 0) {
+        return UDSOTA_PENDING;
+    }
+    M.busy = false;
+    return 0;
+}
+
+#define FUZZ_GATE_NRC 0x88u   /* vehicleSpeedTooHigh: variant 2's NRC, one the core never sends itself */
+
+/* Mock engine.status: slot 0 running and booting, VALID; PENDING_VERIFY in variant 4 once the preamble is done
+ * (ConfirmImage's core precondition, as the old running_pending_verify variant was). */
+static void mock_status(void *ctx, udsota_status_t *out)
+{
+    memset(out, 0, sizeof *out);
+    out->running_slot = UDSOTA_SLOT_OTA0;
+    out->boot_slot = UDSOTA_SLOT_OTA0;
+    out->running_state = (M.live && M.variant == 4u) ? UDSOTA_IMG_PENDING_VERIFY : UDSOTA_IMG_VALID;
+}
+
+/* Mock engine.version: first writes every byte it was offered (an oversized max faults on the guard page), then
+ * 18 bytes of 'v'; 0 when max is short. */
+static size_t mock_version(void *ctx, char *out, size_t max)
+{
+    memset(out, 0xDD, max);
+    if (max < 18u) {
+        return 0;
+    }
+    memset(out, 'v', 18u);
+    return 18u;
+}
+
+/* Mock engine.running_sha: the same guard write, then 32 bytes of 0xA3. */
+static size_t mock_running_sha(void *ctx, uint8_t *out, size_t max)
+{
+    memset(out, 0xDD, max);
+    if (max < UDSOTA_SHA256_LEN) {
+        return 0;
+    }
+    memset(out, 0xA3, UDSOTA_SHA256_LEN);
+    return UDSOTA_SHA256_LEN;
+}
+
+/* Mock hooks.gate: allows during the preamble; afterwards variant 1 (a second device on the IDs; fuzz_poll also calls udsota_end_session) answers 0x22 to every op, 2 answers 0x88
+ * (passed through verbatim), 3 answers 0x21 busy-repeat, and 0 and 4 allow. An op outside udsota_op_t is a defect. */
+static uint8_t mock_gate(void *ctx, udsota_op_t op)
+{
+    static const uint8_t NRC[VARIANT_COUNT] = {0x00u, 0x22u, FUZZ_GATE_NRC, 0x21u, 0x00u};
+    const unsigned o = (unsigned)op;
+    if (o < (unsigned)UDSOTA_OP_ENTER_EXTENDED || o > (unsigned)UDSOTA_OP_CONFIRM) {
+        fail("gate asked about an op outside udsota_op_t", NULL, 0, NULL, 0);
+    }
+    return M.live ? NRC[M.variant] : 0u;
+}
+
+/* Mock hooks.phase: the phase must be one of the five and must differ from the last one reported. */
+static void mock_phase(void *ctx, udsota_phase_t p)
+{
+    if ((unsigned)p > (unsigned)UDSOTA_PHASE_ACTIVATING || (int)p == M.last_phase) {
+        fail("phase hook called with an unknown phase or without a change", NULL, 0, NULL, 0);
+    }
+    M.last_phase = (int)p;
+}
+
+static const uint8_t FUZZ_SERIAL[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
+static const udsota_config_t FUZZ_CFG = {
+    .stmin_monitor = true, .device_id = FUZZ_SERIAL, .device_id_len = sizeof FUZZ_SERIAL,
+};
+static const udsota_engine_t FUZZ_ENGINE = {
+    .check_first = mock_image_check, .begin = mock_ota_begin, .write = mock_ota_write, .verify = mock_ota_end,
+    .activate = mock_ota_activate, .confirm = mock_ota_confirm, .abort = mock_ota_abort,
+    .unverify = mock_ota_unverify, .poll = mock_job_poll, .status = mock_status,
+    .running_sha = mock_running_sha, .version = mock_version, .slot_size = 0u, .ctx = NULL,
+};
+static const udsota_security_t FUZZ_SECURITY = {.rng16 = mock_rng16, .key = mock_key, .ctx = NULL};
+static const udsota_hooks_t FUZZ_HOOKS = {
+    .gate = mock_gate, .phase = mock_phase, .did_read = mock_did_read, .stmin_us = NULL, .reset = mock_reset,
+    .ctx = NULL,
+};
+
+/* True for the SIDs the server serves; every other SID must get NRC 0x11 or 0x7F. */
+static bool sid_served(uint8_t sid)
+{
+    switch (sid) {
+    case UDSOTA_SID_SESSION: case UDSOTA_SID_RESET: case UDSOTA_SID_READ_DID: case UDSOTA_SID_SECURITY:
+    case UDSOTA_SID_ROUTINE: case UDSOTA_SID_REQUEST_DOWNLOAD: case UDSOTA_SID_TRANSFER_DATA:
+    case UDSOTA_SID_TRANSFER_EXIT: case UDSOTA_SID_TESTER_PRESENT:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* True for the 19 NRCs udsota.h defines; anything else on the wire is a server defect. */
+static bool nrc_known(uint8_t nrc)
+{
+    switch (nrc) {
+    case UDSOTA_NRC_GENERAL_REJECT: case UDSOTA_NRC_SERVICE_NOT_SUPPORTED: case UDSOTA_NRC_SUBFUNC_NOT_SUPPORTED:
+    case UDSOTA_NRC_INCORRECT_LENGTH: case UDSOTA_NRC_BUSY_REPEAT: case UDSOTA_NRC_CONDITIONS_NOT_CORRECT:
+    case UDSOTA_NRC_REQUEST_SEQUENCE_ERROR: case UDSOTA_NRC_REQUEST_OUT_OF_RANGE:
+    case UDSOTA_NRC_SECURITY_ACCESS_DENIED: case UDSOTA_NRC_INVALID_KEY: case UDSOTA_NRC_EXCEEDED_ATTEMPTS:
+    case UDSOTA_NRC_TIME_DELAY_NOT_EXPIRED: case UDSOTA_NRC_UPLOAD_DOWNLOAD_NOT_ACCEPTED:
+    case UDSOTA_NRC_TRANSFER_DATA_SUSPENDED: case UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE:
+    case UDSOTA_NRC_WRONG_BLOCK_SEQUENCE_COUNTER: case UDSOTA_NRC_RESPONSE_PENDING:
+    case UDSOTA_NRC_SUBFUNC_NOT_SUPPORTED_IN_SESSION: case UDSOTA_NRC_SERVICE_NOT_SUPPORTED_IN_SESSION:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* A known NRC, or the gate's own NRC in the variant that sends it. */
+static bool nrc_ok(uint8_t nrc)
+{
+    return nrc_known(nrc) || (M.live && M.variant == 2u && nrc == FUZZ_GATE_NRC);
+}
+
+/* True when a positive answer r[0..n) to req has the shape the server tests pin for its SID. */
+static bool positive_shape_ok(const uint8_t *req, size_t rl, const uint8_t *r, size_t n)
+{
+    const uint8_t sub = rl >= 2 ? (uint8_t)(req[1] & (uint8_t)~UDSOTA_SPRMIB) : 0u;
+    switch (req[0]) {
+    case UDSOTA_SID_SESSION:            /* 50 ss 00 32 01 F4 */
+        return n == 6 && rl == 2 && r[1] == sub && r[2] == 0x00 && r[3] == 0x32 && r[4] == 0x01 && r[5] == 0xF4;
+    case UDSOTA_SID_RESET:              /* 51 01 */
+        return n == 2 && r[1] == UDSOTA_RESET_HARD;
+    case UDSOTA_SID_READ_DID:           /* 62 did-hi did-lo data..., one DID per request */
+        return n >= 4 && rl == 3 && r[1] == req[1] && r[2] == req[2];
+    case UDSOTA_SID_SECURITY:           /* 67 ll + 16-byte seed, or 67 ll after a key */
+        return (sub & 1u) != 0 ? (n == 2u + UDSOTA_SEED_LEN && r[1] == sub) : (n == 2 && r[1] == sub);
+    case UDSOTA_SID_ROUTINE:            /* 71 01 rid-hi rid-lo [status] */
+        return (n == 4 || n == 5) && rl >= 4 && r[1] == sub && r[2] == req[2] && r[3] == req[3];
+    case UDSOTA_SID_REQUEST_DOWNLOAD:   /* 74 20 0F FF */
+        return n == 4 && r[1] == UDSOTA_DL_LFID && r[2] == 0x0F && r[3] == 0xFF;
+    case UDSOTA_SID_TRANSFER_DATA:      /* 76 bsc */
+        return n == 2 && rl >= 2 && r[1] == req[1];
+    case UDSOTA_SID_TRANSFER_EXIT:      /* 77 */
+        return n == 1;
+    case UDSOTA_SID_TESTER_PRESENT:     /* 7E 00 */
+        return n == 2 && r[1] == UDSOTA_TP_ZERO_SUBFUNC;
+    default:
+        return false;
+    }
+}
+
+/* Checks the answer to one request against the universal invariants and records coverage. */
+static void check_request_answer(const uint8_t *req, size_t rl, const uint8_t *r, size_t n, size_t resp_max)
+{
+    const bool count = !g_in_preamble;
+    g_stats.requests += count;
+    if (n > resp_max) {
+        fail("response length exceeds resp_max", req, rl, NULL, 0);
+    }
+    if (n == 0) {
+        g_stats.silent += count;
+        return;
+    }
+    if (rl == 0) {
+        fail("answered an empty request", req, rl, r, n);
+    }
+    if (r[0] == UDSOTA_NEG_RESPONSE) {
+        if (n != 3 || r[1] != req[0] || !nrc_ok(r[2])) {
+            fail("malformed negative response (want 7F <request SID> <known NRC>)", req, rl, r, n);
+        }
+        if (count) {
+            g_stats.nrc++;
+            g_stats.nrc_sid[req[0]] = true;
+            g_stats.nrc_code[r[2]] = true;
+        }
+        return;
+    }
+    if (!sid_served(req[0]) || r[0] != UDSOTA_POS(req[0]) || !positive_shape_ok(req, rl, r, n)) {
+        fail("malformed positive response", req, rl, r, n);
+    }
+    if (count) {
+        g_stats.positive++;
+        g_stats.pos_sid[req[0]] = true;
+    }
+}
+
+/* Checks an answer udsota_poll produced: a 0x78/0x72/job NRC, or the positive final answer of one of
+ * the two services that start worker jobs (76 BSC for 0x36, 71 01 <rid> [status] for 0x31). */
+static void check_poll_answer(const uint8_t *r, size_t n, size_t resp_max)
+{
+    if (n > resp_max) {
+        fail("poll response length exceeds resp_max", NULL, 0, NULL, 0);
+    }
+    if (n == 0) {
+        return;
+    }
+    g_stats.poll_answers += !g_in_preamble;
+    if (r[0] == UDSOTA_NEG_RESPONSE) {
+        if (n != 3 || !sid_served(r[1]) || !nrc_ok(r[2])) {
+            fail("malformed negative poll response", NULL, 0, r, n);
+        }
+        return;
+    }
+    const uint8_t sid = (uint8_t)(r[0] & (uint8_t)~UDSOTA_POS_BIT);
+    const bool ok = (r[0] & UDSOTA_POS_BIT) != 0 &&
+                    ((sid == UDSOTA_SID_TRANSFER_DATA && n == 2) ||
+                     (sid == UDSOTA_SID_ROUTINE && (n == 4 || n == 5) && r[1] == UDSOTA_RC_START));
+    if (!ok) {
+        fail("malformed positive poll response", NULL, 0, r, n);
+    }
+    if (!g_in_preamble) {
+        g_stats.pos_sid[sid] = true;   /* an async 0x36 or 0x31 gets its positive answer here */
+    }
+}
+
+/* The server's phase is the last one its hook reported (the hook saw every change). */
+static void check_phase(void)
+{
+    const udsota_phase_t p = udsota_phase(&S);
+    if ((int)p != M.last_phase) {
+        const uint8_t b = (uint8_t)p;
+        fail("udsota_phase() differs from the last phase the hook saw", NULL, 0, &b, 1);
+    }
+}
+
+/* Returns the guarded response buffer for resp_max, with its canary armed. */
+static uint8_t *resp_buf(size_t resp_max)
+{
+    uint8_t *resp = g_resp.page + g_resp.size - resp_max;
+    memset(resp - CANARY_LEN, CANARY, CANARY_LEN);
+    return resp;
+}
+
+/* Fails if the server wrote into the bytes just before its response buffer. */
+static void check_canary(const uint8_t *resp, const uint8_t *req, size_t rl)
+{
+    for (size_t i = 1; i <= CANARY_LEN; i++) {
+        if (resp[-(ptrdiff_t)i] != CANARY) {
+            fail("server wrote before the start of resp", req, rl, NULL, 0);
+        }
+    }
+}
+
+/* Places the request flush against a guard page, makes it read-only, and sends it with a guarded resp. */
+static size_t fuzz_request(const uint8_t *in, size_t len, layout_t lay, size_t resp_max, uint32_t now)
+{
+    arena_protect(&g_req, false);
+    uint8_t *req = (lay == LAYOUT_END) ? g_req.page + g_req.size - len : g_req.page;
+    memcpy(req, in, len);
+    arena_protect(&g_req, true);
+    uint8_t *resp = resp_buf(resp_max);
+    M.now = now;
+    if (len > 7u) {
+        udsota_on_rx_first_frame(&S, now);   /* what the shim does for a multi-frame request */
+    }
+    const size_t n = udsota_on_request(&S, req, len, resp, resp_max, now);
+    check_canary(resp, req, len);
+    check_request_answer(req, len, resp, n, resp_max);
+    check_phase();
+    return n;
+}
+
+/* Polls the server at now into a guarded resp and checks any answer. */
+static void fuzz_poll(size_t resp_max, uint32_t now)
+{
+    uint8_t *resp = resp_buf(resp_max);
+    M.now = now;
+    if (M.live && M.variant == 1u) {
+        udsota_end_session(&S, now);   /* variant 1 is the second device: fuzz the end_pending latch */
+    }
+    const size_t n = udsota_poll(&S, resp, resp_max, now);
+    check_canary(resp, NULL, 0);
+    check_poll_answer(resp, n, resp_max);
+    check_phase();
+}
+
+/* Sends one preamble request (plain buffers) and waits out any worker job; fails unless the final answer is positive. */
+static size_t pre_exchange(uint32_t *now, state_t st, const uint8_t *req, size_t len)
+{
+    *now += 10u;
+    M.now = *now;
+    size_t n = udsota_on_request(&S, req, len, g_pre_resp, sizeof g_pre_resp, *now);
+    check_request_answer(req, len, g_pre_resp, n, sizeof g_pre_resp);
+    for (unsigned k = 0; k < 1000u && (n == 0 || (g_pre_resp[0] == UDSOTA_NEG_RESPONSE &&
+                                                   g_pre_resp[2] == UDSOTA_NRC_RESPONSE_PENDING)); k++) {
+        *now += 5u;
+        M.now = *now;
+        n = udsota_poll(&S, g_pre_resp, sizeof g_pre_resp, *now);
+        check_poll_answer(g_pre_resp, n, sizeof g_pre_resp);
+    }
+    if (n == 0 || g_pre_resp[0] != UDSOTA_POS(req[0])) {
+        fprintf(stderr, "fuzz_udsota: PREAMBLE to state '%s' refused a step, so that state cannot be fuzzed\n",
+                STATE_NAME[st]);
+        dump("request", req, len);
+        dump("response", g_pre_resp, n);
+        exit(1);
+    }
+    return n;
+}
+
+/* Sends one preamble request given as its bytes, through pre_exchange. */
+#define STEP(now, st, ...) do {                                        \
+        const uint8_t step_[] = {__VA_ARGS__};                         \
+        (void)pre_exchange((now), (st), step_, sizeof step_);          \
+    } while (0)
+
+/* Unlocks a security level in the preamble: 27 <level>, then 27 <level+1> with fake_key of the seed. */
+static void unlock(uint32_t *now, state_t st, uint8_t level)
+{
+    const uint8_t seed_req[2] = {UDSOTA_SID_SECURITY, level};
+    (void)pre_exchange(now, st, seed_req, sizeof seed_req);
+    uint8_t key_req[2 + UDSOTA_KEY_LEN] = {UDSOTA_SID_SECURITY, (uint8_t)(level + 1u)};
+    fake_key(&g_pre_resp[2], level, &key_req[2]);
+    (void)pre_exchange(now, st, key_req, sizeof key_req);
+}
+
+/* Sends one 32-byte preamble TransferData block; block 1 starts with the ESP image magic 0xE9. */
+static void send_block(uint32_t *now, state_t st, uint8_t bsc)
+{
+    uint8_t blk[2 + DL_SIZE / 2u];
+    blk[0] = UDSOTA_SID_TRANSFER_DATA;
+    blk[1] = bsc;
+    for (size_t i = 2; i < sizeof blk; i++) {
+        blk[i] = (uint8_t)(i * 7u + bsc);
+    }
+    if (bsc == 1u) {
+        blk[2] = 0xE9;
+    }
+    (void)pre_exchange(now, st, blk, sizeof blk);
+}
+
+/* Drives a fresh server into st with valid requests, asserting each step is accepted. */
+static void reach(state_t st, uint32_t *now)
+{
+    if (st == ST_DEFAULT) {
+        return;
+    }
+    if (st == ST_EXTENDED || st == ST_EXT_UNLOCKED) {
+        STEP(now, st, UDSOTA_SID_SESSION, UDSOTA_SESSION_EXTENDED);
+        if (st == ST_EXT_UNLOCKED) {
+            unlock(now, st, UDSOTA_SA_SEED_EXTENDED);
+        }
+        return;
+    }
+    STEP(now, st, UDSOTA_SID_SESSION, UDSOTA_SESSION_PROGRAMMING);
+    if (st == ST_PROG) {
+        return;
+    }
+    unlock(now, st, UDSOTA_SA_SEED_PROGRAMMING);
+    if (st == ST_PROG_UNLOCKED) {
+        return;
+    }
+    STEP(now, st, UDSOTA_SID_REQUEST_DOWNLOAD, UDSOTA_DL_DFI, UDSOTA_DL_ALFID, 0, 0, 0, 0, 0, 0, 0, DL_SIZE);
+    if (st == ST_DOWNLOAD) {
+        return;
+    }
+    send_block(now, st, 1);
+    if (st == ST_TRANSFER) {
+        return;
+    }
+    send_block(now, st, 2);
+    STEP(now, st, UDSOTA_SID_TRANSFER_EXIT);
+    if (st == ST_EXITED) {
+        return;
+    }
+    const uint8_t ff01[] = {UDSOTA_SID_ROUTINE, UDSOTA_RC_START, 0xFF, 0x01};
+    if (pre_exchange(now, st, ff01, sizeof ff01) != 5u || g_pre_resp[4] != UDSOTA_DL_OK) {
+        die("preamble FF01 did not answer 71 01 FF 01 00 (UDSOTA_DL_OK)");
+    }
+}
+
+/* Starts one replay: a fresh server and mock driven to st with every gate open, then the variant switched on.
+ * Odd runs leave the nullable engine.unverify NULL. */
+static uint32_t start_run(state_t st, unsigned variant, bool async)
+{
+    memset(&M, 0, sizeof M);
+    M.async = async;
+    g_rec = 0;
+    udsota_engine_t engine = FUZZ_ENGINE;
+    if ((g_stats.runs & 1u) != 0u) {
+        engine.unverify = NULL;
+    }
+    udsota_init(&S, &FUZZ_CFG, &engine, &FUZZ_SECURITY, &FUZZ_HOOKS);
+    udsota_set_tx_pending(&S, mock_tx_pending, NULL);
+    uint32_t now = T0;
+    g_in_preamble = true;
+    reach(st, &now);
+    g_in_preamble = false;
+    M.variant = variant;
+    M.live = true;
+    g_stats.reached[st] = true;
+    g_stats.runs++;
+    return now + 10u;
+}
+
+/* Polls past the 0x78 point, the 1.5 s repeat and S3, checking every answer. */
+static void finish_polls(size_t resp_max, uint32_t now)
+{
+    static const uint32_t STEPS[] = {1u, 45u, 100u, 1600u, 5001u};
+    for (size_t i = 0; i < sizeof STEPS / sizeof STEPS[0]; i++) {
+        fuzz_poll(resp_max, now + STEPS[i]);
+    }
+}
+
+/* Records what is being replayed, for failure and crash reports. */
+static void set_label(const char *src, unsigned long idx, size_t len, state_t st, const char *mode,
+                      unsigned variant, size_t resp_max)
+{
+    snprintf(g_label, sizeof g_label, "%s #%lu (%zu B), state %s, %s, variant %u, resp_max %zu",
+             src, idx, len, STATE_NAME[st], mode, variant, resp_max);
+}
+
+/* Replays in[0..len) as one request from state st. The start-guard run uses the async worker, so a
+ * request that queues flash work gets its 0x78 and final answer from the polls that follow. */
+static void run_single(const char *src, unsigned long idx, const uint8_t *in, size_t len, state_t st,
+                       layout_t lay, unsigned variant, size_t resp_max)
+{
+    set_label(src, idx, len, st, lay == LAYOUT_END ? "single/end-guard" : "single/start-guard+async",
+              variant, resp_max);
+    const uint32_t now = start_run(st, variant, lay == LAYOUT_START);
+    (void)fuzz_request(in, len, lay, resp_max, now);
+    finish_polls(resp_max, now);
+}
+
+/* Replays in as records [dt][len | FF hi lo][bytes] from st with an async worker: dt x 25 ms pass (one
+ * poll) before each request; a zero-length record is an abandoned multi-frame request (N_Cr). */
+static void run_sequence(const char *src, unsigned long idx, const uint8_t *in, size_t len, state_t st,
+                         unsigned variant, size_t resp_max)
+{
+    set_label(src, idx, len, st, "sequence", variant, resp_max);
+    uint32_t now = start_run(st, variant, true);
+    size_t pos = 0;
+    for (unsigned rec = 0; pos + 2u <= len && rec < SEQ_MAX_RECORDS; rec++) {
+        g_rec = rec;
+        now += (uint32_t)in[pos++] * SEQ_DT_UNIT_MS;
+        size_t l = in[pos++];
+        if (l == 0xFFu && pos + 2u <= len) {
+            l = (((size_t)in[pos] << 8) | in[pos + 1u]) & 0x0FFFu;
+            pos += 2u;
+        }
+        if (l > len - pos) {
+            l = len - pos;
+        }
+        fuzz_poll(resp_max, now);
+        if (l == 0) {
+            udsota_on_rx_timeout(&S, now);
+        } else {
+            (void)fuzz_request(&in[pos], l, (rec & 1u) ? LAYOUT_START : LAYOUT_END, resp_max, now);
+        }
+        pos += l;
+    }
+    finish_polls(resp_max, now);
+}
+
+/* Replays one input from every state: as one request in both layouts, then as a record stream.
+ * A pristine seed always runs with every gate passing and the full buffer; others rotate both. */
+static void replay_input(const char *src, const uint8_t *in, size_t len, bool pristine)
+{
+    const unsigned long idx = g_stats.inputs++;
+    const size_t one = len > REQ_MAX ? REQ_MAX : len;
+    const size_t seq = len > SEQ_MAX_BYTES ? SEQ_MAX_BYTES : len;
+    const unsigned variant = pristine ? 0u : (unsigned)(idx % VARIANT_COUNT);
+    for (int st = 0; st < ST_COUNT; st++) {
+        const size_t resp_max = pristine ? RESP_FULL : RESP_MAXES[(idx + (unsigned long)st) % RESP_MAX_COUNT];
+        run_single(src, idx, in, one, (state_t)st, LAYOUT_END, variant, resp_max);
+        run_single(src, idx, in, one, (state_t)st, LAYOUT_START, variant, resp_max);
+        run_sequence(src, idx, in, seq, (state_t)st, variant, resp_max);
+    }
+}
+
+/* Maps the two guard arenas once. */
+static void harness_init(void)
+{
+    arena_init(&g_req);
+    arena_init(&g_resp);
+}
+
+#ifdef UDSOTA_LIBFUZZER
+/* libFuzzer entry point: replays one input from every state, both layouts and both modes. */
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+    static bool ready;
+    if (!ready) {
+        harness_init();
+        ready = true;
+    }
+    replay_input("libfuzzer", data, size, false);
+    return 0;
+}
+#else  /* the ctest program: self-tests, seeds, mutants, corpus replay */
+
+/* Writes s to stderr from a signal handler (async-signal-safe). */
+static void say(const char *s)
+{
+    ssize_t r = write(STDERR_FILENO, s, strlen(s));
+    (void)r;
+}
+
+/* Fatal-signal handler: names the input being replayed, then returns so the default action kills the process. */
+static void on_fatal(int sig)
+{
+    char num[16];
+    size_t i = sizeof num - 1;
+    unsigned v = g_rec;
+    num[i] = '\0';
+    do {
+        num[--i] = (char)('0' + v % 10u);
+        v /= 10u;
+    } while (v != 0 && i > 0);
+    say(sig == SIGILL ? "fuzz_udsota: CRASH (SIGILL: UBSan trap)" : "fuzz_udsota: CRASH (fatal signal: guard page or abort)");
+    say(" while replaying ");
+    say(g_label);
+    say(", record ");
+    say(&num[i]);
+    say("\n");
+}
+
+/* Installs on_fatal for the signals a guard-page hit, a UBSan trap or an assert raise. */
+static void install_handlers(void)
+{
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_fatal;
+    sa.sa_flags = SA_RESETHAND;   /* the re-executed fault (or re-raised abort) then takes the default action */
+    sigemptyset(&sa.sa_mask);
+    const int sigs[] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT};
+    for (size_t i = 0; i < sizeof sigs / sizeof sigs[0]; i++) {
+        if (sigaction(sigs[i], &sa, NULL) != 0) {
+            die("sigaction failed");
+        }
+    }
+}
+
+static uint32_t g_rng = 0x26C0FFEEu;   /* mutation PRNG state */
+
+/* xorshift32 with a fixed seed, so every run replays the same mutants. */
+static uint32_t rnd(void)
+{
+    uint32_t x = g_rng;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    g_rng = x;
+    return x;
+}
+
+/* Short hand-written seeds: every served SID in valid, truncated, over-long and wrong-sub-function
+ * forms, plus unserved SIDs. Each is replayed from every state. */
+typedef struct { uint8_t len; uint8_t b[20]; } seed_t;
+#define SEED(...) {(uint8_t)sizeof((uint8_t[]){__VA_ARGS__}), {__VA_ARGS__}}
+static const seed_t SEEDS[] = {
+    SEED(0x10, 0x01), SEED(0x10, 0x02), SEED(0x10, 0x03), SEED(0x10, 0x83), SEED(0x10, 0x04),
+    SEED(0x10), SEED(0x10, 0x03, 0x00),
+    SEED(0x3E, 0x00), SEED(0x3E, 0x80), SEED(0x3E, 0x01), SEED(0x3E), SEED(0x3E, 0x00, 0x00),
+    SEED(0x22, 0xF1, 0x86), SEED(0x22, 0xF1, 0x89), SEED(0x22, 0xF1, 0x8C), SEED(0x22, 0xF1, 0x91),
+    SEED(0x22, 0xF1, 0xB0), SEED(0x22, 0xF1, 0xF0), SEED(0x22, 0xF1, 0xB1), SEED(0x22, 0xF1, 0xF3),
+    SEED(0x22, 0xF1, 0xF1), SEED(0x22, 0xF1, 0xF2), SEED(0x22, 0x02, 0x00), SEED(0x22, 0x02, 0x04),
+    SEED(0x22, 0x01, 0xFF), SEED(0x22, 0xFF, 0xFF), SEED(0x22, 0xF1), SEED(0x22),
+    SEED(0x22, 0xF1, 0x86, 0xF1, 0x89),
+    SEED(0x27, 0x01), SEED(0x27, 0x03), SEED(0x27, 0x05), SEED(0x27), SEED(0x27, 0x03, 0x00),
+    SEED(0x27, 0x81), SEED(0x27, 0x02), SEED(0x27, 0x04, 0x00),
+    SEED(0x27, 0x04, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16),
+    SEED(0x27, 0x02, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15),
+    SEED(0x34, 0x00, 0x44, 0, 0, 0, 0, 0, 0, 0, 0x40), SEED(0x34, 0x00, 0x44, 0, 0, 0, 0, 0, 0, 0, 0),
+    SEED(0x34, 0x00, 0x44, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF), SEED(0x34, 0x00, 0x44, 0, 0, 0x10, 0, 0, 0, 0, 0x40),
+    SEED(0x34, 0x01, 0x44, 0, 0, 0, 0, 0, 0, 0, 0x40), SEED(0x34, 0x00, 0x22, 0, 0, 0, 0x40),
+    SEED(0x34, 0x00, 0x44), SEED(0x34, 0x00, 0x44, 0, 0, 0, 0, 0, 0, 0, 0x40, 0x00),
+    SEED(0x36, 0x01, 0xE9, 0x03, 0x02, 0x4F), SEED(0x36, 0x01, 0x00, 0x03), SEED(0x36, 0x02, 0x55),
+    SEED(0x36, 0x01), SEED(0x36, 0x00, 0x11), SEED(0x36, 0xFF, 0x11), SEED(0x36),
+    SEED(0x37), SEED(0x37, 0x00),
+    SEED(0x31, 0x01, 0xFF, 0x01), SEED(0x31, 0x01, 0xF0, 0x00), SEED(0x31, 0x81, 0xF0, 0x00),
+    SEED(0x31, 0x01, 0xF0, 0x01), SEED(0x31, 0x01, 0xF0, 0x02), SEED(0x31, 0x01, 0x12, 0x34),
+    SEED(0x31, 0x02, 0xFF, 0x01), SEED(0x31, 0x03, 0xFF, 0x01), SEED(0x31, 0x01, 0xFF),
+    SEED(0x31, 0x01, 0xFF, 0x01, 0x00), SEED(0x31),
+    SEED(0x11, 0x01), SEED(0x11, 0x81), SEED(0x11, 0x02), SEED(0x11, 0x03), SEED(0x11), SEED(0x11, 0x01, 0x00),
+    SEED(0x2E, 0x01, 0x00, 0x00), SEED(0x19, 0x02, 0xFF), SEED(0x14, 0xFF, 0xFF, 0xFF), SEED(0x85, 0x01),
+    SEED(0x28, 0x00, 0x01), SEED(0x7F, 0x10, 0x11), SEED(0x50, 0x01), SEED(0x00), SEED(0xFF), SEED(0x3F, 0x00),
+};
+#define SEED_COUNT (sizeof SEEDS / sizeof SEEDS[0])
+
+/* Appends a sequence-mode record (dt byte, length, bytes) to buf; returns the new length. */
+static size_t rec(uint8_t *buf, size_t n, uint8_t dt, const uint8_t *b, size_t len)
+{
+    buf[n++] = dt;
+    if (len >= 0xFFu) {
+        buf[n++] = 0xFF;
+        buf[n++] = (uint8_t)(len >> 8);
+        buf[n++] = (uint8_t)len;
+    } else {
+        buf[n++] = (uint8_t)len;
+    }
+    if (len != 0) {
+        memcpy(&buf[n], b, len);
+    }
+    return n + len;
+}
+
+/* Replays the generated seeds: max-length blocks, over-long forms of short services, and record
+ * streams that finish a download (36 02, 37, FF01, ActivateImage), let S3 expire or walk the 0x27 key paths. */
+static void replay_generated(void)
+{
+    static uint8_t b[REQ_MAX];
+    static uint8_t seq[2 * REQ_MAX];
+    const uint8_t sids[] = {UDSOTA_SID_TRANSFER_DATA, UDSOTA_SID_READ_DID, UDSOTA_SID_TESTER_PRESENT,
+                            UDSOTA_SID_SECURITY, UDSOTA_SID_ROUTINE, UDSOTA_SID_REQUEST_DOWNLOAD};
+    for (size_t k = 0; k < sizeof sids; k++) {
+        b[0] = sids[k];
+        b[1] = (k == 0) ? 0x01 : 0x00;
+        for (size_t i = 2; i < REQ_MAX; i++) {
+            b[i] = (uint8_t)(i * 31u);
+        }
+        b[2] = 0xE9;
+        replay_input("max-length", b, REQ_MAX, true);          /* 4095 B: the ISO-TP limit */
+        replay_input("max-length-1", b, REQ_MAX - 1u, true);
+        replay_input("short-block", b, 34u, true);
+    }
+    /* From mid-transfer: block 2, exit, FF01, ActivateImage. From elsewhere it is just a stream. */
+    uint8_t blk2[2 + DL_SIZE / 2u] = {UDSOTA_SID_TRANSFER_DATA, 0x02};
+    for (size_t i = 2; i < sizeof blk2; i++) {
+        blk2[i] = (uint8_t)(i * 7u + 2u);
+    }
+    const uint8_t exit_[] = {UDSOTA_SID_TRANSFER_EXIT};
+    const uint8_t ff01[] = {UDSOTA_SID_ROUTINE, UDSOTA_RC_START, 0xFF, 0x01};
+    const uint8_t act[] = {UDSOTA_SID_ROUTINE, UDSOTA_RC_START, 0xF0, 0x01};
+    const uint8_t tp[] = {UDSOTA_SID_TESTER_PRESENT, 0x80};
+    const uint8_t sess[] = {UDSOTA_SID_READ_DID, 0xF1, 0x86};
+    size_t n = 0;
+    n = rec(seq, n, 0, blk2, sizeof blk2);
+    n = rec(seq, n, 8, blk2, sizeof blk2);                     /* the repeat of a lost 76 */
+    n = rec(seq, n, 8, exit_, sizeof exit_);
+    n = rec(seq, n, 1, ff01, sizeof ff01);
+    n = rec(seq, n, 0, act, sizeof act);
+    n = rec(seq, n, 8, act, sizeof act);
+    replay_input("seq-finish-download", seq, n, true);
+    n = 0;
+    n = rec(seq, n, 80, tp, sizeof tp);                        /* 2 s: S3 kept alive */
+    n = rec(seq, n, 210, sess, sizeof sess);                   /* 5.25 s: S3 has expired */
+    n = rec(seq, n, 0, NULL, 0);                               /* an abandoned multi-frame request */
+    n = rec(seq, n, 0, b, 300);                                /* long record with a 0xFF length escape */
+    replay_input("seq-s3-expiry", seq, n, true);
+    /* SecurityAccess key paths, which need an outstanding seed no state leaves behind. Per level: the right
+     * key for the run's first seed (unlocks from the matching session with no earlier 0x27 in the run),
+     * then three wrong keys (0x35, 0x35, 0x36) and a seed request inside the delay (0x37). */
+    for (uint8_t level = UDSOTA_SA_SEED_EXTENDED; level <= UDSOTA_SA_SEED_PROGRAMMING; level += 2u) {
+        const uint8_t seed_req[] = {UDSOTA_SID_SECURITY, level};
+        uint8_t key_req[2 + UDSOTA_KEY_LEN] = {UDSOTA_SID_SECURITY, (uint8_t)(level + 1u)};
+        uint8_t seed0[UDSOTA_SEED_LEN];
+        mock_seed(0, seed0);
+        fake_key(seed0, level, &key_req[2]);
+        n = 0;
+        n = rec(seq, n, 0, seed_req, sizeof seed_req);
+        n = rec(seq, n, 1, key_req, sizeof key_req);
+        replay_input("seq-sa-unlock", seq, n, true);
+        memset(&key_req[2], 0x5A, UDSOTA_KEY_LEN);
+        n = 0;
+        for (unsigned k = 0; k < UDSOTA_SA_MAX_ATTEMPTS; k++) {
+            n = rec(seq, n, 0, seed_req, sizeof seed_req);
+            n = rec(seq, n, 1, key_req, sizeof key_req);
+        }
+        n = rec(seq, n, 4, seed_req, sizeof seed_req);
+        replay_input("seq-sa-lockout", seq, n, true);
+    }
+}
+
+/* Writes a mutant of seed into out (capacity REQ_MAX) with 1-4 random edits; returns its length. */
+static size_t mutate(const uint8_t *seed, size_t len, uint8_t *out)
+{
+    static const uint8_t INTERESTING[] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x7F, 0x80, 0x81, 0xFE, 0xFF};
+    static const uint8_t SIDS[] = {0x10, 0x11, 0x22, 0x27, 0x2E, 0x31, 0x34, 0x36, 0x37, 0x3E};
+    size_t n = len;
+    memcpy(out, seed, len);
+    const unsigned edits = 1u + rnd() % 4u;
+    for (unsigned e = 0; e < edits; e++) {
+        switch (rnd() % 7u) {
+        case 0: if (n != 0) { out[rnd() % n] ^= (uint8_t)(1u << (rnd() % 8u)); } break;
+        case 1: if (n != 0) { out[rnd() % n] = INTERESTING[rnd() % sizeof INTERESTING]; } break;
+        case 2: n = (n != 0) ? rnd() % n : 0; break;                                   /* truncate */
+        case 3: for (unsigned a = 1u + rnd() % 64u; a != 0 && n < REQ_MAX; a--) { out[n++] = (uint8_t)rnd(); } break;
+        case 4: if (n != 0) { out[0] = SIDS[rnd() % sizeof SIDS]; } break;              /* re-aim at a handler */
+        case 5: if (n > 1) { out[1] ^= UDSOTA_SPRMIB; } break;                            /* toggle suppress */
+        default: { const size_t t = REQ_MAX - rnd() % 3u; while (n < t) { out[n++] = (uint8_t)rnd(); } } break;
+        }
+    }
+    return n;
+}
+
+/* Replays the seeds pristine, then `mutations` mutants of each, then RANDOM_INPUTS random inputs. */
+static void replay_seeds(unsigned mutations)
+{
+    static uint8_t buf[REQ_MAX];
+    replay_input("seed-empty", buf, 0, true);
+    for (size_t i = 0; i < SEED_COUNT; i++) {
+        replay_input("seed", SEEDS[i].b, SEEDS[i].len, true);
+    }
+    replay_generated();
+    for (size_t i = 0; i < SEED_COUNT; i++) {
+        for (unsigned m = 0; m < mutations; m++) {
+            replay_input("mutant", buf, mutate(SEEDS[i].b, SEEDS[i].len, buf), false);
+        }
+    }
+    for (unsigned i = 0; i < RANDOM_INPUTS; i++) {
+        const size_t n = rnd() % (REQ_MAX + 1u);
+        for (size_t k = 0; k < n; k++) {
+            buf[k] = (uint8_t)rnd();
+        }
+        replay_input("random", buf, n, false);
+    }
+}
+
+static const char *const OP_NAME[OP_COUNT] = {   /* op_id_t names for the coverage report */
+    "ota_begin", "ota_write", "ota_end", "ota_abort", "ota_activate", "ota_confirm", "image_check",
+    "reset", "ota_unverify",
+};
+
+/* The replay's own positive control, from fuzzed requests only (preamble answers never count): every
+ * served SID must have drawn a positive answer and an NRC, some request NRC 0x13 and 0x35, and every platform op
+ * a call, so accepted 0x34s and written 0x36 blocks were reached, not just refusals. */
+static void check_coverage(void)
+{
+    static const uint8_t SERVED[] = {0x10, 0x11, 0x22, 0x27, 0x31, 0x34, 0x36, 0x37, 0x3E};
+    bool ok = g_stats.nrc_code[UDSOTA_NRC_INCORRECT_LENGTH] && g_stats.nrc_code[UDSOTA_NRC_INVALID_KEY];
+    for (size_t i = 0; i < sizeof SERVED; i++) {
+        if (!g_stats.pos_sid[SERVED[i]] || !g_stats.nrc_sid[SERVED[i]]) {
+            fprintf(stderr, "fuzz_udsota: COVERAGE: SID 0x%02X positive=%d NRC=%d\n", SERVED[i],
+                    g_stats.pos_sid[SERVED[i]], g_stats.nrc_sid[SERVED[i]]);
+            ok = false;
+        }
+    }
+    for (int op = 0; op < OP_COUNT; op++) {
+        if (g_stats.op_calls[op] == 0) {
+            fprintf(stderr, "fuzz_udsota: COVERAGE: no fuzzed request reached %s\n", OP_NAME[op]);
+            ok = false;
+        }
+    }
+    for (int st = 0; st < ST_COUNT; st++) {
+        ok = ok && g_stats.reached[st];
+    }
+    if (!ok) {
+        fprintf(stderr, "fuzz_udsota: COVERAGE floor not met (NRC 0x13 seen=%d, 0x35 seen=%d): a clean run would "
+                "prove nothing\n", g_stats.nrc_code[UDSOTA_NRC_INCORRECT_LENGTH], g_stats.nrc_code[UDSOTA_NRC_INVALID_KEY]);
+        exit(1);
+    }
+}
+
+/* Reads one corpus file (up to SEQ_MAX_BYTES) and replays it. */
+static void replay_file(const char *path)
+{
+    static uint8_t buf[SEQ_MAX_BYTES];
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) {
+        die("cannot open %s", path);
+    }
+    const size_t n = fread(buf, 1, sizeof buf, f);
+    fclose(f);
+    const char *base = strrchr(path, '/');
+    replay_input(base != NULL ? base + 1 : path, buf, n, false);
+}
+
+/* qsort comparator for directory entry names, so a corpus replays in a fixed order. */
+static int cmp_names(const void *a, const void *b)
+{
+    return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+/* Replays a corpus file, or every regular file in a corpus directory in name order. */
+static void replay_path(const char *path)
+{
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        die("cannot stat %s", path);
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        replay_file(path);
+        return;
+    }
+    DIR *d = opendir(path);
+    if (d == NULL) {
+        die("cannot open directory %s", path);
+    }
+    size_t cap = 1024, count = 0;
+    char **names = malloc(cap * sizeof *names);
+    for (struct dirent *e = readdir(d); names != NULL && e != NULL; e = readdir(d)) {
+        if (e->d_name[0] == '.') {
+            continue;
+        }
+        if (count == cap) {
+            cap *= 2u;
+            char **grown = realloc(names, cap * sizeof *names);
+            if (grown == NULL) {
+                die("out of memory listing %s", path);
+            }
+            names = grown;
+        }
+        const size_t len = strlen(path) + strlen(e->d_name) + 2u;
+        names[count] = malloc(len);
+        if (names[count] == NULL) {
+            die("out of memory listing %s", path);
+        }
+        snprintf(names[count], len, "%s/%s", path, e->d_name);
+        count++;
+    }
+    closedir(d);
+    if (names == NULL) {
+        die("out of memory listing %s", path);
+    }
+    qsort(names, count, sizeof *names, cmp_names);
+    for (size_t i = 0; i < count; i++) {
+        struct stat fs;
+        if (stat(names[i], &fs) == 0 && S_ISREG(fs.st_mode)) {
+            replay_file(names[i]);
+        }
+        free(names[i]);
+    }
+    free(names);
+    printf("fuzz_udsota: replayed %zu entries from %s\n", count, path);
+}
+
+/* Child side of a self-test: one byte read just past the end-aligned request buffer. */
+static void probe_read_past_end(void)
+{
+    const volatile uint8_t *p = g_req.page + g_req.size - 1u;
+    g_sink = p[1];
+}
+
+/* Child side of a self-test: one byte read just before the start-aligned request buffer. */
+static void probe_read_before_start(void)
+{
+    const volatile uint8_t *p = g_req.page;
+    g_sink = p[-1];
+}
+
+/* Child side of a self-test: one byte written just past a response buffer of resp_max bytes. */
+static void probe_write_past_end(void)
+{
+    volatile uint8_t *p = resp_buf(3u);
+    p[3] = 0;
+}
+
+/* Child side of a self-test: a write into the read-only request. */
+static void probe_write_request(void)
+{
+    arena_protect(&g_req, true);
+    volatile uint8_t *p = g_req.page;
+    p[0] = 0;
+}
+
+/* Child side of a self-test: a signed overflow that UBSan (trap mode) must stop. */
+static void probe_ubsan(void)
+{
+    volatile int a = INT_MAX;
+    volatile int b = 1;
+    volatile int sum = a + b;   /* kept in int: gcc narrows (uint8_t)(a + b) and drops the check */
+    g_sink = (uint8_t)sum;
+}
+
+/* Runs probe in a child and dies unless the child was killed by sig: a detector that cannot fire proves nothing. */
+static void expect_death(const char *what, void (*probe)(void), int sig)
+{
+    fflush(NULL);
+    const pid_t pid = fork();
+    if (pid < 0) {
+        die("fork failed");
+    }
+    if (pid == 0) {
+        (void)prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);   /* no core file for a deliberate crash */
+        probe();
+        _exit(0);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid || !WIFSIGNALED(status) || WTERMSIG(status) != sig) {
+        die("self-test '%s' was not stopped by signal %d (status 0x%x): the harness cannot see this bug class",
+            what, sig, (unsigned)status);
+    }
+}
+
+/* Proves each detector fires before any replay counts: guard reads both sides, guard write, const request, UBSan. */
+static void self_test(void)
+{
+    expect_death("read past the request", probe_read_past_end, SIGSEGV);
+    expect_death("read before the request", probe_read_before_start, SIGSEGV);
+    expect_death("write past resp_max", probe_write_past_end, SIGSEGV);
+    expect_death("write into the request", probe_write_request, SIGSEGV);
+#ifdef UDSOTA_FUZZ_UBSAN_TRAP
+    expect_death("UBSan signed overflow", probe_ubsan, SIGILL);
+#else
+    (void)probe_ubsan;
+#endif
+}
+
+/* Self-tests the detectors, replays the seeds and their mutants, checks the coverage floor, then replays
+ * each corpus path given. Usage: fuzz_udsota [--mutations N] [corpus-dir-or-file ...]. Exit 0 = pass. */
+int main(int argc, char **argv)
+{
+    unsigned mutations = MUTATIONS_DEFAULT;
+    int argi = 1;
+    if (argc > 2 && strcmp(argv[1], "--mutations") == 0) {
+        mutations = (unsigned)strtoul(argv[2], NULL, 10);
+        argi = 3;
+    }
+    harness_init();
+    self_test();
+    install_handlers();
+    replay_seeds(mutations);
+    check_coverage();
+    for (; argi < argc; argi++) {
+        replay_path(argv[argi]);
+    }
+    int reached = 0;
+    for (int st = 0; st < ST_COUNT; st++) {
+        reached += g_stats.reached[st] ? 1 : 0;
+    }
+    printf("fuzz_udsota: PASS %lu inputs, %lu runs, %lu requests (%lu positive, %lu NRC, %lu silent), "
+           "%lu poll answers, %d/%d states reached\n",
+           g_stats.inputs, g_stats.runs, g_stats.requests, g_stats.positive, g_stats.nrc, g_stats.silent,
+           g_stats.poll_answers, reached, (int)ST_COUNT);
+    return 0;
+}
+#endif
