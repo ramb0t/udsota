@@ -161,7 +161,7 @@ udsota enforces its own sequence and nothing else: with no gate, every step is a
 
 **Frames out.** udsota transmits only on `cfg.resp_id`. `ESP_ERR_NO_MEM` from `can_send` means retry: an answer is parked and resent, and a flow-control frame is retried at each service (1 ms apart) for `cfg.fc_retry_ms` (10 ms by default), then dropped. Set it to two token intervals of the driver's rate cap, or an FC refused just after an answer never reaches the next token. Any other error drops the frame. The port logs these losses; F1F2's `resp_frames_dropped` reports only what the app's `tx_dropped` counts. The app's CAN driver is the place for a rate cap or an allowlist that bounds what a fault could put on the bus.
 
-**Pace.** STmin is the client's minimum gap between frames. Pick one the bus can carry beside its normal traffic, either `cfg.stmin_us` or a per-message value from `stmin_us`. Set `stmin_monitor` to stop a client whose median gap is under 0.8 × STmin.
+**Pace.** STmin is the client's minimum gap between frames. Pick one the bus can carry beside its normal traffic, either `cfg.stmin_us` or a per-message value from `stmin_us`. The adapter rounds it up to a value a flow-control frame can carry (100–900 µs in 100 µs steps, else whole milliseconds up to 127 ms), and the monitor judges that value. Set `stmin_monitor` to stop a client whose median gap is under 0.8 × STmin.
 
 **Keys and signing** are covered below. Without either, any node that can send on `cfg.req_id` can install any image the image rules accept.
 

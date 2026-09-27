@@ -463,6 +463,45 @@ static void test_stmin_hook_sets_each_first_fc(void)
     TEST_ASSERT_EQUAL_UINT(2, s_hook_calls);
 }
 
+/* An STmin the FC cannot carry is rounded up to one it can: 150 us -> F2, 950 us -> 1 ms, 1.5 ms -> 2 ms,
+ * 200 ms -> 127 ms (7F). */
+static void test_stmin_rounded_up_to_an_encodable_value(void)
+{
+    static const struct { uint32_t us; uint8_t fc; } cases[] = {
+        {150u, 0xF2}, {900u, 0xF9}, {950u, 0x01}, {1500u, 0x02}, {127000u, 0x7F}, {200000u, 0x7F},
+    };
+    s_hooks.stmin_us = hook_stmin;
+    init_all();
+    static const uint8_t ff[8] = {0x10, 0x14, 0x22, 0xF1, 0x86, 0x00, 0x00, 0x00};   /* FF of 20 bytes */
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        s_hook_stmin = cases[i].us;
+        feed(ff, sizeof ff);
+        TEST_ASSERT_EQUAL_HEX8(0x30, s_fc_last[0]);
+        TEST_ASSERT_EQUAL_HEX8(cases[i].fc, s_fc_last[2]);
+    }
+}
+
+/* The STmin monitor judges the STmin the FC sent: asked for 200 ms, the FC says 127 ms, and a client that keeps
+ * 127 ms gaps finishes the block; asked for 950 us, the FC says 1 ms, and a client at 1 ms passes. */
+static void test_stmin_monitor_judges_the_sent_stmin(void)
+{
+    s_hooks.stmin_us = hook_stmin;
+    init_all();
+    open_download(DATA_LEN + 700u);
+    build_block(1);
+    s_hook_stmin = 200000u;
+    request_mf(s_block, BLOCK_LEN, 127000u, 0u);
+    TEST_ASSERT_TRUE(s_resp_done);
+    TEST_ASSERT_EQUAL_HEX8(0x76, s_resp[0]);
+    build_block(2);
+    s_hook_stmin = 950u;
+    s_written = 0u;
+    request_mf(s_block, 2u + 700u, 1000u, 0u);           /* 99 CFs: the FC at CF 64 is judged */
+    TEST_ASSERT_TRUE(run_until_response(50));
+    TEST_ASSERT_EQUAL_HEX8(0x76, s_resp[0]);
+    TEST_ASSERT_EQUAL_UINT16(0, read_counters().withheld_fcs);
+}
+
 /* The gate refuses CONTINUE_TRANSFER at CF 64. The FC is withheld, the rest of the block is
  * ignored, the transfer and session end and are counted, and the next request is served normally. */
 static void test_gate_deny_at_fc_point_withholds_fc(void)
@@ -718,6 +757,8 @@ int main(void)
     RUN_TEST(test_tx_pending_counts_parked_response);
     RUN_TEST(test_armed_restart_falls_back_after_100_ms);
     RUN_TEST(test_stmin_hook_sets_each_first_fc);
+    RUN_TEST(test_stmin_rounded_up_to_an_encodable_value);
+    RUN_TEST(test_stmin_monitor_judges_the_sent_stmin);
     RUN_TEST(test_gate_deny_at_fc_point_withholds_fc);
     RUN_TEST(test_end_session_while_write_pending);
     RUN_TEST(test_withheld_fc_during_send_orphan_ncr_not_counted);

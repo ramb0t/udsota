@@ -51,13 +51,13 @@ struct udsota_isotp {
     udsota_can_t         can;                /* copied at init */
     uint32_t           (*stmin_us)(void *ctx);   /* hooks.stmin_us, copied at init; NULL = stmin_default_us */
     void                *stmin_ctx;          /* hooks.ctx */
-    uint32_t             stmin_default_us;   /* cfg.stmin_us, 0 = UDSOTA_STMIN_DEFAULT_US (udsota.h) */
+    uint32_t             stmin_default_us;   /* cfg.stmin_us (0 = UDSOTA_STMIN_DEFAULT_US), rounded up to what an FC carries */
     uint16_t             resp_id;
     uint32_t             rx_limit_dl;        /* receive limit while a download is open: cfg.max_block_len */
     uint32_t             rx_limit_idle;      /* receive limit otherwise */
     uint32_t             rx_limit;           /* the link's current receive buffer size */
     udsota_rxwatch_t     rxw;                /* isotp-c's receive state, mirrored from the raw frames */
-    uint32_t             msg_stmin_us;       /* STmin sent in the current message's first FC */
+    uint32_t             msg_stmin_us;       /* STmin sent in the current message's first FC, as encoded (the monitor judges this) */
     bool                 rx_orphan;          /* isotp-c still holds a message dropped at a withheld FC */
     size_t               park_len;           /* bytes in buf->park; 0 = nothing parked */
     uint32_t             resp_lost;          /* answers refused outright by can.send, or replaced unsent */
