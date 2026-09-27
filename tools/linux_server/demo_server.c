@@ -10,6 +10,7 @@
  *
  * See tools/linux_server/README.md for every option. Host only (Linux). */
 #define _GNU_SOURCE
+#include <ctype.h>
 #include <errno.h>
 #include <getopt.h>
 #include <poll.h>
@@ -272,7 +273,8 @@ static bool parse_device_id(const char *s)
             continue;
         }
         unsigned b;
-        if (n == UDSOTA_KEYS_ID_MAX || sscanf(s, "%2x", &b) != 1 || s[1] == '\0' || s[1] == ':') {
+        if (n == UDSOTA_KEYS_ID_MAX || !isxdigit((unsigned char)s[0]) || !isxdigit((unsigned char)s[1]) ||
+            sscanf(s, "%2x", &b) != 1) {
             fprintf(stderr, "udsota_demo_server: --device-id takes 1 to 16 hex bytes, e.g. 02:00:00:00:00:01\n");
             return false;
         }

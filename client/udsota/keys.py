@@ -138,8 +138,12 @@ def keygen(out_dir):
         fd = os.open(private, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "wb") as f:
             f.write(pem)
+    except OSError as e:
+        raise Refused("cannot write the key pair in %s: %s" % (out, e.strerror))
+    try:
         with open(header, "x") as f:
             f.write(pubkey_header(public_point(key)))
     except OSError as e:
+        private.unlink(missing_ok=True)   # no private key is left behind without its public half
         raise Refused("cannot write the key pair in %s: %s" % (out, e.strerror))
     return private, header

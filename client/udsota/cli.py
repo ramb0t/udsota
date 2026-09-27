@@ -51,7 +51,11 @@ def parse_args(argv):
 # The profile's 0x27 secret for flash and reset: the master key (mode hmac) or the private key (mode ecdsa).
 def load_secret(prof, args):
     if prof.security.mode == "ecdsa":
+        if args.master:
+            raise Refused("--master is for mode hmac; profile %s uses mode ecdsa (--private-key)" % prof.name)
         return load_private_key(args.private_key or prof.security.private_key_file)
+    if args.private_key:
+        raise Refused("--private-key is for mode ecdsa; profile %s uses mode hmac (--master)" % prof.name)
     return load_master(args.master or prof.security.master_file)
 
 

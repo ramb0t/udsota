@@ -644,6 +644,44 @@ def test_quiet_bus_bursts_and_keepalive():
     assert mon.alarm is None and not mon._busy
 
 
+# A RecordingBus whose nth send raises CanError.
+class FailingNthBus(RecordingBus):
+    # Fail the send numbered n (1-based).
+    def __init__(self, n):
+        super().__init__()
+        self.n = n
+
+    # Record, or raise on the nth send.
+    def send(self, m, timeout=None):
+        if len(self.sent) + 1 == self.n:
+            self.n = None
+            raise can.CanError("tx queue full")
+        super().send(m, timeout)
+
+
+# Check a send that fails in the quieting burst releases what went out and raises; and that a release that fails
+# after the update failed never hides the update's error.
+def test_quiet_bus_cleans_up_on_send_errors():
+    raw = FailingNthBus(3)
+    with pytest.raises(can.CanError):
+        with transport.QuietBus(transport.GuardedBus(raw, PF), PF, period_s=10, sleep=lambda s: None):
+            pass
+    assert [bytes(m.data[1:3]) for m in raw.sent] == [b"\x10\x83", b"\x85\x82", b"\x28\x80", b"\x85\x81",
+                                                       b"\x10\x81"]
+    raw = FailingNthBus(4)
+    with pytest.raises(errors.UpdateFailed):
+        with transport.QuietBus(transport.GuardedBus(raw, PF), PF, period_s=10, sleep=lambda s: None):
+            raise errors.UpdateFailed("the update's own error")
+
+
+# Check a key flag for the other 0x27 mode is refused, not silently ignored.
+def test_key_flag_for_the_other_mode_is_refused():
+    import argparse
+    hmac_args = argparse.Namespace(master=None, private_key="k.pem")
+    with pytest.raises(errors.Refused, match="--private-key is for mode ecdsa"):
+        cli.load_secret(P, hmac_args)
+
+
 # Check flash enters quiet() once an update is needed and holds it to the end; a no-op flash never enters it.
 def test_flash_holds_quiet_for_the_update_only():
     events = []
@@ -1195,8 +1233,28 @@ def test_lost_activate_request_is_resent_once():
     rc, _, _ = run_flash(d)
     assert rc == 0
     i = d.log.index((0x31, 0xF001))
-    assert d.log[i:i + 3] == [(0x31, 0xF001), (0x22, 0xF1F0), (0x31, 0xF001)]
+    assert d.log[i:i + 4] == [(0x31, 0xF001), (0x22, 0xF1F3), (0x22, 0xF1F0), (0x31, 0xF001)]
     assert d.writes == 300
+
+
+# A FakeServer whose first ActivateImage answer is lost after it has activated and, booting at once, restarted.
+class LostActivateAnswerFastBoot(FakeServer):
+    # Serve the first F001 but drop its answer; everything else as FakeServer.
+    def handle(self, req):
+        answer = super().handle(req)
+        if bytes(req[:4]) == b"\x31\x01\xF0\x01" and not getattr(self, "lost", False):
+            self.lost = True
+            return []
+        return answer
+
+
+# Check no answer to ActivateImage from a server already running the new image (boot slot == running slot, but
+# the new image): it is not sent again, and the update goes on to ConfirmImage.
+def test_lost_activate_answer_after_a_fast_restart_is_not_resent():
+    d = LostActivateAnswerFastBoot(boot_silence=0)
+    rc, _, _ = run_flash(d)
+    assert rc == 0
+    assert d.log.count((0x31, 0xF001)) == 1 and (0x31, 0xF002) in d.log
 
 
 # Check ActivateImage refused with 0x22 stops with the conditions-not-met message.

@@ -232,7 +232,7 @@ def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep
                 uds.routine(RID_ACTIVATE)
                 break
             except NoResponse:
-                if activation_landed(uds, log=log):
+                if activation_landed(uds, img.elf_sha, log=log):
                     break
                 if resent:
                     raise
@@ -257,13 +257,18 @@ def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep
 
 
 # After no answer to ActivateImage: True when the server activated anyway, so its answer, not the request, was
-# lost. A server that answers nothing is restarting; one whose boot slot is not its running slot has switched and
-# restarts next. False when it answers and has not switched: the request itself was lost.
-def activation_landed(uds, log=print):
+# lost. A server that answers nothing is restarting, one that already runs the new image (sha) has restarted, and
+# one whose boot slot is not its running slot has switched and restarts next. False when it answers, runs the old
+# image and has not switched: the request itself was lost.
+def activation_landed(uds, sha, log=print):
     try:
+        running = uds.read_did(DID_RUNNING_SHA)
         state = decode_status(uds.read_did(DID_STATUS))
     except (NoResponse, SendFailed):
         log("no answer to ActivateImage, and none since: the server is restarting")
+        return True
+    if running == sha:
+        log("no answer to ActivateImage, but the server already runs the new image")
         return True
     if state["boot_slot"] != state["running_slot"]:
         log("no answer to ActivateImage, but the boot slot has switched")

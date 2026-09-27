@@ -102,6 +102,12 @@ static int psa_ecdsa_verify_id(psa_key_id_t id, const uint8_t *msg, size_t msg_l
     if (st != PSA_SUCCESS && st != PSA_ERROR_INVALID_SIGNATURE) {
         ESP_LOGW(TAG, "psa_verify_hash: %d", (int)st);
     }
+    /* A failure no signature can cause (memory, hardware, state) is no verdict (0x22, not an attempt), so a
+     * valid key under heap pressure is never counted wrong; anything a signature can cause counts. */
+    if (st == PSA_ERROR_INSUFFICIENT_MEMORY || st == PSA_ERROR_HARDWARE_FAILURE || st == PSA_ERROR_BAD_STATE ||
+        st == PSA_ERROR_COMMUNICATION_FAILURE || st == PSA_ERROR_CORRUPTION_DETECTED) {
+        return -1;
+    }
     return (st == PSA_SUCCESS) ? 1 : 0;
 }
 

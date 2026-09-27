@@ -69,7 +69,9 @@ typedef struct {   /* udsota_init() with security == NULL: 27 answers 0x11, and 
      * now (0x22; not an attempt), anything else = wrong. Counting, lockout, single use and expiry are the same. */
     int   (*verify)(void *ctx, const uint8_t seed[16], uint8_t level, const uint8_t *key, size_t key_len);
     uint16_t key_len;   /* with verify set, the exact key length a sendKey carries (0 = 16; at most 254, the ISO-TP
-                           receive limit outside a download less 27 xx); ignored without verify, whose key is 16 bytes */
+                           receive limit outside a download less 27 xx, and at most cfg.max_block_len - 2, which caps
+                           that limit; a longer key can never arrive, so no key unlocks); ignored without verify,
+                           whose key is 16 bytes */
 } udsota_security_t;
 
 typedef struct {   /* all optional */
@@ -147,7 +149,7 @@ typedef struct udsota_server {
     uint8_t           phase;             /* udsota_phase_t last reported to hooks.phase */
     bool              activating;        /* ActivateImage answered positive and a restart follows */
     bool              s3_running;        /* false in default, during a request and during a job */
-    bool              comm_changed;      /* hooks.comm_control accepted a control other than 00 in this session */
+    bool              comm_changed;      /* hooks.comm_control accepted a 28 other than 00 03 in this session */
     bool              dtc_off;           /* an 85 02 was accepted in this session */
     uint32_t          s3_start_ms;       /* S3 restarts when a request is answered */
     /* The worker-job wait. */

@@ -197,7 +197,8 @@ static void test_comm_control(void)
     TEST_ASSERT_EQUAL_UINT(3, s_cc_calls);                    /* only the three that reached the hook */
 }
 
-/* A return to the default session undoes 28 once, with 00 and all message types; after 28 00 nothing is owed. */
+/* A return to the default session undoes 28 once, with 00 and all message types; after 28 00 03 nothing is owed,
+ * but after a partial 28 00 01 (network management still off) the restore is still owed. */
 static void test_default_session_reenables_communication(void)
 {
     TEST_ASSERT_EQUAL_UINT(6, PHYS(0x10, 0x03));
@@ -209,10 +210,16 @@ static void test_default_session_reenables_communication(void)
     TEST_ASSERT_EQUAL_UINT(6, PHYS(0x10, 0x01));
     TEST_ASSERT_EQUAL_UINT(2, s_cc_calls);
     TEST_ASSERT_EQUAL_UINT(6, PHYS(0x10, 0x03));
-    TEST_ASSERT_EQUAL_UINT(2, PHYS(0x28, 0x03, 0x01));
+    TEST_ASSERT_EQUAL_UINT(2, PHYS(0x28, 0x03, 0x03));
+    TEST_ASSERT_EQUAL_UINT(2, PHYS(0x28, 0x00, 0x03));
+    TEST_ASSERT_EQUAL_UINT(6, PHYS(0x10, 0x01));
+    TEST_ASSERT_EQUAL_UINT(4, s_cc_calls);                    /* no restore owed after 28 00 03 */
+    TEST_ASSERT_EQUAL_UINT(6, PHYS(0x10, 0x03));
+    TEST_ASSERT_EQUAL_UINT(2, PHYS(0x28, 0x03, 0x03));
     TEST_ASSERT_EQUAL_UINT(2, PHYS(0x28, 0x00, 0x01));
     TEST_ASSERT_EQUAL_UINT(6, PHYS(0x10, 0x01));
-    TEST_ASSERT_EQUAL_UINT(4, s_cc_calls);                    /* no restore owed after 28 00 */
+    TEST_ASSERT_EQUAL_UINT(7, s_cc_calls);                    /* 28 00 01 left NM off: restored */
+    TEST_ASSERT_EQUAL_HEX8(UDSOTA_CC_TYPE_ALL, s_cc_type);
 }
 
 /* S3 back to default also re-enables communication and DTC setting. */

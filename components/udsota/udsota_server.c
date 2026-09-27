@@ -1017,7 +1017,8 @@ static size_t handle_comm_control(udsota_server_t *s, const uint8_t *req, size_t
     if (nrc != 0u) {
         return udsota_nrc(resp, resp_max, sid, nrc);
     }
-    s->comm_changed = (control != UDSOTA_CC_ENABLE_RX_TX);
+    /* Only 28 00 for every message type and subnet leaves nothing to undo; a partial enable still owes one. */
+    s->comm_changed = !(control == UDSOTA_CC_ENABLE_RX_TX && comm_type == UDSOTA_CC_TYPE_ALL);
     if (spr || resp_max < 2u) {
         return 0;
     }

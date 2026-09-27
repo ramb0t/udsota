@@ -112,19 +112,31 @@ class QuietBus:
             except (OSError, can.CanError):
                 pass                      # a full TX queue: the next one is 2 s later, well inside S3
 
-    # Quiet the bus and start the keepalive.
+    # Quiet the bus and start the keepalive. A send that fails part-way releases what was sent, then raises.
     def __enter__(self):
-        self._burst(QUIET_START)
+        try:
+            self._burst(QUIET_START)
+        except (OSError, can.CanError):
+            self._release(quiet=True)
+            raise
         self._thread = threading.Thread(target=self._keepalive, name="udsota-quiet", daemon=True)
         self._thread.start()
         return self
 
-    # Stop the keepalive and release the bus.
-    def __exit__(self, *exc):
+    # The release burst; with quiet=True a send error is dropped (another error is already on its way).
+    def _release(self, quiet):
+        try:
+            self._burst(QUIET_END)
+        except (OSError, can.CanError):
+            if not quiet:
+                raise
+
+    # Stop the keepalive and release the bus. A release that fails never hides the error that ended the update.
+    def __exit__(self, exc_type, exc, tb):
         self._stop.set()
         if self._thread is not None:
             self._thread.join()
-        self._burst(QUIET_END)
+        self._release(quiet=exc_type is not None)
 
 
 # Listen listen_s seconds; raise Busy on a busy value, SecondTester on any response-ID frame; pre-roll
