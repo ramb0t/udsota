@@ -2,11 +2,18 @@
  * one port file needs from another. */
 #pragma once
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 #include "udsota.h"
+#include "udsota_esp32_devid.h"
 
 /* Creates the PSA mutex in static storage (cannot fail); idempotent. The start code calls it first, with
  * security on or off; udsota_esp32_security() and udsota_esp32_engine_start() call it too. */
 void udsota_esp32_psa_lock_init(void);
+/* Fixes the port's device ID once (udsota_esp32_devid_fix() over the base MAC): a copy of id when non-NULL
+ * (1 to UDSOTA_KEYS_ID_MAX bytes), else of the base MAC. *dev (dev may be NULL) gets the stored ID, which
+ * F18C serves and the 0x27 key hashes. Start code only (udsota_esp32_start() and udsota_esp32_security()). */
+udsota_esp32_devid_fix_t udsota_esp32_id_fix(const uint8_t *id, size_t id_len, const udsota_esp32_devid_t **dev);
 /* Starts the engine once, before anything uses it. Creates the flash worker (Kconfig core, priority and
  * stack; internal RAM; off the task watchdog), its 4 KB block buffer and job queue. Takes the image identity
  * from cfg (product, hw_id, layout_id, req_id, resp_id; the product string must stay valid), the running

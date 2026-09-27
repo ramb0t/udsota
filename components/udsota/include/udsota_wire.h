@@ -62,7 +62,7 @@ typedef enum {
 #define UDSOTA_SA_SEED_PROGRAMMING  0x03    /* programming session: unlocks download and ECUReset */
 #define UDSOTA_SA_KEY_PROGRAMMING   0x04
 #define UDSOTA_SEED_LEN             16
-#define UDSOTA_KEY_LEN              16      /* first 16 bytes of HMAC-SHA256(K_dev, seed || level || MAC) */
+#define UDSOTA_KEY_LEN              16      /* first 16 bytes of HMAC-SHA256(K_dev, seed || level || device ID), the F18C bytes */
 #define UDSOTA_SA_SEED_VALID_MS     30000u  /* an outstanding seed is single-use and expires after this */
 #define UDSOTA_SA_MAX_ATTEMPTS      3       /* the third wrong key answers 0x36 and starts the delay */
 #define UDSOTA_SA_DELAY_MS          10000u  /* NRC 0x37 window after a lockout, and after every boot */
@@ -75,12 +75,12 @@ typedef enum {
 /* ---- Data identifiers (all readable in any session; none is secret) ---- */
 #define UDSOTA_DID_ACTIVE_SESSION  0xF186   /* 1 B: udsota_session_t */
 #define UDSOTA_DID_SW_VERSION      0xF189   /* git describe string */
-#define UDSOTA_DID_SERIAL          0xF18C   /* the device ID (the ESP32 port uses the 6-byte base MAC) */
+#define UDSOTA_DID_SERIAL          0xF18C   /* the device ID, cfg.device_id_len bytes */
 #define UDSOTA_DID_STATUS          0xF1F0   /* UDSOTA_STATUS_LEN B: udsota_status_t */
 #define UDSOTA_DID_RUNNING_SHA     0xF1F3   /* 32 B: the running image's app_elf_sha256 */
 #define UDSOTA_DID_RESULT          0xF1F1   /* UDSOTA_RESULT_LEN B: udsota_result_t */
 #define UDSOTA_DID_COUNTERS        0xF1F2   /* UDSOTA_COUNTERS_LEN B: udsota_counters_t */
-#define UDSOTA_SERIAL_LEN          6
+#define UDSOTA_SERIAL_LEN          6        /* the ESP32 port's default device ID (base MAC), not an F18C limit */
 #define UDSOTA_SHA256_LEN          32
 
 /* ---- Routine identifiers (31 01 <rid>) ---- */

@@ -1,8 +1,12 @@
 /* 0x27 security for the udsota ESP32 port (udsota_esp32.h): seeds from the hardware RNG, and keys from the
- * core's default derivation (udsota_keys.h) over PSA HMAC-SHA256 with the base MAC as the device ID. The
- * SAR-ADC entropy source is switched on at the first udsota_esp32_security() call and never off, so
- * esp_fill_random() is a true RNG (IDF random.rst: an app that uses no ADC, Wi-Fi or BT may leave it on).
- * Start code, then the server's task only, call into this file, so the PSA lock is its only locking. */
+ * core's default derivation (udsota_keys.h) over PSA HMAC-SHA256. The device ID they hash is fixed once,
+ * cfg.device_id when set and else the base MAC, and kept in s_dev (udsota_esp32_devid.h), which F18C
+ * serves too. The SAR-ADC entropy source is switched on at the first udsota_esp32_security() call and
+ * never off, so esp_fill_random() is a true RNG (IDF random.rst: an app that uses no ADC, Wi-Fi or BT may leave it on).
+ * Start code, then the server's task, call the security functions, which the PSA lock serialises.
+ * udsota_esp32_device_id() may run on any task: it reads the base MAC and the fixed ID behind their
+ * release/acquire flags. */
+#include <stdatomic.h>
 #include <string.h>
 #include "bootloader_random.h"
 #include "esp_log.h"
@@ -11,6 +15,7 @@
 #include "mbedtls/platform_util.h"
 #include "psa/crypto.h"
 #include "udsota_esp32.h"
+#include "udsota_esp32_devid.h"
 #include "udsota_esp32_priv.h"
 #include "udsota_keys.h"
 
@@ -19,16 +24,13 @@ static const char *TAG = "udsota_keys";
 #define SEED_DRAWS   4     /* redraws allowed before a seed request fails */
 #define KEY_LOCK_MS  40u   /* key()'s wait for the PSA lock, inside P2: only an orphaned worker verify holds it longer */
 
-_Static_assert(UDSOTA_ESP32_DEVICE_ID_LEN <= UDSOTA_KEYS_ID_MAX, "the MAC fits the derivation's ID");
-
-static bool    s_inited;
-static bool    s_rng_on;
-static bool    s_keys_ok;
-static bool    s_id_read;
-static bool    s_id_ok;
-static uint8_t s_id[UDSOTA_ESP32_DEVICE_ID_LEN];
-static uint8_t s_kdev[UDSOTA_KEYS_KDEV_LEN];
-static uint8_t s_last_seed[UDSOTA_KEYS_SEED_LEN];
+static bool                 s_inited;
+static bool                 s_rng_on;
+static atomic_bool          s_mac_read;   /* stored last (release): s_mac and s_mac_ok are filled in */
+static bool                 s_mac_ok;
+static uint8_t              s_mac[UDSOTA_ESP32_DEVICE_ID_LEN];
+static udsota_esp32_devid_t s_dev;        /* the ID in use, fixed once, and its K_dev */
+static uint8_t              s_last_seed[UDSOTA_KEYS_SEED_LEN];
 
 /* HMAC-SHA256 through PSA with a volatile key imported for this call and destroyed (PSA wipes its copy)
  * after it. On any failure, including a failed destroy, out is zeroed and false returned. */
@@ -68,19 +70,47 @@ static bool all_zero(const uint8_t *p, size_t n)
     return acc == 0;
 }
 
-/* The base MAC, read once; all-zero if the read failed. */
-const uint8_t *udsota_esp32_device_id(void)
+/* The base MAC, read into a local and published with a release store; all-zero if the read failed. Two
+ * first callers racing both read it and store the same bytes. */
+static const uint8_t *base_mac(void)
 {
-    if (!s_id_read) {
-        s_id_read = true;
-        const esp_err_t err = esp_read_mac(s_id, ESP_MAC_BASE);
-        s_id_ok = (err == ESP_OK);
-        if (!s_id_ok) {
-            memset(s_id, 0, sizeof s_id);
-            ESP_LOGE(TAG, "esp_read_mac: %s; 0x27 unlock disabled", esp_err_to_name(err));
+    if (!atomic_load_explicit(&s_mac_read, memory_order_acquire)) {
+        uint8_t mac[UDSOTA_ESP32_DEVICE_ID_LEN];
+        const esp_err_t err = esp_read_mac(mac, ESP_MAC_BASE);
+        if (err != ESP_OK) {
+            memset(mac, 0, sizeof mac);
+            ESP_LOGE(TAG, "esp_read_mac: %s", esp_err_to_name(err));
         }
+        memcpy(s_mac, mac, sizeof s_mac);
+        s_mac_ok = (err == ESP_OK);
+        atomic_store_explicit(&s_mac_read, true, memory_order_release);
     }
-    return s_id;
+    return s_mac;
+}
+
+/* Fixes the device ID once; see udsota_esp32_priv.h. */
+udsota_esp32_devid_fix_t udsota_esp32_id_fix(const uint8_t *id, size_t id_len, const udsota_esp32_devid_t **dev)
+{
+    const uint8_t *mac = base_mac();
+    if (dev != NULL) {
+        *dev = &s_dev;
+    }
+    return udsota_esp32_devid_fix(&s_dev, id, id_len, mac, s_mac_ok);
+}
+
+/* The fixed device ID, or the base MAC while none is fixed; see udsota_esp32.h. */
+const uint8_t *udsota_esp32_device_id(size_t *len)
+{
+    if (atomic_load_explicit(&s_dev.fixed, memory_order_acquire)) {
+        if (len != NULL) {
+            *len = s_dev.id_len;
+        }
+        return s_dev.id;
+    }
+    if (len != NULL) {
+        *len = UDSOTA_ESP32_DEVICE_ID_LEN;
+    }
+    return base_mac();
 }
 
 /* udsota_security_t.rng16: 16 fresh bytes, never all-zero and never the previous seed; false (zeroed) otherwise. */
@@ -113,19 +143,20 @@ static bool sec_key(void *ctx, const uint8_t seed[UDSOTA_KEYS_SEED_LEN], uint8_t
     if (out == NULL) {
         return false;
     }
-    if (!s_keys_ok || !udsota_esp32_psa_lock(KEY_LOCK_MS)) {
+    if (!s_dev.kdev_ok || !udsota_esp32_psa_lock(KEY_LOCK_MS)) {
         memset(out, 0, UDSOTA_KEYS_KEY_LEN);
         return false;
     }
-    const bool ok = udsota_keys_derive_key(psa_hmac_sha256, s_kdev, seed, level, s_id, sizeof s_id, out);
+    const bool ok = udsota_esp32_devid_key(&s_dev, psa_hmac_sha256, seed, level, out);
     udsota_esp32_psa_unlock();
     return ok;
 }
 
 static const udsota_security_t s_security = { .rng16 = sec_rng16, .key = sec_key, .ctx = NULL };
 
-/* Switches the RNG on, reads the device ID, self-tests PSA HMAC and derives K_dev once; see udsota_esp32.h. */
-const udsota_security_t *udsota_esp32_security(const char *label, const uint8_t *master, size_t master_len)
+/* Switches the RNG on, fixes the device ID, self-tests PSA HMAC and derives K_dev once; see udsota_esp32.h. */
+const udsota_security_t *udsota_esp32_security(const char *label, const uint8_t *master, size_t master_len,
+                                               const uint8_t *id, size_t id_len)
 {
     if (label == NULL) {
         return NULL;
@@ -137,20 +168,29 @@ const udsota_security_t *udsota_esp32_security(const char *label, const uint8_t 
     udsota_esp32_psa_lock_init();
     bootloader_random_enable();              /* never disabled; the README gives the ADC/Wi-Fi/BT caveat */
     s_rng_on = true;
-    (void)udsota_esp32_device_id();
-    if (!s_id_ok || master == NULL || master_len == 0u) {
-        return &s_security;                  /* security on, and no key can match */
+    /* From here on security is on; every early return leaves no key that can match. */
+    if (udsota_esp32_id_fix(id, id_len, NULL) == UDSOTA_ESP32_DEVID_BAD) {
+        ESP_LOGE(TAG, "device ID of %u B (1 to %d allowed); 0x27 unlock disabled", (unsigned)id_len,
+                 UDSOTA_KEYS_ID_MAX);
+        return &s_security;
+    }
+    if (s_dev.is_mac && !s_dev.mac_ok) {
+        ESP_LOGE(TAG, "no base MAC for the device ID; 0x27 unlock disabled");
+        return &s_security;
+    }
+    if (master == NULL || master_len == 0u) {
+        return &s_security;
     }
     (void)udsota_esp32_psa_lock(UDSOTA_ESP32_PSA_WAIT_FOREVER);
     const bool ok = udsota_keys_self_test(psa_hmac_sha256) &&
-                    udsota_keys_derive_kdev(psa_hmac_sha256, master, master_len, label, s_id, sizeof s_id, s_kdev);
+                    udsota_esp32_devid_derive_kdev(&s_dev, psa_hmac_sha256, master, master_len, label);
     udsota_esp32_psa_unlock();
     if (!ok) {
-        mbedtls_platform_zeroize(s_kdev, sizeof s_kdev);
+        s_dev.kdev_ok = false;
+        mbedtls_platform_zeroize(s_dev.kdev, sizeof s_dev.kdev);
         ESP_LOGE(TAG, "HMAC self-test or K_dev derivation failed; 0x27 unlock disabled");
         return &s_security;
     }
-    s_keys_ok = true;
     ESP_LOGD(TAG, "0x27 keys ready");
     return &s_security;
 }

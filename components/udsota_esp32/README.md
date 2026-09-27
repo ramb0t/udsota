@@ -6,7 +6,7 @@ udsota_esp32 is the ESP-IDF port of [udsota](../udsota/README.md). It runs the U
 
 | Function | Call from | Does |
 |---|---|---|
-| `esp_err_t udsota_esp32_start(const udsota_config_t *cfg, const udsota_hooks_t *hooks, const udsota_esp32_can_t *can)` | once, after the app's CAN driver runs | copies `cfg`, `hooks` and `can`, fills `cfg.device_id` with the base MAC when it is NULL, and starts the diag task and flash worker. Security is on when `cfg->key_label` is set, and a NULL `hooks->reset` means `esp_restart()`. Bad arguments, a second call or no memory return an error and leave the updater off; no inactive slot, or no worker, leaves it answering but refusing downloads |
+| `esp_err_t udsota_esp32_start(const udsota_config_t *cfg, const udsota_hooks_t *hooks, const udsota_esp32_can_t *can)` | once, after the app's CAN driver runs | copies `cfg`, `hooks` and `can`, fixes the device ID (below), and starts the diag task and flash worker. Security is on when `cfg->key_label` is set, and a NULL `hooks->reset` means `esp_restart()`. Bad arguments, a second call or no memory return an error and leave the updater off; no inactive slot, or no worker, leaves it answering but refusing downloads |
 | `udsota_esp32_on_frame(id, data, dlc, rx_us)` | the app's CAN receive task | queues one request frame; never blocks. Drops other IDs, frames before start, and frames past a full queue (counted) |
 | `udsota_esp32_end_session()` | any task | ends an open session, after a running flash job has answered; the diag task runs `udsota_end_session()` |
 | `udsota_esp32_phase()` | any task | the current `udsota_phase_t` |
@@ -14,13 +14,15 @@ udsota_esp32 is the ESP-IDF port of [udsota](../udsota/README.md). It runs the U
 | `udsota_esp32_status(out)` | any task | the cached F1F0 snapshot |
 | `udsota_esp32_engine()` | any task | the engine, for a front end other than UDS |
 | `bool udsota_esp32_engine_busy(void)` | any task | true while an engine job or the boot-time OTA read is queued or running |
-| `const udsota_security_t *udsota_esp32_security(const char *label, const uint8_t *master, size_t master_len)` | start code, before the diag task runs | builds the 0x27 security that start installs (start calls it itself); NULL label gives NULL, and no master gives security with no key that matches |
-| `const uint8_t *udsota_esp32_device_id(void)` | start code first | the 6-byte base MAC the keys derive from; start fills `cfg.device_id` with it |
+| `const udsota_security_t *udsota_esp32_security(const char *label, const uint8_t *master, size_t master_len, const uint8_t *id, size_t id_len)` | start code, before the diag task runs | builds the 0x27 security that start installs (start calls it itself, with `cfg.device_id`) over `id`, or the base MAC when `id` is NULL; NULL label gives NULL, and no master or a bad `id_len` gives security with no key that matches |
+| `const uint8_t *udsota_esp32_device_id(size_t *len)` | any task | the device ID in use and its length: the ID start or `udsota_esp32_security()` fixed, else the 6-byte base MAC |
 | `udsota_reason_t udsota_esp32_image_check(const uint8_t *buf, size_t len, uint32_t announced_size, uint16_t chip_id, const udsota_image_ctx_t *ctx, bool *is_release_out)` | any task (pure, host-testable) | the ESP image header half of the first-block check, then the core's image rules |
 | `udsota_esp32_psa_lock(wait_ms)`, `udsota_esp32_psa_unlock()` | any task | the mutex the port's key HMAC and image verify hold around PSA crypto; take it around the app's own PSA operations, since ESP-IDF v6.1's PSA is not thread-safe for them |
 | `udsota_esp32_bootloop_init()` | first thing in `app_main` | counts this boot |
 | `udsota_esp32_bootloop_config_ignored()` | any task | true when this boot should skip stored settings |
 | `udsota_esp32_bootloop_mark_healthy()` | once the app is healthy | clears the count |
+
+The device ID is `cfg.device_id` (1 to 16 bytes) when set, else the 6-byte base MAC. Start copies it once, serves the copy as F18C and derives the 0x27 keys from the same bytes, so the key a client derives from F18C always matches. A set `device_id` of any other length makes start return `ESP_ERR_INVALID_ARG`. A custom ID must be unique per device, or devices share K_dev.
 
 `udsota_esp32_can_t` is the app's transport: `can_send` (required; `ESP_ERR_NO_MEM` means retry), `tx_pending` (frames still in the driver, so a restart waits for its answer) and `tx_dropped` (response frames the driver dropped after queueing them, reported as F1F2 `resp_frames_dropped`), all called on the diag task; the last two may be NULL.
 

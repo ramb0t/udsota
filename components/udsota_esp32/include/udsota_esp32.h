@@ -11,7 +11,7 @@
 #include "udsota.h"
 #include "udsota_image_desc.h"
 
-#define UDSOTA_ESP32_DEVICE_ID_LEN     6u           /* the base MAC: F18C and the key derivation's device ID */
+#define UDSOTA_ESP32_DEVICE_ID_LEN     6u           /* the base MAC: the device ID when cfg.device_id is NULL */
 #define UDSOTA_ESP32_PSA_WAIT_FOREVER  UINT32_MAX   /* udsota_esp32_psa_lock(): no time limit */
 
 /* ---- Engine (udsota_esp32_engine.c) ---- */
@@ -38,14 +38,19 @@ bool udsota_esp32_engine_busy(void);
 
 /* 0x27 security with the core's default derivation (udsota_keys.h): seeds from the hardware RNG, and keys
  * from K_dev = HMAC-SHA256(master, label || device ID), derived once here, computed under the PSA lock.
- * The first call switches the SAR-ADC entropy source on for good, reads the device ID, self-tests PSA HMAC
- * and derives K_dev. Later calls return the same struct and ignore their arguments. label NULL: returns
- * NULL (no security). master NULL or master_len 0, or a failed self-test: security is on and no key matches.
+ * The device ID is id (id_len bytes, 1 to UDSOTA_KEYS_ID_MAX) or, with id NULL, the base MAC; an ID that
+ * udsota_esp32_start() or an earlier call already fixed wins. Serve the same bytes as F18C
+ * (udsota_esp32_device_id() returns them); start does. The first call switches the SAR-ADC entropy source
+ * on for good, fixes the device ID, self-tests PSA HMAC and derives K_dev. Later calls return the same
+ * struct and ignore their arguments. label NULL: returns NULL (no security). A bad id_len, a failed MAC
+ * read for a MAC ID, master NULL or master_len 0, or a failed self-test: security is on and no key matches.
  * Call it from start code, before the server's task runs. */
-const udsota_security_t *udsota_esp32_security(const char *label, const uint8_t *master, size_t master_len);
-/* The base MAC (UDSOTA_ESP32_DEVICE_ID_LEN bytes), read on the first call: exactly the bytes the key
- * derivation hashes, for cfg.device_id (F18C). All-zero if the read failed. First call from start code. */
-const uint8_t *udsota_esp32_device_id(void);
+const udsota_security_t *udsota_esp32_security(const char *label, const uint8_t *master, size_t master_len,
+                                               const uint8_t *id, size_t id_len);
+/* The device ID the port serves as F18C and the keys hash, with its length in *len (len may be NULL). Until
+ * udsota_esp32_start() or udsota_esp32_security() fixes it, this is the base MAC (UDSOTA_ESP32_DEVICE_ID_LEN
+ * bytes), and calling it fixes nothing. The MAC is all-zero if its read failed. Any task may call it. */
+const uint8_t *udsota_esp32_device_id(size_t *len);
 
 /* ---- PSA lock (udsota_esp32_psa.c) ---- */
 
@@ -105,16 +110,17 @@ typedef struct {
     void      *ctx;
 } udsota_esp32_can_t;
 
-/* Starts udsota once. It copies *cfg (the strings and arrays cfg points to must outlive the port), sets
- * device_id to udsota_esp32_device_id() when it is NULL, turns security on when cfg->key_label is set,
- * starts the engine, and creates the buffers, the frame queue and the diag task (Kconfig UDSOTA_ESP32_*).
- * hooks may be NULL; a NULL hooks->reset restarts with esp_restart(). Returns ESP_ERR_INVALID_ARG for a
- * NULL cfg, can or can_send, ESP_ERR_INVALID_STATE on a second call, and ESP_ERR_NO_MEM when an
- * allocation or the task fails. Only a bad-argument failure may be retried: after ESP_ERR_NO_MEM the updater
- * stays off for this boot, and a second call returns ESP_ERR_INVALID_STATE. When the buffers
- * or frame queue cannot be allocated nothing else was started; when the diag task cannot be created, what
- * start already set up stays behind: the flash worker with its buffer and queue and, with key_label set,
- * the derived key in RAM and the SAR-ADC entropy source, left on. */
+/* Starts udsota once. It copies *cfg (the strings and arrays cfg points to must outlive the port), fixes
+ * the device ID (a copy of cfg->device_id when set, else the base MAC) and serves it as F18C, turns security
+ * on when cfg->key_label is set, with keys over that same ID, starts the engine, and creates the buffers,
+ * the frame queue and the diag task (Kconfig UDSOTA_ESP32_*). hooks may be NULL; a NULL hooks->reset
+ * restarts with esp_restart(). Returns ESP_ERR_INVALID_ARG for a NULL cfg, can or can_send, or a set
+ * device_id whose device_id_len is not 1 to UDSOTA_KEYS_ID_MAX (16); ESP_ERR_INVALID_STATE on a second
+ * call; and ESP_ERR_NO_MEM when an allocation or the task fails. Only a bad-argument failure may be
+ * retried: after ESP_ERR_NO_MEM the updater stays off for this boot, and a second call returns
+ * ESP_ERR_INVALID_STATE. When the buffers or frame queue cannot be allocated nothing else was started; when
+ * the diag task cannot be created, what start already set up stays behind: the flash worker with its
+ * buffer and queue and, with key_label set, the derived key in RAM and the SAR-ADC entropy source, left on. */
 esp_err_t udsota_esp32_start(const udsota_config_t *cfg, const udsota_hooks_t *hooks, const udsota_esp32_can_t *can);
 /* Any task: queues one frame on cfg->req_id with its receive time in microseconds; never blocks.
  * Other IDs, frames before start and frames past a full queue are dropped (the last counted). */

@@ -99,8 +99,8 @@ typedef struct {
     const char *key_label;             /* port: security on; K_dev = HMAC(master, label || device_id) */
     const uint8_t *key_master;         /* port: with key_label set and this NULL, security is on and no key matches */
     size_t      key_master_len;        /* port */
-    const uint8_t *device_id;          /* the core serves it as F18C; on ESP32 leave it NULL: the port fills in the
-                                          base MAC, and its key derivation always uses the base MAC */
+    const uint8_t *device_id;          /* the core serves it as F18C; the ESP32 port hashes the same bytes into the
+                                          0x27 key and takes 1 to 16 of them, or the base MAC when NULL */
     size_t      device_id_len;
     const char *product;               /* port: image identity, esp_app_desc project name; NULL = not checked */
     uint8_t     hw_id, layout_id;      /* port: descriptor values the image must carry */

@@ -131,6 +131,11 @@ udsota_test(test_udsota_esp32_ctl
     SOURCES  test/test_udsota_esp32_ctl.c ${ESP32_DIR}/udsota_esp32_ctl.c ${SERVER_SRCS}
     INCLUDES ${CORE_INC} ${CORE_PRIV} ${ESP32_DIR}/priv)
 
+# The device ID the port serves as F18C and the K_dev and keys over it, with the real server and key derivation.
+udsota_test(test_udsota_esp32_devid
+    SOURCES  test/test_udsota_esp32_devid.c ${ESP32_DIR}/udsota_esp32_devid.c ${CORE_DIR}/udsota_keys.c ${SERVER_SRCS}
+    INCLUDES ${CORE_INC} ${CORE_PRIV} ${ESP32_DIR}/include ${ESP32_DIR}/priv)
+
 # ---- Host fake of a two-slot OTA engine (file-backed, POSIX), kept for a future SocketCAN demo
 # server. Its test checks the fake and its SHA-256 against known answers.
 if(UNIX)

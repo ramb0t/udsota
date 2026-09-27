@@ -22,6 +22,7 @@
 #include "udsota.h"
 #include "udsota_esp32.h"
 #include "udsota_esp32_ctl.h"
+#include "udsota_esp32_devid.h"
 #include "udsota_esp32_priv.h"
 #include "udsota_isotp.h"
 
@@ -29,8 +30,6 @@ static const char *TAG = "udsota";
 
 #define MAX_WAIT_MS   100u      /* longest sleep, so a queued end-session never waits longer */
 #define LOG_EVERY_MS  5000u
-
-_Static_assert(UDSOTA_ESP32_DEVICE_ID_LEN == UDSOTA_SERIAL_LEN, "F18C serves exactly the bytes the 0x27 key hashes");
 
 #if defined(CONFIG_UDSOTA_ESP32_BUFS_PSRAM)
 #define BUF_CAPS   (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
@@ -52,7 +51,7 @@ typedef struct {
 
 /* Set by udsota_esp32_start() before the task exists; read-only afterwards. */
 static bool               s_started;
-static udsota_config_t    s_cfg;             /* the app's config, device_id filled in */
+static udsota_config_t    s_cfg;             /* the app's config, device_id pointed at the port's stored ID */
 static udsota_esp32_can_t s_can;
 static udsota_hooks_t     s_hooks;           /* udsota_esp32_ctl_init()'s wrappers */
 static udsota_can_t       s_tpcan;
@@ -201,7 +200,8 @@ static void task_main(void *arg)
 /* See udsota_esp32.h. Allocates everything once, then starts the task and publishes the queue last. */
 esp_err_t udsota_esp32_start(const udsota_config_t *cfg, const udsota_hooks_t *hooks, const udsota_esp32_can_t *can)
 {
-    if (cfg == NULL || can == NULL || can->can_send == NULL) {
+    if (cfg == NULL || can == NULL || can->can_send == NULL ||
+        !udsota_esp32_devid_len_ok(cfg->device_id, cfg->device_id_len)) {
         return ESP_ERR_INVALID_ARG;
     }
     if (s_started) {
@@ -212,9 +212,10 @@ esp_err_t udsota_esp32_start(const udsota_config_t *cfg, const udsota_hooks_t *h
     const size_t int_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
 #endif
     s_cfg = *cfg;
-    if (s_cfg.device_id == NULL) {
-        s_cfg.device_id = udsota_esp32_device_id();   /* the bytes the key derivation hashes */
-        s_cfg.device_id_len = UDSOTA_ESP32_DEVICE_ID_LEN;
+    /* Fixed before security, which then hashes it; an ID an earlier udsota_esp32_security() call fixed wins. */
+    const udsota_esp32_devid_t *dev = NULL;
+    if (udsota_esp32_id_fix(s_cfg.device_id, s_cfg.device_id_len, &dev) == UDSOTA_ESP32_DEVID_OTHER) {
+        ESP_LOGW(TAG, "cfg.device_id ignored: udsota_esp32_security() already fixed another device ID");
     }
     s_can = *can;
     udsota_esp32_ctl_init(&s_ctl, hooks, default_reset, &s_hooks);
@@ -230,7 +231,9 @@ esp_err_t udsota_esp32_start(const udsota_config_t *cfg, const udsota_hooks_t *h
     }
     udsota_esp32_psa_lock_init();                /* before the first PSA user, security on or off */
     const udsota_security_t *sec = (s_cfg.key_label != NULL)
-        ? udsota_esp32_security(s_cfg.key_label, s_cfg.key_master, s_cfg.key_master_len) : NULL;
+        ? udsota_esp32_security(s_cfg.key_label, s_cfg.key_master, s_cfg.key_master_len,
+                                s_cfg.device_id, s_cfg.device_id_len) : NULL;
+    udsota_esp32_devid_serve(dev, &s_cfg);       /* F18C serves the stored bytes the key hashes */
     udsota_esp32_engine_start(&s_cfg);           /* logs its own failures; the engine then refuses downloads */
     udsota_init(&s_srv, &s_cfg, udsota_esp32_engine(), sec, &s_hooks);   /* once per boot */
     s_tpcan = (udsota_can_t){

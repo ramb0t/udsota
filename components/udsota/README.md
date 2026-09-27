@@ -169,7 +169,7 @@ udsota enforces its own sequence and nothing else: with no gate, every step is a
 
 With security on (the ESP32 port turns it on when `cfg.key_label` is set), SecurityAccess (27) guards programming. `cfg.level_programming` (default 0x03) unlocks 34, 36, 37, FF01, ActivateImage and 11 01, and `cfg.level_extended` (default 0x01) unlocks 11 01. ConfirmImage needs no key, because it can only keep an image that passed FF01 and ActivateImage.
 
-Each 16-byte seed is single-use and valid for 30 s. The key is the first 16 bytes of HMAC-SHA256(K_dev, seed ‖ level ‖ device_id), where K_dev = HMAC-SHA256(K_master, label ‖ device_id); `level` is the requestSeed sub-function, `device_id` is what F18C returns, and the server compares keys in constant time. The ESP32 port always derives keys from the 6-byte base MAC, so on ESP32 leave `cfg.device_id` NULL for the port to fill; any other ID makes F18C disagree with the key, and every key is refused (0x35, then 0x36 and 0x37). Three wrong keys answer 0x36, then 0x37 for 10 s, and the same 10 s delay follows every boot. An unlock ends at a session change, an S3 timeout or a reset. With a label but no master (a CI build, say), security stays on and no key can match: sendKey answers 0x22 and counts no attempt.
+Each 16-byte seed is single-use and valid for 30 s. The key is the first 16 bytes of HMAC-SHA256(K_dev, seed ‖ level ‖ device_id), where K_dev = HMAC-SHA256(K_master, label ‖ device_id); `level` is the requestSeed sub-function, `device_id` is what F18C returns, and the server compares keys in constant time. The ESP32 port serves and hashes `cfg.device_id` when it is set (1 to 16 bytes), otherwise the 6-byte base MAC. Three wrong keys answer 0x36, then 0x37 for 10 s, and the same 10 s delay follows every boot. An unlock ends at a session change, an S3 timeout or a reset. With a label but no master (a CI build, say), security stays on and no key can match: sendKey answers 0x22 and counts no attempt.
 
 With `security` NULL, or `cfg.key_label` NULL in the port, 27 answers 0x11, and the programming session, the download, activation and reset need no key.
 
@@ -233,7 +233,7 @@ A 31 in the default session answers 0x7F. A RID that isn't served in the current
 |---|---|---|
 | F186 | active session, 1 byte | the server |
 | F189 | running version string | `engine.version` |
-| F18C | device ID | `cfg.device_id` (the port fills in the base MAC) |
+| F18C | device ID | `cfg.device_id` (the ESP32 port's base MAC when it is NULL) |
 | F1F0 | update status, 16 bytes | `engine.status` |
 | F1F1 | last download result, 5 bytes | the server |
 | F1F2 | counters, 16 bytes | the server and the transport |
