@@ -84,3 +84,16 @@ bool udsota_esp32_ctl_run_end(udsota_esp32_ctl_t *ctl, udsota_server_t *s, uint3
     udsota_end_session(s, now_ms);
     return true;
 }
+
+/* Milliseconds to ticks, rounded down but never to 0 for a real wait; see udsota_esp32_ctl.h. */
+uint32_t udsota_esp32_ctl_ticks(uint32_t ms, uint32_t tick_hz)
+{
+    if (ms == 0u) {
+        return 0u;
+    }
+    const uint64_t t = (uint64_t)ms * tick_hz / 1000u;
+    if (t == 0u) {
+        return 1u;
+    }
+    return (t > UINT32_MAX) ? UINT32_MAX : (uint32_t)t;
+}

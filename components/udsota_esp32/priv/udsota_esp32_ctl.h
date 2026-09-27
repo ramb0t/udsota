@@ -28,3 +28,7 @@ void udsota_esp32_ctl_request_end(udsota_esp32_ctl_t *ctl);
 /* Diag task, outside every server call: runs udsota_end_session() once if a request is pending (the core
  * latches it during a job and ignores it while a restart is armed); true when it ran. */
 bool udsota_esp32_ctl_run_end(udsota_esp32_ctl_t *ctl, udsota_server_t *s, uint32_t now_ms);
+/* The FreeRTOS ticks to block for a wait of ms milliseconds at tick_hz: rounded down, so a deadline is never
+ * overslept by more than one tick, but at least 1 for any wait above 0, so a short wait never becomes a
+ * non-blocking poll (pdMS_TO_TICKS(5) is 0 at 100 Hz, which spun the diag task). 0 stays 0. */
+uint32_t udsota_esp32_ctl_ticks(uint32_t ms, uint32_t tick_hz);

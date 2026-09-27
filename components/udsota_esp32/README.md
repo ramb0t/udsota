@@ -30,6 +30,8 @@ The device ID is `cfg.device_id` (1 to 16 bytes) when set, else the 6-byte base 
 
 Rollback follows `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`; the core README's [Rollback and confirm](../udsota/README.md#rollback-and-confirm) says what changes without it.
 
+The diag task sleeps on its frame queue until the adapter's next deadline, and the flash worker wakes it as each job finishes, so a block's 76 goes out as soon as its write is done. Set `CONFIG_FREERTOS_HZ=1000` (the example does): at 100 Hz the task wakes in 10 ms steps, which is slower per block and puts the first 0x78 near the end of P2, and the port logs a warning at start.
+
 ## Kconfig
 
 | Symbol | Default | What |
@@ -47,7 +49,7 @@ Rollback follows `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`; the core README's [Rol
 
 ## Memory and tasks
 
-`udsota_esp32_start()` allocates everything once, and nothing after. By default the ISO-TP adapter's buffers (`UDSOTA_ESP32_BUFS_PSRAM`) and the diag task's stack (`UDSOTA_ESP32_TASK_STACK_PSRAM`) go in PSRAM. That needs `CONFIG_SPIRAM`, and the stack also needs `CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM`; it is safe because the diag task never touches flash. The flash worker's stack and its 4 KB block buffer stay in internal RAM, because flash operations disable the cache that PSRAM is reached through, and so do the request queue (which the app's CAN task writes), the worker's job queue and the PSA lock.
+`udsota_esp32_start()` allocates everything once, and nothing after. By default the ISO-TP adapter's buffers (`UDSOTA_ESP32_BUFS_PSRAM`) and the diag task's stack (`UDSOTA_ESP32_TASK_STACK_PSRAM`) go in PSRAM. That needs `CONFIG_SPIRAM`, and the stack also needs `CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM`; it is safe because the diag task never touches flash. The app's hooks (`gate`, `did_read`, `phase`, `reset`) run on the diag task too, so with the stack in PSRAM a hook must not touch flash either (NVS, `esp_partition_*`): turn `UDSOTA_ESP32_TASK_STACK_PSRAM` off if one does. The flash worker's stack and its 4 KB block buffer stay in internal RAM, because flash operations disable the cache that PSRAM is reached through, and so do the request queue (which the app's CAN task writes), the worker's job queue and the PSA lock.
 
 With security on, start enables the SAR-ADC entropy source (`bootloader_random_enable()`) and leaves it on, so seeds are truly random without Wi-Fi or Bluetooth. ESP-IDF's `random.rst` says the source must be disabled before the app uses the ADC, Wi-Fi or Bluetooth, so an app that uses any of them needs this changed first.
 

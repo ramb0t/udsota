@@ -22,6 +22,9 @@ udsota_esp32_devid_fix_t udsota_esp32_id_fix(const uint8_t *id, size_t id_len, c
  * allocation or a missing inactive slot is logged, and every download is then refused. Links against
  * udsota_image_desc, so the app places one with UDSOTA_ESP32_IMAGE_DESC. */
 void udsota_esp32_engine_start(const udsota_config_t *cfg);
+/* Installs the function the flash worker calls after each finished job, from the worker's task, so the diag
+ * task answers at once instead of at its next poll. Call before udsota_esp32_engine_start(); NULL = none. */
+void udsota_esp32_engine_set_wake(void (*wake)(void));
 /* True when the app ran udsota_esp32_bootloop_init() this boot and the boot step chose to ignore config
  * (status flag 0x02). Never runs the boot step itself, so an app without the counter never sees the flag. */
 bool udsota_esp32_bootloop_reported(void);

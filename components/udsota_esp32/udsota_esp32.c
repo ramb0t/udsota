@@ -42,12 +42,14 @@ static const char *TAG = "udsota";
 #define STACK_CAPS (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
 #endif
 
-/* One received request frame and the microsecond the app received it. */
+/* One received request frame and the microsecond the app received it, or a wake from the flash worker. */
 typedef struct {
     uint8_t  data[8];
-    uint8_t  dlc;
+    uint8_t  dlc;                  /* RX_WAKE_DLC: no frame, the worker finished a job */
     uint32_t t_us;
 } rx_item_t;
+
+#define RX_WAKE_DLC  0xFFu
 
 /* Set by udsota_esp32_start() before the task exists; read-only afterwards. */
 static bool               s_started;
@@ -62,6 +64,7 @@ static udsota_isotp_t     s_tp;
 static udsota_esp32_ctl_t     s_ctl;         /* phase and end-session request, atomics inside */
 static _Atomic(QueueHandle_t) s_q;           /* published last by start(); NULL = frames are dropped */
 static atomic_uint            s_rx_q_dropped;   /* written by the app's CAN task */
+static atomic_bool            s_wake_posted;    /* a wake item is queued and not yet taken: at most one at a time */
 
 /* Milliseconds since boot: the server's clock (the 0x27 boot delay counts from 0). */
 static uint32_t now_ms(void)
@@ -156,9 +159,28 @@ static void log_status(uint32_t now, log_state_t *lg)
     }
 }
 
-/* One queued request frame into the adapter; warns when the gate, the STmin monitor or a latched end withheld an FC. */
+/* Flash worker, after each finished job: queues one wake item so the diag task serves the job's answer at once.
+ * A full queue needs none, since the diag task is about to wake anyway. */
+static void worker_wake(void)
+{
+    QueueHandle_t q = atomic_load_explicit(&s_q, memory_order_acquire);
+    if (q == NULL || atomic_exchange_explicit(&s_wake_posted, true, memory_order_acq_rel)) {
+        return;
+    }
+    const rx_item_t it = { .dlc = RX_WAKE_DLC };
+    if (xQueueSend(q, &it, 0) != pdTRUE) {
+        atomic_store_explicit(&s_wake_posted, false, memory_order_release);
+    }
+}
+
+/* One queued request frame into the adapter; warns when the gate, the STmin monitor or a latched end withheld an FC.
+ * A wake item only re-arms the next wake. */
 static void rx_frame(const rx_item_t *it, uint32_t now)
 {
+    if (it->dlc == RX_WAKE_DLC) {
+        atomic_store_explicit(&s_wake_posted, false, memory_order_release);
+        return;
+    }
     const uint16_t withheld = s_srv.counters.withheld_fcs;
     udsota_isotp_on_frame(&s_tp, it->data, it->dlc, it->t_us, now);
     if (s_srv.counters.withheld_fcs != withheld) {
@@ -177,7 +199,7 @@ static void task_main(void *arg)
     uint32_t wait = 0;
     for (;;) {
         rx_item_t it;
-        bool got = xQueueReceive(q, &it, pdMS_TO_TICKS(wait)) == pdTRUE;
+        bool got = xQueueReceive(q, &it, (TickType_t)udsota_esp32_ctl_ticks(wait, configTICK_RATE_HZ)) == pdTRUE;
         const uint32_t now = now_ms();
         mirror_resp_dropped();
         (void)udsota_esp32_ctl_run_end(&s_ctl, &s_srv, now);
@@ -234,6 +256,11 @@ esp_err_t udsota_esp32_start(const udsota_config_t *cfg, const udsota_hooks_t *h
         ? udsota_esp32_security(s_cfg.key_label, s_cfg.key_master, s_cfg.key_master_len,
                                 s_cfg.device_id, s_cfg.device_id_len) : NULL;
     udsota_esp32_devid_serve(dev, &s_cfg);       /* F18C serves the stored bytes the key hashes */
+#if configTICK_RATE_HZ < 1000
+    ESP_LOGW(TAG, "CONFIG_FREERTOS_HZ=%d: the diag task wakes in %d ms steps; 1000 keeps the first 0x78 well "
+             "inside P2", configTICK_RATE_HZ, 1000 / configTICK_RATE_HZ);
+#endif
+    udsota_esp32_engine_set_wake(worker_wake);
     udsota_esp32_engine_start(&s_cfg);           /* logs its own failures; the engine then refuses downloads */
     udsota_init(&s_srv, &s_cfg, udsota_esp32_engine(), sec, &s_hooks);   /* once per boot */
     s_tpcan = (udsota_can_t){
@@ -269,7 +296,7 @@ void udsota_esp32_on_frame(uint16_t id, const uint8_t *data, uint8_t dlc, uint32
     if (q == NULL || data == NULL || id != s_cfg.req_id) {
         return;
     }
-    rx_item_t it = { .dlc = dlc, .t_us = rx_us };
+    rx_item_t it = { .dlc = (dlc > 8u) ? 8u : dlc, .t_us = rx_us };   /* classic CAN: DLC 9-15 carry 8 bytes */
     memcpy(it.data, data, (dlc > 8u) ? 8u : dlc);
     if (xQueueSend(q, &it, 0) != pdTRUE) {
         atomic_fetch_add_explicit(&s_rx_q_dropped, 1u, memory_order_relaxed);

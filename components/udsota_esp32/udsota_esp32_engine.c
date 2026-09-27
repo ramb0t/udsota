@@ -506,6 +506,15 @@ static void finish(job_kind_t kind, int result)
     taskEXIT_CRITICAL(&s_mux);
 }
 
+/* Set once by udsota_esp32_engine_set_wake() before the worker exists: called after every finished job. */
+static void (*s_wake)(void);
+
+/* See udsota_esp32_priv.h. */
+void udsota_esp32_engine_set_wake(void (*wake)(void))
+{
+    s_wake = wake;
+}
+
 /* The flash worker: runs queued jobs one at a time, forever. Not on the task watchdog: an erase
  * busy-waits for up to ~43 s, yielding only between flash commands. */
 static void worker_task(void *arg)
@@ -528,6 +537,9 @@ static void worker_task(void *arg)
         default:           r = UDSOTA_DL_ABORTED; break;
         }
         finish((job_kind_t)j.kind, r);
+        if (s_wake != NULL) {
+            s_wake();
+        }
     }
 }
 
