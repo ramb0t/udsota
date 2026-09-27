@@ -451,6 +451,21 @@ static void test_tx_pending_counts_parked_response(void)
     TEST_ASSERT_EQUAL_UINT(1, s_resets);                 /* about 72 ms after arming: not the fallback */
 }
 
+/* Without can.tx_pending the driver's queue is unknown: 11 01's answer reaches can.send at once, and the restart
+ * still waits the full 100 ms, so the answer is not lost in the driver's queue. */
+static void test_restart_waits_100_ms_without_tx_pending(void)
+{
+    s_can.tx_pending = NULL;
+    udsota_isotp_init(&s_tp, &s_srv, &s_cfg, &s_hooks, &s_can, &s_bufs);
+    enter_extended();
+    static const uint8_t reset[] = {0x11, 0x01};
+    TEST_ASSERT_EQUAL_UINT32(2, request_sf(reset, sizeof reset, 0));
+    run_ms(95);
+    TEST_ASSERT_EQUAL_UINT(0, s_resets);
+    run_ms(10);
+    TEST_ASSERT_EQUAL_UINT(1, s_resets);
+}
+
 /* While a restart is armed the adapter polls the server even though the answer is still parked, so the
  * 100 ms fallback fires. */
 static void test_armed_restart_falls_back_after_100_ms(void)
@@ -777,6 +792,7 @@ int main(void)
     RUN_TEST(test_parked_answer_dropped_after_limit_and_s3_still_runs);
     RUN_TEST(test_tx_pending_counts_parked_response);
     RUN_TEST(test_armed_restart_falls_back_after_100_ms);
+    RUN_TEST(test_restart_waits_100_ms_without_tx_pending);
     RUN_TEST(test_stmin_hook_sets_each_first_fc);
     RUN_TEST(test_stmin_rounded_up_to_an_encodable_value);
     RUN_TEST(test_stmin_monitor_judges_the_sent_stmin);

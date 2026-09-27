@@ -29,7 +29,7 @@
 
 typedef struct {
     int      (*send)(void *ctx, uint16_t id, const uint8_t data[8], uint8_t len);   /* 0 queued, UDSOTA_TX_RETRY, else dropped */
-    uint32_t (*tx_pending)(void *ctx);       /* nullable: frames still queued in the app's CAN driver */
+    uint32_t (*tx_pending)(void *ctx);       /* nullable: frames still queued in the app's CAN driver; NULL = unknown, so a restart waits the full 100 ms */
     uint32_t (*now_us)(void *ctx);           /* monotonic microseconds (isotp_user_get_us) */
     void     *ctx;
 } udsota_can_t;

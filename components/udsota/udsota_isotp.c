@@ -193,11 +193,12 @@ static uint32_t next_wait_ms(const udsota_isotp_t *t, uint32_t now_ms)
 }
 
 /* Installed on the server: frames still to leave, the app's driver queue plus a parked answer and a
- * multi-frame send in progress, so a restart never overtakes its own answer. */
+ * multi-frame send in progress, so a restart never overtakes its own answer. Without can.tx_pending the driver
+ * queue is unknown and counts as one frame, so a restart waits the full UDSOTA_RESET_TX_WAIT_MS. */
 static uint32_t tp_tx_pending(void *ctx)
 {
     const udsota_isotp_t *t = (const udsota_isotp_t *)ctx;
-    uint32_t n = (t->can.tx_pending != NULL) ? t->can.tx_pending(t->can.ctx) : 0u;
+    uint32_t n = (t->can.tx_pending != NULL) ? t->can.tx_pending(t->can.ctx) : 1u;
     n += (t->park_len != 0u) ? 1u : 0u;
     n += (t->link.send_status == ISOTP_SEND_STATUS_INPROGRESS) ? 1u : 0u;
     return n;
