@@ -933,7 +933,7 @@ def test_busy_nrc_is_retried_with_backoff():
     d = FakeServer(nrc_once={(0x22, 0xF1F0): 0x21})
     rc, ft, _ = run_flash(d)
     assert rc == 0
-    assert d.log[:2] == [(0x22, 0xF1F0), (0x22, 0xF1F0)] and ft.sleeps[0] == BUSY_BACKOFF_S[0]
+    assert d.log[:2] == [(0x22, 0xF1F0), (0x22, 0xF1F0)]   # the backoff is listened out, not slept
 
 
 # Check NRC 0x37 to the seed request (the post-boot delay) is waited out once, with 3E 00 keeping S3 alive.
@@ -1023,6 +1023,28 @@ def test_ff01_failure_stops_before_activate():
     with pytest.raises(errors.UpdateFailed, match="DL_SIG_FAILED"):
         run_flash(d)
     assert d.log[-1] == (0x31, 0xFF01)
+
+
+# A FakeServer that never gets the first ActivateImage request: no answer, and nothing activated.
+class LostActivateRequest(FakeServer):
+    # Swallow the first F001 unanswered and unserved; everything else as FakeServer.
+    def handle(self, req):
+        if bytes(req[:4]) == b"\x31\x01\xF0\x01" and not getattr(self, "lost", False):
+            self.lost = True
+            self.log.append((0x31, 0xF001))
+            return []
+        return super().handle(req)
+
+
+# Check no answer to ActivateImage from a server that answers F1F0 with the boot slot unchanged: the request was
+# lost, so it is sent once more (with no new download) and the update completes.
+def test_lost_activate_request_is_resent_once():
+    d = LostActivateRequest()
+    rc, _, _ = run_flash(d)
+    assert rc == 0
+    i = d.log.index((0x31, 0xF001))
+    assert d.log[i:i + 3] == [(0x31, 0xF001), (0x22, 0xF1F0), (0x31, 0xF001)]
+    assert d.writes == 300
 
 
 # Check ActivateImage refused with 0x22 stops with the conditions-not-met message.

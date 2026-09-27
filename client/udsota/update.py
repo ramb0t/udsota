@@ -216,7 +216,7 @@ def flash(uds, profile, image, master, drop_76=None, preroll=lambda: None, sleep
         enter_programming(uds, profile, keys)
         if verified:
             log("the other slot already holds this image, verified: skipping to ActivateImage")
-        need_download, recovered = not verified, False
+        need_download, recovered, resent = not verified, False, False
         while True:
             if need_download:
                 download(uds, image, drop_76=drop_76, log=log)
@@ -225,6 +225,13 @@ def flash(uds, profile, image, master, drop_76=None, preroll=lambda: None, sleep
             try:
                 uds.routine(RID_ACTIVATE)
                 break
+            except NoResponse:
+                if activation_landed(uds, log=log):
+                    break
+                if resent:
+                    raise
+                resent, need_download = True, False   # the request itself was lost: send it once more
+                continue
             except Nrc as e:
                 if e.code == NRC_CONDITIONS:
                     raise UpdateFailed("ActivateImage refused (0x22): the server's conditions are not met. The image "
@@ -241,6 +248,22 @@ def flash(uds, profile, image, master, drop_76=None, preroll=lambda: None, sleep
         wait_for_image(uds, img.elf_sha, preroll, sleep=sleep, clock=clock)
         log("the server runs %s; confirming" % img.version)
         return confirm(uds, sleep=sleep, clock=clock, log=log)
+
+
+# After no answer to ActivateImage: True when the server activated anyway, so its answer, not the request, was
+# lost. A server that answers nothing is restarting; one whose boot slot is not its running slot has switched and
+# restarts next. False when it answers and has not switched: the request itself was lost.
+def activation_landed(uds, log=print):
+    try:
+        state = decode_status(uds.read_did(DID_STATUS))
+    except (NoResponse, SendFailed):
+        log("no answer to ActivateImage, and none since: the server is restarting")
+        return True
+    if state["boot_slot"] != state["running_slot"]:
+        log("no answer to ActivateImage, but the boot slot has switched")
+        return True
+    log("no answer to ActivateImage and the boot slot has not switched: sending it again")
+    return False
 
 
 # After 0x72 to ActivateImage: the status DID shows whether set_boot landed (boot slot != running slot). If it

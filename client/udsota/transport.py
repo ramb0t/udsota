@@ -222,6 +222,10 @@ class GuardedConnection(BaseConnection):
             self.monitor.end()
             raise
 
+    # A response is awaited with no send of ours (a late or still-pending answer): the monitor counts it as ours.
+    def expect(self):
+        self.monitor.begin()
+
     # Wait for one response; any answer but NRC 0x78 ends the outstanding request.
     def specific_wait_frame(self, timeout=None):
         try:

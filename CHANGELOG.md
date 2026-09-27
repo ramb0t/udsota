@@ -19,6 +19,9 @@ Fixed:
 - ISO-TP: with no `can.tx_pending`, a restart waits the full 100 ms for its answer to leave, as documented. Before, it fired at the next poll and the answer to ActivateImage or 11 01 could be lost in the driver's queue.
 - ESP32 port: a wait under one FreeRTOS tick no longer becomes a non-blocking poll. At `CONFIG_FREERTOS_HZ=100` the diag task spun while a flash job ran and starved the flash worker on its core, so the first erase never finished. The port warns when the tick rate is under 1000 Hz, and the example sets 1000.
 - ESP32 port: `udsota_esp32_on_frame()` clamps a DLC over 8 to 8.
+- Client: no answer to ActivateImage no longer fails `flash`. The client reads F1F0: a server that answers nothing is restarting and one whose boot slot switched restarts next, so it waits for the new image and confirms it; one that has not switched never got the request, which is sent once more.
+- Client: after NRC 0x21 the client listens out its backoff instead of sleeping through it, so when an earlier send's 0x78 was lost it takes the next 0x78 and waits for that request's answer. Before, a lost 0x78 on a job over about 3 s (an erase) ended the update with 0x21.
+- Client: a 76 carrying the previous block's counter (a late answer to a resend) is passed over and the block's own answer awaited. Before, it ended the update with "block N answered with counter N-1".
 
 Breaking, for code that fills `udsota_hooks_t` or `udsota_config_t` positionally: both gained fields (`comm_control`, `dtc_setting`; `func_id`, `p2_prog_ms`, `p2star_prog_ms`). Designated initializers are unaffected.
 

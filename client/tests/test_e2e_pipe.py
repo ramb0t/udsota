@@ -294,28 +294,16 @@ def is_activate_answer(msg):
     return bytes(msg.data[:5]) == bytes([0x04, 0x71, 0x01, 0xF0, 0x01])
 
 
-# Check a lost ActivateImage answer: the server has activated and restarts into the new image, but the client
-# sees only a timeout. It stops with exit 1, and `confirm` then finishes the update.
-def test_lost_activate_answer_leaves_the_image_unconfirmed(demo, tmp_path, capsys):
-    s = demo()
-    s.drop = lambda m: is_activate_answer(m) and not s.dropped
-    image = build_image("v0.2.0")
-    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash", image_file(tmp_path, image)]) == 1
-    assert "no response to service 0x31" in capsys.readouterr().err
-    status, _, _ = read_state_after_restart(s, elf_sha(image))
-    assert (status["running_slot"], status["running_state"]) == (1, PENDING)
-    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "confirm"]) == 0
-    assert read_state(s)[0]["running_state"] == VALID
-
-
-# Suspected in the client audit, confirmed here: a lost ActivateImage answer is reported as a failed update,
-# though the server activated and restarts into the new image. The client could read F1F0 or wait on F1F3.
-@pytest.mark.xfail(strict=True, reason="client: a lost ActivateImage answer ends flash with exit 1, not a confirm")
+# Check a lost ActivateImage answer: the server has activated and restarts into the new image, and the client,
+# seeing only a timeout, finds it restarting, waits for the new image and confirms it.
 def test_lost_activate_answer_still_confirms(demo, tmp_path):
     s = demo()
     s.drop = lambda m: is_activate_answer(m) and not s.dropped
-    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash",
-                       image_file(tmp_path, build_image("v0.2.0"))]) == 0
+    image = build_image("v0.2.0")
+    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash", image_file(tmp_path, image)]) == 0
+    assert len(s.dropped) == 1
+    status, _, version = read_state(s)
+    assert (status["running_slot"], status["running_state"], version) == (1, VALID, "v0.2.0")
 
 
 # True for a single-frame 76 <bsc>.
@@ -341,11 +329,11 @@ def test_busy_resends_outlast_a_short_job(demo, tmp_path):
     assert len(s.dropped) == 2 and is_block_answer(s.dropped[1], 1)
 
 
-# Found by these tests: an answer that arrives after P2 is not stale-proof. Block 1's 76 is delayed until the
+# Found by these tests, and fixed: an answer that arrives after P2 is not stale-proof. Block 1's 76 is delayed until the
 # client has resent the block, so it answers the resend; the server's answer to the repeat then arrives while
 # the client sends block 2, and the client takes "76 01" as block 2's answer and stops ("block 2 answered with
-# counter 01") instead of discarding it and waiting for 76 02. A lost 0x78 on a short job hits the same race.
-@pytest.mark.xfail(strict=True, reason="client: a late duplicate 76 is read as the next block's answer")
+# counter 01") instead of discarding it and waiting for 76 02. It now passes over a 76 with the previous
+# block's counter. A lost 0x78 on a short job hits the same race.
 def test_late_answer_is_not_the_next_blocks(demo, tmp_path):
     s = demo()
     held, sent, lock = [], [], threading.Lock()
@@ -370,11 +358,10 @@ def test_late_answer_is_not_the_next_blocks(demo, tmp_path):
                        image_file(tmp_path, build_image("v0.2.0"))]) == 0
 
 
-# Suspected in the client audit, confirmed here: when the first 0x78 of a job longer than the 0x21 backoff
-# (an erase of 8 s) is lost, every resend answers 0x21 until the client gives up, although the server would
-# have answered the original request. The 0x78 repeats the server sends every 1.5 s arrive while the client
-# sleeps between retries and are discarded before its next send.
-@pytest.mark.xfail(strict=True, reason="a lost 0x78 on a job over ~3 s: resends get 0x21 until the client gives up")
+# Suspected in the client audit, confirmed here, and fixed: when the first 0x78 of a job longer than the 0x21
+# backoff (an erase of 8 s) is lost, every resend answered 0x21 until the client gave up, because the 0x78s the
+# server repeats every 1.5 s arrived while the client slept between retries. The client now listens out each
+# backoff, takes the next 0x78 and waits for the original request's answer.
 def test_lost_response_pending_on_a_long_job(demo, tmp_path):
     s = demo("--job-ms", "8000")
     s.drop = lambda m: is_nrc(m, 0x36, 0x78) and not s.dropped

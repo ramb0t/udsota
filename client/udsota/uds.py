@@ -12,6 +12,8 @@ from .wire import DL_ALFID, DL_DFI, DL_MAX_DATA, NRC_BUSY, NRC_TIME_DELAY
 BUSY_BACKOFF_S = (0.05, 0.1, 0.2, 0.4, 0.8, 1.6)   # waits before each retry after NRC 0x21
 SA_DELAY_S = 10.0        # the server's 0x27 delay after boot or after three wrong keys
 KEEPALIVE_S = 2.0        # 3E 00 interval while waiting in a session (at least every 2 s)
+LATE_WAIT_S = 5.5        # how long a late answer, or the next 0x78 of a job still running, is waited for (P2*)
+NRC_PENDING = 0x78
 
 
 # One request method per service the update uses.
@@ -31,7 +33,11 @@ class Uds:
                 return bytes(resp.data or b"")
             except NegativeResponseException as e:
                 if e.response.code == NRC_BUSY and delay is not None:
-                    self.sleep(delay)
+                    # 0x21 often means an earlier send of this request is still being served (its 0x78 was
+                    # lost): listen out the backoff for that answer rather than sleep through its 0x78s.
+                    late = self.await_answer(service, delay)
+                    if late is not None:
+                        return late
                     continue
                 raise Nrc(service.request_id(), e.response.code)
             except TimeoutException as e:
@@ -39,6 +45,29 @@ class Uds:
             except (InvalidResponseException, UnexpectedResponseException) as e:
                 raise UpdateFailed("unexpected answer to service 0x%02X: %s" % (service.request_id(), e))
         raise AssertionError("unreachable")
+
+    # Listen window_s seconds for an answer to service that no send of ours is waiting for: a late one, or one
+    # still being served. A 0x78 extends the wait by LATE_WAIT_S each time, as it would for a request. Returns the
+    # positive response after its SID, raises Nrc for a final NRC, and returns None when nothing arrives. 0x21 and
+    # frames for other services are passed over. The second-tester monitor counts the wait as a request of ours.
+    def await_answer(self, service, window_s):
+        sid, conn = service.request_id(), self.client.conn
+        timeout = window_s
+        while True:
+            expect = getattr(conn, "expect", None)
+            if expect is not None:
+                expect()
+            frame = conn.wait_frame(timeout=timeout)
+            if frame is None:
+                return None
+            if len(frame) >= 3 and frame[0] == 0x7F and frame[1] == sid:
+                if frame[2] == NRC_PENDING:
+                    timeout = LATE_WAIT_S
+                    continue
+                if frame[2] != NRC_BUSY:
+                    raise Nrc(sid, frame[2])
+            elif len(frame) >= 1 and frame[0] == sid | 0x40:
+                return bytes(frame[1:])
 
     # send_request, resent once after an ISO-TP send error (OSError: no FC within N_Bs, e.g. one a rate cap
     # dropped). Safe: without the FC the server never got the request, and a seed stays valid 30 s.
@@ -104,9 +133,17 @@ class Uds:
             raise UpdateFailed("maxNumberOfBlockLength %d is too small" % max_block)
         return min(max_block - 2, DL_MAX_DATA)
 
-    # TransferData: one block with its counter; checks the counter echo.
+    # TransferData: one block with its counter; checks the counter echo. A 76 with the previous block's counter
+    # is that block's late answer to a resend (its first answer came after P2): it is passed over, and this
+    # block's own answer awaited.
     def transfer(self, bsc, chunk):
         d = self.request(services.TransferData, data=bytes([bsc]) + bytes(chunk))
+        previous = bytes([(bsc - 1) & 0xFF])
+        while d[:1] == previous:
+            d = self.await_answer(services.TransferData, LATE_WAIT_S)
+            if d is None:
+                raise NoResponse("no response to service 0x36 block %d after a late answer to block %d"
+                                 % (bsc, previous[0]))
         if d[:1] != bytes([bsc]):
             raise UpdateFailed("block %d answered with counter %s" % (bsc, d[:1].hex()))
 
