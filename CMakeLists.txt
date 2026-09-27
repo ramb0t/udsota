@@ -69,9 +69,10 @@ udsota_test(test_udsota_image
     SOURCES  test/test_udsota_image.c ${CORE_DIR}/udsota_image.c
     INCLUDES ${CORE_INC} ${TEST_DIR})
 
+# With the host SHA-256, for the digest of the ECDSA mode's known-answer message.
 udsota_test(test_udsota_keys
-    SOURCES  test/test_udsota_keys.c ${CORE_DIR}/udsota_keys.c
-    INCLUDES ${CORE_INC})
+    SOURCES  test/test_udsota_keys.c ${CORE_DIR}/udsota_keys.c ${CORE_DIR}/test/sha256_host.c
+    INCLUDES ${CORE_INC} ${CORE_DIR}/test)
 
 udsota_test(test_udsota_rxwatch
     SOURCES  test/test_udsota_rxwatch.c ${CORE_DIR}/udsota_rxwatch.c

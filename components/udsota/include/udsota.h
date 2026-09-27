@@ -61,8 +61,15 @@ typedef struct {   /* required; only unverify, status, running_sha and version m
 
 typedef struct {   /* udsota_init() with security == NULL: 27 answers 0x11, and nothing needs a key */
     bool  (*rng16)(void *ctx, uint8_t out[16]);
-    bool  (*key)(void *ctx, const uint8_t seed[16], uint8_t level, uint8_t out[16]);  /* false = no key available now (0x22; not an attempt) */
+    bool  (*key)(void *ctx, const uint8_t seed[16], uint8_t level, uint8_t out[16]);  /* false = no key available now (0x22; not an attempt);
+                                                                                          unused (may be NULL) when verify is set */
     void  *ctx;
+    /* Optional verifier, for a key the server cannot compute (the ECDSA mode: a signature over the seed, udsota_keys.h).
+     * When set, the server asks it instead of calling key and comparing: 1 = the key is right, -1 = no verdict
+     * now (0x22; not an attempt), anything else = wrong. Counting, lockout, single use and expiry are the same. */
+    int   (*verify)(void *ctx, const uint8_t seed[16], uint8_t level, const uint8_t *key, size_t key_len);
+    uint16_t key_len;   /* with verify set, the exact key length a sendKey carries (0 = 16; at most 254, the ISO-TP
+                           receive limit outside a download less 27 xx); ignored without verify, whose key is 16 bytes */
 } udsota_security_t;
 
 typedef struct {   /* all optional */
@@ -104,6 +111,10 @@ typedef struct {
     size_t      device_id_len;
     const char *product;               /* port: image identity, esp_app_desc project name; NULL = not checked */
     uint8_t     hw_id, layout_id;      /* port: descriptor values the image must carry */
+    const uint8_t *key_pubkey;         /* port: security on in the ECDSA mode (udsota_keys.h): the tester's P-256 public
+                                          key, an uncompressed SEC1 point (04 || X || Y). It wins over key_label and
+                                          key_master, and a bad one leaves security on with no key that matches */
+    size_t      key_pubkey_len;        /* port: UDSOTA_KEYS_PUBKEY_LEN (65) */
 } udsota_config_t;
 
 struct udsota_server;
