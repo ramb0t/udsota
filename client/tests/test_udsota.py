@@ -455,6 +455,91 @@ def test_guarded_bus_blocks_forbidden_ids(can_id):
     assert sent == []
 
 
+FUNCTIONAL = """
+[can]
+req_id = 0x710
+resp_id = 0x718
+deny_tx = [0x7E0]
+
+[functional]
+id = 0x7DF
+quiet_bus = true
+"""
+PF = profile.from_dict("functional", tomllib.loads(FUNCTIONAL))
+
+
+# Check [functional] parses, and that its id may not be the request or response ID or a deny_tx ID.
+@pytest.mark.parametrize("fid", [0x710, 0x718, 0x7E0])
+def test_functional_profile(fid):
+    assert (PF.func_id, PF.quiet_bus) == (0x7DF, True)
+    assert (P.func_id, P.quiet_bus) == (None, False)
+    with pytest.raises(errors.Refused):
+        profile.from_dict("bad", tomllib.loads(FUNCTIONAL.replace("id = 0x7DF", "id = 0x%03X" % fid)))
+    with pytest.raises(errors.Refused):
+        profile.from_dict("bad", tomllib.loads(FUNCTIONAL.replace("quiet_bus = true", "quiet_bus = 1")))
+
+
+# Check the TX guard allows the [functional] id as a standard frame only, and still nothing else.
+def test_check_tx_id_allows_the_functional_id():
+    transport.check_tx_id(PF, 0x7DF)
+    transport.check_tx_id(PF, 0x710)
+    for can_id, ext in ((0x7DF, True), (0x7E0, False), (0x718, False)):
+        with pytest.raises(errors.Refused):
+            transport.check_tx_id(PF, can_id, extended=ext)
+    with pytest.raises(errors.Refused):
+        transport.check_tx_id(P, 0x7DF)
+
+
+# Records every frame the guard lets through.
+class RecordingBus:
+    # An empty log.
+    def __init__(self):
+        self.sent = []
+
+    # Record the frame.
+    def send(self, m, timeout=None):
+        self.sent.append(m)
+
+
+# Check QuietBus sends the quieting burst, a functional 3E 80 while held, and the release burst, all padded
+# single frames on 0x7DF, and that the monitor counts each burst as a request of ours.
+def test_quiet_bus_bursts_and_keepalive():
+    raw = RecordingBus()
+    mon = transport.SecondTesterMonitor(0x718)
+    with transport.QuietBus(transport.GuardedBus(raw, PF), PF, mon, period_s=0.02, sleep=lambda s: None):
+        time.sleep(0.15)
+    frames = [bytes(m.data) for m in raw.sent]
+    assert all(m.arbitration_id == 0x7DF and not m.is_extended_id and m.dlc == 8 for m in raw.sent)
+    pad = lambda b: bytes([len(b)]) + b + bytes([0xAA] * (7 - len(b)))
+    assert frames[:3] == [pad(b"\x10\x83"), pad(b"\x85\x82"), pad(b"\x28\x83\x03")]
+    assert frames[-3:] == [pad(b"\x28\x80\x03"), pad(b"\x85\x81"), pad(b"\x10\x81")]
+    assert len(frames) >= 8 and set(frames[3:-3]) == {pad(b"\x3E\x80")}
+    assert mon.alarm is None and not mon._busy
+
+
+# Check flash enters quiet() once an update is needed and holds it to the end; a no-op flash never enters it.
+def test_flash_holds_quiet_for_the_update_only():
+    events = []
+
+    # Records enter and exit, and the server log length at each.
+    class Quiet:
+        # Record the entry.
+        def __enter__(self):
+            events.append(("enter", len(d.log)))
+
+        # Record the exit.
+        def __exit__(self, *exc):
+            events.append(("exit", len(d.log)))
+
+    d = FakeServer()
+    assert run_flash(d, quiet=Quiet)[0] == 0
+    assert events == [("enter", len(PRECHECK)), ("exit", len(d.log))]
+    events.clear()
+    d = FakeServer(sha=NEW_SHA)
+    assert run_flash(d, quiet=Quiet)[0] == 0
+    assert events == []
+
+
 # Check the ISO-TP address builder refuses a deny_tx pair before touching can-isotp.
 def test_isotp_address_refuses_deny_tx_ids():
     with pytest.raises(errors.Refused):

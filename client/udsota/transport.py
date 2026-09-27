@@ -1,5 +1,7 @@
-"""The bus side: the TX guard (only the profile's request ID, never a deny_tx ID), pre-flight listening with
-the optional busy detector and pre-roll, the second-tester monitor and the kernel ISO-TP binding."""
+"""The bus side: the TX guard (only the profile's request ID and optional functional ID, never a deny_tx ID),
+pre-flight listening with the optional busy detector and pre-roll, the second-tester monitor, the optional bus
+quieting over the functional ID and the kernel ISO-TP binding."""
+import contextlib
 import selectors
 import threading
 import time
@@ -16,6 +18,12 @@ PAD = 0xAA               # ISO-TP padding byte; every frame goes out at DLC 8, w
 LISTEN_S = 2.0
 PREROLL_DATA = bytes([0x02, 0x3E, 0x80]) + bytes([PAD] * 5)   # TesterPresent, positive response suppressed
 PREROLL_GAP_S = 0.01
+FUNC_GAP_S = 0.02        # between the functional requests of a quieting burst
+QUIET_KEEPALIVE_S = 2.0  # functional 3E 80 while the bus is quiet: well inside every node's 5 s S3
+# Functional requests, all with the suppress bit: extended session, DTC setting off, normal and NM messages off.
+QUIET_START = (b"\x10\x83", b"\x85\x82", b"\x28\x83\x03")
+# And back: messages on, DTC setting on, default session (which alone would undo the other two).
+QUIET_END = (b"\x28\x80\x03", b"\x85\x81", b"\x10\x81")
 P2_S = 0.15              # client P2
 P2_STAR_S = 5.5          # client P2*; the server repeats 0x78 every 1.5 s
 REQUEST_TIMEOUT_S = 100.0   # overall per request: above the server's 90 s flash-job cap
@@ -23,11 +31,12 @@ GRACE_S = 0.25           # a response frame this soon after our last response is
 RX_ERROR_PAUSE_S = 0.02  # the receive thread's pause after a socket error, before it listens again
 
 
-# Raise Refused unless can_id is the profile's request ID as a standard frame; deny_tx IDs are a hard limit.
+# Raise Refused unless can_id is the profile's request ID, or its [functional] id, as a standard frame; deny_tx
+# IDs are a hard limit.
 def check_tx_id(profile, can_id, extended=False):
     if not extended and can_id in profile.deny_tx:
         raise Refused("hard limit: never transmit on 0x%03X (profile %s deny_tx)" % (can_id, profile.name))
-    if extended or can_id != profile.req_id:
+    if extended or can_id not in (profile.req_id, profile.func_id):
         raise Refused("refusing to transmit on 0x%X: this tool sends only on 0x%03X" % (can_id, profile.req_id))
 
 
@@ -64,6 +73,58 @@ def send_preroll(bus, profile, sleep=time.sleep):
     for _ in range(profile.preroll_frames):
         bus.send(can.Message(arbitration_id=profile.req_id, is_extended_id=False, data=PREROLL_DATA))
         sleep(PREROLL_GAP_S)
+
+
+# One functional request (a Single Frame of up to 7 bytes, padded) on the profile's [functional] id.
+def send_functional(bus, profile, payload):
+    data = bytes([len(payload)]) + payload
+    bus.send(can.Message(arbitration_id=profile.func_id, is_extended_id=False, data=data + bytes([PAD] * (8 - len(data)))))
+
+
+# [functional] quiet_bus while flashing: every node on the bus to the extended session with DTC setting and its
+# normal and network-management messages off, held there by a functional 3E 80 every QUIET_KEEPALIVE_S, and back
+# to the default session on exit, whatever happened. Each request has the suppress bit, so only an NRC can answer;
+# the monitor treats the burst as a request of ours.
+class QuietBus:
+    # bus: a GuardedBus; monitor: the SecondTesterMonitor (or None).
+    def __init__(self, bus, profile, monitor=None, period_s=QUIET_KEEPALIVE_S, sleep=time.sleep):
+        self.bus, self.profile, self.monitor, self.period_s, self._sleep = bus, profile, monitor, period_s, sleep
+        self._stop = threading.Event()
+        self._thread = None
+
+    # Send one burst of functional requests, FUNC_GAP_S apart, as one request of ours.
+    def _burst(self, payloads):
+        if self.monitor is not None:
+            self.monitor.begin()
+        try:
+            for p in payloads:
+                send_functional(self.bus, self.profile, p)
+                self._sleep(FUNC_GAP_S)
+        finally:
+            if self.monitor is not None:
+                self.monitor.end()
+
+    # The keepalive thread: 3E 80 until stopped (it never needs the monitor: nothing answers 3E 80).
+    def _keepalive(self):
+        while not self._stop.wait(self.period_s):
+            try:
+                send_functional(self.bus, self.profile, b"\x3E\x80")
+            except (OSError, can.CanError):
+                pass                      # a full TX queue: the next one is 2 s later, well inside S3
+
+    # Quiet the bus and start the keepalive.
+    def __enter__(self):
+        self._burst(QUIET_START)
+        self._thread = threading.Thread(target=self._keepalive, name="udsota-quiet", daemon=True)
+        self._thread.start()
+        return self
+
+    # Stop the keepalive and release the bus.
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+        self._burst(QUIET_END)
 
 
 # Listen listen_s seconds; raise Busy on a busy value, SecondTester on any response-ID frame; pre-roll
@@ -246,6 +307,12 @@ class Transport:
     # The profile's pre-roll on the raw bus (used while the server restarts).
     def preroll(self):
         send_preroll(self.raw, self.profile)
+
+    # The bus quieting for flash: QuietBus with [functional] quiet_bus, else nothing.
+    def quiet(self):
+        if not self.profile.quiet_bus:
+            return contextlib.nullcontext()
+        return QuietBus(self.raw, self.profile, self.monitor)
 
     # Start the response monitor and open the UDS client over the kernel ISO-TP socket.
     def uds(self):

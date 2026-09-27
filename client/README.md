@@ -41,6 +41,7 @@ Start from [`example.toml`](udsota/profiles/example.toml), which comments every 
 | `[board]` | `did`, `names` | a DID naming the device's board, and the board name for each `hw_id`, so `flash` refuses an image for another board |
 | `[busy]` | `id`, `byte`, `values` | a frame whose byte at `byte` holds one of `values` means another tester has a session |
 | `[preroll]` | `tester_present_frames` | TesterPresent frames sent first on a quiet bus, for a device whose CAN driver waits to hear traffic |
+| `[functional]` | `id`, `quiet_bus` (false) | the functional ID (0x7DF on most buses), the only ID besides `req_id` the tool may send on. With `quiet_bus`, `flash` first sends 10 83, 85 82 and 28 83 03 to every node, holds them there with 3E 80 every 2 s, and afterwards sends 28 80 03, 85 81 and 10 81, whether or not the update succeeded. Turn it on only on a bus where every node may stop its normal messages while you flash, never on a vehicle that is in use |
 | `[dids]` | `"0xNNNN"` or `"0xNNNN-0xNNNN"` = `{ name, decode }` | extra DIDs `info` reads after the server's own, decoded as `hex`, `ascii` or `version3`; a range stops at its first absent DID |
 
 ## Limits

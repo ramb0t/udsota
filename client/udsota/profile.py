@@ -16,6 +16,7 @@ KEYS = {"can": {"interface", "req_id", "resp_id", "deny_tx"},
         "board": {"did", "names"},
         "busy": {"id", "byte", "values"},
         "preroll": {"tester_present_frames"},
+        "functional": {"id", "quiet_bus"},
         "dids": None}
 
 
@@ -64,6 +65,8 @@ class Profile:
     busy: BusyDetector | None
     preroll_frames: int
     dids: tuple
+    func_id: int | None = None      # [functional] id: the only other ID the tool may transmit on
+    quiet_bus: bool = False         # [functional] quiet_bus: silence the bus's other nodes while flashing
 
 
 # Raise Refused naming the profile and the problem.
@@ -110,6 +113,14 @@ def _str(name, t, key, required=False):
     return t[key]
 
 
+# t[key] as a bool, or default when absent.
+def _bool(name, t, key, default):
+    v = t.get(key, default)
+    if not isinstance(v, bool):
+        _bad(name, "%s must be true or false" % key)
+    return v
+
+
 # "0xF191" or "0x0200-0x02FF" to (first, last).
 def _did_range(name, key):
     m = re.fullmatch(r"0x([0-9A-Fa-f]{1,4})(?:-0x([0-9A-Fa-f]{1,4}))?", key)
@@ -136,6 +147,11 @@ def from_dict(name, d):
         _bad(name, "req_id 0x%03X is in deny_tx" % req_id)
     if req_id == resp_id:
         _bad(name, "req_id and resp_id are both 0x%03X" % req_id)
+    func_t, func_id = d.get("functional"), None
+    if func_t is not None:
+        func_id = _int(name, func_t, "id", 0, 0x7FF, required=True)
+        if func_id in deny_tx or func_id in (req_id, resp_id):
+            _bad(name, "[functional] id 0x%03X is the request or response ID, or in deny_tx" % func_id)
     sec_t, security = d.get("security"), None
     if sec_t is not None:
         label = _str(name, sec_t, "label", required=True)
@@ -174,7 +190,8 @@ def from_dict(name, d):
                    board_did=None if board_t is None else _int(name, board_t, "did", 0, 0xFFFF, required=True),
                    board_names=board_names, busy=busy,
                    preroll_frames=_int(name, d.get("preroll", {}), "tester_present_frames", 0, 64, default=0),
-                   dids=tuple(dids))
+                   dids=tuple(dids), func_id=func_id,
+                   quiet_bus=func_t is not None and _bool(name, func_t, "quiet_bus", False))
 
 
 # Load a profile by name (a file in udsota/profiles) or by path (anything with a / or ending .toml).

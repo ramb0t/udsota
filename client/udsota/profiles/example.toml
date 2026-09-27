@@ -37,6 +37,13 @@ names = { 1 = "devkit" }              # board name for each hw_id; flash refuses
 # [preroll]
 # tester_present_frames = 5           # TesterPresent frames sent first when the bus is quiet (0 to 64)
 
+# [functional] names the functional ID, the only other ID the tool may send on. With quiet_bus, flash tells every
+# node on the bus to stop its normal messages (10 83, 85 82, 28 83 03, then 3E 80 every 2 s) and releases them at
+# the end. Only for a bench or a vehicle at rest, where every node may go quiet.
+# [functional]
+# id = 0x7DF                          # the functional request ID
+# quiet_bus = false
+
 # [dids] lists extra DIDs `info` reads after the server's own, decoded as hex, ascii or version3.
 # A range stops at its first absent DID.
 [dids]

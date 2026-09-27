@@ -1,5 +1,6 @@
 """The commands: info, the flash sequence (precheck to ConfirmImage, with its recovery paths), confirm and
 the keyed reset. Every product-specific step comes from the profile."""
+import contextlib
 import time
 
 from .errors import NoResponse, Nrc, Refused, SendFailed, UpdateFailed
@@ -188,9 +189,10 @@ def read_status_precheck(uds):
 
 
 # `flash`: precheck, programming session (and unlock), download, FF01, ActivateImage, the restart and
-# ConfirmImage. Returns 0 or raises ToolError. master is unused when the profile has no [security].
+# ConfirmImage. Returns 0 or raises ToolError. master is unused when the profile has no [security]. quiet() is
+# entered once an update is needed and held until the end (the transport's bus quieting).
 def flash(uds, profile, image, master, drop_76=None, preroll=lambda: None, sleep=time.sleep,
-          clock=time.monotonic, log=print):
+          clock=time.monotonic, log=print, quiet=contextlib.nullcontext):
     img = parse_image(profile, image)
     board_of = profile.board_names.get(img.hw_id, "hw_id %d" % img.hw_id)
     log("image %s for %s, %d bytes, app_elf_sha256 %s" % (img.version, board_of, img.size, img.elf_sha[:8].hex()))
@@ -210,34 +212,35 @@ def flash(uds, profile, image, master, drop_76=None, preroll=lambda: None, sleep
         raise Refused("image is for %s but the server is %s" % (board_of, board))
     verified = state["other_state"] == OTHER_VERIFIED and state["other_sha_prefix"] == img.elf_sha[:8]
     keys = make_keys(profile, master, device_id)
-    enter_programming(uds, profile, keys)
-    if verified:
-        log("the other slot already holds this image, verified: skipping to ActivateImage")
-    need_download, recovered = not verified, False
-    while True:
-        if need_download:
-            download(uds, image, drop_76=drop_76, log=log)
-            check_image(uds, log=log)
-            drop_76 = None                    # the fault injection applies to the first download only
-        try:
-            uds.routine(RID_ACTIVATE)
-            break
-        except Nrc as e:
-            if e.code == NRC_CONDITIONS:
-                raise UpdateFailed("ActivateImage refused (0x22): the server's conditions are not met. The image "
-                                   "stays verified until the server restarts; run flash again when they are") from e
-            if e.code == NRC_PROGRAMMING_FAILURE:
-                activation_failed(uds, profile, keys, e, log=log)
+    with quiet():                             # [functional] quiet_bus: the other nodes stay quiet until the end
+        enter_programming(uds, profile, keys)
+        if verified:
+            log("the other slot already holds this image, verified: skipping to ActivateImage")
+        need_download, recovered = not verified, False
+        while True:
+            if need_download:
+                download(uds, image, drop_76=drop_76, log=log)
+                check_image(uds, log=log)
+                drop_76 = None                    # the fault injection applies to the first download only
+            try:
+                uds.routine(RID_ACTIVATE)
                 break
-            if recovered or e.code != NRC_SEQUENCE:
-                raise
-            recovered = True                  # one re-download per run
-        log("ActivateImage answered 0x24 (the slot is not verified): downloading again")
-        need_download = True
-    log("activated; waiting for the server to restart")
-    wait_for_image(uds, img.elf_sha, preroll, sleep=sleep, clock=clock)
-    log("the server runs %s; confirming" % img.version)
-    return confirm(uds, sleep=sleep, clock=clock, log=log)
+            except Nrc as e:
+                if e.code == NRC_CONDITIONS:
+                    raise UpdateFailed("ActivateImage refused (0x22): the server's conditions are not met. The image "
+                                       "stays verified until the server restarts; run flash again when they are") from e
+                if e.code == NRC_PROGRAMMING_FAILURE:
+                    activation_failed(uds, profile, keys, e, log=log)
+                    break
+                if recovered or e.code != NRC_SEQUENCE:
+                    raise
+                recovered = True                  # one re-download per run
+            log("ActivateImage answered 0x24 (the slot is not verified): downloading again")
+            need_download = True
+        log("activated; waiting for the server to restart")
+        wait_for_image(uds, img.elf_sha, preroll, sleep=sleep, clock=clock)
+        log("the server runs %s; confirming" % img.version)
+        return confirm(uds, sleep=sleep, clock=clock, log=log)
 
 
 # After 0x72 to ActivateImage: the status DID shows whether set_boot landed (boot slot != running slot). If it

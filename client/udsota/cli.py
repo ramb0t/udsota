@@ -7,6 +7,7 @@ the profile's req_id only, never on a deny_tx ID. Before sending, the tool liste
 stops on the profile's busy value or on any resp_id frame, then pre-rolls a quiet bus if the profile asks.
 """
 import argparse
+import contextlib
 import logging
 import pathlib
 import sys
@@ -69,7 +70,8 @@ def main(argv=None, transport=Transport):
             if args.cmd == "info":
                 return info(uds, prof)
             if args.cmd == "flash":
-                return flash(uds, prof, image, master, drop_76=args.drop_76, preroll=t.preroll)
+                return flash(uds, prof, image, master, drop_76=args.drop_76, preroll=t.preroll,
+                             quiet=getattr(t, "quiet", contextlib.nullcontext))
             if args.cmd == "confirm":
                 return confirm_cmd(uds)
             return reset(uds, prof, master)
