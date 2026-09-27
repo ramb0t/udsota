@@ -254,9 +254,15 @@ static const row_t MATRIX[] = {
     {"D 37",                 ST_D,  B(0x37),             B(0x7F, 0x37, 0x7F)},
     {"P 37 locked",          ST_P,  B(0x37),             B(0x7F, 0x37, 0x33)},
     {"P3 37 no download",    ST_P3, B(0x37),             B(0x7F, 0x37, 0x24)},
-    /* Services udsota doesn't serve at all. */
+    /* 0x85 ControlDTCSetting: extended or programming, no key, no hook needed. */
+    {"D 85",                 ST_D,  B(0x85, 0x02),       B(0x7F, 0x85, 0x7F)},
+    {"E 85 off",             ST_E,  B(0x85, 0x02),       B(0xC5, 0x02)},
+    {"P3 85 DTCSetting",     ST_P3, B(0x85, 0x01),       B(0xC5, 0x01)},
+    {"E 85 03",              ST_E,  B(0x85, 0x03),       B(0x7F, 0x85, 0x12)},
+    {"E 85 short",           ST_E,  B(0x85),             B(0x7F, 0x85, 0x13)},
+    /* Services udsota doesn't serve at all (0x28 needs hooks.comm_control, which this suite leaves NULL). */
     {"E1 19 ReadDTC",        ST_E1, B(0x19, 0x02, 0xFF), B(0x7F, 0x19, 0x11)},
-    {"P3 85 DTCSetting",     ST_P3, B(0x85, 0x01),       B(0x7F, 0x85, 0x11)},
+    {"E 28 no hook",         ST_E,  B(0x28, 0x03, 0x01), B(0x7F, 0x28, 0x11)},
 };
 
 /* Every matrix row from a fresh server in its state: one assertion per row on length and bytes together. */

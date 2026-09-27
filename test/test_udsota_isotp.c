@@ -340,6 +340,56 @@ static uint8_t read_session(void)
     return s_resp[3];
 }
 
+/* Feeds one functional frame, padded to 8 with 0xAA, then services once. */
+static void feed_func(const uint8_t *d, uint8_t n)
+{
+    uint8_t f[8];
+    memset(f, 0xAA, sizeof f);
+    memcpy(f, d, n);
+    resp_clear();
+    udsota_isotp_on_func_frame(&s_tp, f, 8, now_ms());
+    service();
+}
+
+/* A functional SF is answered on the response ID; a functional FF gets no FC and no answer, a CF or an FC is
+ * ignored, and nothing is counted. */
+static void test_functional_single_frame_only(void)
+{
+    static const uint8_t sf[] = {0x02, 0x3E, 0x00};
+    feed_func(sf, sizeof sf);
+    TEST_ASSERT_TRUE(s_resp_done);
+    TEST_ASSERT_EQUAL_HEX8(0x7E, s_resp[0]);
+    const unsigned frames = s_log_n;
+    static const uint8_t ff[8] = {0x10, 0x14, 0x22, 0xF1, 0x86, 0x00, 0x00, 0x00};
+    feed_func(ff, sizeof ff);
+    static const uint8_t cf[] = {0x21, 0x00};
+    feed_func(cf, sizeof cf);
+    static const uint8_t fc[] = {0x30, 0x00, 0x00};
+    feed_func(fc, sizeof fc);
+    static const uint8_t sf0[] = {0x00, 0x3E};
+    feed_func(sf0, sizeof sf0);
+    run_ms(5);
+    TEST_ASSERT_EQUAL_UINT(frames, s_log_n);             /* nothing sent: no FC, no answer */
+    TEST_ASSERT_EQUAL_UINT(0, s_fc_n);
+    TEST_ASSERT_EQUAL_UINT32(0, udsota_isotp_resp_lost(&s_tp));
+}
+
+/* A functional request while a physical one is mid-message is dropped, and the physical one completes. */
+static void test_functional_dropped_during_a_physical_request(void)
+{
+    static const uint8_t ff[8] = {0x10, 0x08, 0x22, 0xF1, 0x86, 0x00, 0x00, 0x00};   /* 22 F1 86 + 5 bytes: 0x13 */
+    feed(ff, sizeof ff);
+    TEST_ASSERT_EQUAL_UINT(1, s_fc_n);
+    static const uint8_t sf[] = {0x02, 0x3E, 0x00};
+    feed_func(sf, sizeof sf);
+    TEST_ASSERT_FALSE(s_resp_done);
+    static const uint8_t cf[] = {0x21, 0x00, 0x00};
+    feed(cf, sizeof cf);
+    TEST_ASSERT_TRUE(run_until_response(10));
+    static const uint8_t nrc[] = {0x7F, 0x22, 0x13};
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(nrc, s_resp, sizeof nrc);
+}
+
 /* Single-frame requests get single-frame answers on the response ID, padded with 0xAA. */
 static void test_single_frame_request_and_response(void)
 {
@@ -786,6 +836,8 @@ int main(void)
 {
     UNITY_BEGIN();
     RUN_TEST(test_single_frame_request_and_response);
+    RUN_TEST(test_functional_single_frame_only);
+    RUN_TEST(test_functional_dropped_during_a_physical_request);
     RUN_TEST(test_4095_byte_block_with_fc_every_64_cfs);
     RUN_TEST(test_receive_limit_256_outside_a_download);
     RUN_TEST(test_parked_response_retried_after_tx_retry);

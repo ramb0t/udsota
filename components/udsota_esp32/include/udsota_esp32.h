@@ -122,8 +122,9 @@ typedef struct {
  * the diag task cannot be created, what start already set up stays behind: the flash worker with its
  * buffer and queue and, with key_label set, the derived key in RAM and the SAR-ADC entropy source, left on. */
 esp_err_t udsota_esp32_start(const udsota_config_t *cfg, const udsota_hooks_t *hooks, const udsota_esp32_can_t *can);
-/* Any task: queues one frame on cfg->req_id with its receive time in microseconds; never blocks.
- * Other IDs, frames before start and frames past a full queue are dropped (the last counted). */
+/* Any task: queues one frame on cfg->req_id, or on cfg->func_id when set (a functional request), with its receive
+ * time in microseconds; never blocks. Other IDs, frames before start and frames past a full queue are dropped (the
+ * last counted). */
 void udsota_esp32_on_frame(uint16_t id, const uint8_t *data, uint8_t dlc, uint32_t rx_us);
 /* Any task, an app hook included: asks the diag task to end the session (udsota_end_session) after the
  * request it is serving, or after a running job's answer; requests before it runs count once. No-op

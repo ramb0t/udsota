@@ -46,6 +46,7 @@ static const char *TAG = "udsota";
 typedef struct {
     uint8_t  data[8];
     uint8_t  dlc;                  /* RX_WAKE_DLC: no frame, the worker finished a job */
+    bool     func;                 /* arrived on cfg.func_id: a functional request */
     uint32_t t_us;
 } rx_item_t;
 
@@ -181,6 +182,10 @@ static void rx_frame(const rx_item_t *it, uint32_t now)
         atomic_store_explicit(&s_wake_posted, false, memory_order_release);
         return;
     }
+    if (it->func) {
+        udsota_isotp_on_func_frame(&s_tp, it->data, it->dlc, now);
+        return;
+    }
     const uint16_t withheld = s_srv.counters.withheld_fcs;
     udsota_isotp_on_frame(&s_tp, it->data, it->dlc, it->t_us, now);
     if (s_srv.counters.withheld_fcs != withheld) {
@@ -293,10 +298,11 @@ esp_err_t udsota_esp32_start(const udsota_config_t *cfg, const udsota_hooks_t *h
 void udsota_esp32_on_frame(uint16_t id, const uint8_t *data, uint8_t dlc, uint32_t rx_us)
 {
     QueueHandle_t q = atomic_load_explicit(&s_q, memory_order_acquire);
-    if (q == NULL || data == NULL || id != s_cfg.req_id) {
+    const bool func = (s_cfg.func_id != 0u && id == s_cfg.func_id);
+    if (q == NULL || data == NULL || (id != s_cfg.req_id && !func)) {
         return;
     }
-    rx_item_t it = { .dlc = (dlc > 8u) ? 8u : dlc, .t_us = rx_us };   /* classic CAN: DLC 9-15 carry 8 bytes */
+    rx_item_t it = { .dlc = (dlc > 8u) ? 8u : dlc, .func = func, .t_us = rx_us };   /* classic CAN: DLC 9-15 carry 8 bytes */
     memcpy(it.data, data, (dlc > 8u) ? 8u : dlc);
     if (xQueueSend(q, &it, 0) != pdTRUE) {
         atomic_fetch_add_explicit(&s_rx_q_dropped, 1u, memory_order_relaxed);

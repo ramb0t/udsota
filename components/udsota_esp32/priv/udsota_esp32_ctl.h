@@ -16,8 +16,8 @@ typedef struct {
 } udsota_esp32_ctl_t;
 
 /* Before the server exists: copies *app (NULL = no hooks), stores IDLE, clears any request, and fills
- * *out with the hooks to give the server and the adapter. out->ctx is ctl. out's gate, did_read and
- * stmin_us stay NULL where the app's are, so the core's defaults hold; out's phase is always set, and
+ * *out with the hooks to give the server and the adapter. out->ctx is ctl. out's gate, did_read, stmin_us,
+ * comm_control and dtc_setting stay NULL where the app's are, so the core's defaults hold; out's phase is always set, and
  * out's reset is set when the app or default_reset gives one. */
 void udsota_esp32_ctl_init(udsota_esp32_ctl_t *ctl, const udsota_hooks_t *app,
                            bool (*default_reset)(void *ctx), udsota_hooks_t *out);

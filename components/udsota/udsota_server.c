@@ -351,16 +351,28 @@ static void apply_end_pending(udsota_server_t *s)
     }
 }
 
-/* First 0x78 of a job: four fifths of P2 (40 ms at the default 50 ms), so it leaves inside P2. */
-static uint32_t pending_first_ms(const udsota_server_t *s)
+/* P2 in `session`: cfg.p2_prog_ms in the programming session (cfg_resolve fills it), else cfg.p2_ms. */
+static uint16_t p2_in(const udsota_server_t *s, uint8_t session)
 {
-    return (uint32_t)s->cfg.p2_ms * 4u / 5u;
+    return session == UDSOTA_SESSION_PROGRAMMING ? s->cfg.p2_prog_ms : s->cfg.p2_ms;
 }
 
-/* 0x78 repeat period: three tenths of P2* (1.5 s at the default 5 s), well inside P2*. */
+/* P2* in `session`, as p2_in. */
+static uint16_t p2star_in(const udsota_server_t *s, uint8_t session)
+{
+    return session == UDSOTA_SESSION_PROGRAMMING ? s->cfg.p2star_prog_ms : s->cfg.p2star_ms;
+}
+
+/* First 0x78 of a job: four fifths of the session's P2 (40 ms at the default 50 ms), so it leaves inside P2. */
+static uint32_t pending_first_ms(const udsota_server_t *s)
+{
+    return (uint32_t)p2_in(s, s->session) * 4u / 5u;
+}
+
+/* 0x78 repeat period: three tenths of the session's P2* (1.5 s at the default 5 s), well inside P2*. */
 static uint32_t pending_repeat_ms(const udsota_server_t *s)
 {
-    return (uint32_t)s->cfg.p2star_ms * 3u / 10u;
+    return (uint32_t)p2star_in(s, s->session) * 3u / 10u;
 }
 
 /* True once the transport reports nothing left to send; always false without a tx_pending source. */
@@ -395,6 +407,21 @@ static void abort_download(udsota_server_t *s)
     udsota_sat_inc16(&s->counters.aborts);
 }
 
+/* Back in the default session: what 28 and 85 changed is undone (ISO 14229-1), through the same hooks. */
+static void restore_default_comm(udsota_server_t *s)
+{
+    if (s->comm_changed) {
+        s->comm_changed = false;
+        (void)s->hooks.comm_control(s->hooks.ctx, UDSOTA_CC_ENABLE_RX_TX, UDSOTA_CC_TYPE_ALL);
+    }
+    if (s->dtc_off) {
+        s->dtc_off = false;
+        if (s->hooks.dtc_setting != NULL) {
+            s->hooks.dtc_setting(s->hooks.ctx, true);
+        }
+    }
+}
+
 /* Enters `session` (an accepted 10 xx, S3, the 90 s cap or an app's end_session request): any open download is
  * aborted and security relocks, the same session included (ISO 14229-1 re-initialises it).
  * slot_verified survives, so ActivateImage can follow in a later session. */
@@ -405,10 +432,13 @@ static void enter_session(udsota_server_t *s, uint8_t session)
     s->end_pending = false;   /* any session change fulfils a latched end_session */
     s->session = session;
     s->s3_running = false;     /* answered() restarts it in a non-default session */
+    if (session == UDSOTA_SESSION_DEFAULT) {
+        restore_default_comm(s);
+    }
 }
 
 /* 0x10 DiagnosticSessionControl: 01/02/03. 02 needs the core's download conditions, then gate(ENTER_PROGRAMMING);
- * 03 needs gate(ENTER_EXTENDED). The positive answer carries cfg's P2 and P2* (10 ms units). */
+ * 03 needs gate(ENTER_EXTENDED). The positive answer carries the new session's P2 and P2* (10 ms units). */
 static size_t handle_session(udsota_server_t *s, const uint8_t *req, size_t len, uint8_t *resp, size_t resp_max)
 {
     if (len < 2) {
@@ -437,8 +467,8 @@ static size_t handle_session(udsota_server_t *s, const uint8_t *req, size_t len,
     enter_session(s, sub);
     resp[0] = UDSOTA_POS(UDSOTA_SID_SESSION);
     resp[1] = sub;
-    udsota_put_u16be(&resp[2], s->cfg.p2_ms);
-    udsota_put_u16be(&resp[4], (uint16_t)(s->cfg.p2star_ms / 10u));
+    udsota_put_u16be(&resp[2], p2_in(s, sub));
+    udsota_put_u16be(&resp[4], (uint16_t)(p2star_in(s, sub) / 10u));
     return spr ? 0 : 6;
 }
 
@@ -943,6 +973,72 @@ static size_t handle_ecu_reset(udsota_server_t *s, const uint8_t *req, size_t le
     return 2;
 }
 
+/* 0x28 CommunicationControl (only with hooks.comm_control): controlType 00-03 with a communicationType, in the
+ * extended or programming session; the hook decides. Check order: session 7F, length 13, sub-function 12, exact
+ * length 13, communicationType 31 (no message type named), then the hook's NRC. 68 <controlType>. */
+static size_t handle_comm_control(udsota_server_t *s, const uint8_t *req, size_t len, uint8_t *resp, size_t resp_max)
+{
+    const uint8_t sid = UDSOTA_SID_COMM_CONTROL;
+    if (s->session == UDSOTA_SESSION_DEFAULT) {
+        return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_SERVICE_NOT_SUPPORTED_IN_SESSION);
+    }
+    if (len < 2u) {
+        return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_INCORRECT_LENGTH);
+    }
+    const uint8_t control = req[1] & (uint8_t)~UDSOTA_SPRMIB;
+    const bool spr = (req[1] & UDSOTA_SPRMIB) != 0;
+    if (control > UDSOTA_CC_DISABLE_RX_TX) {
+        return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_SUBFUNC_NOT_SUPPORTED);
+    }
+    if (len != 3u) {
+        return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_INCORRECT_LENGTH);
+    }
+    const uint8_t comm_type = req[2];
+    if ((comm_type & UDSOTA_CC_TYPE_ALL) == 0u) {
+        return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_REQUEST_OUT_OF_RANGE);
+    }
+    const uint8_t nrc = s->hooks.comm_control(s->hooks.ctx, control, comm_type);
+    if (nrc != 0u) {
+        return udsota_nrc(resp, resp_max, sid, nrc);
+    }
+    s->comm_changed = (control != UDSOTA_CC_ENABLE_RX_TX);
+    if (spr || resp_max < 2u) {
+        return 0;
+    }
+    resp[0] = UDSOTA_POS(sid);
+    resp[1] = control;
+    return 2;
+}
+
+/* 0x85 ControlDTCSetting: 01 on, 02 off, in the extended or programming session, with any option record. udsota
+ * records no DTCs itself, so it answers C5 <sub> and tells hooks.dtc_setting, when set. Check order: session 7F,
+ * length 13, sub-function 12. */
+static size_t handle_dtc_setting(udsota_server_t *s, const uint8_t *req, size_t len, uint8_t *resp, size_t resp_max)
+{
+    const uint8_t sid = UDSOTA_SID_DTC_SETTING;
+    if (s->session == UDSOTA_SESSION_DEFAULT) {
+        return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_SERVICE_NOT_SUPPORTED_IN_SESSION);
+    }
+    if (len < 2u) {
+        return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_INCORRECT_LENGTH);
+    }
+    const uint8_t sub = req[1] & (uint8_t)~UDSOTA_SPRMIB;
+    const bool spr = (req[1] & UDSOTA_SPRMIB) != 0;
+    if (sub != UDSOTA_DTC_ON && sub != UDSOTA_DTC_OFF) {
+        return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_SUBFUNC_NOT_SUPPORTED);
+    }
+    s->dtc_off = (sub == UDSOTA_DTC_OFF);
+    if (s->hooks.dtc_setting != NULL) {
+        s->hooks.dtc_setting(s->hooks.ctx, sub == UDSOTA_DTC_ON);
+    }
+    if (spr || resp_max < 2u) {
+        return 0;
+    }
+    resp[0] = UDSOTA_POS(sid);
+    resp[1] = sub;
+    return 2;
+}
+
 /* Routes one request (no job running) to its service handler; unknown SIDs get NRC 0x11. */
 static size_t dispatch(udsota_server_t *s, const uint8_t *req, size_t len, uint8_t *resp, size_t resp_max,
                        uint32_t now_ms)
@@ -968,6 +1064,11 @@ static size_t dispatch(udsota_server_t *s, const uint8_t *req, size_t len, uint8
     case UDSOTA_SID_RESET:               /* no reset hook: 0x11 before anything else */
         return s->hooks.reset != NULL ? handle_ecu_reset(s, req, len, resp, resp_max, now_ms)
                                       : udsota_nrc(resp, resp_max, UDSOTA_SID_RESET, UDSOTA_NRC_SERVICE_NOT_SUPPORTED);
+    case UDSOTA_SID_COMM_CONTROL:        /* no comm_control hook: 0x11 before anything else */
+        return s->hooks.comm_control != NULL ? handle_comm_control(s, req, len, resp, resp_max)
+                                             : udsota_nrc(resp, resp_max, req[0], UDSOTA_NRC_SERVICE_NOT_SUPPORTED);
+    case UDSOTA_SID_DTC_SETTING:
+        return handle_dtc_setting(s, req, len, resp, resp_max);
     /* 0x2E is not served. */
     default:
         return udsota_nrc(resp, resp_max, req[0], UDSOTA_NRC_SERVICE_NOT_SUPPORTED);
@@ -985,6 +1086,8 @@ static udsota_config_t cfg_resolve(const udsota_config_t *in)
     }
     if (c.p2_ms == 0u) c.p2_ms = UDSOTA_P2_MS;
     if (c.p2star_ms == 0u) c.p2star_ms = UDSOTA_P2STAR_MS;
+    if (c.p2_prog_ms == 0u) c.p2_prog_ms = c.p2_ms;
+    if (c.p2star_prog_ms == 0u) c.p2star_prog_ms = c.p2star_ms;
     if (c.s3_ms == 0u) c.s3_ms = UDSOTA_S3_MS;
     if (c.max_block_len == 0u || c.max_block_len > UDSOTA_DL_MAX_BLOCK_LEN) c.max_block_len = UDSOTA_DL_MAX_BLOCK_LEN;
     if (c.stmin_us == 0u) c.stmin_us = UDSOTA_STMIN_DEFAULT_US;
@@ -1098,6 +1201,59 @@ size_t udsota_on_request(udsota_server_t *s, const uint8_t *req, size_t req_len,
     }
     phase_sync(s);
     return n;
+}
+
+/* True for a request udsota serves functionally: 10 01, 10 03, 3E, 22, 28 and 85 (a 10 02 is sent physically, to the
+ * one device being programmed). */
+static bool functional_served(const uint8_t *req, size_t len)
+{
+    switch (req[0]) {
+    case UDSOTA_SID_SESSION: {
+        const uint8_t sub = (len >= 2u) ? (uint8_t)(req[1] & (uint8_t)~UDSOTA_SPRMIB) : 0u;
+        return sub == UDSOTA_SESSION_DEFAULT || sub == UDSOTA_SESSION_EXTENDED;
+    }
+    case UDSOTA_SID_TESTER_PRESENT:
+    case UDSOTA_SID_READ_DID:
+    case UDSOTA_SID_COMM_CONTROL:
+    case UDSOTA_SID_DTC_SETTING:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* True when n bytes in resp are an NRC that ISO 14229-1 suppresses for a functional request: 0x11, 0x12, 0x31, 0x7E
+ * or 0x7F. */
+static bool functional_suppressed(const uint8_t *resp, size_t n)
+{
+    if (n != 3u || resp[0] != UDSOTA_NEG_RESPONSE) {
+        return false;
+    }
+    switch (resp[2]) {
+    case UDSOTA_NRC_SERVICE_NOT_SUPPORTED:
+    case UDSOTA_NRC_SUBFUNC_NOT_SUPPORTED:
+    case UDSOTA_NRC_REQUEST_OUT_OF_RANGE:
+    case UDSOTA_NRC_SUBFUNC_NOT_SUPPORTED_IN_SESSION:
+    case UDSOTA_NRC_SERVICE_NOT_SUPPORTED_IN_SESSION:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* See udsota.h: the functional subset, through the same path as a physical request, with the functional NRCs
+ * suppressed. While a job runs only 3E is served (a busy 0x21 to a broadcast would be noise). */
+size_t udsota_on_functional_request(udsota_server_t *s, const uint8_t *req, size_t req_len,
+                                    uint8_t *resp, size_t resp_max, uint32_t now_ms)
+{
+    if (req == NULL || req_len == 0 || resp == NULL || !functional_served(req, req_len)) {
+        return 0;
+    }
+    if (s->job_running && req[0] != UDSOTA_SID_TESTER_PRESENT) {
+        return 0;
+    }
+    const size_t n = udsota_on_request(s, req, req_len, resp, resp_max, now_ms);
+    return functional_suppressed(resp, n) ? 0 : n;
 }
 
 /* Takes a finished job's result: clears the job, builds its answer, applies SPRMIB and restarts S3. */

@@ -12,12 +12,14 @@
 #define UDSOTA_SID_RESET             0x11   /* ECUReset (keyed) */
 #define UDSOTA_SID_READ_DID          0x22   /* ReadDataByIdentifier */
 #define UDSOTA_SID_SECURITY          0x27   /* SecurityAccess */
+#define UDSOTA_SID_COMM_CONTROL      0x28   /* CommunicationControl: served only with hooks.comm_control */
 #define UDSOTA_SID_WRITE_DID         0x2E   /* WriteDataByIdentifier: reserved for config writes; not served */
 #define UDSOTA_SID_ROUTINE           0x31   /* RoutineControl */
 #define UDSOTA_SID_REQUEST_DOWNLOAD  0x34
 #define UDSOTA_SID_TRANSFER_DATA     0x36
 #define UDSOTA_SID_TRANSFER_EXIT     0x37   /* RequestTransferExit */
 #define UDSOTA_SID_TESTER_PRESENT    0x3E
+#define UDSOTA_SID_DTC_SETTING       0x85   /* ControlDTCSetting */
 
 #define UDSOTA_POS_BIT       0x40           /* positive response SID = request SID | 0x40 */
 #define UDSOTA_NEG_RESPONSE  0x7F           /* negative response: 7F <sid> <nrc> */
@@ -27,6 +29,11 @@
 #define UDSOTA_RESET_HARD       0x01        /* 11 01 hardReset, the only reset served */
 #define UDSOTA_RC_START         0x01        /* 31 01 startRoutine, the only routine control served */
 #define UDSOTA_TP_ZERO_SUBFUNC  0x00        /* 3E 00 (3E 80 with the suppress bit) */
+#define UDSOTA_CC_ENABLE_RX_TX  0x00        /* 28 00 enableRxAndTx; 01 and 02 disable one direction */
+#define UDSOTA_CC_DISABLE_RX_TX 0x03        /* 28 03 disableRxAndTx, the highest controlType served */
+#define UDSOTA_CC_TYPE_ALL      0x03        /* communicationType: normal and network-management messages, all subnets */
+#define UDSOTA_DTC_ON           0x01        /* 85 01 */
+#define UDSOTA_DTC_OFF          0x02        /* 85 02 */
 
 /* ---- Negative response codes (ISO 14229-1; values match iso14229 src/uds.h) ---- */
 #define UDSOTA_NRC_GENERAL_REJECT                  0x10

@@ -277,6 +277,26 @@ void udsota_isotp_on_frame(udsota_isotp_t *t, const uint8_t *data, uint8_t dlc, 
     take_request(t, now_ms);
 }
 
+/* One functional frame (see udsota_isotp.h): a Single Frame of 1 to 7 bytes goes to the server's functional path
+ * while both directions are idle; anything else, or anything while the link is busy, is dropped without an FC. */
+void udsota_isotp_on_func_frame(udsota_isotp_t *t, const uint8_t *data, uint8_t dlc, uint32_t now_ms)
+{
+    if (data == NULL || dlc < 2u || dlc > CAN_DL || (data[0] >> 4) != 0u) {
+        return;                                           /* only an SF: functional requests never segment */
+    }
+    const uint8_t n = data[0] & 0x0Fu;
+    if (n == 0u || n > dlc - 1u) {
+        return;
+    }
+    t->now_ms = now_ms;
+    if (tx_busy(t) || t->link.receive_status != ISOTP_RECEIVE_STATUS_IDLE) {
+        return;                                           /* a physical request or answer owns the server */
+    }
+    uint8_t req[CAN_DL - 1u];
+    memcpy(req, &data[1], n);
+    tx_response(t, udsota_on_functional_request(t->srv, req, n, t->buf->resp, UDSOTA_ISOTP_RESP_MAX, now_ms));
+}
+
 /* isotp-c's timers and CFs, N_Cr, the parked FC and answer, the server's poll, a waiting request and the limit switch. */
 uint32_t udsota_isotp_service(udsota_isotp_t *t, uint32_t now_ms)
 {

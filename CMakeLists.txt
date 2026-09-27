@@ -107,6 +107,10 @@ udsota_test(test_udsota_server_hooks
     SOURCES  test/test_udsota_server_hooks.c ${SERVER_SRCS}
     INCLUDES ${CORE_INC} ${CORE_PRIV})
 
+udsota_test(test_udsota_server_functional
+    SOURCES  test/test_udsota_server_functional.c ${SERVER_SRCS}
+    INCLUDES ${CORE_INC} ${CORE_PRIV})
+
 # ---- Image descriptor: one UDSOTA_ESP32_IMAGE_DESC instance per variant, as a dev image for two
 # boards and as a release image. On target, udsota_esp32_image_desc() sets UDSOTA_ESP32_IMG_RELEASE
 # from PROJECT_VER.

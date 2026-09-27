@@ -83,6 +83,11 @@ void     udsota_isotp_init(udsota_isotp_t *t, udsota_server_t *s, const udsota_c
 /* One request frame already filtered to cfg.req_id; rx_us is its arrival (for the STmin median). May send an
  * FC or an answer through can.send before it returns. */
 void     udsota_isotp_on_frame(udsota_isotp_t *t, const uint8_t *data, uint8_t dlc, uint32_t rx_us, uint32_t now_ms);
+/* One frame already filtered to cfg.func_id (functional addressing). Only a Single Frame is served, through
+ * udsota_on_functional_request(), and never with an FC; it is dropped while an answer is going out or a physical
+ * request is being received or waits, since the server answers one request at a time. May send the answer through
+ * can.send before it returns. */
+void     udsota_isotp_on_func_frame(udsota_isotp_t *t, const uint8_t *data, uint8_t dlc, uint32_t now_ms);
 /* Runs after every wake: isotp-c's timers and CFs, a parked FC or answer, the server's poll, a waiting
  * request and the receive-limit switch. Returns the milliseconds the caller may sleep (a frame wakes it sooner). */
 uint32_t udsota_isotp_service(udsota_isotp_t *t, uint32_t now_ms);

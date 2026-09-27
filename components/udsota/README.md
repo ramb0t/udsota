@@ -128,6 +128,8 @@ Every struct carries its own `ctx`, which is passed back to its callbacks. A NUL
 | `did_read(ctx, did, buf, max)` | for a 22 on any DID the core does not serve; returns the bytes written, 0 for "no such DID" | every such DID answers 0x31 |
 | `stmin_us(ctx)` | when a request's first frame arrives, for that message's flow control | `cfg.stmin_us` (2 ms) |
 | `reset(ctx)` | once the answer to 11 01 or ActivateImage has left (the transport's `tx_pending` reads 0, or after 100 ms); it returns only on failure, and the server then re-opens | in the core, 11 01 answers 0x11 and ActivateImage answers positive without a restart, so the new image boots at the next power cycle. The ESP32 port uses `esp_restart()` |
+| `comm_control(ctx, control, comm_type)` | for a 28 that passed the core's checks; returns 0 once the app has stopped or resumed its own frames as asked, else the NRC. Called again with 00 and 03 (enable everything) when the session returns to default after a change | 28 answers 0x11 |
+| `dtc_setting(ctx, on)` | after an accepted 85 01 or 85 02, and with `true` when the session returns to default after 85 02 | 85 is still answered: udsota records no DTCs, so there is nothing to stop |
 
 The gate returns 0 to allow, or the NRC to send: 0x22 conditionsNotCorrect in general, a specific code where one fits (0x88 vehicleSpeedTooHigh, 0x90 shifterLeverNotInPark, 0x92/0x93 voltage too high or too low, all ISO 14229-1), or 0x21 busyRepeatRequest for a condition that clears by itself shortly.
 
@@ -213,8 +215,14 @@ The first 36 block is checked before anything is erased, and FF01 checks the who
 | 36 | TransferData | block counter from 01, wrapping FF to 00, and up to 4,093 data bytes; a repeat of the last counter is answered and not rewritten | programming | programming |
 | 37 | RequestTransferExit | once every announced byte has arrived | programming | programming |
 | 3E | TesterPresent | 00; 80 suppresses the answer | any | – |
+| 28 | CommunicationControl (with `comm_control` only) | controlType 00–03 and a communicationType naming normal or network-management messages; answers `68 xx` | extended, programming | – |
+| 85 | ControlDTCSetting | 01 on, 02 off, with any option record; answers `C5 xx` | extended, programming | – |
 
-Any other SID answers 0x11. While a flash job runs, every request but 3E answers 0x21. The key column applies only with security on.
+Any other SID answers 0x11. While a flash job runs, every request but 3E answers 0x21. The key column applies only with security on. A return to the default session, by 10 01, S3 or an end of session, undoes 28 and 85 through their hooks.
+
+### Functional addressing
+
+With `cfg.func_id` set (OBD's broadcast ID is 0x7DF), the port hands single frames on that ID to `udsota_isotp_on_func_frame()`, and the answers go out on `cfg.resp_id` as usual. This lets a tester send 3E 80 to every device on the bus, or switch them all to the extended session and quiet them with 85 02 and 28 03 before it programs one of them. A functional request is served only when it is 10 01, 10 03, 3E, 22, 28 or 85, as a single frame, and while no other request or answer is in progress; anything else gets no answer at all, including a 10 02, since the programming session is entered physically on the one device being programmed. NRCs 0x11, 0x12, 0x31, 0x7E and 0x7F are suppressed for a functional request, as ISO 14229-1 asks, so a device that serves none of a request stays silent. While a flash job runs only a functional 3E is answered.
 
 ### Routines
 
@@ -245,7 +253,7 @@ Every other DID goes to `did_read`, and so does any of these whose source is NUL
 
 | NRC | Name | udsota sends it for |
 |---|---|---|
-| 0x11 | serviceNotSupported | an unknown SID; 27 with security off; 11 01 with no `reset` hook |
+| 0x11 | serviceNotSupported | an unknown SID; 27 with security off; 11 01 with no `reset` hook; 28 with no `comm_control` hook |
 | 0x12 | subFunctionNotSupported | an unknown sub-function |
 | 0x13 | incorrectMessageLengthOrInvalidFormat | a wrong length, or more than one DID in a 22 |
 | 0x21 | busyRepeatRequest | any request but 3E while a flash job runs; or the gate's choice |
@@ -261,11 +269,11 @@ Every other DID goes to `did_read`, and so does any of these whose source is NUL
 | 0x73 | wrongBlockSequenceCounter | a 36 counter that is neither the next nor a repeat |
 | 0x78 | responsePending | a flash job still running after 40 ms, repeated every 1.5 s |
 | 0x7E | subFunctionNotSupportedInActiveSession | a 27 level that belongs to the other session |
-| 0x7F | serviceNotSupportedInActiveSession | 11, 27 or 31 in the default session; 34, 36 or 37 outside programming |
+| 0x7F | serviceNotSupportedInActiveSession | 11, 27, 28, 31 or 85 in the default session; 34, 36 or 37 outside programming |
 
 ### Timing
 
-P2 is 50 ms and P2\* 5,000 ms (`cfg.p2_ms`, `cfg.p2star_ms`). S3 is 5 s after the last answer (`cfg.s3_ms`); it pauses while a multi-frame request arrives, and its expiry returns the server to the default session, which aborts a download. A flash job not done within 40 ms gets 0x78, repeated every 1.5 s, and at 90 s the server answers 0x72 and ends the session.
+P2 is 50 ms and P2\* 5,000 ms (`cfg.p2_ms`, `cfg.p2star_ms`); the programming session can have its own (`cfg.p2_prog_ms`, `cfg.p2star_prog_ms`), which its 10 02 answer carries and its 0x78 cadence follows. S3 is 5 s after the last answer (`cfg.s3_ms`); it pauses while a multi-frame request arrives, and its expiry returns the server to the default session, which aborts a download. A flash job not done within four fifths of P2 (40 ms) gets 0x78, repeated every three tenths of P2\* (1.5 s), and at 90 s the server answers 0x72 and ends the session.
 
 ISO-TP flow control uses a block size of 64 (`cfg.block_size`) and an STmin of 2 ms, with frames padded with 0xAA. N_Cr is 1 s. The receive limit is 256 bytes, or 4,095 while a download is open.
 

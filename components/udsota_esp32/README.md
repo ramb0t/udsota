@@ -7,7 +7,7 @@ udsota_esp32 is the ESP-IDF port of [udsota](../udsota/README.md). It runs the U
 | Function | Call from | Does |
 |---|---|---|
 | `esp_err_t udsota_esp32_start(const udsota_config_t *cfg, const udsota_hooks_t *hooks, const udsota_esp32_can_t *can)` | once, after the app's CAN driver runs | copies `cfg`, `hooks` and `can`, fixes the device ID (below), and starts the diag task and flash worker. Security is on when `cfg->key_label` is set, and a NULL `hooks->reset` means `esp_restart()`. Bad arguments, a second call or no memory return an error and leave the updater off; no inactive slot, or no worker, leaves it answering but refusing downloads |
-| `udsota_esp32_on_frame(id, data, dlc, rx_us)` | the app's CAN receive task | queues one request frame; never blocks. Drops other IDs, frames before start, and frames past a full queue (counted) |
+| `udsota_esp32_on_frame(id, data, dlc, rx_us)` | the app's CAN receive task | queues one request frame on `cfg.req_id`, or on `cfg.func_id` when it is set (functional addressing); never blocks. Drops other IDs, frames before start, and frames past a full queue (counted) |
 | `udsota_esp32_end_session()` | any task | ends an open session, after a running flash job has answered; the diag task runs `udsota_end_session()` |
 | `udsota_esp32_phase()` | any task | the current `udsota_phase_t` |
 | `udsota_esp32_image_unconfirmed()` | any task | true while the running image is pending verify and is the boot slot |
