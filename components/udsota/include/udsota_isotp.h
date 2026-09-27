@@ -25,6 +25,7 @@
 #define UDSOTA_ISOTP_WAIT_OPEN_MS      10u    /* longest wait in a non-default session or mid-message */
 #define UDSOTA_ISOTP_WAIT_IDLE_MS      100u   /* longest wait otherwise */
 #define UDSOTA_ISOTP_FC_RETRY_MS       10u    /* default FC retry window while cfg.fc_retry_ms is 0 */
+#define UDSOTA_ISOTP_PARK_MAX_MS       1000u  /* a parked answer the bus keeps refusing is dropped after this long */
 
 typedef struct {
     int      (*send)(void *ctx, uint16_t id, const uint8_t data[8], uint8_t len);   /* 0 queued, UDSOTA_TX_RETRY, else dropped */
@@ -60,6 +61,7 @@ struct udsota_isotp {
     uint32_t             msg_stmin_us;       /* STmin sent in the current message's first FC, as encoded (the monitor judges this) */
     bool                 rx_orphan;          /* isotp-c still holds a message dropped at a withheld FC */
     size_t               park_len;           /* bytes in buf->park; 0 = nothing parked */
+    uint32_t             park_ms;            /* when the parked answer was parked */
     uint32_t             resp_lost;          /* answers refused outright by can.send, or replaced unsent */
     bool                 fc_parked;          /* an FC can.send refused with UDSOTA_TX_RETRY waits in fc_frame */
     uint16_t             fc_id;
@@ -84,7 +86,7 @@ void     udsota_isotp_on_frame(udsota_isotp_t *t, const uint8_t *data, uint8_t d
 /* Runs after every wake: isotp-c's timers and CFs, a parked FC or answer, the server's poll, a waiting
  * request and the receive-limit switch. Returns the milliseconds the caller may sleep (a frame wakes it sooner). */
 uint32_t udsota_isotp_service(udsota_isotp_t *t, uint32_t now_ms);
-/* Answers dropped: refused outright by can.send, or replaced before they left. */
+/* Answers dropped: refused outright by can.send, still refused after UDSOTA_ISOTP_PARK_MAX_MS, or replaced before they left. */
 uint32_t udsota_isotp_resp_lost(const udsota_isotp_t *t);
 /* Flow-control frames dropped: refused outright, still refused after the cfg.fc_retry_ms window, superseded by a
  * newer FC, or dropped with their message (link re-init, withheld message). */

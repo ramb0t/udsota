@@ -409,6 +409,26 @@ static void test_parked_response_retried_after_tx_retry(void)
     TEST_ASSERT_EQUAL_UINT32(1, udsota_isotp_resp_lost(&s_tp));
 }
 
+/* A bus that refuses every frame (no node acknowledges) holds a parked answer for UDSOTA_ISOTP_PARK_MAX_MS, then
+ * the answer is dropped and counted, and the server's timers run again: S3 ends the open session. */
+static void test_parked_answer_dropped_after_limit_and_s3_still_runs(void)
+{
+    enter_extended();
+    static const uint8_t tp[] = {0x3E, 0x00};
+    s_refuse = 0xFFFFFFFFu;
+    (void)request_sf(tp, sizeof tp, 0);
+    run_ms(UDSOTA_ISOTP_PARK_MAX_MS - 10u);
+    TEST_ASSERT_EQUAL_UINT32(0, udsota_isotp_resp_lost(&s_tp));
+    TEST_ASSERT_EQUAL_UINT32(UDSOTA_ISOTP_WAIT_SEND_MS, service());
+    run_ms(20);
+    TEST_ASSERT_EQUAL_UINT32(1, udsota_isotp_resp_lost(&s_tp));
+    TEST_ASSERT_FALSE(s_resp_done);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_EXTENDED, s_srv.session);
+    run_ms(UDSOTA_S3_MS);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_DEFAULT, s_srv.session);   /* while the bus still refuses */
+    TEST_ASSERT_EQUAL_INT(UDSOTA_PHASE_IDLE, s_phase);
+}
+
 /* 11 01's restart waits while its answer is parked, then while the app's driver still holds frames, and
  * fires once both are empty, before the 100 ms fallback. */
 static void test_tx_pending_counts_parked_response(void)
@@ -754,6 +774,7 @@ int main(void)
     RUN_TEST(test_4095_byte_block_with_fc_every_64_cfs);
     RUN_TEST(test_receive_limit_256_outside_a_download);
     RUN_TEST(test_parked_response_retried_after_tx_retry);
+    RUN_TEST(test_parked_answer_dropped_after_limit_and_s3_still_runs);
     RUN_TEST(test_tx_pending_counts_parked_response);
     RUN_TEST(test_armed_restart_falls_back_after_100_ms);
     RUN_TEST(test_stmin_hook_sets_each_first_fc);

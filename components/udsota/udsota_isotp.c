@@ -72,14 +72,17 @@ static bool tx_busy(const udsota_isotp_t *t)
 }
 
 /* Hands the parked answer to isotp-c. NOSPACE (the bus said retry) or INPROGRESS keeps it for the next
- * service; a hard refusal drops it, counted, and the client retries. */
+ * service, for UDSOTA_ISOTP_PARK_MAX_MS at most; a hard refusal or that limit drops it, counted, and the
+ * client retries. The limit keeps a bus that acknowledges nothing from freezing the server, whose poll (S3
+ * among it) waits while an answer is parked. */
 static void tx_flush(udsota_isotp_t *t)
 {
     if (t->park_len == 0u || t->link.send_status == ISOTP_SEND_STATUS_INPROGRESS) {
         return;
     }
     const int ret = isotp_send(&t->link, t->buf->park, (uint32_t)t->park_len);
-    if (ret == ISOTP_RET_NOSPACE || ret == ISOTP_RET_INPROGRESS) {
+    if ((ret == ISOTP_RET_NOSPACE || ret == ISOTP_RET_INPROGRESS) &&
+        (uint32_t)(t->now_ms - t->park_ms) < UDSOTA_ISOTP_PARK_MAX_MS) {
         return;
     }
     if (ret != ISOTP_RET_OK) {
@@ -102,6 +105,7 @@ static void tx_response(udsota_isotp_t *t, size_t n)
     }
     memcpy(t->buf->park, t->buf->resp, n);
     t->park_len = n;
+    t->park_ms = t->now_ms;
     tx_flush(t);
 }
 
@@ -297,7 +301,7 @@ uint32_t udsota_isotp_service(udsota_isotp_t *t, uint32_t now_ms)
     return next_wait_ms(t, now_ms);
 }
 
-/* Answers dropped: refused outright by can.send, or replaced before they left. */
+/* Answers dropped: refused outright by can.send, still refused after UDSOTA_ISOTP_PARK_MAX_MS, or replaced before they left. */
 uint32_t udsota_isotp_resp_lost(const udsota_isotp_t *t)
 {
     return t->resp_lost;
