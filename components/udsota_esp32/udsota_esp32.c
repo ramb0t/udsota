@@ -228,7 +228,8 @@ static void task_main(void *arg)
 esp_err_t udsota_esp32_start(const udsota_config_t *cfg, const udsota_hooks_t *hooks, const udsota_esp32_can_t *can)
 {
     if (cfg == NULL || can == NULL || can->can_send == NULL ||
-        !udsota_esp32_devid_len_ok(cfg->device_id, cfg->device_id_len)) {
+        !udsota_esp32_devid_len_ok(cfg->device_id, cfg->device_id_len) ||
+        (cfg->func_id != 0u && (cfg->func_id == cfg->req_id || cfg->func_id == cfg->resp_id))) {
         return ESP_ERR_INVALID_ARG;
     }
     if (s_started) {

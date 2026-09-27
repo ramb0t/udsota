@@ -115,7 +115,8 @@ typedef struct {
  * on when cfg->key_label is set, with keys over that same ID, starts the engine, and creates the buffers,
  * the frame queue and the diag task (Kconfig UDSOTA_ESP32_*). hooks may be NULL; a NULL hooks->reset
  * restarts with esp_restart(). Returns ESP_ERR_INVALID_ARG for a NULL cfg, can or can_send, or a set
- * device_id whose device_id_len is not 1 to UDSOTA_KEYS_ID_MAX (16); ESP_ERR_INVALID_STATE on a second
+ * device_id whose device_id_len is not 1 to UDSOTA_KEYS_ID_MAX (16), or a set func_id equal to req_id or
+ * resp_id; ESP_ERR_INVALID_STATE on a second
  * call; and ESP_ERR_NO_MEM when an allocation or the task fails. Only a bad-argument failure may be
  * retried: after ESP_ERR_NO_MEM the updater stays off for this boot, and a second call returns
  * ESP_ERR_INVALID_STATE. When the buffers or frame queue cannot be allocated nothing else was started; when
