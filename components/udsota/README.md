@@ -12,7 +12,7 @@ app            CAN driver · gate and phase hooks · its own DIDs · product pol
 udsota         ISO-TP adapter (udsota_isotp) → UDS server (udsota_server) → engine interface
                image rules (descriptor, version) · key derivation · boot-loop counter
   │
-udsota_esp32   diag task and flash worker · engine on esp_ota_* · PSA HMAC and RNG · RTC boot-loop storage
+udsota_esp32   diag task and flash worker · engine on esp_ota_* · PSA ECDSA or HMAC, and RNG · RTC boot-loop storage
 ```
 
 Dependencies point down only. The app owns the CAN bus. udsota transmits through the app's send callback, receives only the frames the app hands it, and never touches the controller. The ISO-TP adapter, on `components/isotp`, is the only CAN-specific code in the core. A port implements the engine (`udsota_engine_t`: check the first block, erase, write, verify, activate, confirm, abort and status), and any other front end that delivers an image can drive the same engine.
@@ -32,7 +32,7 @@ An integration is one C file and two build lines. This is all of it for a produc
 #include "udsota_wire.h"
 #include "udsota_esp32.h"
 
-extern const uint8_t app_key_master[32];   /* 0x27 master key, embedded from a git-ignored file */
+#include "udsota_pubkey.h"   /* the tester's 0x27 public key, from `udsota keygen`; it unlocks nothing */
 
 /* Allows each update step only while parked; confirming needs the app's own self-test instead. */
 static uint8_t app_gate(void *ctx, udsota_op_t op)
@@ -70,7 +70,7 @@ esp_err_t app_updater_start(void)
 {
     static const udsota_config_t cfg = {
         .req_id = 0x710, .resp_id = 0x718,
-        .key_label = "udsota-example", .key_master = app_key_master, .key_master_len = sizeof app_key_master,
+        .key_pubkey = udsota_pubkey, .key_pubkey_len = sizeof udsota_pubkey,   /* the ECDSA mode (Security) */
         .product = "example", .hw_id = 1, .layout_id = 1,
         .stmin_monitor = true,
     };
@@ -169,11 +169,20 @@ udsota enforces its own sequence and nothing else: with no gate, every step is a
 
 ## Security
 
-With security on (the ESP32 port turns it on when `cfg.key_label` is set), SecurityAccess (27) guards programming. `cfg.level_programming` (default 0x03) unlocks 34, 36, 37, FF01, ActivateImage and 11 01, and `cfg.level_extended` (default 0x01) unlocks 11 01. ConfirmImage needs no key, because it can only keep an image that passed FF01 and ActivateImage.
+With security on (the ESP32 port turns it on when `cfg.key_pubkey` or `cfg.key_label` is set), SecurityAccess (27) guards programming. `cfg.level_programming` (default 0x03) unlocks 34, 36, 37, FF01, ActivateImage and 11 01, and `cfg.level_extended` (default 0x01) unlocks 11 01. ConfirmImage needs no key, because it can only keep an image that passed FF01 and ActivateImage.
 
-Each 16-byte seed is single-use and valid for 30 s. The key is the first 16 bytes of HMAC-SHA256(K_dev, seed ‖ level ‖ device_id), where K_dev = HMAC-SHA256(K_master, label ‖ device_id); `level` is the requestSeed sub-function, `device_id` is what F18C returns, and the server compares keys in constant time. The ESP32 port serves and hashes `cfg.device_id` when it is set (1 to 16 bytes), otherwise the 6-byte base MAC. Three wrong keys answer 0x36, then 0x37 for 10 s, and the same 10 s delay follows every boot. An unlock ends at a session change, an S3 timeout or a reset. With a label but no master (a CI build, say), security stays on and no key can match: sendKey answers 0x22 and counts no attempt.
+Each 16-byte seed is single-use and valid for 30 s. What the tester sends back in 27 02 or 27 04 depends on the mode. In both, `level` is the requestSeed sub-function and `device_id` is what F18C returns.
 
-With `security` NULL, or `cfg.key_label` NULL in the port, 27 answers 0x11, and the programming session, the download, activation and reset need no key.
+- **ECDSA** (recommended for production). The key is a 64-byte ECDSA P-256 signature, r ‖ s with 32 big-endian bytes each, over SHA-256("udsota-27-ecdsa-v1" ‖ seed ‖ level ‖ id_len ‖ device_id), where `id_len` is one byte; `udsota_keys_sig_msg()` builds the message. The tester signs with a private key that never leaves it, and the device holds only the public key. The server asks `security.verify` with `security.key_len` set to 64, so a sendKey is exactly 66 bytes. A high S is accepted as well as a low one: a seed is used once, so a second valid signature for it gains nothing. This follows SAE paper 2022-01-0132, as driftregion's iso14229 fwupdate example does with RSA.
+- **HMAC** (the default, as in 0.1.0). The key is the first 16 bytes of HMAC-SHA256(K_dev, seed ‖ level ‖ device_id), where K_dev = HMAC-SHA256(K_master, label ‖ device_id). The server asks `security.key` for the expected key and compares the two in constant time.
+
+Use ECDSA for a product. In the HMAC mode every device must be able to compute its own keys, so the port builds the fleet's master key into every image, and one leaked image or one flash dump unlocks every device. In the ECDSA mode a device stores nothing that makes a key: a dump yields a public key, and a signature for one seed only unlocks one level of one device, once. So keep the private key in an HSM or a signing service that answers seeds for authorised testers, never in a repository or an image. `udsota keygen` makes a key pair. The HMAC mode still suits a bench, or a fleet whose images and flash are protected (flash encryption) and whose master can be rotated.
+
+The ESP32 port serves `cfg.device_id` as F18C and binds the keys to it when it is set (1 to 16 bytes), otherwise to the 6-byte base MAC. It picks the ECDSA mode when `cfg.key_pubkey` is set (65 bytes, 04 ‖ X ‖ Y), and the HMAC mode when only `cfg.key_label` is. A software P-256 verify takes tens of milliseconds on chips without an ECC accelerator, such as the ESP32 and ESP32-S3, so a sendKey answer may come after P2 (50 ms). The udsota client waits 150 ms. For a tester that holds the server to its announced P2, raise `cfg.p2_ms`. A port for another platform sets `verify` to its own P-256 verify over the same message.
+
+Three wrong keys answer 0x36, then 0x37 for 10 s, and the same 10 s delay follows every boot. An unlock ends at a session change, an S3 timeout or a reset. When no key can be checked, security stays on and no key matches: sendKey answers 0x22 and counts no attempt. That happens with a label but no master (a CI build, say), with a public key that PSA refuses, or when the port's start-up self-test of its HMAC or ECDSA fails.
+
+With `security` NULL, or both `cfg.key_pubkey` and `cfg.key_label` NULL in the port, 27 answers 0x11, and the programming session, the download, activation and reset need no key.
 
 ## Rollback and confirm
 
@@ -209,7 +218,7 @@ The first 36 block is checked before anything is erased, and FF01 checks the who
 | 10 | DiagnosticSessionControl | 01 default, 02 programming, 03 extended; answers `50 xx` then P2 and P2*/10 as two big-endian words (`00 32 01 F4` by default) | any | – |
 | 11 | ECUReset | 01 hardReset: answers, then restarts through `reset` | extended, programming | either level |
 | 22 | ReadDataByIdentifier | one DID per request | any | – |
-| 27 | SecurityAccess | `level_extended` and the next sub-function in extended, `level_programming` and the next in programming | extended, programming | – |
+| 27 | SecurityAccess | `level_extended` and the next sub-function in extended, `level_programming` and the next in programming; a sendKey carries exactly 16 key bytes, or 64 in the ECDSA mode | extended, programming | – |
 | 31 | RoutineControl | 01 startRoutine | per routine | per routine |
 | 34 | RequestDownload | DFI 00, ALFID 44, address 0, 0 < size ≤ slot; answers `74 20 0F FF` (`cfg.max_block_len`, 4,095 by default) | programming | programming |
 | 36 | TransferData | block counter from 01, wrapping FF to 00, and up to 4,093 data bytes; a repeat of the last counter is answered and not rewritten | programming | programming |

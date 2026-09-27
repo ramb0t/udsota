@@ -6,7 +6,7 @@ udsota_esp32 is the ESP-IDF port of [udsota](../udsota/README.md). It runs the U
 
 | Function | Call from | Does |
 |---|---|---|
-| `esp_err_t udsota_esp32_start(const udsota_config_t *cfg, const udsota_hooks_t *hooks, const udsota_esp32_can_t *can)` | once, after the app's CAN driver runs | copies `cfg`, `hooks` and `can`, fixes the device ID (below), and starts the diag task and flash worker. Security is on when `cfg->key_label` is set, and a NULL `hooks->reset` means `esp_restart()`. Bad arguments (a `func_id` equal to `req_id` or `resp_id` among them), a second call or no memory return an error and leave the updater off; no inactive slot, or no worker, leaves it answering but refusing downloads |
+| `esp_err_t udsota_esp32_start(const udsota_config_t *cfg, const udsota_hooks_t *hooks, const udsota_esp32_can_t *can)` | once, after the app's CAN driver runs | copies `cfg`, `hooks` and `can`, fixes the device ID (below), and starts the diag task and flash worker. Security is on when `cfg->key_pubkey` or `cfg->key_label` is set (below), and a NULL `hooks->reset` means `esp_restart()`. Bad arguments (a `func_id` equal to `req_id` or `resp_id` among them), a second call or no memory return an error and leave the updater off; no inactive slot, or no worker, leaves it answering but refusing downloads |
 | `udsota_esp32_on_frame(id, data, dlc, rx_us)` | the app's CAN receive task | queues one request frame on `cfg.req_id`, or on `cfg.func_id` when it is set (functional addressing); never blocks. Drops other IDs, frames before start, and frames past a full queue (counted) |
 | `udsota_esp32_end_session()` | any task | ends an open session, after a running flash job has answered; the diag task runs `udsota_end_session()` |
 | `udsota_esp32_phase()` | any task | the current `udsota_phase_t` |
@@ -14,15 +14,29 @@ udsota_esp32 is the ESP-IDF port of [udsota](../udsota/README.md). It runs the U
 | `udsota_esp32_status(out)` | any task | the cached F1F0 snapshot |
 | `udsota_esp32_engine()` | any task | the engine, for a front end other than UDS |
 | `bool udsota_esp32_engine_busy(void)` | any task | true while an engine job or the boot-time OTA read is queued or running |
-| `const udsota_security_t *udsota_esp32_security(const char *label, const uint8_t *master, size_t master_len, const uint8_t *id, size_t id_len)` | start code, before the diag task runs | builds the 0x27 security that start installs (start calls it itself, with `cfg.device_id`) over `id`, or the base MAC when `id` is NULL; NULL label gives NULL, and no master or a bad `id_len` gives security with no key that matches |
+| `const udsota_security_t *udsota_esp32_security(const char *label, const uint8_t *master, size_t master_len, const uint8_t *id, size_t id_len)` | start code, before the diag task runs | builds the HMAC-mode 0x27 security that start installs (start calls it itself, with `cfg.device_id`) over `id`, or the base MAC when `id` is NULL; NULL label gives NULL, and no master or a bad `id_len` gives security with no key that matches |
+| `const udsota_security_t *udsota_esp32_security_ecdsa(const uint8_t *pubkey, size_t pubkey_len, const uint8_t *id, size_t id_len)` | start code, before the diag task runs | the same for the ECDSA mode: self-tests PSA ECDSA and imports `pubkey` once; NULL `pubkey` gives NULL, and a key that is not a 65-byte P-256 point, a failed self-test or a bad `id_len` gives security with no key that matches. The first call of either function fixes the mode |
 | `const uint8_t *udsota_esp32_device_id(size_t *len)` | any task | the device ID in use and its length: the ID start or `udsota_esp32_security()` fixed, else the 6-byte base MAC |
 | `udsota_reason_t udsota_esp32_image_check(const uint8_t *buf, size_t len, uint32_t announced_size, uint16_t chip_id, const udsota_image_ctx_t *ctx, bool *is_release_out)` | any task (pure, host-testable) | the ESP image header half of the first-block check, then the core's image rules |
-| `udsota_esp32_psa_lock(wait_ms)`, `udsota_esp32_psa_unlock()` | any task | the mutex the port's key HMAC and image verify hold around PSA crypto; take it around the app's own PSA operations, since ESP-IDF v6.1's PSA is not thread-safe for them |
+| `udsota_esp32_psa_lock(wait_ms)`, `udsota_esp32_psa_unlock()` | any task | the mutex the port's 0x27 HMAC or ECDSA check and image verify hold around PSA crypto; take it around the app's own PSA operations, since ESP-IDF v6.1's PSA is not thread-safe for them |
 | `udsota_esp32_bootloop_init()` | first thing in `app_main` | counts this boot |
 | `udsota_esp32_bootloop_config_ignored()` | any task | true when this boot should skip stored settings |
 | `udsota_esp32_bootloop_mark_healthy()` | once the app is healthy | clears the count |
 
-The device ID is `cfg.device_id` (1 to 16 bytes) when set, else the 6-byte base MAC. Start copies it once, serves the copy as F18C and derives the 0x27 keys from the same bytes, so the key a client derives from F18C always matches. A set `device_id` of any other length makes start return `ESP_ERR_INVALID_ARG`. A custom ID must be unique per device, or devices share K_dev.
+The device ID is `cfg.device_id` (1 to 16 bytes) when set, else the 6-byte base MAC. Start copies it once, serves the copy as F18C and derives or checks the 0x27 keys over the same bytes, so the key a client makes from F18C always matches. A set `device_id` of any other length makes start return `ESP_ERR_INVALID_ARG`. A custom ID must be unique per device, or devices share K_dev (HMAC) or accept each other's signatures (ECDSA).
+
+### Security config
+
+Start reads these `udsota_config_t` fields for 0x27; the core README's [Security](../udsota/README.md#security) describes the two modes.
+
+| Field | Mode | What |
+|---|---|---|
+| `key_pubkey`, `key_pubkey_len` | ECDSA | the tester's P-256 public key, uncompressed SEC1 (`04 ‖ X ‖ Y`, 65 bytes), as `udsota keygen` writes it in `udsota_pubkey.h`. It is public: the image holds no secret. Set, it turns security on in the ECDSA mode and wins over the fields below |
+| `key_label` | HMAC | turns security on in the HMAC mode when `key_pubkey` is NULL; K_dev = HMAC-SHA256(master, label ‖ device ID) |
+| `key_master`, `key_master_len` | HMAC | the fleet's master key, which every image then carries. NULL gives security with no key that matches. Given with `key_pubkey`, it is ignored and start logs a warning: leave it out of the image |
+| `device_id`, `device_id_len` | both | the device ID above |
+
+The ECDSA mode verifies with PSA (`psa_verify_hash`, `PSA_ALG_ECDSA(PSA_ALG_SHA_256)`) on the diag task, under the PSA lock, against the public key start imports once as a volatile key. It needs `CONFIG_MBEDTLS_ECDSA_C` and `CONFIG_MBEDTLS_ECP_DP_SECP256R1_ENABLED`, which are on by default; start self-tests the verify against the core's known answer (two P-256 verifies), and logs an error and refuses every key when it fails. Each unlock costs one verify, tens of milliseconds in software, so the answer may come after P2 (see the core README), and it runs on the diag task's stack: check `UDSOTA_ESP32_TASK_STACK`'s headroom after an unlock with `UDSOTA_ESP32_DEBUG_MEASURE`.
 
 `udsota_esp32_can_t` is the app's transport: `can_send` (required; `ESP_ERR_NO_MEM` means retry), `tx_pending` (frames still in the driver, so a restart waits for its answer) and `tx_dropped` (response frames the driver dropped after queueing them, reported as F1F2 `resp_frames_dropped`), all called on the diag task; the last two may be NULL.
 
@@ -38,7 +52,7 @@ The diag task sleeps on its frame queue until the adapter's next deadline, and t
 |---|---|---|
 | `UDSOTA_ESP32_TASK_CORE` | 0 | core of the diag task (ISO-TP and the UDS server); put it on the app's CAN task's core |
 | `UDSOTA_ESP32_TASK_PRIO` | 5 | its priority: below the app's CAN task, above the app's other tasks and the flash worker |
-| `UDSOTA_ESP32_TASK_STACK` | 6144 | its stack, in bytes |
+| `UDSOTA_ESP32_TASK_STACK` | 6144 | its stack, in bytes; the 0x27 check runs on it too (an ECDSA verify in that mode) |
 | `UDSOTA_ESP32_TASK_STACK_PSRAM` | y | put the diag task's stack in PSRAM |
 | `UDSOTA_ESP32_BUFS_PSRAM` | y | put the ISO-TP adapter's 9,214 bytes of buffers in PSRAM |
 | `UDSOTA_ESP32_WORKER_CORE` | 0 | core of the flash worker (erase, write, verify, activate, confirm) |

@@ -17,6 +17,11 @@ typedef struct {
     int     hmac_calls;
     uint8_t hmac_level;      /* level passed on the last hmac_key call */
     uint8_t hmac_seed[16];   /* seed passed on the last hmac_key call */
+    int     verify_forced;   /* 0: mock_verify checks the key; else it answers this */
+    int     verify_calls;
+    uint8_t verify_level;    /* level passed on the last verify call */
+    uint8_t verify_seed[16]; /* seed passed on the last verify call */
+    size_t  verify_len;      /* key_len passed on the last verify call */
 } mock_t;
 
 static mock_t       M;
@@ -59,6 +64,31 @@ static bool mock_key(void *ctx, const uint8_t seed[16], uint8_t level, uint8_t o
     }
     fake_key(seed, level, out);
     return true;
+}
+
+/* The verifier mode's stand-in for a signature: n bytes, sig[i] = seed[i % 16] ^ level ^ i. */
+static void fake_sig(const uint8_t seed[16], uint8_t level, uint8_t *out, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        out[i] = (uint8_t)(seed[i % 16] ^ level ^ i);
+    }
+}
+
+/* Mock security.verify: records its arguments; answers verify_forced when set, else 1 when key is fake_sig. */
+static int mock_verify(void *ctx, const uint8_t seed[16], uint8_t level, const uint8_t *key, size_t key_len)
+{
+    mock_t *m = ctx;
+    m->verify_calls++;
+    m->verify_level = level;
+    memcpy(m->verify_seed, seed, 16);
+    m->verify_len = key_len;
+    if (m->verify_forced != 0) {
+        return m->verify_forced;
+    }
+    uint8_t want[128];
+    TEST_ASSERT_TRUE(key_len <= sizeof want);
+    fake_sig(seed, level, want, key_len);
+    return memcmp(key, want, key_len) == 0 ? 1 : 0;
 }
 
 static udsota_mock_t g_mock;
@@ -518,6 +548,148 @@ static void test_relock_on_reset(void)
     txreq(SEED01, 2, 501);  assert_nrc(0x37);
 }
 
+/* ---- the verifier mode (security.verify, as the ECDSA mode uses it) ---- */
+
+#define SIG_LEN 64u
+
+/* Reboots the server with a verifier taking key_len-byte keys (0 = 16); key stays set, so the tests see it unused. */
+static void boot_verifier(uint16_t key_len)
+{
+    const udsota_config_t cfg = udsota_mock_cfg();
+    const udsota_hooks_t hooks = udsota_mock_hooks(&g_mock);
+    const udsota_security_t sec = {.rng16 = mock_rng16, .key = mock_key, .ctx = &M,
+                                   .verify = mock_verify, .key_len = key_len};
+    udsota_init(&S, &cfg, &ENGINE, &sec, &hooks);
+}
+
+/* Sends 27 <sub> with n key bytes (a sendKey). */
+static void send_sig(uint8_t sub, const uint8_t *key, size_t n, uint32_t now)
+{
+    uint8_t r[2 + 128] = {0x27, sub};
+    TEST_ASSERT_TRUE(n <= 128);
+    memcpy(&r[2], key, n);
+    txreq(r, 2 + n, now);
+}
+
+/* Requests a seed at now and sends its key as n signature bytes at now+1, with bit 0 of byte flip flipped
+ * (flip < 0: none); the answer is left in R. */
+static void sig_attempt(uint8_t level, size_t n, int flip, uint32_t now)
+{
+    uint8_t seed[16], sig[128];
+    request_seed(level, now, seed);
+    fake_sig(seed, level, sig, n);
+    if (flip >= 0) {
+        sig[flip] ^= 0x01;
+    }
+    send_sig((uint8_t)(level + 1), sig, n, now + 1);
+}
+
+/* A 64-byte key the verifier accepts unlocks: the verifier sees the seed, the requestSeed level and the length,
+ * and the HMAC key callback is never asked. */
+static void test_verifier_unlocks_with_its_key_length(void)
+{
+    boot_verifier(SIG_LEN);
+    enter(UDSOTA_SESSION_PROGRAMMING, T0);
+    sig_attempt(0x03, SIG_LEN, -1, T0 + 1);
+    TEST_ASSERT_EQUAL_UINT(2, RL);
+    TEST_ASSERT_EQUAL_HEX8(0x67, R[0]);
+    TEST_ASSERT_EQUAL_HEX8(0x04, R[1]);
+    TEST_ASSERT_EQUAL_HEX8(UDSOTA_SA_SEED_PROGRAMMING, S.security);
+    TEST_ASSERT_EQUAL_INT(1, M.verify_calls);
+    TEST_ASSERT_EQUAL_HEX8(0x03, M.verify_level);
+    TEST_ASSERT_EQUAL_UINT(SIG_LEN, M.verify_len);
+    TEST_ASSERT_EQUAL_HEX8(0x10, M.verify_seed[0]);
+    TEST_ASSERT_EQUAL_INT(0, M.hmac_calls);
+}
+
+/* The sendKey length is exactly 2 + key_len: 16 (the HMAC length), 63 and 65 key bytes answer 13 without asking
+ * the verifier or consuming the seed. */
+static void test_verifier_key_length_is_exact(void)
+{
+    uint8_t seed[16], sig[128];
+    boot_verifier(SIG_LEN);
+    enter(UDSOTA_SESSION_EXTENDED, T0);
+    request_seed(0x01, T0 + 1, seed);
+    fake_sig(seed, 0x01, sig, sizeof sig);
+    const size_t bad[] = {16, SIG_LEN - 1, SIG_LEN + 1, 0};
+    for (size_t i = 0; i < 4; i++) {
+        send_sig(0x02, sig, bad[i], T0 + 2 + i);
+        assert_nrc(0x13);
+    }
+    TEST_ASSERT_EQUAL_INT(0, M.verify_calls);
+    send_sig(0x02, sig, SIG_LEN, T0 + 10);                           /* the seed is still live */
+    TEST_ASSERT_EQUAL_HEX8(0x67, R[0]);
+}
+
+/* key_len 0 with a verifier means 16 bytes; without a verifier key_len is ignored and the HMAC key is 16 bytes. */
+static void test_key_len_defaults_and_is_ignored_without_verifier(void)
+{
+    boot_verifier(0);
+    enter(UDSOTA_SESSION_EXTENDED, T0);
+    sig_attempt(0x01, 16, -1, T0 + 1);
+    TEST_ASSERT_EQUAL_HEX8(0x67, R[0]);
+    TEST_ASSERT_EQUAL_UINT(16, M.verify_len);
+
+    const udsota_config_t cfg = udsota_mock_cfg();
+    const udsota_hooks_t hooks = udsota_mock_hooks(&g_mock);
+    const udsota_security_t sec = {.rng16 = mock_rng16, .key = mock_key, .ctx = &M, .key_len = SIG_LEN};
+    udsota_init(&S, &cfg, &ENGINE, &sec, &hooks);
+    enter(UDSOTA_SESSION_EXTENDED, T0);
+    unlock(0x01, T0 + 1);                                           /* 18-byte sendKey, HMAC compare */
+    TEST_ASSERT_EQUAL_INT(1, M.verify_calls);                       /* only the first server's */
+}
+
+/* Wrong signatures count as today: 35, 35, 36, then 37 for 10 s; a verdict other than 1 is a wrong key too. */
+static void test_verifier_wrong_keys_lock_out(void)
+{
+    boot_verifier(SIG_LEN);
+    enter(UDSOTA_SESSION_EXTENDED, T0);
+    sig_attempt(0x01, SIG_LEN, 0, T0 + 10);   assert_nrc(0x35);
+    M.verify_forced = 2;
+    sig_attempt(0x01, SIG_LEN, -1, T0 + 20);  assert_nrc(0x35);
+    M.verify_forced = 0;
+    sig_attempt(0x01, SIG_LEN, 63, T0 + 30);  assert_nrc(0x36);
+    TEST_ASSERT_EQUAL_HEX8(0x00, S.security);
+    txreq(SEED01, 2, T0 + 32);                assert_nrc(0x37);
+    sig_attempt(0x01, SIG_LEN, -1, T0 + 31 + 10000u);
+    TEST_ASSERT_EQUAL_HEX8(0x67, R[0]);
+}
+
+/* A verifier with no verdict (-1) answers 22, consumes the seed and is not an attempt. */
+static void test_verifier_unavailable_is_not_an_attempt(void)
+{
+    uint8_t seed[16], sig[SIG_LEN];
+    boot_verifier(SIG_LEN);
+    enter(UDSOTA_SESSION_EXTENDED, T0);
+    M.verify_forced = -1;
+    for (uint32_t i = 0; i < 3; i++) {
+        sig_attempt(0x01, SIG_LEN, -1, T0 + 10 * i);
+        assert_nrc(0x22);
+    }
+    M.verify_forced = 0;
+    request_seed(0x01, T0 + 40, seed);
+    fake_sig(seed, 0x01, sig, SIG_LEN);
+    send_sig(0x02, sig, SIG_LEN, T0 + 41);
+    TEST_ASSERT_EQUAL_HEX8(0x67, R[0]);
+    send_sig(0x02, sig, SIG_LEN, T0 + 42);    assert_nrc(0x24);     /* single use */
+}
+
+/* A key without a live seed (none, or expired at 30 s) answers 24 without asking the verifier. */
+static void test_verifier_needs_a_live_seed(void)
+{
+    uint8_t seed[16], sig[SIG_LEN];
+    boot_verifier(SIG_LEN);
+    enter(UDSOTA_SESSION_EXTENDED, T0);
+    memset(sig, 0, sizeof sig);
+    send_sig(0x02, sig, SIG_LEN, T0 + 1);     assert_nrc(0x24);
+    request_seed(0x01, T0 + 2, seed);
+    fake_sig(seed, 0x01, sig, SIG_LEN);
+    keep_alive(T0 + 2, T0 + 2 + 30000u);
+    send_sig(0x02, sig, SIG_LEN, T0 + 2 + 30000u);
+    assert_nrc(0x24);
+    TEST_ASSERT_EQUAL_INT(0, M.verify_calls);
+}
+
 /* Runs every SecurityAccess test. */
 int main(void)
 {
@@ -543,5 +715,11 @@ int main(void)
     RUN_TEST(test_relock_on_session_change);
     RUN_TEST(test_relock_on_s3_timeout);
     RUN_TEST(test_relock_on_reset);
+    RUN_TEST(test_verifier_unlocks_with_its_key_length);
+    RUN_TEST(test_verifier_key_length_is_exact);
+    RUN_TEST(test_key_len_defaults_and_is_ignored_without_verifier);
+    RUN_TEST(test_verifier_wrong_keys_lock_out);
+    RUN_TEST(test_verifier_unavailable_is_not_an_attempt);
+    RUN_TEST(test_verifier_needs_a_live_seed);
     return UNITY_END();
 }

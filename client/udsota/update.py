@@ -5,7 +5,7 @@ import time
 
 from .errors import NoResponse, Nrc, Refused, SendFailed, UpdateFailed
 from .image import parse_image
-from .keys import DeviceKeys
+from .keys import DeviceKeys, SigningKeys
 from .wire import (DID_COUNTERS, DID_DEVICE_ID, DID_RESULT, DID_RUNNING_SHA, DID_SESSION, DID_STATUS, DID_VERSION,
                    IMG_PENDING_VERIFY, IMG_STATES, NRC_CONDITIONS, NRC_OUT_OF_RANGE, NRC_PROGRAMMING_FAILURE,
                    NRC_SEQUENCE, OTHER_VERIFIED, RID_ACTIVATE, RID_CHECK_DEPS, RID_CONFIRM, SESSION_EXTENDED,
@@ -168,14 +168,19 @@ def read_device_id(uds, profile):
     return None if profile.security is None else uds.read_did(profile.security.device_id_did)
 
 
-# The DeviceKeys for device_id; None when the profile has no [security].
-def make_keys(profile, master, device_id):
-    return None if profile.security is None else DeviceKeys(master, profile.security.label, device_id)
+# The keys for device_id: DeviceKeys from the master key (mode hmac) or SigningKeys from the private key (mode
+# ecdsa), secret being that key; None when the profile has no [security].
+def make_keys(profile, secret, device_id):
+    if profile.security is None:
+        return None
+    if profile.security.mode == "ecdsa":
+        return SigningKeys(secret, device_id)
+    return DeviceKeys(secret, profile.security.label, device_id)
 
 
-# The DeviceKeys for this server, reading its device ID; None when the profile has no [security].
-def device_keys(uds, profile, master):
-    return make_keys(profile, master, read_device_id(uds, profile))
+# The keys for this server, reading its device ID; None when the profile has no [security].
+def device_keys(uds, profile, secret):
+    return make_keys(profile, secret, read_device_id(uds, profile))
 
 
 # The precheck's F1F0 read; NRC 0x31 means the device does not serve udsota's status DID, so it is no udsota server.
@@ -189,9 +194,10 @@ def read_status_precheck(uds):
 
 
 # `flash`: precheck, programming session (and unlock), download, FF01, ActivateImage, the restart and
-# ConfirmImage. Returns 0 or raises ToolError. master is unused when the profile has no [security]. quiet() is
-# entered once an update is needed and held until the end (the transport's bus quieting).
-def flash(uds, profile, image, master, drop_76=None, preroll=lambda: None, sleep=time.sleep,
+# ConfirmImage. Returns 0 or raises ToolError. secret is the master or private key (make_keys), unused when the
+# profile has no [security]. quiet() is entered once an update is needed and held until the end (the transport's
+# bus quieting).
+def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep=time.sleep,
           clock=time.monotonic, log=print, quiet=contextlib.nullcontext):
     img = parse_image(profile, image)
     board_of = profile.board_names.get(img.hw_id, "hw_id %d" % img.hw_id)
@@ -211,7 +217,7 @@ def flash(uds, profile, image, master, drop_76=None, preroll=lambda: None, sleep
     if board is not None and board != profile.board_names.get(img.hw_id):
         raise Refused("image is for %s but the server is %s" % (board_of, board))
     verified = state["other_state"] == OTHER_VERIFIED and state["other_sha_prefix"] == img.elf_sha[:8]
-    keys = make_keys(profile, master, device_id)
+    keys = make_keys(profile, secret, device_id)
     with quiet():                             # [functional] quiet_bus: the other nodes stay quiet until the end
         enter_programming(uds, profile, keys)
         if verified:
@@ -303,7 +309,7 @@ def keyed_reset(uds, profile, keys):
 
 
 # `reset`: ECUReset from the extended session, keyed when the profile has [security].
-def reset(uds, profile, master, log=print):
-    keyed_reset(uds, profile, device_keys(uds, profile, master))
+def reset(uds, profile, secret, log=print):
+    keyed_reset(uds, profile, device_keys(uds, profile, secret))
     log("reset accepted: the server restarts")
     return 0

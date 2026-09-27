@@ -52,6 +52,10 @@ menu "udsota ESP32 port"
         int "Diag task stack (bytes)"
         range 4096 16384
         default 6144
+        help
+            The task also runs the 0x27 key check: a PSA HMAC, or in the ECDSA mode (cfg.key_pubkey) a
+            P-256 signature verify, which needs more. In that mode, check the headroom with
+            UDSOTA_ESP32_DEBUG_MEASURE after an unlock.
 
     config UDSOTA_ESP32_TASK_STACK_PSRAM
         bool "Diag task stack in PSRAM"

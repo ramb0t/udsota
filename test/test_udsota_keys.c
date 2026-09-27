@@ -1,9 +1,11 @@
 /* Host tests for the core key derivation (udsota_keys.c): the exact HMAC inputs, the level rule, the
- * label and device-ID bounds, fail-closed outputs, and the self-test against real HMAC answers. */
+ * label and device-ID bounds, fail-closed outputs, and the self-test against real HMAC answers; then the
+ * ECDSA mode's signed message against known bytes and its verify self-test. */
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 #include "unity.h"
+#include "sha256_host.h"
 #include "udsota_keys.h"
 
 /* ---- recording fake: stores each call's key and message, answers a fixed pattern ---- */
@@ -63,6 +65,12 @@ static const uint8_t T_L3_FULL[32] = {   /* HMAC(T_KDEV, 10..1F || 03 || T_ID) *
 
 static int g_corrupt = -1;   /* 0 TC2, 1 K_dev, 2 level-1 key, 3 level-3 key: flip bit 0 of that answer */
 
+/* What the fake ECDSA verifiers saw: their calls and the last message. */
+static int     g_vcalls;
+static uint8_t g_vmsg[UDSOTA_KEYS_SIG_MSG_MAX];
+static size_t  g_vmsg_len;
+static int     g_vanswer;   /* what always_verify answers */
+
 /* Fills the test master (0..31) and test seed (0x10..0x1F). */
 static void test_inputs(uint8_t master[32], uint8_t seed[16])
 {
@@ -120,6 +128,9 @@ void setUp(void)
     g_ncalls = 0;
     g_fail = false;
     g_corrupt = -1;
+    g_vcalls = 0;
+    g_vmsg_len = 0;
+    g_vanswer = 0;
 }
 
 /* Unity per-test hook; nothing to release. */
@@ -300,6 +311,113 @@ static void test_self_test_fails_on_null_or_wrong_hmac(void)
     TEST_ASSERT_FALSE(udsota_keys_self_test(rec_hmac));
 }
 
+/* ---- the ECDSA mode: the signed message and the verify self-test ---- */
+
+/* The message for seed 0x10..0x1F, level 0x03 and T_ID, and its SHA-256 (what the tester signs and the device
+ * verifies). client/tests/test_udsota.py pins the same bytes:
+ *   python3 -c 'import hashlib; m=b"udsota-27-ecdsa-v1"+bytes(range(16,32))+bytes([3,6,2,0,0,0,0,1]); print(m.hex(), hashlib.sha256(m).hexdigest())' */
+static const uint8_t T_SIG_MSG_L3[42] = {
+    'u', 'd', 's', 'o', 't', 'a', '-', '2', '7', '-', 'e', 'c', 'd', 's', 'a', '-', 'v', '1',
+    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
+    0x03, 0x06, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01,
+};
+static const uint8_t T_SIG_DIGEST_L3[32] = {
+    0xaf, 0x91, 0x4b, 0xa6, 0xad, 0x03, 0x0d, 0x8a, 0xc1, 0x02, 0xfe, 0x70, 0xba, 0x98, 0x25, 0x5a,
+    0x9e, 0x50, 0xad, 0x7c, 0x45, 0x37, 0x39, 0x41, 0xdb, 0x3d, 0x4a, 0xaa, 0xc2, 0x46, 0xb4, 0xce,
+};
+
+/* A verify that records its inputs and answers g_vanswer, whatever they are. */
+static int always_verify(const uint8_t *pubkey, const uint8_t *msg, size_t msg_len,
+                         const uint8_t sig[UDSOTA_KEYS_SIG_LEN])
+{
+    g_vcalls++;
+    g_vmsg_len = msg_len < sizeof g_vmsg ? msg_len : sizeof g_vmsg;
+    memcpy(g_vmsg, msg, g_vmsg_len);
+    return g_vanswer;
+}
+
+/* A verify that is true for exactly the level-0x03 KAT message and 0 for any other: what a correct ECDSA gives. */
+static int kat_verify(const uint8_t *pubkey, const uint8_t *msg, size_t msg_len,
+                      const uint8_t sig[UDSOTA_KEYS_SIG_LEN])
+{
+    g_vcalls++;
+    TEST_ASSERT_EQUAL_HEX8(0x04, pubkey[0]);
+    return (msg_len == sizeof T_SIG_MSG_L3 && memcmp(msg, T_SIG_MSG_L3, msg_len) == 0) ? 1 : 0;
+}
+
+/* The message is tag || seed || level || id_len || id: the known bytes, and their known SHA-256. */
+static void test_sig_msg_known_answer(void)
+{
+    uint8_t master[32], seed[16], msg[UDSOTA_KEYS_SIG_MSG_MAX + 1], digest[32];
+    test_inputs(master, seed);
+    memset(msg, 0xEE, sizeof msg);
+    TEST_ASSERT_EQUAL_UINT(sizeof T_SIG_MSG_L3, udsota_keys_sig_msg(seed, 0x03, T_ID, sizeof T_ID, msg));
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(T_SIG_MSG_L3, msg, sizeof T_SIG_MSG_L3);
+    TEST_ASSERT_EQUAL_HEX8(0xEE, msg[sizeof T_SIG_MSG_L3]);   /* nothing past the message */
+    TEST_ASSERT_TRUE(sha256_host(msg, sizeof T_SIG_MSG_L3, digest));
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(T_SIG_DIGEST_L3, digest, 32);
+}
+
+/* The level byte and the length-prefixed ID bind the message: level 0x01 differs in one byte, and the longest
+ * ID fills UDSOTA_KEYS_SIG_MSG_MAX exactly. */
+static void test_sig_msg_binds_level_and_id(void)
+{
+    uint8_t master[32], seed[16], msg[UDSOTA_KEYS_SIG_MSG_MAX], id[UDSOTA_KEYS_ID_MAX];
+    test_inputs(master, seed);
+    TEST_ASSERT_EQUAL_UINT(42, udsota_keys_sig_msg(seed, 0x01, T_ID, sizeof T_ID, msg));
+    TEST_ASSERT_EQUAL_HEX8(0x01, msg[34]);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(T_SIG_MSG_L3, msg, 34);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(&T_SIG_MSG_L3[35], &msg[35], 7);
+    memset(id, 0x5A, sizeof id);
+    TEST_ASSERT_EQUAL_UINT(UDSOTA_KEYS_SIG_MSG_MAX, udsota_keys_sig_msg(seed, 0x7D, id, sizeof id, msg));
+    TEST_ASSERT_EQUAL_HEX8(UDSOTA_KEYS_ID_MAX, msg[35]);
+    TEST_ASSERT_EACH_EQUAL_HEX8(0x5A, &msg[36], UDSOTA_KEYS_ID_MAX);
+    TEST_ASSERT_EQUAL_UINT(36, udsota_keys_sig_msg(seed, 0x03, id, 0, msg));   /* an empty ID is still length-prefixed */
+    TEST_ASSERT_EQUAL_HEX8(0x00, msg[35]);
+}
+
+/* A bad level, an ID over UDSOTA_KEYS_ID_MAX or a NULL argument builds nothing and writes nothing. */
+static void test_sig_msg_refuses_bad_input(void)
+{
+    uint8_t master[32], seed[16], msg[UDSOTA_KEYS_SIG_MSG_MAX], id[UDSOTA_KEYS_ID_MAX + 1] = {0};
+    test_inputs(master, seed);
+    memset(msg, 0xEE, sizeof msg);
+    const uint8_t bad[] = {0x00, 0x02, 0x7F, 0x81};
+    for (size_t i = 0; i < sizeof bad; i++) {
+        TEST_ASSERT_EQUAL_UINT(0, udsota_keys_sig_msg(seed, bad[i], T_ID, sizeof T_ID, msg));
+    }
+    TEST_ASSERT_EQUAL_UINT(0, udsota_keys_sig_msg(seed, 0x03, id, sizeof id, msg));
+    TEST_ASSERT_EQUAL_UINT(0, udsota_keys_sig_msg(NULL, 0x03, T_ID, sizeof T_ID, msg));
+    TEST_ASSERT_EQUAL_UINT(0, udsota_keys_sig_msg(seed, 0x03, NULL, sizeof T_ID, msg));
+    TEST_ASSERT_EQUAL_UINT(0, udsota_keys_sig_msg(seed, 0x03, T_ID, sizeof T_ID, NULL));
+    TEST_ASSERT_EACH_EQUAL_HEX8(0xEE, msg, sizeof msg);
+}
+
+/* The self-test passes with a verify that accepts only the level-0x03 message, and hands it that message. */
+static void test_sig_self_test_passes_with_correct_verify(void)
+{
+    TEST_ASSERT_TRUE(udsota_keys_sig_self_test(kat_verify));
+    TEST_ASSERT_EQUAL_INT(2, g_vcalls);
+}
+
+/* The self-test fails with no verify, one that accepts anything (it must refuse the level-0x01 message), one
+ * that accepts nothing, and one that cannot check. */
+static void test_sig_self_test_fails_on_wrong_verify(void)
+{
+    TEST_ASSERT_FALSE(udsota_keys_sig_self_test(NULL));
+    const int answers[] = {1, 0, -1};
+    for (size_t i = 0; i < 3; i++) {
+        g_vanswer = answers[i];
+        TEST_ASSERT_FALSE(udsota_keys_sig_self_test(always_verify));
+    }
+    g_vcalls = 0;
+    g_vanswer = 1;
+    (void)udsota_keys_sig_self_test(always_verify);
+    TEST_ASSERT_EQUAL_INT(2, g_vcalls);
+    TEST_ASSERT_EQUAL_UINT(42, g_vmsg_len);
+    TEST_ASSERT_EQUAL_HEX8(0x01, g_vmsg[34]);                 /* the second call asks about level 0x01 */
+}
+
 /* Runs every key-derivation test. */
 int main(void)
 {
@@ -316,5 +434,10 @@ int main(void)
     RUN_TEST(test_self_test_passes_with_correct_hmac);
     RUN_TEST(test_self_test_fails_on_each_wrong_stage);
     RUN_TEST(test_self_test_fails_on_null_or_wrong_hmac);
+    RUN_TEST(test_sig_msg_known_answer);
+    RUN_TEST(test_sig_msg_binds_level_and_id);
+    RUN_TEST(test_sig_msg_refuses_bad_input);
+    RUN_TEST(test_sig_self_test_passes_with_correct_verify);
+    RUN_TEST(test_sig_self_test_fails_on_wrong_verify);
     return UNITY_END();
 }

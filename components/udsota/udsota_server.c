@@ -7,7 +7,7 @@
 #include "udsota_priv.h"
 #include "udsota_rxwatch.h"   /* UDSOTA_CF_MEDIAN_NONE */
 
-/* ---- SecurityAccess 0x27: HMAC seed/key, lockout, relock. RAM only. ---- */
+/* ---- SecurityAccess 0x27: seed, then an HMAC key or a verified one (sec.verify), lockout, relock. RAM only. ---- */
 
 /* Zeroes n bytes through a volatile pointer so wiping a seed or key is not optimised away. */
 static void sa_wipe(void *p, size_t n)
@@ -36,6 +36,12 @@ static bool sa_keys_equal(const uint8_t *a, const uint8_t *b)
         diff |= (uint8_t)(a[i] ^ b[i]);
     }
     return diff == 0;
+}
+
+/* The exact key length a sendKey carries: sec.key_len with a verifier (0 = 16), else the 16-byte HMAC key. */
+static size_t sa_key_len(const udsota_server_t *s)
+{
+    return (s->sec.verify != NULL && s->sec.key_len != 0u) ? s->sec.key_len : UDSOTA_KEY_LEN;
 }
 
 /* Drops the outstanding seed, if any, and wipes it. */
@@ -101,8 +107,20 @@ static size_t sa_request_seed(udsota_server_t *s, uint8_t level, bool suppress,
     return 2u + UDSOTA_SEED_LEN;
 }
 
-/* 27 02 / 27 04: checks the key against the outstanding seed (consumed either way); 3rd wrong key -> 0x36 + delay. */
-static size_t sa_send_key(udsota_server_t *s, uint8_t level, const uint8_t *key, bool suppress,
+/* The HMAC check: sec.key's expected key for the outstanding seed, compared in constant time. 1 match, 0 wrong,
+ * -1 no key available now. */
+static int sa_key_matches(udsota_server_t *s, uint8_t level, const uint8_t *key)
+{
+    uint8_t expected[UDSOTA_KEY_LEN];
+    const bool have = s->sec.key(s->sec.ctx, s->sa_seed, level, expected);
+    const int verdict = !have ? -1 : (sa_keys_equal(key, expected) ? 1 : 0);
+    sa_wipe(expected, sizeof expected);
+    return verdict;
+}
+
+/* 27 02 / 27 04: checks the key_len-byte key against the outstanding seed, through sec.verify when set and else
+ * sec.key; the seed is consumed either way. No verdict -> 0x22 (not an attempt); 3rd wrong key -> 0x36 + delay. */
+static size_t sa_send_key(udsota_server_t *s, uint8_t level, const uint8_t *key, size_t key_len, bool suppress,
                           uint8_t *resp, size_t resp_max, uint32_t now_ms)
 {
     if (!s->sa_seed_valid || s->sa_seed_level != level ||
@@ -110,16 +128,13 @@ static size_t sa_send_key(udsota_server_t *s, uint8_t level, const uint8_t *key,
         sa_forget_seed(s);                                  /* key without (a live) seed: not an attempt */
         return udsota_nrc(resp, resp_max, UDSOTA_SID_SECURITY, UDSOTA_NRC_REQUEST_SEQUENCE_ERROR);
     }
-    uint8_t expected[UDSOTA_KEY_LEN];
-    const bool have = s->sec.key(s->sec.ctx, s->sa_seed, level, expected);
+    const int verdict = (s->sec.verify != NULL) ? s->sec.verify(s->sec.ctx, s->sa_seed, level, key, key_len)
+                                                : sa_key_matches(s, level, key);
     sa_forget_seed(s);                                      /* single use, whatever the outcome */
-    if (!have) {
-        sa_wipe(expected, sizeof expected);
+    if (verdict < 0) {
         return udsota_nrc(resp, resp_max, UDSOTA_SID_SECURITY, UDSOTA_NRC_CONDITIONS_NOT_CORRECT);
     }
-    const bool match = sa_keys_equal(key, expected);
-    sa_wipe(expected, sizeof expected);
-    if (!match) {
+    if (verdict != 1) {                                     /* only 1 unlocks: any other verdict is a wrong key */
         s->sa_failed++;
         if (s->sa_failed >= UDSOTA_SA_MAX_ATTEMPTS) {
             s->sa_failed = 0;                               /* three fresh attempts once the delay ends */
@@ -166,14 +181,15 @@ static size_t sa_handle(udsota_server_t *s, const uint8_t *req, size_t req_len,
         return udsota_nrc(resp, resp_max, UDSOTA_SID_SECURITY, UDSOTA_NRC_SUBFUNC_NOT_SUPPORTED_IN_SESSION);
     }
     const bool is_seed = (sub == level);
-    if (req_len != (is_seed ? 2u : 2u + UDSOTA_KEY_LEN)) {
+    const size_t key_len = sa_key_len(s);
+    if (req_len != (is_seed ? 2u : 2u + key_len)) {
         return udsota_nrc(resp, resp_max, UDSOTA_SID_SECURITY, UDSOTA_NRC_INCORRECT_LENGTH);
     }
     if (sa_delay_running(s, now_ms)) {
         return udsota_nrc(resp, resp_max, UDSOTA_SID_SECURITY, UDSOTA_NRC_TIME_DELAY_NOT_EXPIRED);
     }
     return is_seed ? sa_request_seed(s, level, suppress, resp, resp_max, now_ms)
-                   : sa_send_key(s, level, &req[2], suppress, resp, resp_max, now_ms);
+                   : sa_send_key(s, level, &req[2], key_len, suppress, resp, resp_max, now_ms);
 }
 
 /* Writes 7F <sid> <nrc>; returns 3, or 0 without writing when resp_max < 3. */

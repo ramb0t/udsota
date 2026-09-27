@@ -104,8 +104,9 @@ class Uds:
     def tester_present(self):
         self.request(services.TesterPresent, 0x00)
 
-    # SecurityAccess seed then key at seed_level, keys a keys.DeviceKeys; an all-zero seed means already
-    # unlocked. NRC 0x37 (the server's delay after boot) is waited out once, with 3E 00 keeping S3 alive.
+    # SecurityAccess seed then key at seed_level, keys a keys.DeviceKeys (16-byte keys) or keys.SigningKeys (64-byte
+    # signatures); an all-zero seed means already unlocked. NRC 0x37 (the server's delay after boot) is waited out
+    # once, with 3E 00 keeping S3 alive.
     def unlock(self, seed_level, keys):
         try:
             seed = self.request(services.SecurityAccess, seed_level)[1:]
