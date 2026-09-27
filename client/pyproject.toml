@@ -10,8 +10,9 @@ readme = "README.md"
 license = "MIT"
 authors = [{ name = "The udsota contributors" }]
 requires-python = ">=3.11"
-# Exact pins: transport.RxResilientIsoTPConnection copies udsoncan 1.26.1's receive loop.
-dependencies = ["python-can==4.6.1", "can-isotp==2.0.7", "udsoncan==1.26.1"]
+# Exact pins: transport.RxResilientIsoTPConnection copies udsoncan 1.26.1's receive loop. cryptography signs the
+# ecdsa mode's seeds through its stable EC API only, so it takes a lower bound and its security fixes install.
+dependencies = ["python-can==4.6.1", "can-isotp==2.0.7", "udsoncan==1.26.1", "cryptography>=42"]
 
 [project.scripts]
 udsota = "udsota.cli:main"

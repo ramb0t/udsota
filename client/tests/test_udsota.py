@@ -3,10 +3,12 @@ guard and pre-roll, the TX-ID hard limit, profiles, and a run with a minimal pro
 and no vcan: the UDS layer runs over a stub udsoncan connection, the pre-flight over python-can virtual buses.
 Most tests run with FULL (P), a profile that turns every optional feature on."""
 import errno
+import hashlib
 import os
 import pathlib
 import re
 import socket
+import stat
 import struct
 import threading
 import time
@@ -15,6 +17,10 @@ from collections import deque
 
 import can
 import pytest
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 from udsoncan.client import Client
 from udsoncan.connections import BaseConnection, IsoTPSocketConnection
 from udsoncan.exceptions import TimeoutException
@@ -62,6 +68,13 @@ tester_present_frames = 5
 """
 P = profile.from_dict("full", tomllib.loads(FULL))
 BUSY_ID = 0x100
+# FULL with [security] in the ecdsa mode, and a tester key pair made for this run (FakeServer holds the public half).
+FULL_ECDSA = FULL.replace('label = "udsota-example"\nmaster_file = "master.bin"\n',
+                          'mode = "ecdsa"\nprivate_key_file = "udsota_private.pem"\n')
+PE = profile.from_dict("full-ecdsa", tomllib.loads(FULL_ECDSA))
+TESTER_KEY = ec.generate_private_key(ec.SECP256R1())
+TESTER_PUB = TESTER_KEY.public_key().public_bytes(serialization.Encoding.X962,
+                                                  serialization.PublicFormat.UncompressedPoint)
 
 
 # Another node on a virtual channel: sends msg every 20 ms from a thread until stop is set.
@@ -81,6 +94,30 @@ OLD_SHA = bytes([0x11]) * 32
 NEW_SHA = bytes(range(0xA0, 0xC0))
 STATUS_FIXTURE = bytes([0x01, 0x02, 0x01, 0x03, 0x00, 0x02, 0x07,
                     0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0x05])
+
+
+# The ecdsa mode's known answers, pinned in udsota_keys.c (KAT_SIG_*) and test/test_udsota_keys.c too: the
+# message for SEED, level 0x03 and MAC, its SHA-256, and the test key (private scalar 01 02 .. 20) with its
+# signature over that message.
+SIG_MSG_L3 = bytes.fromhex("7564736f74612d32372d65636473612d7631101112131415161718191a1b1c1d1e1f0306020000000001")
+SIG_DIGEST_L3 = "af914ba6ad030d8ac102fe70ba98255a9e50ad7c45373941db3d4aaac246b4ce"
+KAT_SCALAR = int.from_bytes(bytes(range(1, 33)), "big")
+KAT_PUB = bytes.fromhex("04515c3d6eb9e396b904d3feca7f54fdcd0cc1e997bf375dca515ad0a6c3b4035f"
+                        "4536be3a50f318fbf9a5475902a221502bef0d57e08c53b2cc0a56f17d9f9354")
+KAT_SIG_L3 = bytes.fromhex("34435c645a77fbc22fc53e78ec4f579c9c794563d939912466bbea9a74287c1f"
+                           "e332925181f319e2fab67568815c93c4751d8223ec8ca3359e6815bc2f65d5a8")
+
+
+# True when sig (r || s) is a valid P-256 ECDSA signature over SHA-256(msg) under the 65-byte point pub, as the
+# device's PSA verify decides.
+def ecdsa_valid(pub, sig, msg):
+    key = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), bytes(pub))
+    der = encode_dss_signature(int.from_bytes(sig[:32], "big"), int.from_bytes(sig[32:], "big"))
+    try:
+        key.verify(der, bytes(msg), ec.ECDSA(hashes.SHA256()))
+        return True
+    except InvalidSignature:
+        return False
 
 
 # A synthetic signed-image prefix: 0xE9 header, esp_app_desc_t at 32, udsota_image_desc_t at 288.
@@ -124,7 +161,8 @@ class FakeServer:
     def __init__(self, max_block=18, boot_silence=2, confirm_refusals=2, running_state=3, sha=OLD_SHA,
                  board=b"devkit", other_state=0, other_sha=bytes(32), lose_76_once=None, mute_block=None,
                  nrc_once=None, activate_refusals=0, ff01_status=0, config=None, lose_77_once=False,
-                 lose_ff01_once=False, activate_nrcs=None, activate_fail=None, no_fc=None, security=True):
+                 lose_ff01_once=False, activate_nrcs=None, activate_fail=None, no_fc=None, security=True,
+                 pubkey=None):
         self.max_block, self.boot_silence, self.confirm_refusals = max_block, boot_silence, confirm_refusals
         self.running_state, self.sha, self.board = running_state, sha, board
         self.other_state, self.other_sha = other_state, other_sha
@@ -137,6 +175,7 @@ class FakeServer:
         self.no_fc = dict(no_fc or {})          # {(sid, arg): n}: the next n sends get no FC (kernel ECOMM)
         self.config = {} if config is None else config
         self.security = security
+        self.pubkey = pubkey                    # a P-256 public key: the ecdsa mode, 64-byte signed keys
         self.log, self.written, self.writes = [], bytearray(), 0
         self.silence, self.announced, self.next_bsc, self.last_bsc = 0, None, 1, None
         self.session, self.unlocked, self.last_t, self.clock = 1, 0, 0.0, lambda: 0.0
@@ -207,13 +246,19 @@ class FakeServer:
             return self.nrc(0x22, 0x31)
         return [b"\x62" + did.to_bytes(2, "big") + records[did]]
 
-    # 0x27 SecurityAccess: fixed seed; the key must match the udsota-example vector (KEYS) for the level.
+    # 0x27 SecurityAccess: fixed seed; the key must match the udsota-example vector (KEYS) for the level, or with
+    # a pubkey be exactly a 64-byte signature under it over the seed, level and MAC (the ecdsa mode).
     def s27(self, req, sub):
         if not self.security:
             return self.nrc(0x27, 0x11)
         if sub & 1:
             return [bytes([0x67, sub]) + SEED]
-        if req[2:] != KEYS[sub - 1]:
+        if self.pubkey is not None:
+            if len(req) != 2 + keys.SIG_LEN:
+                return self.nrc(0x27, 0x13)
+            if not ecdsa_valid(self.pubkey, req[2:], keys.sig_message(SEED, sub - 1, MAC)):
+                return self.nrc(0x27, 0x35)
+        elif req[2:] != KEYS[sub - 1]:
             return self.nrc(0x27, 0x35)
         self.unlocked = sub - 1
         return [bytes([0x67, sub])]
@@ -419,6 +464,88 @@ def test_load_master_refuses_anything_else(tmp_path, content):
         p.write_bytes(content)
     with pytest.raises(errors.Refused):
         keys.load_master(p)
+
+
+# ---- keys: the ecdsa mode ----
+
+# Check the signed message and its SHA-256 against the bytes udsota_keys.c builds (test/test_udsota_keys.c pins them).
+def test_sig_message_known_answer():
+    m = keys.sig_message(SEED, 0x03, MAC)
+    assert m == SIG_MSG_L3 and hashlib.sha256(m).hexdigest() == SIG_DIGEST_L3
+    assert keys.sig_message(SEED, 0x01, MAC) == SIG_MSG_L3[:34] + b"\x01" + SIG_MSG_L3[35:]
+    assert keys.sig_message(SEED, 0x03, b"") == SIG_MSG_L3[:35] + b"\x00"
+
+
+# Check a seed that is not 16 bytes or a device ID over 16 bytes builds no message.
+@pytest.mark.parametrize("seed,device_id", [(SEED[:15], MAC), (SEED, bytes(17))])
+def test_sig_message_refuses_bad_input(seed, device_id):
+    with pytest.raises(errors.UpdateFailed):
+        keys.sig_message(seed, 0x03, device_id)
+
+
+# Check the device's ECDSA self-test vector (udsota_keys.c KAT_SIG_*): the test scalar's public point, and a
+# signature that verifies over the level-3 message and not over the level-1 one.
+def test_sig_self_test_vector():
+    assert keys.public_point(ec.derive_private_key(KAT_SCALAR, ec.SECP256R1())) == KAT_PUB
+    assert ecdsa_valid(KAT_PUB, KAT_SIG_L3, SIG_MSG_L3)
+    assert not ecdsa_valid(KAT_PUB, KAT_SIG_L3, keys.sig_message(SEED, 0x01, MAC))
+
+
+# Check a signature is 64 bytes of r || s that verifies under the public point, only for its own seed, level
+# and device ID, and that SigningKeys signs with the ID it was given.
+def test_sign_verify_roundtrip():
+    sig = keys.sign_seed(TESTER_KEY, SEED, 0x03, MAC)
+    assert len(sig) == keys.SIG_LEN and ecdsa_valid(TESTER_PUB, sig, SIG_MSG_L3)
+    for other in (keys.sig_message(SEED, 0x01, MAC), keys.sig_message(bytes(16), 0x03, MAC),
+                  keys.sig_message(SEED, 0x03, bytes.fromhex("020000000002"))):
+        assert not ecdsa_valid(TESTER_PUB, sig, other)
+    sk = keys.SigningKeys(TESTER_KEY, MAC)
+    assert ecdsa_valid(TESTER_PUB, sk.key(SEED, 0x01), keys.sig_message(SEED, 0x01, MAC))
+    assert len(keys.public_point(TESTER_KEY)) == keys.PUBKEY_LEN and TESTER_PUB[0] == 0x04
+
+
+# Check SigningKeys refuses an empty or a 17-byte device ID, as the server never reports one.
+@pytest.mark.parametrize("device_id", [b"", bytes(17)])
+def test_signing_keys_refuse_bad_device_ids(device_id):
+    with pytest.raises(errors.UpdateFailed):
+        keys.SigningKeys(TESTER_KEY, device_id)
+
+
+# Check the private key loads from an unencrypted P-256 PEM, and a missing file, a raw master, an encrypted PEM
+# and a P-384 key are refused.
+def test_load_private_key(tmp_path):
+    good = tmp_path / "good.pem"
+    good.write_bytes(TESTER_KEY.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                              serialization.NoEncryption()))
+    assert keys.public_point(keys.load_private_key(good)) == TESTER_PUB
+    enc = tmp_path / "enc.pem"
+    enc.write_bytes(TESTER_KEY.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                             serialization.BestAvailableEncryption(b"pw")))
+    p384 = tmp_path / "p384.pem"
+    p384.write_bytes(ec.generate_private_key(ec.SECP384R1()).private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+    raw = tmp_path / "master.bin"
+    raw.write_bytes(MASTER)
+    for path, why in ((tmp_path / "absent.pem", "cannot read"), (raw, "not a PEM"), (enc, "encrypted"),
+                      (p384, "not a P-256")):
+        with pytest.raises(errors.Refused, match=why):
+            keys.load_private_key(path)
+
+
+# Check keygen writes an owner-only PEM and a header holding its 65-byte public point, and never overwrites.
+def test_keygen_writes_a_matching_pair(tmp_path):
+    private, header = keys.keygen(tmp_path / "keys")
+    assert (private.name, header.name) == ("udsota_private.pem", "udsota_pubkey.h")
+    assert stat.S_IMODE(os.stat(private).st_mode) == 0o600
+    text = header.read_text()
+    assert "static const uint8_t udsota_pubkey[65] = {" in text and "never in a" in text
+    point = bytes(int(x, 16) for x in re.findall(r"0x([0-9a-f]{2})", text.split("{", 1)[1]))
+    assert point == keys.public_point(keys.load_private_key(private))
+    with pytest.raises(errors.Refused, match="never overwrites"):
+        keys.keygen(tmp_path / "keys")
+    private.unlink()
+    with pytest.raises(errors.Refused, match="udsota_pubkey.h exists"):
+        keys.keygen(tmp_path / "keys")                      # the header alone blocks a new pair too
 
 
 # ---- TX-ID hard limit ----
@@ -860,6 +987,31 @@ def test_security_delay_is_waited_out():
     assert d.log[12] == (0x27, 4) and ft.sleeps[:5] == [KEEPALIVE_S] * 5
 
 
+# Check flash in the ecdsa mode runs the same sequence, and its programming unlock is a signature the server
+# verifies under the tester's public key.
+def test_flash_ecdsa_unlocks_with_a_signature():
+    d = FakeServer(pubkey=TESTER_PUB)
+    rc, _, _ = run_flash(d, prof=PE, master=TESTER_KEY)
+    assert rc == 0 and d.log[:len(PRECHECK) + len(UNLOCK_PROG) + 1] == PRECHECK + UNLOCK_PROG + [(0x34, None)]
+    assert bytes(d.written) == make_image() and d.sha == NEW_SHA and d.running_state == 3
+
+
+# Check a private key whose public half the server does not hold is refused (0x35) before any download.
+def test_flash_ecdsa_other_key_is_refused():
+    d = FakeServer(pubkey=TESTER_PUB)
+    with pytest.raises(errors.Nrc) as e:
+        run_flash(d, prof=PE, master=ec.generate_private_key(ec.SECP256R1()))
+    assert e.value.code == 0x35 and d.log[-1] == (0x27, 4) and (0x34, None) not in d.log
+
+
+# Check the modes do not mix: an hmac profile's 16-byte key to an ecdsa server is the wrong length (0x13).
+def test_hmac_key_to_an_ecdsa_server_is_the_wrong_length():
+    d = FakeServer(pubkey=TESTER_PUB)
+    with pytest.raises(errors.Nrc) as e:
+        run_flash(d)
+    assert e.value.code == 0x13 and (0x34, None) not in d.log
+
+
 # Check the precheck stops before 10 02 on an unconfirmed running image or the wrong board.
 @pytest.mark.parametrize("server,image", [
     (FakeServer(running_state=2), make_image()),
@@ -1075,6 +1227,13 @@ def test_reset_waits_out_the_post_boot_delay():
     assert ft.t >= SA_DELAY_S
 
 
+# Check reset in the ecdsa mode unlocks level 01/02 with a signature over the F18C bytes, then sends 11 01.
+def test_reset_ecdsa_is_keyed():
+    ft, d = FakeTime(), FakeServer(pubkey=TESTER_PUB)
+    assert update.reset(uds_for(d, ft), PE, TESTER_KEY, log=lambda *a: None) == 0
+    assert d.log == [(0x22, 0xF18C), (0x10, 3), (0x27, 1), (0x27, 2), (0x11, 1)]
+
+
 # Check info reads the identity DIDs and config DIDs up to the first absent one, without a session change.
 def test_info_reads_identity_and_config():
     ft, lines = FakeTime(), []
@@ -1201,6 +1360,7 @@ def test_full_profile_values():
     s = P.security
     assert (s.label, s.master_file, s.device_id_did) == (b"udsota-example", "master.bin", 0xF18C)
     assert (s.level_extended, s.level_programming) == (0x01, 0x03)
+    assert (s.mode, s.private_key_file) == ("hmac", None)                 # hmac is the default mode
     assert (P.product, P.hw_ids, P.layout_id, P.slot_size) == ("example", (1, 2, 3), 1, 0x400000)
     assert (P.board_did, P.board_names) == (0xF191, {1: "devkit", 2: "devkit-two", 3: "devkit-three"})
     assert (P.busy.id, P.busy.byte, P.busy.values, P.preroll_frames) == (BUSY_ID, 1, (2, 3), 5)
@@ -1209,8 +1369,17 @@ def test_full_profile_values():
         (0xF1B0, 0xF1B0, "serial", "hex"), (0x0200, 0x02FF, "calibration", "hex")]
 
 
-# A profile with a minimal [security], for the level cases.
-SEC = "[can]\nreq_id = 0x710\nresp_id = 0x718\n[security]\nlabel = \"x\"\nmaster_file = \"m\"\n"
+# Check FULL_ECDSA's [security]: the ecdsa mode with its private key file, no label or master, the default levels.
+def test_ecdsa_profile_values():
+    s = PE.security
+    assert (s.mode, s.private_key_file, s.label, s.master_file) == ("ecdsa", "udsota_private.pem", None, None)
+    assert (s.device_id_did, s.level_extended, s.level_programming) == (0xF18C, 0x01, 0x03)
+
+
+# A profile with a minimal [security], for the level cases, and its [can] alone for the mode cases.
+CAN = "[can]\nreq_id = 0x710\nresp_id = 0x718\n"
+SEC = CAN + "[security]\nlabel = \"x\"\nmaster_file = \"m\"\n"
+SEC_E = CAN + "[security]\nmode = \"ecdsa\"\n"
 
 
 # Check a broken profile is refused with its reason: each case breaks one rule.
@@ -1233,6 +1402,11 @@ SEC = "[can]\nreq_id = 0x710\nresp_id = 0x718\n[security]\nlabel = \"x\"\nmaster
     (SEC + "level_extended = 0x02\n", "level_extended must be odd"),
     (SEC + "level_programming = 0x00\n", "level_programming must be an integer from 0x1 to 0x7D"),
     (SEC + "level_programming = 0x7F\n", "level_programming must be an integer from 0x1 to 0x7D"),
+    (CAN + "[security]\nmode = \"rsa\"\nlabel = \"x\"\nmaster_file = \"m\"\n", "mode must be one of hmac, ecdsa"),
+    (SEC_E, "missing private_key_file"),
+    (SEC_E + "private_key_file = \"k.pem\"\nmaster_file = \"m\"\n", "master_file is for mode = \"hmac\""),
+    (SEC_E + "private_key_file = \"k.pem\"\nlabel = \"x\"\n", "label is for mode = \"hmac\""),
+    (SEC + "private_key_file = \"k.pem\"\n", "private_key_file is for mode = \"ecdsa\", not \"hmac\""),
 ])
 def test_bad_profiles_are_refused(tmp_path, text, why):
     p = tmp_path / "bad.toml"
@@ -1269,6 +1443,37 @@ def test_main_refuses_a_bad_profile(tmp_path, capsys):
     bad = tmp_path / "bad.toml"
     bad.write_text("[can]\nreq_id = 0x7DF\nresp_id = 0x7E8\ndeny_tx = [0x7DF]\n")
     assert cli.main(["--profile", str(bad), "info"], transport=no_transport) == 2
+
+
+# Check every command but keygen still needs --profile (argparse's exit 2).
+def test_main_needs_a_profile(capsys):
+    with pytest.raises(SystemExit) as e:
+        cli.main(["info"], transport=no_transport)
+    assert e.value.code == 2 and "--profile" in capsys.readouterr().err
+
+
+# Check keygen runs with no profile and no bus, says where the private key belongs, and a second run into the
+# same directory is refused (exit 2).
+def test_main_keygen(tmp_path, capsys):
+    out = tmp_path / "keys"
+    assert cli.main(["keygen", "--out", str(out)], transport=no_transport) == 0
+    assert "never commit it" in capsys.readouterr().out
+    assert (out / "udsota_private.pem").exists() and (out / "udsota_pubkey.h").exists()
+    assert cli.main(["keygen", "--out", str(out)], transport=no_transport) == 2
+
+
+# Check main runs reset with an ecdsa profile and --private-key end to end, and a missing key file exits 2 before
+# the bus opens.
+def test_main_ecdsa_reset(tmp_path):
+    p = tmp_path / "ecdsa.toml"
+    p.write_text(FULL_ECDSA)
+    private, _ = keys.keygen(tmp_path / "keys")
+    d = FakeServer(pubkey=keys.public_point(keys.load_private_key(private)))
+    assert cli.main(["--profile", str(p), "--private-key", str(private), "reset"],
+                    transport=lambda prof, i: FakeTransport(d, i)) == 0
+    assert d.log == [(0x22, 0xF18C), (0x10, 3), (0x27, 1), (0x27, 2), (0x11, 1)]
+    assert cli.main(["--profile", str(p), "--private-key", str(tmp_path / "absent.pem"), "reset"],
+                    transport=no_transport) == 2
 
 
 # ---- a generic profile: other IDs, no busy detector, no pre-roll, no [security], another image identity ----
