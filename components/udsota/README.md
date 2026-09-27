@@ -21,7 +21,7 @@ Dependencies point down only. The app owns the CAN bus. udsota transmits through
 
 The transport is classic CAN with 11-bit IDs only: `udsota_can_t.send` takes a `uint16_t` ID and has no extended flag. The image rules assume the ESP-IDF app-image layout (`udsota_image.c` reads `esp_app_desc_t` and the descriptor at fixed offsets), so a port for another platform must produce that layout or bring its own rules. The ISO-TP pad byte is fixed at 0xAA. The adapter defines isotp-c's platform hooks, so no other isotp-c user can link into the same image.
 
-Future work: 29-bit IDs, CAN FD, a per-link isotp send callback so that another isotp-c user can share the image, and a Linux SocketCAN demo server for end-to-end client tests.
+Future work: 29-bit IDs, CAN FD, and a per-link isotp send callback so that another isotp-c user can share the image. The core runs on Linux in [`tools/linux_server`](../../tools/linux_server/README.md), a demo server over SocketCAN or a frame pipe that the client's end-to-end tests drive.
 
 ## Integrating on ESP32
 

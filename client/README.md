@@ -2,7 +2,7 @@
 
 `udsota` is the PC client for a [udsota](../components/udsota/README.md) server. It reads a device's identity and update state and installs firmware over UDS on ISO-TP. Everything product-specific lives in a TOML profile, so one tool serves every product that embeds udsota.
 
-It runs on Linux with SocketCAN and the kernel's ISO-TP module, on Python 3.11 or newer. `pip install ./client` installs the `udsota` command and pins python-can, can-isotp and udsoncan. The tests run on virtual buses and open no CAN interface: `python -m pytest client/tests`.
+It runs on Linux with SocketCAN and the kernel's ISO-TP module, on Python 3.11 or newer. `pip install ./client` installs the `udsota` command and pins python-can, can-isotp and udsoncan. The unit tests run on virtual buses and open no CAN interface: `python -m pytest client/tests`. The end-to-end tests drive the [Linux demo server](../tools/linux_server/README.md) once it is built: over a frame pipe, and over vcan0 with the kernel's ISO-TP module when both are there. Otherwise they skip.
 
 ## Commands
 

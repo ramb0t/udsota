@@ -1,5 +1,5 @@
-/* File-backed fake of an ESP32 device's two OTA slots and otadata, for host tools (a SocketCAN demo
- * server is future work) and test_fake_engine. It models what the pure UDS server can observe through the
+/* File-backed fake of an ESP32 device's two OTA slots and otadata, for host tools (tools/linux_server's
+ * demo server) and test_fake_engine. It models what the pure UDS server can observe through the
  * ESP32 port's engine: esp_ota_begin erasing the image extent, sequential writes, esp_ota_end's image check
  * (segment walk + appended SHA-256; no RSA signature, so F1F0 bit 0 stays clear), set_boot, mark-valid,
  * and the bootloader's rollback of an image that reboots while still PENDING_VERIFY. State survives a

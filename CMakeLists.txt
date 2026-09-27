@@ -1,5 +1,6 @@
-# Host build for udsota: the Unity unit tests, the UDS request-parser fuzz harness and the core
-# portability probe. ESP-IDF builds the components through examples/esp32, not through this file.
+# Host build for udsota: the Unity unit tests, the UDS request-parser fuzz harness, the core portability
+# probe and, on Linux, the demo server. ESP-IDF builds the components through examples/esp32, not through
+# this file.
 #   cmake -S . -B build && cmake --build build -j && ctest --test-dir build --output-on-failure
 cmake_minimum_required(VERSION 3.20)
 project(udsota C)
@@ -140,7 +141,7 @@ udsota_test(test_udsota_esp32_devid
     SOURCES  test/test_udsota_esp32_devid.c ${ESP32_DIR}/udsota_esp32_devid.c ${CORE_DIR}/udsota_keys.c ${SERVER_SRCS}
     INCLUDES ${CORE_INC} ${CORE_PRIV} ${ESP32_DIR}/include ${ESP32_DIR}/priv)
 
-# ---- Host fake of a two-slot OTA engine (file-backed, POSIX), kept for a future SocketCAN demo
+# ---- Host fake of a two-slot OTA engine (file-backed, POSIX), the engine behind tools/linux_server's demo
 # server. Its test checks the fake and its SHA-256 against known answers.
 if(UNIX)
     set(FAKE_DIR ${CORE_DIR}/test)
@@ -214,3 +215,9 @@ endif()
 add_executable(udsota_image_check tools/image_check.c ${ESP32_DIR}/udsota_esp32_image.c ${CORE_DIR}/udsota_image.c)
 target_include_directories(udsota_image_check PRIVATE ${CORE_INC} ${ESP32_DIR}/include)
 target_compile_options(udsota_image_check PRIVATE -Wall -Wextra -Werror)
+
+# ---- tools/linux_server: the core on Linux (SocketCAN or a stdin/stdout frame pipe) with a file-backed A/B
+# engine, for the client's end-to-end tests (client/tests/test_e2e_*.py). Linux only: it opens CAN_RAW sockets.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_subdirectory(tools/linux_server)
+endif()
