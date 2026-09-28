@@ -66,7 +66,6 @@ _Static_assert(UDSOTA_ESP32_CHIP_ID_S3 == ESP_CHIP_ID_ESP32S3, "the host tests' 
 #define WORKER_PRIO     CONFIG_UDSOTA_ESP32_WORKER_PRIO    /* below the app's own tasks, so they run during an erase */
 #define WORKER_CORE     CONFIG_UDSOTA_ESP32_WORKER_CORE
 #define QUEUE_LEN       4       /* BEGIN + WRITE of the first block, plus slack */
-#define SHA_PREFIX      8u      /* status other_elf_sha_prefix */
 #define BLOCK_BUF       4096u   /* the worker's internal-RAM block buffer: one whole 0x36 payload */
 #define PATCH_BUF       1024u   /* DFI 0x30: inflated patch bytes on their way to detools */
 #define ERR_NOT_STARTED (-1)    /* engine not started, its allocation failed, or no inactive slot */
@@ -88,18 +87,13 @@ typedef struct {
 } job_t;
 
 typedef struct {
-    bool    ready;              /* the boot read has finished */
-    uint8_t running_slot;       /* UDSOTA_SLOT_* */
-    uint8_t running_state;      /* udsota_img_state_t */
-    uint8_t boot_slot;          /* UDSOTA_SLOT_*: the otadata boot target */
-    uint8_t other_slot_state;   /* udsota_other_state_t */
-    uint8_t other_version[3];   /* when INVALID: the rolled-back image's version */
-    uint8_t other_sha_prefix[SHA_PREFIX];
+    bool            ready;      /* the boot read has finished */
+    udsota_status_t st;         /* flags stays 0: udsota_esp32_status() fills it */
 } ota_cache_t;
 
 /* Shared: read and written under s_mux. */
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
-static ota_cache_t s_cache = {.running_slot = UDSOTA_SLOT_NONE, .boot_slot = UDSOTA_SLOT_NONE};
+static ota_cache_t s_cache = {.st = {.running_slot = UDSOTA_SLOT_NONE, .boot_slot = UDSOTA_SLOT_NONE}};
 static uint32_t s_pending;          /* ops jobs queued and not finished */
 static uint32_t s_refreshing;       /* refresh jobs queued and not finished */
 static int s_batch_result;          /* first failure since s_pending was last 0 */
@@ -166,8 +160,8 @@ static void cache_put(const ota_cache_t *c)
 {
     taskENTER_CRITICAL(&s_mux);
     s_cache = *c;
-    if (s_cache.other_slot_state == UDSOTA_OTHER_VERIFIED && !s_verified) {
-        s_cache.other_slot_state = UDSOTA_OTHER_UNVERIFIED;
+    if (s_cache.st.other_slot_state == UDSOTA_OTHER_VERIFIED && !s_verified) {
+        s_cache.st.other_slot_state = UDSOTA_OTHER_UNVERIFIED;
     }
     taskEXIT_CRITICAL(&s_mux);
 }
@@ -187,18 +181,18 @@ static bool verified_get(void)
 static void fill_other(ota_cache_t *c, uint8_t state)
 {
     esp_app_desc_t d;
-    memset(c->other_version, 0, sizeof c->other_version);
-    memset(c->other_sha_prefix, 0, sizeof c->other_sha_prefix);
-    c->other_slot_state = state;
+    memset(c->st.other_version, 0, sizeof c->st.other_version);
+    memset(c->st.other_elf_sha_prefix, 0, sizeof c->st.other_elf_sha_prefix);
+    c->st.other_slot_state = state;
     if (state == UDSOTA_OTHER_WRITING) {
         return;
     }
     if (s_target == NULL || esp_ota_get_partition_description(s_target, &d) != ESP_OK) {
-        c->other_slot_state = UDSOTA_OTHER_EMPTY;
+        c->st.other_slot_state = UDSOTA_OTHER_EMPTY;
         return;
     }
-    (void)udsota_parse_version(d.version, sizeof d.version, c->other_version, NULL);
-    memcpy(c->other_sha_prefix, d.app_elf_sha256, SHA_PREFIX);
+    (void)udsota_parse_version(d.version, sizeof d.version, c->st.other_version, NULL);
+    memcpy(c->st.other_elf_sha_prefix, d.app_elf_sha256, sizeof c->st.other_elf_sha_prefix);
 }
 
 /* Worker: sets the other slot's state in the cache and re-reads its descriptor. */
@@ -214,17 +208,17 @@ static void set_other(uint8_t state)
  * a verified slot keeps its in-RAM state. */
 static void refresh_all(void)
 {
-    ota_cache_t c = {.running_slot = UDSOTA_SLOT_NONE, .boot_slot = UDSOTA_SLOT_NONE};
+    ota_cache_t c = {.st = {.running_slot = UDSOTA_SLOT_NONE, .boot_slot = UDSOTA_SLOT_NONE}};
     const esp_partition_t *run = esp_ota_get_running_partition();
     esp_ota_img_states_t st;
-    c.running_slot = slot_of(run);
-    c.boot_slot = slot_of(esp_ota_get_boot_partition());
-    c.running_state = (esp_ota_get_state_partition(run, &st) == ESP_OK) ? map_state(st) : UDSOTA_IMG_UNDEFINED;
+    c.st.running_slot = slot_of(run);
+    c.st.boot_slot = slot_of(esp_ota_get_boot_partition());
+    c.st.running_state = (esp_ota_get_state_partition(run, &st) == ESP_OK) ? map_state(st) : UDSOTA_IMG_UNDEFINED;
 #if !CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE
     /* Without rollback nothing waits for a confirm: an image the otadata of a rollback build left pending
      * is as permanent as any other, and the core then answers ConfirmImage without calling confirm. */
-    if (c.running_state == UDSOTA_IMG_PENDING_VERIFY) {
-        c.running_state = UDSOTA_IMG_VALID;
+    if (c.st.running_state == UDSOTA_IMG_PENDING_VERIFY) {
+        c.st.running_state = UDSOTA_IMG_VALID;
     }
 #endif
     uint8_t other = UDSOTA_OTHER_UNVERIFIED;
@@ -247,8 +241,8 @@ static void refresh_all(void)
     c.ready = true;
     cache_put(&c);
     ESP_LOGD(TAG, "OTA state: running slot %u state %u, boot slot %u, other slot state %u (v%u.%u.%u)",
-             c.running_slot, c.running_state, c.boot_slot, c.other_slot_state,
-             c.other_version[0], c.other_version[1], c.other_version[2]);
+             c.st.running_slot, c.st.running_state, c.st.boot_slot, c.st.other_slot_state,
+             c.st.other_version[0], c.st.other_version[1], c.st.other_version[2]);
 }
 
 /* Chip revision and flash mode against the running app (IDF, :1131), then the header and core rules with
@@ -322,7 +316,7 @@ static int job_begin(uint32_t size)
         return r;
     }
     const ota_cache_t now = cache_get();
-    if (now.boot_slot == slot_of(s_target)) {
+    if (now.st.boot_slot == slot_of(s_target)) {
         ESP_LOGE(TAG, "download refused before any erase: %s is the boot slot until the reset", s_target->label);
         set_other(UDSOTA_OTHER_UNVERIFIED);
         return UDSOTA_DL_FLASH_ERROR;
@@ -659,7 +653,7 @@ static int job_activate(void)
         return r;
     }
     ota_cache_t c = cache_get();
-    c.boot_slot = slot_of(s_target);
+    c.st.boot_slot = slot_of(s_target);
     cache_put(&c);
     return UDSOTA_DL_OK;
 }
@@ -670,10 +664,10 @@ static int job_activate(void)
 static int job_confirm(void)
 {
     ota_cache_t c = cache_get();
-    if (!c.ready || c.running_slot == UDSOTA_SLOT_NONE || c.boot_slot != c.running_slot ||
-        c.running_state != UDSOTA_IMG_PENDING_VERIFY) {
+    if (!c.ready || c.st.running_slot == UDSOTA_SLOT_NONE || c.st.boot_slot != c.st.running_slot ||
+        c.st.running_state != UDSOTA_IMG_PENDING_VERIFY) {
         ESP_LOGW(TAG, "confirm refused: running slot %u state %u, boot slot %u",
-                 c.running_slot, c.running_state, c.boot_slot);
+                 c.st.running_slot, c.st.running_state, c.st.boot_slot);
         return UDSOTA_DL_ABORTED;
     }
     esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
@@ -682,7 +676,7 @@ static int job_confirm(void)
         return UDSOTA_DL_ABORTED;
     }
     c = cache_get();                            /* only the worker writes these fields; re-read keeps other_* current */
-    c.running_state = UDSOTA_IMG_VALID;
+    c.st.running_state = UDSOTA_IMG_VALID;
     cache_put(&c);
     ESP_LOGD(TAG, "running image confirmed");
     return UDSOTA_DL_OK;
@@ -801,14 +795,7 @@ void udsota_esp32_status(udsota_status_t *out)
     if (out == NULL) {
         return;
     }
-    const ota_cache_t c = cache_get();
-    memset(out, 0, sizeof *out);
-    out->running_slot = c.running_slot;
-    out->running_state = c.running_state;
-    out->boot_slot = c.boot_slot;
-    out->other_slot_state = c.other_slot_state;
-    memcpy(out->other_version, c.other_version, sizeof out->other_version);
-    memcpy(out->other_elf_sha_prefix, c.other_sha_prefix, sizeof out->other_elf_sha_prefix);
+    *out = cache_get().st;
     out->flags = status_flags();
 }
 
@@ -816,8 +803,8 @@ void udsota_esp32_status(udsota_status_t *out)
 bool udsota_esp32_image_unconfirmed(void)
 {
     const ota_cache_t c = cache_get();
-    return c.ready && c.running_slot != UDSOTA_SLOT_NONE && c.boot_slot == c.running_slot &&
-           c.running_state == UDSOTA_IMG_PENDING_VERIFY;
+    return c.ready && c.st.running_slot != UDSOTA_SLOT_NONE && c.st.boot_slot == c.st.running_slot &&
+           c.st.running_state == UDSOTA_IMG_PENDING_VERIFY;
 }
 
 /* True while an ops job or the boot-time refresh is queued or running. */
@@ -1048,8 +1035,8 @@ static void eng_unverify(void *ctx)
     taskENTER_CRITICAL(&s_mux);
     s_verified = false;
     s_unverify_gen++;
-    if (s_cache.other_slot_state == UDSOTA_OTHER_VERIFIED) {
-        s_cache.other_slot_state = UDSOTA_OTHER_UNVERIFIED;
+    if (s_cache.st.other_slot_state == UDSOTA_OTHER_VERIFIED) {
+        s_cache.st.other_slot_state = UDSOTA_OTHER_UNVERIFIED;
     }
     taskEXIT_CRITICAL(&s_mux);
 }
