@@ -51,6 +51,8 @@ typedef struct {
     const char *make_image, *version; /* --make-image OUT --version V */
     uint32_t    payload;
     bool        self_test;
+    uint32_t    withhold_fc_after;    /* --withhold-fc-after N: refuse the FC point after a message's Nth CF, once */
+    uint32_t    drop_fc_after;        /* --drop-fc-after N: lose the FC sent after a message's Nth CF, once */
 } opts_t;
 
 /* The one server instance: its options, engine, bus, and the state a restart replaces. */
@@ -74,6 +76,8 @@ typedef struct {
     unsigned            boots;
     bool                temp_dir;     /* the state directory is ours to remove */
     char                dir[240];
+    uint32_t            cfs;          /* CFs of the request message now arriving (fault injection counts them) */
+    bool                ignore_ff;    /* the FF after a withheld FC is dropped unanswered */
 } demo_t;
 
 static demo_t d;
@@ -117,10 +121,20 @@ static const char *img_state(uint8_t s)
 
 /* ---- Hooks and security ---- */
 
-/* hooks.gate: allows everything, except CONFIRM during the first --soak-ms of a boot (0x22, as an app's soak). */
+/* hooks.gate: allows everything, except CONFIRM during the first --soak-ms of a boot (0x22, as an app's soak), and
+ * CONTINUE_TRANSFER at the FC point --withhold-fc-after names (0x22, which withholds the FC). */
 static uint8_t on_gate(void *ctx, udsota_op_t op)
 {
     (void)ctx;
+    /* In the middle of a message only: the gate is also asked for the whole 36, after its last CF. */
+    if (op == UDSOTA_OP_CONTINUE_TRANSFER && d.o.withhold_fc_after != 0u && d.cfs == d.o.withhold_fc_after &&
+        d.tp.rxw.in_msg) {
+        d.o.withhold_fc_after = 0u;
+        d.ignore_ff = true;
+        fprintf(stderr, "udsota_demo_server: --withhold-fc-after: refusing the FC point after CF %u\n",
+                (unsigned)d.cfs);
+        return UDSOTA_NRC_CONDITIONS_NOT_CORRECT;
+    }
     if (op == UDSOTA_OP_CONFIRM && d.o.soak_ms != 0u && mono_us() / 1000u - d.boot_ms < d.o.soak_ms) {
         return UDSOTA_NRC_CONDITIONS_NOT_CORRECT;
     }
@@ -172,13 +186,39 @@ static bool on_key(void *ctx, const uint8_t seed[16], uint8_t level, uint8_t out
 
 /* ---- Boot and restart ---- */
 
-/* One request frame from the bus: dropped while restarting, else handed to the adapter. */
+/* One request frame from the bus: dropped while restarting, else handed to the adapter. Counts a message's CFs for
+ * the fault options; after --withhold-fc-after's refusal the next FF is dropped, as a server on an erroring bus that
+ * never answers it. */
 static void on_frame(void *ctx, const demo_frame_t *f)
 {
     (void)ctx;
-    if (!d.booting) {
-        udsota_isotp_on_frame(&d.tp, f->data, f->dlc, f->rx_us, server_ms());
+    if (d.booting) {
+        return;
     }
+    const uint8_t pci = (f->dlc >= 1u) ? (uint8_t)(f->data[0] >> 4) : 0xFFu;
+    if (pci == 1u) {
+        d.cfs = 0u;
+        if (d.ignore_ff) {
+            d.ignore_ff = false;
+            fprintf(stderr, "udsota_demo_server: --withhold-fc-after: ignoring the next FF\n");
+            return;
+        }
+    } else if (pci == 2u) {
+        d.cfs++;
+    }
+    udsota_isotp_on_frame(&d.tp, f->data, f->dlc, f->rx_us, server_ms());
+}
+
+/* udsota_can_t.send: demo_can_send, except that the FC after a message's --drop-fc-after'th CF is lost (reported
+ * sent), once. */
+static int on_send(void *ctx, uint16_t id, const uint8_t data[8], uint8_t len)
+{
+    if (len >= 1u && (data[0] >> 4) == 3u && d.o.drop_fc_after != 0u && d.cfs == d.o.drop_fc_after) {
+        d.o.drop_fc_after = 0u;
+        fprintf(stderr, "udsota_demo_server: --drop-fc-after: losing the FC after CF %u\n", (unsigned)d.cfs);
+        return 0;
+    }
+    return demo_can_send(ctx, id, data, len);
 }
 
 /* Starts a fresh server and adapter on the image now running, as a boot of the device would. */
@@ -189,11 +229,13 @@ static void start_server(void)
     };
     static const udsota_security_t sec = { .rng16 = on_rng16, .key = on_key };
     const udsota_can_t can = {
-        .send = demo_can_send, .now_us = can_now_us, .ctx = &d.can,   /* a written frame has left: no tx_pending */
+        .send = on_send, .now_us = can_now_us, .ctx = &d.can,   /* a written frame has left: no tx_pending */
     };
     const udsota_engine_t eng = demo_engine_ops(&d.eng);
     d.boot_ms = mono_us() / 1000u;
     d.boots++;
+    d.cfs = 0u;
+    d.ignore_ff = false;
     udsota_init(&d.srv, &d.cfg, &eng, d.secured ? &sec : NULL, &hooks);
     udsota_isotp_init(&d.tp, &d.srv, &d.cfg, &hooks, &can, &d.bufs);
     char v[33];
@@ -299,6 +341,8 @@ static void usage(FILE *out)
           "          --no-compress (refuse DFI 0x10 downloads)\n"
           "security: --label LABEL [--master FILE (32 bytes)], --device-id 02:00:00:00:00:01, --skip-boot-delay\n"
           "timing:   --boot-ms 500, --job-ms 0, --soak-ms 0, --stmin-us 2000, --block-size 64, --stmin-monitor\n"
+          "faults:   --withhold-fc-after N (refuse the FC point after a message's Nth CF, then ignore the next FF),\n"
+          "          --drop-fc-after N (lose the FC sent after a message's Nth CF); each once, N a multiple of the BS\n"
           "          -v logs every frame on stderr\n", out);
 }
 
@@ -308,7 +352,8 @@ static bool parse_args(int argc, char **argv)
     enum {
         O_SOCKETCAN = 256, O_REQ, O_RESP, O_PRODUCT, O_HW, O_LAYOUT, O_BOARD, O_CHIP, O_DIR, O_FRESH, O_SLOT, O_RUNNING,
         O_NO_ROLLBACK, O_LABEL, O_MASTER, O_DEVID, O_SKIP_DELAY, O_BOOT_MS, O_JOB_MS, O_SOAK_MS, O_STMIN, O_BS,
-        O_MONITOR, O_MAKE, O_VERSION, O_PAYLOAD, O_SELF_TEST, O_HELP, O_REAL_BUS, O_NO_COMPRESS,
+        O_MONITOR, O_MAKE, O_VERSION, O_PAYLOAD, O_SELF_TEST, O_HELP, O_REAL_BUS, O_NO_COMPRESS, O_WITHHOLD_FC,
+        O_DROP_FC,
     };
     static const struct option longopts[] = {
         {"socketcan", required_argument, NULL, O_SOCKETCAN}, {"req-id", required_argument, NULL, O_REQ},
@@ -326,6 +371,8 @@ static bool parse_args(int argc, char **argv)
         {"version", required_argument, NULL, O_VERSION}, {"payload", required_argument, NULL, O_PAYLOAD},
         {"self-test", no_argument, NULL, O_SELF_TEST}, {"help", no_argument, NULL, O_HELP},
         {"allow-real-bus", no_argument, NULL, O_REAL_BUS}, {"no-compress", no_argument, NULL, O_NO_COMPRESS},
+        {"withhold-fc-after", required_argument, NULL, O_WITHHOLD_FC},
+        {"drop-fc-after", required_argument, NULL, O_DROP_FC},
         {NULL, 0, NULL, 0},
     };
     d.o = (opts_t){
@@ -358,6 +405,9 @@ static bool parse_args(int argc, char **argv)
         case O_RUNNING:     d.o.running_version = optarg; break;
         case O_NO_ROLLBACK: d.o.no_rollback = true; break;
         case O_NO_COMPRESS: d.o.no_compress = true; break;
+        case O_WITHHOLD_FC: ok = num("withhold-fc-after", optarg, 1, 585, &v);
+                            d.o.withhold_fc_after = (uint32_t)v; break;
+        case O_DROP_FC:     ok = num("drop-fc-after", optarg, 1, 585, &v); d.o.drop_fc_after = (uint32_t)v; break;
         case O_LABEL:       label = optarg; break;
         case O_MASTER:      d.o.master_file = optarg; break;
         case O_DEVID:       ok = parse_device_id(optarg); break;

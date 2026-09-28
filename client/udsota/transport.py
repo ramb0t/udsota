@@ -3,6 +3,7 @@ pre-flight listening with the optional busy detector and pre-roll, the second-te
 quieting over the functional ID and the kernel ISO-TP binding."""
 import contextlib
 import selectors
+import socket
 import threading
 import time
 
@@ -259,13 +260,17 @@ def isotp_address(profile, txid=None, rxid=None):
     return isotp.Address(isotp.AddressingMode.Normal_11bits, txid=txid, rxid=rxid)
 
 
-# udsoncan's kernel ISO-TP connection with a receive thread that survives a socket error. A TX timeout
-# (no FC within N_Bs) puts ECOMM on the socket, and whichever of recv() and sendmsg() reads it first clears
+# udsoncan's kernel ISO-TP connection with a receive thread that survives a socket error and never blocks
+# outside its select(). A TX timeout (no FC within N_Bs) puts ECOMM on the socket and wakes both the select()
+# and a sendmsg() waiting for the PDU to leave; whichever of recv() and sendmsg() reads the error first clears
 # it. udsoncan's own thread ends on any exception from recv(), which leaves the client deaf to every later
-# answer. Tied to udsoncan 1.26.1 (pinned in pyproject.toml): rxthread_task is that version's loop.
+# answer, and its blocking recv() waits for ever once sendmsg() has taken the error it woke for, so close(),
+# which joins the thread, never returns. Tied to udsoncan 1.26.1 (pinned in pyproject.toml): rxthread_task is
+# that version's loop.
 class RxResilientIsoTPConnection(IsoTPSocketConnection):
-    # udsoncan 1.26.1's receive loop, except that an OSError is logged and the loop listens again. Any other
-    # error still ends it, and it stops once close() sets exit_requested or the socket is closed.
+    # udsoncan 1.26.1's receive loop, except that recv() never blocks (a wakeup whose error sendmsg() took reads
+    # nothing, and the loop selects again) and an OSError is logged and the loop listens again. Any other error
+    # still ends it, and it stops within 0.2 s once close() sets exit_requested or the socket is closed.
     def rxthread_task(self):
         sel = selectors.DefaultSelector()
         sel.register(self.tpsock._socket, selectors.EVENT_READ)
@@ -274,9 +279,11 @@ class RxResilientIsoTPConnection(IsoTPSocketConnection):
                 try:
                     events = sel.select(timeout=0.2)
                     if events:
-                        data = self.tpsock.recv()
+                        data = self.tpsock.recv(flags=socket.MSG_DONTWAIT)
                         if data is not None:
                             self.rxqueue.put(data)
+                except BlockingIOError:
+                    continue
                 except OSError as e:
                     if self.exit_requested or self.tpsock.closed:
                         break

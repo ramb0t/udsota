@@ -4,6 +4,7 @@ stdout. No vcan or kernel ISO-TP needed; skipped when the demo is not built."""
 import random
 import subprocess
 import threading
+import time
 import tomllib
 
 import pytest
@@ -279,6 +280,30 @@ def test_drop_76_resends_one_block(demo, tmp_path):
                        image_file(tmp_path, build_image("v0.2.0")), "--drop-76", "2"]) == 0
     answers = [bytes(m.data[:3]) for m in s.sent if m.data[1] == 0x76]
     assert answers.count(b"\x02\x76\x02") == 2
+    assert read_state(s)[2] == "v0.2.0"
+
+
+# Check a server that withholds the FC after the first block of CFs of block 1, then ignores the resent FF: `flash`
+# exits 1 within seconds, naming the block and the server's own reason from F1F1 (DL_ABORTED), and the old image
+# still runs.
+def test_withheld_flow_control_exits_1_with_the_servers_reason(demo, tmp_path, capsys):
+    s = demo("--withhold-fc-after", "64")
+    t0 = time.monotonic()
+    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash",
+                       image_file(tmp_path, build_image("v0.2.0"))]) == 1
+    assert time.monotonic() - t0 < 15.0
+    err = capsys.readouterr().err
+    assert "block 1:" in err and "F1F1 reads DL_ABORTED" in err, err
+    assert read_state(s)[2] == OLD
+
+
+# Check one FC lost on the bus (after the first block of CFs of block 1): the client's N_Bs timeout resends the block
+# from a new FF, the server takes it in place of the message it was still receiving, and the update completes.
+def test_lost_flow_control_is_resent_and_the_update_completes(demo, tmp_path):
+    s = demo("--drop-fc-after", "64")
+    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash",
+                       image_file(tmp_path, build_image("v0.2.0"))]) == 0
+    assert "--drop-fc-after: losing the FC" in s.log_path.read_text()
     assert read_state(s)[2] == "v0.2.0"
 
 
