@@ -9,7 +9,7 @@ import tomllib
 import pytest
 
 from udsota import cli, profile, update, wire
-from udsota.errors import Nrc
+from udsota.errors import NoResponse, Nrc
 
 from .demo_server import LABEL, MASTER, DemoServer, PipeTransport, binary_or_skip, build_image, elf_sha
 
@@ -238,7 +238,10 @@ def test_unconfirmed_image_rolls_back(demo):
         update.enter_programming(uds, EXAMPLE, None)
         update.download(uds, image, log=lambda *a: None)
         update.check_image(uds)
-        uds.routine(wire.RID_ACTIVATE)
+        try:
+            uds.routine(wire.RID_ACTIVATE)
+        except NoResponse:   # a slow runner can miss the 150 ms P2 as the server restarts; flash tolerates it too
+            assert update.activation_landed(uds, elf_sha(image), log=lambda *a: None)
         update.wait_for_image(uds, elf_sha(image), t.preroll)
         status = wire.decode_status(uds.read_did(wire.DID_STATUS))
         assert (status["running_slot"], status["running_state"]) == (1, PENDING)
