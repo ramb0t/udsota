@@ -658,14 +658,21 @@ static int job_activate(void)
     return UDSOTA_DL_OK;
 }
 
-/* Worker: ConfirmImage. Marks the running image valid only when the cache shows it PENDING_VERIFY
- * and the boot slot, because esp_ota_mark_app_valid_cancel_rollback() marks the active (newest valid)
- * otadata entry, not necessarily the running one (:1179-1222). */
+/* The running image is PENDING_VERIFY and the boot slot: when job_confirm acts, and what
+ * udsota_esp32_image_unconfirmed() reports, so the two can't drift apart. */
+static bool pending_confirm(const ota_cache_t *c)
+{
+    return c->ready && c->st.running_slot != UDSOTA_SLOT_NONE && c->st.boot_slot == c->st.running_slot &&
+           c->st.running_state == UDSOTA_IMG_PENDING_VERIFY;
+}
+
+/* Worker: ConfirmImage. Marks the running image valid only when pending_confirm(), because
+ * esp_ota_mark_app_valid_cancel_rollback() marks the active (newest valid) otadata entry, not
+ * necessarily the running one (:1179-1222). */
 static int job_confirm(void)
 {
     ota_cache_t c = cache_get();
-    if (!c.ready || c.st.running_slot == UDSOTA_SLOT_NONE || c.st.boot_slot != c.st.running_slot ||
-        c.st.running_state != UDSOTA_IMG_PENDING_VERIFY) {
+    if (!pending_confirm(&c)) {
         ESP_LOGW(TAG, "confirm refused: running slot %u state %u, boot slot %u",
                  c.st.running_slot, c.st.running_state, c.st.boot_slot);
         return UDSOTA_DL_ABORTED;
@@ -799,12 +806,11 @@ void udsota_esp32_status(udsota_status_t *out)
     out->flags = status_flags();
 }
 
-/* PENDING_VERIFY and the boot slot, from the cache only. */
+/* pending_confirm() on the cache. */
 bool udsota_esp32_image_unconfirmed(void)
 {
     const ota_cache_t c = cache_get();
-    return c.ready && c.st.running_slot != UDSOTA_SLOT_NONE && c.st.boot_slot == c.st.running_slot &&
-           c.st.running_state == UDSOTA_IMG_PENDING_VERIFY;
+    return pending_confirm(&c);
 }
 
 /* True while an ops job or the boot-time refresh is queued or running. */
