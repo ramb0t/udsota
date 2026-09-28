@@ -77,6 +77,36 @@ def test_repository_current_version_is_released():
     assert release.problems("v" + version, (root / "CHANGELOG.md").read_text(), init) == []
 
 
+# Check a bump counts from the latest tag: minor resets the patch number.
+@pytest.mark.parametrize("latest, part, want", [
+    ("0.4.0", "minor", "0.5.0"), ("0.4.2", "minor", "0.5.0"), ("0.4.0", "patch", "0.4.1"), ("1.9.9", "minor", "1.10.0"),
+])
+def test_next_version(latest, part, want):
+    assert release.next_version(latest, part) == want
+
+
+# Check a bump moves [Unreleased]'s entries under the new dated heading, leaves an empty [Unreleased] above it and
+# sets __version__, and that the result passes check for the new tag.
+def test_bump_dates_unreleased_and_sets_the_version():
+    changelog, init, version = release.bump("minor", "v0.4.0", CHANGELOG, INIT, "2026-10-02")
+    assert version == "0.5.0" and init == INIT.replace("0.4.0", "0.5.0")
+    assert "## [Unreleased]\n\n## [0.5.0] - 2026-10-02\n\nWork in progress.\n\n## [0.4.0]" in changelog
+    assert release.problems("v0.5.0", changelog, init) == []
+    assert release.section(changelog, "0.4.0") == ("2026-10-01", "Added progress.")
+
+
+# Check a bump refuses an empty [Unreleased], files that don't match the latest tag, and a version already there.
+@pytest.mark.parametrize("changelog, latest, part, want", [
+    (CHANGELOG.replace("Work in progress.\n", ""), "v0.4.0", "minor", "nothing to release"),
+    (CHANGELOG, "v0.3.0", "patch", "don't match v0.3.0"),
+    (CHANGELOG.replace("## [0.4.0]", "## [0.4.1] - 2026-10-02\n\nFix.\n\n## [0.4.0]"), "v0.4.0", "patch",
+     "already has a ## [0.4.1]"),
+])
+def test_bump_refuses(changelog, latest, part, want):
+    with pytest.raises(ValueError, match=want.replace("[", "\\[").replace(".", "\\.")):
+        release.bump(part, latest, changelog, INIT, "2026-10-02")
+
+
 # Check the command line: check exits 0 or 1, notes prints the section.
 def test_main(tmp_path, capsys):
     cl, ini = tmp_path / "CHANGELOG.md", tmp_path / "__init__.py"
@@ -87,3 +117,7 @@ def test_main(tmp_path, capsys):
     assert "not '0.3.0'" in capsys.readouterr().err
     assert release.main(["notes", "v0.4.0", "--changelog", str(cl)]) == 0
     assert capsys.readouterr().out.startswith("Added progress.")
+    assert release.main(["bump", "patch", "--latest", "v0.4.0", "--date", "2026-10-02",
+                         "--changelog", str(cl), "--init", str(ini)]) == 0
+    assert capsys.readouterr().out == "0.4.1\n"
+    assert release.main(["check", "v0.4.1", "--changelog", str(cl), "--init", str(ini)]) == 0

@@ -1,10 +1,12 @@
-"""Release checks and release notes, from CHANGELOG.md and the client's __version__ (see RELEASING.md).
+"""Release checks, release notes and version bumps, from CHANGELOG.md and the client's __version__ (see RELEASING.md).
 
   python tools/release.py check v0.4.0    # the tag, CHANGELOG heading and client/udsota/__init__.py agree
   python tools/release.py notes v0.4.0    # the CHANGELOG section for 0.4.0, for the GitHub Release
+  python tools/release.py bump minor --latest v0.4.0   # date [Unreleased] as 0.5.0, set __version__, print 0.5.0
 
 --changelog and --init read other files, as the release workflow does for a tagged commit (git show)."""
 import argparse
+import datetime
 import pathlib
 import re
 import sys
@@ -16,6 +18,7 @@ HEADING = re.compile(r"^## \[(?P<version>[^\]]+)\] - (?P<date>.+)$", re.M)
 DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 CLIENT_VERSION = re.compile(r'^__version__ = "([^"]+)"', re.M)
 RELATIVE_LINK = re.compile(r"\]\((?![a-z][a-z0-9+.-]*:)([^)\s]+)\)")
+UNRELEASED = re.compile(r"^## \[Unreleased\]\n(?P<body>.*?)(?=^## \[|\Z)", re.M | re.S)
 
 
 # The X.Y.Z of a vX.Y.Z tag; ValueError for anything else.
@@ -78,16 +81,61 @@ def notes(tag, changelog):
                           % (body, date), tag)
 
 
-# Parse the arguments and run check or notes; returns the exit code.
+# The version after latest (X.Y.Z): part is "minor" (X.Y+1.0) or "patch" (X.Y.Z+1).
+def next_version(latest, part):
+    major, minor, patch = (int(n) for n in latest.split("."))
+    if part == "minor":
+        return "%d.%d.0" % (major, minor + 1)
+    if part == "patch":
+        return "%d.%d.%d" % (major, minor, patch + 1)
+    raise ValueError("bump %r is not minor or patch" % part)
+
+
+# changelog with [Unreleased]'s entries under a new ## [version] - date heading, and an empty [Unreleased] above
+# it; ValueError when [Unreleased] is missing or empty, or version already has a section.
+def cut(changelog, version, date):
+    m = UNRELEASED.search(changelog)
+    if m is None:
+        raise ValueError("CHANGELOG.md has no ## [Unreleased] section")
+    if not m["body"].strip():
+        raise ValueError("CHANGELOG.md's ## [Unreleased] is empty: nothing to release")
+    if any(h["version"] == version for h in HEADING.finditer(changelog)):
+        raise ValueError("CHANGELOG.md already has a ## [%s] section" % version)
+    return "%s## [Unreleased]\n\n## [%s] - %s\n%s%s" % (changelog[:m.start()], version, date, m["body"],
+                                                       changelog[m.end():])
+
+
+# Date [Unreleased] as the version after the latest tag and set __version__ to it, once the latest tag agrees
+# with both files; returns (changelog, client_init, version).
+def bump(part, latest_tag, changelog, client_init, date):
+    found = problems(latest_tag, changelog, client_init)
+    if found:
+        raise ValueError("the files don't match %s: %s" % (latest_tag, "; ".join(found)))
+    version = next_version(version_of(latest_tag), part)
+    return cut(changelog, version, date), CLIENT_VERSION.sub('__version__ = "%s"' % version, client_init), version
+
+
+# Parse the arguments and run check, notes or bump; returns the exit code.
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("cmd", choices=("check", "notes"))
-    p.add_argument("tag", help="the release tag, vX.Y.Z")
+    p.add_argument("cmd", choices=("check", "notes", "bump"))
+    p.add_argument("tag", help="the release tag, vX.Y.Z; for bump, minor or patch")
+    p.add_argument("--latest", help="bump: the latest release tag, vX.Y.Z")
+    p.add_argument("--date", default=datetime.date.today().isoformat(), help="bump: the release date")
     p.add_argument("--changelog", type=pathlib.Path, default=ROOT / "CHANGELOG.md")
     p.add_argument("--init", type=pathlib.Path, default=ROOT / "client" / "udsota" / "__init__.py")
     args = p.parse_args(argv)
     changelog = args.changelog.read_text(encoding="utf-8")
     try:
+        if args.cmd == "bump":
+            if args.latest is None:
+                p.error("bump needs --latest")
+            changelog, client_init, version = bump(args.tag, args.latest, changelog,
+                                                   args.init.read_text(encoding="utf-8"), args.date)
+            args.changelog.write_text(changelog, encoding="utf-8")
+            args.init.write_text(client_init, encoding="utf-8")
+            print(version)
+            return 0
         if args.cmd == "notes":
             sys.stdout.write(notes(args.tag, changelog))
             return 0
