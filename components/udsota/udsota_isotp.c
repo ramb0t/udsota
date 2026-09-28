@@ -293,9 +293,7 @@ void udsota_isotp_on_func_frame(udsota_isotp_t *t, const uint8_t *data, uint8_t 
     if (tx_busy(t) || t->link.receive_status != ISOTP_RECEIVE_STATUS_IDLE) {
         return;                                           /* a physical request or answer owns the server */
     }
-    uint8_t req[CAN_DL - 1u];
-    memcpy(req, &data[1], n);
-    tx_response(t, udsota_on_functional_request(t->srv, req, n, t->buf->resp, UDSOTA_ISOTP_RESP_MAX, now_ms));
+    tx_response(t, udsota_on_functional_request(t->srv, &data[1], n, t->buf->resp, UDSOTA_ISOTP_RESP_MAX, now_ms));
 }
 
 /* isotp-c's timers and CFs, N_Cr, the parked FC and answer, the server's poll, a waiting request and the limit switch. */
@@ -323,14 +321,13 @@ uint32_t udsota_isotp_service(udsota_isotp_t *t, uint32_t now_ms)
     return next_wait_ms(t, now_ms);
 }
 
-/* Answers dropped: refused outright by can.send, still refused after UDSOTA_ISOTP_PARK_MAX_MS, or replaced before they left. */
+/* See udsota_isotp.h. */
 uint32_t udsota_isotp_resp_lost(const udsota_isotp_t *t)
 {
     return t->resp_lost;
 }
 
-/* Flow-control frames dropped: refused outright, still refused after cfg.fc_retry_ms, superseded by a
- * newer FC, or dropped with their message (link re-init, withheld message). */
+/* See udsota_isotp.h. */
 uint32_t udsota_isotp_fc_lost(const udsota_isotp_t *t)
 {
     return t->fc_lost;

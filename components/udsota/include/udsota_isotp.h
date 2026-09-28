@@ -62,14 +62,13 @@ struct udsota_isotp {
     bool                 rx_orphan;          /* isotp-c still holds a message dropped at a withheld FC */
     size_t               park_len;           /* bytes in buf->park; 0 = nothing parked */
     uint32_t             park_ms;            /* when the parked answer was parked */
-    uint32_t             resp_lost;          /* answers refused outright by can.send, or replaced unsent */
+    uint32_t             resp_lost;          /* see udsota_isotp_resp_lost() */
     bool                 fc_parked;          /* an FC can.send refused with UDSOTA_TX_RETRY waits in fc_frame */
     uint16_t             fc_id;
     uint8_t              fc_frame[8];
     uint32_t             fc_park_ms;         /* when it was parked */
     uint32_t             fc_retry_ms;        /* cfg.fc_retry_ms, 0 = UDSOTA_ISOTP_FC_RETRY_MS */
-    uint32_t             fc_lost;            /* FCs refused outright, still refused after fc_retry_ms,
-                                              * superseded by a newer FC, or dropped with their message */
+    uint32_t             fc_lost;            /* see udsota_isotp_fc_lost() */
     uint32_t             now_ms;             /* this call's time, for the FC retry window */
 };
 typedef struct udsota_isotp udsota_isotp_t;
