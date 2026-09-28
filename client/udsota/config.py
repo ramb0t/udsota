@@ -7,7 +7,7 @@ import time
 
 from .errors import Nrc, Refused, ToolError, UpdateFailed
 from .profile import TYPES
-from .update import device_keys, wait_for_boot
+from .update import device_keys, read_record, wait_for_boot
 from .wire import DECODE, NRC_CONDITIONS, NRC_NOT_SUPPORTED, NRC_OUT_OF_RANGE, NRC_SEQUENCE, SESSION_EXTENDED
 
 NO_CONFIG_WRITES = "this firmware has no config writes"
@@ -66,16 +66,6 @@ def parse_writes(profile, assignments, commit, reset):
         seen.add(name)
         writes.append((keys[name], encode_value(keys[name], text)))
     return writes
-
-
-# One DID's record, or None when the server answers 0x31 (it does not serve that DID).
-def read_record(uds, did):
-    try:
-        return uds.read_did(did)
-    except Nrc as e:
-        if e.code != NRC_OUT_OF_RANGE:
-            raise
-        return None
 
 
 # One DID's record decoded with decode, or "not supported" when the server answers 0x31.

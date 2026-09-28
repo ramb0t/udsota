@@ -36,22 +36,25 @@ CORE_DIDS = ((DID_SESSION, "active session", DECODE["hex"]),
               lambda d: " ".join("%s=%d" % kv for kv in decode_counters(d).items())))
 
 
+# One DID's record, or None when the server answers 0x31 (it does not serve that DID).
+def read_record(uds, did):
+    try:
+        return uds.read_did(did)
+    except Nrc as e:
+        if e.code != NRC_OUT_OF_RANGE:
+            raise
+        return None
+
+
 # `info`: the server-owned DIDs, then the profile's [dids] in file order; a range stops at its first absent DID.
 def info(uds, profile, log=print):
     for did, name, render in CORE_DIDS:
-        try:
-            log("%04X %s: %s" % (did, name, render(uds.read_did(did))))
-        except Nrc as e:
-            if e.code != NRC_OUT_OF_RANGE:
-                raise
-            log("%04X %s: not supported" % (did, name))
+        d = read_record(uds, did)
+        log("%04X %s: %s" % (did, name, "not supported" if d is None else render(d)))
     for entry in profile.dids:
         for did in range(entry.first, entry.last + 1):
-            try:
-                d = uds.read_did(did)
-            except Nrc as e:
-                if e.code != NRC_OUT_OF_RANGE:
-                    raise
+            d = read_record(uds, did)
+            if d is None:
                 if entry.first == entry.last:
                     log("%04X %s: not supported" % (did, entry.name))
                 break
@@ -363,16 +366,6 @@ def device_keys(uds, profile, secret):
     return make_keys(profile, secret, read_device_id(uds, profile))
 
 
-# The precheck's F1F0 read; NRC 0x31 means the device does not serve udsota's status DID, so it is no udsota server.
-def read_status_precheck(uds):
-    try:
-        return uds.read_did(DID_STATUS)
-    except Nrc as e:
-        if e.code != NRC_OUT_OF_RANGE:
-            raise
-        raise Refused("the device does not serve the udsota status DID F1F0; is it running a udsota server?") from e
-
-
 # `flash`: precheck, programming session (and unlock), download, FF01, ActivateImage, the restart and
 # ConfirmImage. Returns 0 or raises ToolError. secret is the master or private key (make_keys), unused when the
 # profile has no [security]. quiet() is entered once an update is needed and held until the end (the transport's
@@ -391,7 +384,10 @@ def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep
     img = parse_image(profile, image)
     board_of = profile.board_names.get(img.hw_id, "hw_id %d" % img.hw_id)
     log("image %s for %s, %d bytes, app_elf_sha256 %s" % (img.version, board_of, img.size, img.elf_sha[:8].hex()))
-    state = decode_status(read_status_precheck(uds))
+    status = read_record(uds, DID_STATUS)
+    if status is None:                        # 0x31: no udsota status DID, so no udsota server
+        raise Refused("the device does not serve the udsota status DID F1F0; is it running a udsota server?")
+    state = decode_status(status)
     running_sha = uds.read_did(DID_RUNNING_SHA)
     board = None if profile.board_did is None else cstr(uds.read_did(profile.board_did))
     device_id = read_device_id(uds, profile)   # read in the precheck, used only once an update is needed
