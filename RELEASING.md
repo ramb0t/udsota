@@ -21,26 +21,17 @@ Add a line to `## [Unreleased]` in `CHANGELOG.md` for anything a user would noti
 
 ## Making a release
 
-1. **Open a release PR against `main`:**
-   - rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD` and start a new, empty `## [Unreleased]` above it;
-   - set `__version__ = "X.Y.Z"` in `client/udsota/__init__.py`;
-   - run `python tools/release.py check vX.Y.Z` locally.
-2. **Merge it once CI is green.**
-3. **Tag the merge commit on `main`** with an annotated tag, and push it:
+**Right after merging, run Actions → cut release → Run workflow** on `main`, with **minor** or **patch** from the table above. It takes the next version from the latest tag, moves `[Unreleased]`'s entries under `## [X.Y.Z] - today` with a new empty `[Unreleased]` above them, sets `__version__`, commits that to `main` as "Release X.Y.Z", and pushes an annotated tag. It refuses when `[Unreleased]` is empty or `main`'s CI hasn't passed on the commit. Release after each user-visible merge, or after several.
 
-   ```sh
-   git checkout main && git pull
-   git tag -a vX.Y.Z -m "udsota X.Y.Z"
-   git push origin vX.Y.Z
-   ```
+It then runs the [release workflow](.github/workflows/release.yml) on the tag. That checks the tag, builds the client's wheel and sdist and the example's app image for esp32 and esp32s3 at the tag, and publishes a GitHub Release. The notes are the version's CHANGELOG section, with its links made absolute at the tag. Releases are not marked as pre-releases, even at 0.x, so the newest one is GitHub's Latest and `/releases/latest` finds it.
 
-4. **The [release workflow](.github/workflows/release.yml) does the rest.** It checks the tag, builds the client's wheel and sdist and the example's app image for esp32 and esp32s3 at the tag, and publishes a GitHub Release. The notes are the version's CHANGELOG section, with its links made absolute at the tag. Releases are not marked as pre-releases, even at 0.x, so the newest one is GitHub's Latest and `/releases/latest` finds it.
+The cut pushes to `main` directly. That works while `main` has no branch protection; with protection on, it needs a bypass, or a release PR instead.
 
-If the check fails, nothing is published: fix `main` and tag a new patch version.
+To release by hand instead, merge a PR that makes the same two edits (`python tools/release.py bump minor --latest <latest tag>` makes them), then tag its merge commit with `git tag -a vX.Y.Z -m "udsota X.Y.Z"` and push the tag. The tag push runs the release workflow. If its check fails, nothing is published: fix `main` and release the next patch version.
 
 ## Rules
 
-- Tag only commits on `main` whose CI is green.
+- Tag only commits on `main` whose CI is green. The cut's own commit changes only the CHANGELOG and `__version__`, on top of one whose CI passed.
 - Tags are annotated and named `vX.Y.Z`.
 - Never move or delete a published tag, or replace a published Release's files. Fix a bad release with a new patch release.
 
@@ -48,12 +39,4 @@ If the check fails, nothing is published: fix `main` and tag a new patch version
 
 For a version tagged before the workflow existed, run the workflow by hand: **Actions → release → Run workflow**, with the tag and, for an older commit whose CHANGELOG may still say "unreleased", **backfill** on. Backfill skips the version check and takes the notes from `main`'s CHANGELOG. The tag must already exist on `main` and be annotated; the workflow never creates one.
 
-The Releases this repository needed when the workflow was added, run in this order:
-
-| Tag | Commit | backfill |
-|---|---|---|
-| `v0.1.0` | `da16abf`, the initial import | on |
-| `v0.2.0` | `8e8d0fe` | on |
-| `v0.3.0` | `1183863` | off |
-
-A Release attaches the client only when the tagged client's `__version__` is the Release's version. `v0.2.0`'s has none: its client was unchanged and still reports 0.1.0.
+A Release attaches the client only when the tagged client's `__version__` is the Release's version, which is why `v0.2.0`'s has none.

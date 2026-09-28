@@ -2,7 +2,9 @@
 # CHANGELOG section and the client's __version__ agree, builds the client and the example's app images at the
 # tag, and publishes them with the CHANGELOG section as the notes. Run it by hand (workflow_dispatch) to release
 # an existing tag that has no Release yet; with backfill set it skips the version check and takes the notes from
-# main's CHANGELOG. It never creates or moves a tag. Actions are pinned by commit, since this job publishes.
+# main's CHANGELOG. cut-release.yml calls it (workflow_call) for the tag it pushes, since a tag pushed with a
+# workflow's token starts no workflow. It never creates or moves a tag. Actions are pinned by commit, since this
+# job publishes.
 name: release
 
 on:
@@ -15,6 +17,14 @@ on:
         required: true
       backfill:
         description: "An older version: skip the version check and take the notes from main's CHANGELOG"
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+      backfill:
         type: boolean
         default: false
 
