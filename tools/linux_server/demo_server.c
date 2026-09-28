@@ -77,7 +77,6 @@ typedef struct {
     bool                temp_dir;     /* the state directory is ours to remove */
     char                dir[240];
     uint32_t            cfs;          /* CFs of the request message now arriving (fault injection counts them) */
-    bool                withhold_now; /* the gate refuses CONTINUE_TRANSFER at this FC point */
     bool                ignore_ff;    /* the FF after a withheld FC is dropped unanswered */
 } demo_t;
 
@@ -127,8 +126,10 @@ static const char *img_state(uint8_t s)
 static uint8_t on_gate(void *ctx, udsota_op_t op)
 {
     (void)ctx;
-    if (op == UDSOTA_OP_CONTINUE_TRANSFER && d.withhold_now) {
-        d.withhold_now = false;
+    /* In the middle of a message only: the gate is also asked for the whole 36, after its last CF. */
+    if (op == UDSOTA_OP_CONTINUE_TRANSFER && d.o.withhold_fc_after != 0u && d.cfs == d.o.withhold_fc_after &&
+        d.tp.rxw.in_msg) {
+        d.o.withhold_fc_after = 0u;
         d.ignore_ff = true;
         fprintf(stderr, "udsota_demo_server: --withhold-fc-after: refusing the FC point after CF %u\n",
                 (unsigned)d.cfs);
@@ -186,8 +187,8 @@ static bool on_key(void *ctx, const uint8_t seed[16], uint8_t level, uint8_t out
 /* ---- Boot and restart ---- */
 
 /* One request frame from the bus: dropped while restarting, else handed to the adapter. Counts a message's CFs for
- * the fault options: --withhold-fc-after arms the gate's refusal at its CF, and the next FF is then dropped, as a
- * server on an erroring bus that never answers it. */
+ * the fault options; after --withhold-fc-after's refusal the next FF is dropped, as a server on an erroring bus that
+ * never answers it. */
 static void on_frame(void *ctx, const demo_frame_t *f)
 {
     (void)ctx;
@@ -202,9 +203,8 @@ static void on_frame(void *ctx, const demo_frame_t *f)
             fprintf(stderr, "udsota_demo_server: --withhold-fc-after: ignoring the next FF\n");
             return;
         }
-    } else if (pci == 2u && ++d.cfs == d.o.withhold_fc_after) {
-        d.o.withhold_fc_after = 0u;
-        d.withhold_now = true;
+    } else if (pci == 2u) {
+        d.cfs++;
     }
     udsota_isotp_on_frame(&d.tp, f->data, f->dlc, f->rx_us, server_ms());
 }
@@ -234,6 +234,8 @@ static void start_server(void)
     const udsota_engine_t eng = demo_engine_ops(&d.eng);
     d.boot_ms = mono_us() / 1000u;
     d.boots++;
+    d.cfs = 0u;
+    d.ignore_ff = false;
     udsota_init(&d.srv, &d.cfg, &eng, d.secured ? &sec : NULL, &hooks);
     udsota_isotp_init(&d.tp, &d.srv, &d.cfg, &hooks, &can, &d.bufs);
     char v[33];

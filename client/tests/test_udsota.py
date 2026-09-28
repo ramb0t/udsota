@@ -882,16 +882,18 @@ def test_rx_thread_wakeup_without_data_does_not_block_close():
         conn, sock = open_over_ecomm(transport.RxResilientIsoTPConnection, b"wakeup", errors=0, stolen=True)
         closer = threading.Thread(target=conn.close, daemon=True)
         try:
-            assert sock.woken.wait(timeout=1.0)
-            if answer is not None:
+            woken = sock.woken.wait(timeout=1.0)
+            got = None
+            if woken and answer is not None:
                 time.sleep(0.3)                   # the thread is back in select(), not stuck in recv()
                 sock.peer.send(answer)
-                assert conn.rxqueue.get(timeout=1.0) == answer
+                got = conn.rxqueue.get(timeout=1.0)
         finally:
             t0 = time.monotonic()
             closer.start()
             closer.join(timeout=2.0)
-            assert not closer.is_alive() and time.monotonic() - t0 < 1.0 and not conn.rxthread.is_alive()
+        assert woken and got == answer
+        assert not closer.is_alive() and time.monotonic() - t0 < 1.0 and not conn.rxthread.is_alive()
 
 
 # ---- pre-flight: listen, busy guard, pre-roll ----
@@ -1142,12 +1144,14 @@ def test_lost_76_is_resent_once():
     assert d.writes == 300 and bytes(d.written) == make_image()
 
 
-# Check a block that times out twice stops the update before 0x37.
+# Check a block that times out twice stops the update before 0x37, naming the block. F1F1 is not read: the
+# download may still be open, so it would describe the previous one.
 def test_second_timeout_stops_the_transfer():
     d = FakeServer(mute_block=5)
-    with pytest.raises(errors.NoResponse):
+    with pytest.raises(errors.NoResponse, match=r"^block 5: ") as e:
         run_flash(d)
-    assert d.log.count((0x36, 5)) == 2 and (0x37, None) not in d.log
+    assert "F1F1" not in str(e.value)
+    assert d.log.count((0x36, 5)) == 2 and (0x37, None) not in d.log and d.log[-1] == (0x36, 5)
 
 
 # Check one ISO-TP send error (no FC for the multi-frame 27 04 key, kernel ECOMM) is resent once and the update completes.
@@ -1168,12 +1172,29 @@ def test_second_send_error_stops_with_no_flow_control():
     assert d.no_fc[(0x27, 4)] == 0 and (0x34, None) not in d.log
 
 
-# Check a send error on a 0x36 block is resent inside the request, so send_block adds no third send.
+# Check a send error on a 0x36 block is resent inside the request, so send_block adds no third send, and the error
+# names the block and F1F1's reason.
 def test_send_errors_on_a_block_send_it_twice_only():
     d = FakeServer(no_fc={(0x36, 5): 3})
-    with pytest.raises(errors.SendFailed):
+    with pytest.raises(errors.SendFailed,
+                       match=r"^block 5: .*; the last-result DID F1F1 reads DL_OK, \d+ bytes received$"):
         run_flash(d)
-    assert d.no_fc[(0x36, 5)] == 1 and (0x36, 5) not in d.log
+    assert d.no_fc[(0x36, 5)] == 1 and (0x36, 5) not in d.log and d.log[-1] == (0x22, 0xF1F1)
+
+
+# Check --drop-76's resend fails the same way as a block's first send: the error names the block and F1F1.
+def test_drop_76_resend_failure_names_the_block():
+    # A server that stops sending FCs for block 5 once it has taken it.
+    class RefusesTheResend(FakeServer):
+        # 0x36, then no FC for the next two sends of block 5.
+        def s36(self, req, bsc):
+            if bsc == 5:
+                self.no_fc[(0x36, 5)] = 2
+            return super().s36(req, bsc)
+
+    d = RefusesTheResend()
+    with pytest.raises(errors.SendFailed, match=r"^block 5: .*; the last-result DID F1F1 reads"):
+        run_flash(d, drop_76=5)
 
 
 # Check the reboot wait after ActivateImage keeps polling through send errors, as through timeouts.

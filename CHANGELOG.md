@@ -4,7 +4,7 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ## [Unreleased]
 
-Fixed: a refused download now exits 1 instead of hanging. When a server withheld its flow control mid-block and ignored the resent block, `udsota flash` over the kernel's ISO-TP socket could hang for ever after the failed resend. The socket's N_Bs error woke the receive thread's `select()`, the send took the error first, and the receive thread's blocking `recv()` then waited for a frame that never came, so closing the connection, which joins that thread, never returned. The receive thread now never blocks outside its `select()`. A block that fails after its resend now names the block and, when the server still answers, F1F1's reason, such as `block 1: ... F1F1 reads DL_ABORTED, 0 bytes received`. The demo server gains `--withhold-fc-after N` and `--drop-fc-after N` to inject both faults. Not breaking.
+Fixed: a refused download now exits 1 instead of hanging. When a server withheld its flow control mid-block and ignored the resent block, `udsota flash` over the kernel's ISO-TP socket could hang for ever after the failed resend. A block that fails after its resend now names the block, and after a send the server stopped also F1F1's reason, such as `block 1: ... F1F1 reads DL_ABORTED, 0 bytes received`. The demo server gains `--withhold-fc-after N` and `--drop-fc-after N` to inject both faults. Not breaking.
 
 ## [0.5.0] - 2026-09-28
 

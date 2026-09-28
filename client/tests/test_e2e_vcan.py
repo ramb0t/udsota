@@ -204,21 +204,17 @@ def test_cli_flash_with_security_over_vcan(vcan_demo, tmp_path):
 
 
 # Check a server that withholds the FC after the first block of CFs of block 1, then ignores the resent FF (the
-# refused-download hang): the `udsota` command exits 1 within seconds, naming the block and F1F1's DL_ABORTED.
-# Before, the kernel socket's N_Bs error could wake the receive thread's select() and be taken by sendmsg(), leaving
-# that thread in a blocking recv() that close() joined for ever. The race goes either way, so it runs five times.
+# refused-download hang): the `udsota` command exits 1 within seconds, naming the block and F1F1's DL_ABORTED. The
+# hang itself is a thread race this run rarely hits; test_rx_thread_wakeup_without_data_does_not_block_close forces it.
 def test_cli_flash_exits_1_when_the_server_withholds_flow_control(vcan_demo, tmp_path):
     kernel_isotp_or_skip()
+    demo = vcan_demo("--withhold-fc-after", "64")
     image = tmp_path / "v0.2.0.bin"
     image.write_bytes(build_image("v0.2.0"))
-    for _ in range(5):
-        demo = vcan_demo("--withhold-fc-after", "64")
-        t0 = time.monotonic()
-        r = udsota("--profile", "example", "--interface", IFACE, "flash", str(image), timeout_s=30)
-        assert r.returncode == 1 and time.monotonic() - t0 < 15.0, r.stdout + r.stderr + demo.log.read_text()
-        assert "block 1:" in r.stderr and "F1F1 reads DL_ABORTED" in r.stderr, r.stderr
-        demo.send_signal(signal.SIGTERM)
-        demo.wait(timeout=5)
+    t0 = time.monotonic()
+    r = udsota("--profile", "example", "--interface", IFACE, "flash", str(image), timeout_s=30)
+    assert r.returncode == 1 and time.monotonic() - t0 < 15.0, r.stdout + r.stderr + demo.log.read_text()
+    assert "block 1:" in r.stderr and "F1F1 reads DL_ABORTED" in r.stderr, r.stderr
 
 
 # Check one FC lost on the bus is resent by the kernel stack's N_Bs error and the update completes over the socket.
