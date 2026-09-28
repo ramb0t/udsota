@@ -9,6 +9,7 @@ It runs on Linux with SocketCAN and the kernel's ISO-TP module, on Python 3.11 o
 ```
 udsota --profile example info                    # identity, update state, the profile's DIDs
 udsota --profile example flash build/example.bin # precheck, download, verify, activate, confirm
+udsota --profile example flash --compress build/example.bin   # the same, sending the image as raw DEFLATE
 udsota --profile example confirm                 # ConfirmImage for an image left unconfirmed
 udsota --profile example reset                   # 11 01; an unconfirmed image rolls back
 udsota --profile example config show             # the writable DIDs, the config status and hash
@@ -24,6 +25,8 @@ udsota keygen --out keys                         # a new ecdsa-mode key pair; no
 
 `config set NAME=VALUE ...` writes the profile's writable DIDs (the example's are commented out). It checks every value against the profile before it opens the bus. Then it opens the extended session, unlocks at `level_extended`, and stages each value with WriteDataByIdentifier (0x2E). `--commit` runs the profile's commit routine, which must answer status 00. `--reset` needs `--commit`. It sends the keyed 11 01, waits for the restart as `flash` does, reads back every key it wrote, and checks the device's config hash when the profile has one. Staged values that are never committed are dropped when the session ends. Firmware that answers 0x2E with NRC 0x11, or the commit routine with 0x31, has no config writes, and the tool stops with exit code 2. `config show` reads the keys, the status DID and the hash check without changing session, and stops the same way when the device serves none of the keys.
 
+`flash --compress` sends the image as a raw DEFLATE stream (Python's `zlib`, level 9, no header), which usually takes an update to 50–65 % of its time on the bus. The RequestDownload still announces the image's own size, and the device writes the same bytes. Once the device takes the compressed download, the tool prints the ratio, and after it the time saved. A device answers 0x31 when it has no compressed downloads, or when the image is larger than its slot, and 0x22 with F1F1 reading `DL_NO_MEMORY` when it has no memory for the inflater now. `--compress` then stops before anything is written: exit code 2 for the first, 1 for the second, whose message says a plain flash may work. `--compress-auto` sends the image uncompressed in both cases instead. `[image] compression` in the profile sets the default, `"deflate"`, `"auto"` or `"none"`, which `--compress`, `--compress-auto` and `--no-compress` override. No download resumes, compressed or not: a new run starts from the first byte.
+
 The tool transmits only on the profile's request ID and never on a `deny_tx` ID. Before its first frame it listens for 2 s and stops if it hears the response ID or the profile's busy value. During a run it stops if a response arrives that it did not ask for.
 
 The exit code says why it stopped:
@@ -32,7 +35,7 @@ The exit code says why it stopped:
 |---|---|
 | 0 | done |
 | 1 | the device refused or failed a step |
-| 2 | refused with nothing written: a bad profile, image, key file or `config set` value, a precheck stop (an image for another board, a running image still unconfirmed, a device that does not serve the udsota status DID F1F0), or firmware without config writes |
+| 2 | refused with nothing written: a bad profile, image, key file or `config set` value, a precheck stop (an image for another board, a running image still unconfirmed, a device that does not serve the udsota status DID F1F0), firmware without config writes, or `flash --compress` on a server without compressed downloads |
 | 3 | another tester holds a session |
 | 4 | a second tester is on the bus |
 
@@ -44,7 +47,7 @@ Start from [`example.toml`](udsota/profiles/example.toml), which comments every 
 |---|---|---|
 | `[can]` | `interface`, `req_id`, `resp_id`, `deny_tx` | the SocketCAN interface, the ID pair, and IDs the tool must never send on |
 | `[security]` | `mode` (`"hmac"`), `label`, `master_file`, `private_key_file`, `device_id_did` (0xF18C), `level_extended` (0x01), `level_programming` (0x03) | the 0x27 keys and the requestSeed levels (odd, 0x01 to 0x7D); without it the tool never unlocks. Mode `hmac` derives each key from `master_file` (32 raw bytes) and `label`; mode `ecdsa` signs each seed with `private_key_file` (a P-256 PEM) and takes no `label` or `master_file`. The mode must match the server's; the core README's Security section explains both and why ecdsa suits a product |
-| `[image]` | `product`, `hw_ids`, `layout_id`, `slot_size` (0x400000) | the image identity `flash` checks before sending |
+| `[image]` | `product`, `hw_ids`, `layout_id`, `slot_size` (0x400000), `compression` (`"none"`) | the image identity `flash` checks before sending, and whether it sends the image compressed: `"deflate"` as `--compress`, `"auto"` as `--compress-auto`, `"none"` as `--no-compress` |
 | `[board]` | `did`, `names` | a DID naming the device's board, and the board name for each `hw_id`, so `flash` refuses an image for another board |
 | `[busy]` | `id`, `byte`, `values` | a frame whose byte at `byte` holds one of `values` means another tester has a session |
 | `[preroll]` | `tester_present_frames` | TesterPresent frames sent first on a quiet bus, for a device whose CAN driver waits to hear traffic |
