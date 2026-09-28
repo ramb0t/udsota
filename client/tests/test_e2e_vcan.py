@@ -16,15 +16,12 @@ import time
 import can
 import pytest
 
-from udsota import cli, profile, wire
-
-from .demo_server import LABEL, MASTER, ROOT, PipeTransport, binary_or_skip, build_image
+from .demo_server import (BUILD_HINT, EXAMPLE, LABEL, MASTER, ROOT, SECURED, build_image, find_binary, image_file,
+                          read_state, run_cli)
 
 IFACE = os.environ.get("UDSOTA_VCAN", "vcan0")
-CLI_TIMEOUT_S = 240
-
-
 IFACE_REQUIRED = "UDSOTA_VCAN" in os.environ   # set (as in CI): a missing vcan, demo or python-can fails
+CLI_TIMEOUT_S = 240
 
 
 # A skip naming what is missing, or a failure when IFACE_REQUIRED.
@@ -39,14 +36,9 @@ def missing(reason):
 def vcan_or_skip():
     if not IFACE.startswith("vcan"):
         missing("UDSOTA_VCAN=%s is not a vcan interface name; this test only runs on vcan" % IFACE)
-    try:
-        binary = binary_or_skip()
-    except pytest.skip.Exception as e:
-        reason = str(e)
-    else:
-        reason = None
-    if reason is not None:
-        missing(reason)
+    binary = find_binary()
+    if binary is None:
+        missing(BUILD_HINT)
     if not os.path.exists("/sys/class/net/%s" % IFACE):
         missing("no %s: modprobe vcan && ip link add dev %s type vcan && ip link set up %s" % (IFACE, IFACE, IFACE))
     return binary
@@ -91,21 +83,9 @@ class VcanLink:
 @pytest.fixture
 def link():
     vcan_or_skip()
-    lk = VcanLink(profile.load("example").resp_id)
+    lk = VcanLink(EXAMPLE.resp_id)
     yield lk
     lk.close()
-
-
-# Runs cli.main over link (the Python ISO-TP stack on vcan) and returns its exit code.
-def run_cli(link, argv):
-    return cli.main(argv, transport=lambda prof, interface: PipeTransport(prof, link))
-
-
-# Reads F1F0 and F189 over link.
-def read_state(link):
-    with PipeTransport(profile.load("example"), link) as t:
-        uds = t.uds()
-        return wire.decode_status(uds.read_did(wire.DID_STATUS)), wire.cstr(uds.read_did(wire.DID_VERSION))
 
 
 # Starts the demo on the interface (fresh temporary slots) and stops it with SIGTERM after the test.
@@ -149,11 +129,10 @@ def udsota(*args, timeout_s=CLI_TIMEOUT_S):
 # flash is a no-op.
 def test_flash_over_vcan_with_python_isotp(vcan_demo, link, tmp_path):
     demo = vcan_demo()
-    image = tmp_path / "v0.2.0.bin"
-    image.write_bytes(build_image("v0.2.0"))
-    argv = ["--profile", "example", "--interface", IFACE, "flash", str(image)]
+    image = image_file(tmp_path, build_image("v0.2.0"), "v0.2.0.bin")
+    argv = ["--profile", "example", "--interface", IFACE, "flash", image]
     assert run_cli(link, argv) == 0, demo.log.read_text()
-    status, version = read_state(link)
+    status, _, version = read_state(link)
     assert (status["running_slot"], status["running_state"], version) == (1, 3, "v0.2.0")
     assert run_cli(link, argv) == 0
 
@@ -165,11 +144,9 @@ def test_flash_with_security_over_vcan_with_python_isotp(vcan_demo, link, tmp_pa
     master.write_bytes(MASTER)
     demo = vcan_demo("--label", LABEL, "--master", str(master), "--skip-boot-delay")
     prof = tmp_path / "secured.toml"
-    prof.write_text('[can]\nreq_id = 0x710\nresp_id = 0x718\n\n[security]\nlabel = "%s"\nmaster_file = "%s"\n\n'
-                    '[image]\nproduct = "example"\nhw_ids = [1]\nlayout_id = 1\n' % (LABEL, master))
-    image = tmp_path / "v0.2.0.bin"
-    image.write_bytes(build_image("v0.2.0"))
-    assert run_cli(link, ["--profile", str(prof), "--interface", IFACE, "flash", str(image)]) == 0, \
+    prof.write_text(SECURED % (LABEL, master))
+    image = image_file(tmp_path, build_image("v0.2.0"), "v0.2.0.bin")
+    assert run_cli(link, ["--profile", str(prof), "--interface", IFACE, "flash", image]) == 0, \
         demo.log.read_text()
 
 
@@ -178,14 +155,13 @@ def test_flash_with_security_over_vcan_with_python_isotp(vcan_demo, link, tmp_pa
 def test_cli_flash_over_vcan(vcan_demo, tmp_path):
     kernel_isotp_or_skip()
     demo = vcan_demo()
-    image = tmp_path / "v0.2.0.bin"
-    image.write_bytes(build_image("v0.2.0"))
-    r = udsota("--profile", "example", "--interface", IFACE, "flash", str(image))
+    image = image_file(tmp_path, build_image("v0.2.0"), "v0.2.0.bin")
+    r = udsota("--profile", "example", "--interface", IFACE, "flash", image)
     assert r.returncode == 0, r.stdout + r.stderr + demo.log.read_text()
     assert "confirmed: running slot 1 VALID" in r.stdout
     r = udsota("--profile", "example", "--interface", IFACE, "info")
     assert r.returncode == 0 and "F189 version: v0.2.0" in r.stdout, r.stdout + r.stderr
-    r = udsota("--profile", "example", "--interface", IFACE, "flash", str(image))
+    r = udsota("--profile", "example", "--interface", IFACE, "flash", image)
     assert r.returncode == 0 and "already runs this image" in r.stdout, r.stdout + r.stderr
 
 
@@ -196,11 +172,9 @@ def test_cli_flash_with_security_over_vcan(vcan_demo, tmp_path):
     master.write_bytes(MASTER)
     demo = vcan_demo("--label", LABEL, "--master", str(master), "--skip-boot-delay")
     prof = tmp_path / "secured.toml"
-    prof.write_text('[can]\nreq_id = 0x710\nresp_id = 0x718\n\n[security]\nlabel = "%s"\nmaster_file = "%s"\n\n'
-                    '[image]\nproduct = "example"\nhw_ids = [1]\nlayout_id = 1\n' % (LABEL, master))
-    image = tmp_path / "v0.2.0.bin"
-    image.write_bytes(build_image("v0.2.0"))
-    r = udsota("--profile", str(prof), "--interface", IFACE, "flash", str(image))
+    prof.write_text(SECURED % (LABEL, master))
+    image = image_file(tmp_path, build_image("v0.2.0"), "v0.2.0.bin")
+    r = udsota("--profile", str(prof), "--interface", IFACE, "flash", image)
     assert r.returncode == 0, r.stdout + r.stderr + demo.log.read_text()
 
 
@@ -210,10 +184,9 @@ def test_cli_flash_with_security_over_vcan(vcan_demo, tmp_path):
 def test_cli_flash_exits_1_when_the_server_withholds_flow_control(vcan_demo, tmp_path):
     kernel_isotp_or_skip()
     demo = vcan_demo("--withhold-fc-after", "64")
-    image = tmp_path / "v0.2.0.bin"
-    image.write_bytes(build_image("v0.2.0"))
+    image = image_file(tmp_path, build_image("v0.2.0"), "v0.2.0.bin")
     t0 = time.monotonic()
-    r = udsota("--profile", "example", "--interface", IFACE, "flash", str(image), timeout_s=30)
+    r = udsota("--profile", "example", "--interface", IFACE, "flash", image, timeout_s=30)
     assert r.returncode == 1 and time.monotonic() - t0 < 15.0, r.stdout + r.stderr + demo.log.read_text()
     assert "block 1:" in r.stderr and "F1F1 reads DL_ABORTED" in r.stderr, r.stderr
 
@@ -222,8 +195,7 @@ def test_cli_flash_exits_1_when_the_server_withholds_flow_control(vcan_demo, tmp
 def test_cli_flash_resends_after_a_lost_flow_control(vcan_demo, tmp_path):
     kernel_isotp_or_skip()
     demo = vcan_demo("--drop-fc-after", "64")
-    image = tmp_path / "v0.2.0.bin"
-    image.write_bytes(build_image("v0.2.0"))
-    r = udsota("--profile", "example", "--interface", IFACE, "flash", str(image), timeout_s=60)
+    image = image_file(tmp_path, build_image("v0.2.0"), "v0.2.0.bin")
+    r = udsota("--profile", "example", "--interface", IFACE, "flash", image, timeout_s=60)
     assert r.returncode == 0, r.stdout + r.stderr + demo.log.read_text()
     assert "--drop-fc-after: losing the FC" in demo.log.read_text()
