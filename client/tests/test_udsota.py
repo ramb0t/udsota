@@ -2681,9 +2681,9 @@ def test_main_diff_flag_misuse(tmp_path, full_path, capsys):
     (tmp_path / "empty").mkdir()
     d = delta_server()
     tr = lambda prof, interface: FakeTransport(d, interface)   # noqa: E731
-    pytest.importorskip("detools")
     assert cli.main(["--profile", full_path, "flash", str(img), "--diff-format", "deflate"], transport=tr) == 2
     assert "--diff-format needs --diff-from" in capsys.readouterr().err
+    pytest.importorskip("detools")                              # load_bases checks for it before the directory
     assert cli.main(["--profile", full_path, "flash", str(img), "--diff-from", str(tmp_path / "empty")],
                     transport=tr) == 2
     assert "holds no .bin files" in capsys.readouterr().err

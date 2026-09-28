@@ -586,14 +586,19 @@ static void test_trailing_bytes_fail_their_36(void)
         set_payload(forms[f].p, forms[f].n);
         g_p[g_p_len++] = 0x00;
         enter_programming();
-        send_34(UDSOTA_DL_DFI_DELTA, (uint32_t)(f == 2u ? sizeof DELTA_TAIL : IMG_LEN));
-        uint8_t bsc = 1;
-        for (size_t off = 0; off < g_p_len; off += BLOCK, bsc++) {   /* the last 36 carries the extra byte */
-            send_36_data(bsc, &g_p[off], g_p_len - off < BLOCK ? g_p_len - off : BLOCK);
+        const uint32_t size = (uint32_t)(f == 2u ? sizeof DELTA_TAIL : IMG_LEN);
+        send_34(UDSOTA_DL_DFI_DELTA, size);
+        size_t off = 0;
+        for (uint8_t bsc = 1; off < g_p_len; bsc++) {                  /* the last 36 carries the extra byte */
+            const size_t n = g_p_len - off < BLOCK ? g_p_len - off : BLOCK;
+            send_36_data(bsc, &g_p[off], n);
+            off += n;
             if (g_resp[0] != 0x76) break;
         }
         EXPECT(0x7F, 0x36, 0x31);
         expect_reason(UDSOTA_DL_BAD_STREAM);
+        TEST_ASSERT_EQUAL_size_t(g_p_len, off);                    /* refused at the last 36 */
+        TEST_ASSERT_EQUAL_UINT32(size, e.next_off);                /* after the whole image was rebuilt */
         TEST_ASSERT_EQUAL_UINT(e.allocs, e.frees);
     }
 }
@@ -619,6 +624,7 @@ static void test_trailing_patch_bytes_under_30_fail_their_36(void)
     EXPECT(0x7F, 0x36, 0x31);
     expect_reason(UDSOTA_DL_BAD_STREAM);
     TEST_ASSERT_TRUE(off < zn);
+    TEST_ASSERT_EQUAL_UINT32(IMG_LEN, e.next_off);              /* the patch had ended: its image was whole */
 }
 
 /* Bytes after the DEFLATE stream's end under 30 fail the 37, as under 10. */
