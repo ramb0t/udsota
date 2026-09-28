@@ -8,6 +8,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "udsota_image.h"
 #include "udsota_wire.h"
 
 #define FAKE_OTA_SECTOR          4096u
@@ -84,7 +85,9 @@ uint32_t fake_ota_resume_point(const fake_ota_t *f);
  * appended SHA-256 (hash_appended must be 1). UDSOTA_DL_OK or UDSOTA_DL_VERIFY_FAILED. */
 udsota_reason_t fake_ota_verify_image(const uint8_t *img, size_t len);
 /* Builds a minimal image that passes udsota_image_check and fake_ota_verify_image: one segment of
- * payload_len bytes (>= 288, multiple of 4) holding esp_app_desc_t (project FAKE_OTA_PROJECT, this version) and
- * the udsota descriptor for hw_id at 288, release-flagged exactly when version matches ^v?[0-9]+\.[0-9]+\.[0-9]+$.
+ * payload_len bytes (>= 288, multiple of 4) holding esp_app_desc_t (id's product, this version) and the udsota
+ * descriptor at 288 with id's hw_id, layout and diag IDs, release-flagged exactly when version matches
+ * ^v?[0-9]+\.[0-9]+\.[0-9]+$. id NULL: hw_id 1 and the FAKE_OTA_* identity; a NULL product is FAKE_OTA_PROJECT.
  * Returns the image length, or 0 if cap is short, an argument is bad or the SHA-256 fails. */
-size_t fake_ota_build_image(uint8_t *out, size_t cap, const char *version, uint8_t hw_id, uint32_t payload_len);
+size_t fake_ota_build_image(uint8_t *out, size_t cap, const char *version, const udsota_image_ctx_t *id,
+                            uint32_t payload_len);

@@ -4,14 +4,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include "sha256_host.h"
 #include "udsota_esp32_image.h"
-#include "udsota_image_desc.h"
 
-#define SEG0_OFS     32u    /* segment 0 data: esp_image_header_t 24 + esp_image_segment_header_t 8 */
-#define PROJECT_OFS  80u    /* esp_app_desc_t.project_name (32 B) */
-#define HASH_LEN     32u
-#define SEED_CAP     (SEG0_OFS + DEMO_SEED_PAYLOAD + 16u + HASH_LEN)
+#define SEED_CAP (32u + DEMO_SEED_PAYLOAD + 16u + 32u)   /* headers, segment 0, checksum padding, SHA-256 */
 
 /* Monotonic milliseconds, for the emulated worker jobs. */
 static uint64_t mono_ms(void)
@@ -19,13 +14,6 @@ static uint64_t mono_ms(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
-}
-
-/* Writes a little-endian u16. */
-static void put_le16(uint8_t *p, uint16_t v)
-{
-    p[0] = (uint8_t)v;
-    p[1] = (uint8_t)(v >> 8);
 }
 
 /* Re-reads the version rule's inputs from the running slot: its version and whether it is a clean release. */
@@ -289,7 +277,7 @@ bool demo_engine_open(demo_engine_t *e, const char *dir, uint32_t slot_size, boo
     uint8_t sha[32];
     if (!fake_ota_slot_desc(&e->ota, e->ota.running_slot, v, sha)) {
         uint8_t img[SEED_CAP];
-        const size_t n = demo_image_build(img, sizeof img, seed_version, cfg, DEMO_SEED_PAYLOAD);
+        const size_t n = fake_ota_build_image(img, sizeof img, seed_version, &e->rules, DEMO_SEED_PAYLOAD);
         if (n == 0u || fake_ota_load_slot(&e->ota, e->ota.running_slot, img, n) != 0) {
             fake_ota_close(&e->ota);
             return false;
@@ -334,29 +322,12 @@ udsota_engine_t demo_engine_ops(demo_engine_t *e)
     };
 }
 
-/* fake_ota_build_image's image, restamped for cfg and resealed; see demo_engine.h. */
+/* fake_ota_build_image's image with cfg's identity; see demo_engine.h. */
 size_t demo_image_build(uint8_t *out, size_t cap, const char *version, const udsota_config_t *cfg,
                         uint32_t payload_len)
 {
-    const char *product = (cfg->product != NULL) ? cfg->product : FAKE_OTA_PROJECT;
-    if (strlen(product) > 31u) {
-        return 0;
-    }
-    const size_t total = fake_ota_build_image(out, cap, version, cfg->hw_id, payload_len);
-    if (total == 0u) {
-        return 0;
-    }
-    memset(&out[PROJECT_OFS], 0, 32);
-    memcpy(&out[PROJECT_OFS], product, strlen(product));
-    uint8_t *d = &out[UDSOTA_IMG_DESC_OFFSET];
-    d[offsetof(udsota_image_desc_t, partition_layout_id)] = cfg->layout_id;
-    put_le16(&d[offsetof(udsota_image_desc_t, diag_request_id)], cfg->req_id);
-    put_le16(&d[offsetof(udsota_image_desc_t, diag_response_id)], cfg->resp_id);
-    const size_t padded = total - HASH_LEN;         /* segment 0, then the checksum byte ending a 16-byte block */
-    uint8_t x = 0xEF;                               /* ESP_ROM_CHECKSUM_INITIAL */
-    for (size_t i = SEG0_OFS; i < SEG0_OFS + payload_len; i++) {
-        x ^= out[i];
-    }
-    out[padded - 1u] = x;
-    return sha256_host(out, padded, &out[padded]) ? total : 0u;
+    const udsota_image_ctx_t id = {.hw_id = cfg->hw_id, .partition_layout_id = cfg->layout_id,
+                                   .diag_request_id = cfg->req_id, .diag_response_id = cfg->resp_id,
+                                   .product = cfg->product};
+    return fake_ota_build_image(out, cap, version, &id, payload_len);
 }

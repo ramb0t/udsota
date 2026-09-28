@@ -24,7 +24,7 @@ static size_t     img_len;
 void setUp(void)
 {
     TEST_ASSERT_TRUE(fake_ota_open(&f, FAKE_OTA_TEST_DIR, SLOT, true));
-    img_len = fake_ota_build_image(img, sizeof img, "v0.3.0", 1, PAYLOAD);
+    img_len = fake_ota_build_image(img, sizeof img, "v0.3.0", NULL, PAYLOAD);
     TEST_ASSERT_NOT_EQUAL(0, img_len);
 }
 
@@ -109,8 +109,8 @@ static void test_built_image_passes_both_checks(void)
     TEST_ASSERT_EQUAL_INT(UDSOTA_DL_OK, udsota_image_check(img, UDSOTA_IMAGE_MIN_LEN, (uint32_t)img_len, &ic, &release));
     TEST_ASSERT_TRUE(release);
     TEST_ASSERT_EQUAL_INT(UDSOTA_DL_OK, fake_ota_verify_image(img, img_len));
-    TEST_ASSERT_EQUAL_UINT(0, fake_ota_build_image(img, 100, "v0.3.0", 1, PAYLOAD));   /* cap too small */
-    TEST_ASSERT_EQUAL_UINT(0, fake_ota_build_image(img, sizeof img, "v0.3.0", 1, 287)); /* no room for descriptors */
+    TEST_ASSERT_EQUAL_UINT(0, fake_ota_build_image(img, 100, "v0.3.0", NULL, PAYLOAD));   /* cap too small */
+    TEST_ASSERT_EQUAL_UINT(0, fake_ota_build_image(img, sizeof img, "v0.3.0", NULL, 287)); /* no room for descriptors */
 }
 
 /* The descriptor's release flag is set exactly for a clean [v]M.m.p, so both kinds pass image_check,
@@ -130,7 +130,7 @@ static void test_release_flag_follows_version(void)
         .running_version = {0, 2, 9}, .running_is_release = false, .slot_size = SLOT,
     };
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
-        img_len = fake_ota_build_image(img, sizeof img, cases[i].v, 1, PAYLOAD);
+        img_len = fake_ota_build_image(img, sizeof img, cases[i].v, NULL, PAYLOAD);
         TEST_ASSERT_NOT_EQUAL_MESSAGE(0, img_len, cases[i].v);
         TEST_ASSERT_EQUAL_HEX8_MESSAGE(cases[i].release ? UDSOTA_IMG_FLAG_RELEASE : 0u, img[FLAGS_OFS], cases[i].v);
         bool release = !cases[i].release;

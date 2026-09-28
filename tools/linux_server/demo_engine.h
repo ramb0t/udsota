@@ -60,7 +60,7 @@ udsota_engine_t demo_engine_ops(demo_engine_t *e);
 void demo_engine_version(const demo_engine_t *e, char out[33]);
 
 /* Builds an image that passes the demo's first-block rules and FF01: fake_ota_build_image's one-segment image
- * (hw_id, version, payload_len bytes of segment 0), restamped with cfg's product, layout and IDs and resealed
- * (checksum byte and appended SHA-256). Returns its length, or 0 on a bad argument or a short out. */
+ * (version, payload_len bytes of segment 0) carrying cfg's product, hw_id, layout and IDs. Returns its length, or 0
+ * on a bad argument or a short out. */
 size_t demo_image_build(uint8_t *out, size_t cap, const char *version, const udsota_config_t *cfg,
                         uint32_t payload_len);

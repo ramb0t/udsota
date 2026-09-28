@@ -8,7 +8,6 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include "udsota_image.h"        /* udsota_parse_version */
 #include "udsota_image_desc.h"
 #include "sha256_host.h"
 
@@ -485,10 +484,12 @@ bool fake_ota_slot_hash(const fake_ota_t *f, uint8_t slot, uint8_t out[32])
 }
 
 /* Builds a one-segment image that passes udsota_image_check and fake_ota_verify_image. */
-size_t fake_ota_build_image(uint8_t *out, size_t cap, const char *version, uint8_t hw_id, uint32_t payload_len)
+size_t fake_ota_build_image(uint8_t *out, size_t cap, const char *version, const udsota_image_ctx_t *id,
+                            uint32_t payload_len)
 {
-    if (out == NULL || version == NULL || strlen(version) > 31 || payload_len < FAKE_OTA_MIN_PAYLOAD ||
-        payload_len % 4u != 0) {
+    const char *product = (id != NULL && id->product != NULL) ? id->product : FAKE_OTA_PROJECT;
+    if (out == NULL || version == NULL || strlen(version) > 31 || strlen(product) > 31 ||
+        payload_len < FAKE_OTA_MIN_PAYLOAD || payload_len % 4u != 0) {
         return 0;
     }
     size_t unpadded = HDR_LEN + SEG_HDR_LEN + payload_len;
@@ -509,15 +510,16 @@ size_t fake_ota_build_image(uint8_t *out, size_t cap, const char *version, uint8
     put_le32(&out[28], payload_len);                 /* segment 0 data_len */
     put_le32(&out[APP_DESC_OFS], APP_DESC_MAGIC);
     memcpy(&out[FAKE_OTA_VERSION_OFS], version, strlen(version));
-    memcpy(&out[PROJECT_OFS], FAKE_OTA_PROJECT, strlen(FAKE_OTA_PROJECT));
+    memcpy(&out[PROJECT_OFS], product, strlen(product));
     memcpy(&out[IDF_VER_OFS], "v6.1", 4);
     if (!sha256_host((const uint8_t *)version, strlen(version), &out[FAKE_OTA_ELF_SHA_OFS])) {   /* distinct per version */
         return 0;
     }
     const udsota_image_desc_t d = {
-        .magic = UDSOTA_IMG_DESC_MAGIC, .desc_version = UDSOTA_IMG_DESC_VERSION, .hw_id = hw_id,
-        .partition_layout_id = FAKE_OTA_LAYOUT_ID,
-        .diag_request_id = FAKE_OTA_REQ_ID, .diag_response_id = FAKE_OTA_RESP_ID,
+        .magic = UDSOTA_IMG_DESC_MAGIC, .desc_version = UDSOTA_IMG_DESC_VERSION, .hw_id = id ? id->hw_id : 1u,
+        .partition_layout_id = id ? id->partition_layout_id : FAKE_OTA_LAYOUT_ID,
+        .diag_request_id = id ? id->diag_request_id : FAKE_OTA_REQ_ID,
+        .diag_response_id = id ? id->diag_response_id : FAKE_OTA_RESP_ID,
         .flags = is_clean_tag(version) ? UDSOTA_IMG_FLAG_RELEASE : 0u,   /* as the ESP32 port's build sets it */
     };
     memcpy(&out[UDSOTA_IMG_DESC_OFFSET], &d, sizeof d);          /* little-endian host, as on the S3 */

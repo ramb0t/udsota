@@ -70,7 +70,7 @@ Exit codes: 0 at EOF or on a signal, 1 on a runtime error, such as a missing int
 
 ## Images
 
-The engine checks what an ESP-IDF build would carry, but it does not run a real app. An image is `fake_ota_build_image`'s one-segment ESP32-S3 image. It holds `esp_app_desc_t` at offset 32 and the udsota descriptor at 288, with the release flag set exactly when the version is a clean `[v]X.Y.Z`. Its `app_elf_sha256` is the SHA-256 of the version string, then come the checksum byte and the appended SHA-256 over the image. `--make-image` restamps it with the configured product, layout and IDs and reseals it. `client/tests/demo_server.py` builds the same bytes in Python. There is no signature check, so F1F0 flag 0x01 stays clear.
+The engine checks what an ESP-IDF build would carry, but it does not run a real app. An image is `fake_ota_build_image`'s one-segment ESP32-S3 image. It holds `esp_app_desc_t` at offset 32 and the udsota descriptor at 288, with the release flag set exactly when the version is a clean `[v]X.Y.Z`. Its `app_elf_sha256` is the SHA-256 of the version string, then come the checksum byte and the appended SHA-256 over the image. `--make-image` builds it with the configured product, hw_id, layout and IDs. `client/tests/demo_server.py` builds the same bytes in Python. There is no signature check, so F1F0 flag 0x01 stays clear.
 
 ## Tests
 
