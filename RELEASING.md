@@ -1,5 +1,7 @@
 # Releasing udsota
 
+How udsota is versioned and released. After a user-visible merge, run **Actions → cut release** with minor or patch; the rest explains what that does and the by-hand paths.
+
 ## Version numbers
 
 udsota uses [semantic versioning](https://semver.org). While it is 0.x:
@@ -32,7 +34,6 @@ To release by hand instead, merge a PR that makes the same two edits (`python to
 ## Rules
 
 - Tag only commits on `main` whose CI is green. The cut's own commit changes only the CHANGELOG and `__version__`, on top of one whose CI passed.
-- Tags are annotated and named `vX.Y.Z`.
 - Never move or delete a published tag, or replace a published Release's files. Fix a bad release with a new patch release.
 
 ## Releasing an older tag
