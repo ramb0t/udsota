@@ -22,6 +22,28 @@ menu "udsota ESP32 port"
             Always internal RAM, since the worker writes flash. 8192 fits the RSA-3072 signature check
             inside esp_ota_end().
 
+    config UDSOTA_ESP32_COMPRESSION
+        bool "Compressed downloads (RequestDownload DFI 0x10, raw DEFLATE)"
+        default n
+        help
+            Serve downloads whose 0x36 blocks carry a raw DEFLATE stream of the image. The flash worker
+            inflates each block (tinfl: the ROM's copy, which every target has) before it writes, so
+            an update crosses the bus in roughly 60 % of the time. Each such download allocates about 47 KB
+            at its 34 (the inflater's 11 KB state and 32 KB dictionary, and a 4 KB internal buffer) and frees
+            it at its 37 or abort; nothing at boot. A 34 that finds no memory is refused with 0x22.
+            Compressed downloads cannot resume. Off, a 34 with DFI 0x10 answers 0x31 as before.
+
+    config UDSOTA_ESP32_INFLATE_PSRAM
+        bool "Inflater state and dictionary in PSRAM"
+        depends on UDSOTA_ESP32_COMPRESSION && SPIRAM && !(IDF_TARGET_ESP32 && ESP32_REV_MIN_FULL < 300)
+        default y
+        help
+            Allocate the inflater's 43 KB in PSRAM, falling back to internal RAM, so only the 4 KB
+            buffer the worker writes flash from comes from internal RAM. Off, all of it is internal.
+            Not offered for an ESP32 below revision 3: its PSRAM cache bug can lose a write when an
+            interrupt lands, and the ROM's tinfl, which writes the dictionary, is not built with
+            the compiler's workaround (ESP-IDF keeps ROM newlib off PSRAM there for the same reason).
+
     config UDSOTA_ESP32_DEBUG_MEASURE
         bool "Log update timings, stack headroom and internal heap"
         default n

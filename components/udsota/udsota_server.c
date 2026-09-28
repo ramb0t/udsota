@@ -619,7 +619,36 @@ static void dl_flash_failed(udsota_server_t *s)
     s->last_dl.reason_code = UDSOTA_DL_FLASH_ERROR;
 }
 
-/* 0x34: DFI 00, ALFID 44, address 0 (no resume point), 0 < size <= slot, gated like 10 02; 74 20 0F FF. */
+/* True for a dataFormatIdentifier the server takes: 00, and 10 (raw DEFLATE) when the engine has zbegin and
+ * UDSOTA_COMPRESSION is on. */
+static bool dl_dfi_ok(const udsota_server_t *s, uint8_t dfi)
+{
+    return dfi == UDSOTA_DL_DFI || (UDSOTA_COMPRESSION && dfi == UDSOTA_DL_DFI_DEFLATE && s->engine.zbegin != NULL);
+}
+
+/* True while the open download is compressed. A macro, so that with UDSOTA_COMPRESSION 0 it is the constant 0 at any
+ * optimisation level and every compressed branch compiles away. */
+#define DL_Z(s) (UDSOTA_COMPRESSION && (s)->dl_compressed)
+
+/* Bytes the 36s of this download may carry: memorySize, or UDSOTA_DL_Z_BOUND of it when compressed. */
+static uint32_t dl_limit(const udsota_server_t *s)
+{
+    if (!DL_Z(s)) {
+        return s->dl_announced;
+    }
+    const uint64_t bound = UDSOTA_DL_Z_BOUND(s->dl_announced);
+    return bound > UINT32_MAX ? UINT32_MAX : (uint32_t)bound;
+}
+
+/* A reason code from an engine result: r itself when it names one, else fallback. */
+static uint8_t dl_reason(int r, udsota_reason_t fallback)
+{
+    return (r > (int)UDSOTA_DL_OK && r < (int)UDSOTA_DL_REASON_COUNT) ? (uint8_t)r : (uint8_t)fallback;
+}
+
+/* 0x34: DFI 00 (or 10 with engine.zbegin), ALFID 44, address 0 (no resume point), 0 < size <= slot, gated like 10 02;
+ * 74 20 0F FF. With DFI 10 a failed zbegin answers 0x22 before anything else changes, save an unverified image the
+ * same 34 released. */
 static size_t handle_request_download(udsota_server_t *s, const uint8_t *req, size_t req_len,
                                       uint8_t *resp, size_t resp_max)
 {
@@ -637,11 +666,24 @@ static size_t handle_request_download(udsota_server_t *s, const uint8_t *req, si
     }
     const uint32_t addr = udsota_get_u32be(&req[3]);
     const uint32_t size = udsota_get_u32be(&req[7]);
-    if (req[1] != UDSOTA_DL_DFI || req[2] != UDSOTA_DL_ALFID || addr != 0u || size == 0u || size > dl_slot_size(s)) {
+    if (!dl_dfi_ok(s, req[1]) || req[2] != UDSOTA_DL_ALFID || addr != 0u || size == 0u || size > dl_slot_size(s)) {
         return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_REQUEST_OUT_OF_RANGE);
     }
     if (resp_max < 4u) {
         return 0;
+    }
+    const bool compressed = UDSOTA_COMPRESSION && req[1] == UDSOTA_DL_DFI_DEFLATE;
+    if (compressed) {
+        if (s->ota_open) {                        /* released first, so its abort cannot free the new inflater */
+            s->engine.abort(s->engine.ctx);
+            s->ota_open = false;
+        }
+        const int rc = s->engine.zbegin(s->engine.ctx, size);
+        if (rc != 0) {
+            s->last_dl.reason_code = dl_reason(rc, UDSOTA_DL_NO_MEMORY);
+            s->last_dl.bytes_received = 0u;
+            return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_CONDITIONS_NOT_CORRECT);
+        }
     }
     /* Accepted. The other slot stops counting as verified before anything is queued. */
     if (s->engine.unverify != NULL) {
@@ -653,6 +695,8 @@ static size_t handle_request_download(udsota_server_t *s, const uint8_t *req, si
         s->ota_open = false;
     }
     s->download_active = true;
+    s->ota_open = compressed;                     /* the engine holds the inflater from here */
+    s->dl_compressed = compressed;
     s->dl_complete = false;
     s->next_bsc = 1u;
     s->dl_announced = size;
@@ -668,18 +712,40 @@ static size_t handle_request_download(udsota_server_t *s, const uint8_t *req, si
     return 4;
 }
 
+/* True for a compressed block's result that refuses the data rather than the flash: a first-block rule
+ * (UDSOTA_DL_BAD_HEADER to UDSOTA_DL_TOO_BIG) or UDSOTA_DL_BAD_STREAM. */
+static bool dl_z_refused(int result)
+{
+    return (result >= (int)UDSOTA_DL_BAD_HEADER && result <= (int)UDSOTA_DL_TOO_BIG) ||
+           result == (int)UDSOTA_DL_BAD_STREAM;
+}
+
 /* Final answer for a 0x36 job (udsota_job_done_fn): 76 BSC once the worker wrote the block, else 0x72 and the
- * download ends with UDSOTA_DL_FLASH_ERROR. job_arg carries the block's data length in bits 8..20 and its BSC in bits 0..7. */
+ * download ends with UDSOTA_DL_FLASH_ERROR. A compressed block the engine refused (dl_z_refused) ends it with 0x31
+ * and that reason instead, as a first-block refusal does. job_arg carries the block's data length in bits 8..20 and
+ * its BSC in bits 0..7. */
 static size_t dl_block_done(udsota_server_t *s, int result, uint8_t *resp, size_t resp_max, uint32_t now_ms)
 {
     (void)now_ms;
     const uint8_t bsc = (uint8_t)(s->job_arg & 0xFFu);
+    if (result != 0 && DL_Z(s) && dl_z_refused(result)) {
+        abort_download(s);
+        s->last_dl.reason_code = (uint8_t)result;
+        return udsota_nrc(resp, resp_max, UDSOTA_SID_TRANSFER_DATA, UDSOTA_NRC_REQUEST_OUT_OF_RANGE);
+    }
     if (result != 0) {
         dl_flash_failed(s);
         return udsota_nrc(resp, resp_max, UDSOTA_SID_TRANSFER_DATA, UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE);
     }
     s->dl_received += s->job_arg >> 8;
-    s->dl_written += s->job_arg >> 8;             /* the block's bytes are image bytes */
+    if (!DL_Z(s)) {
+        s->dl_written += s->job_arg >> 8;         /* the block's bytes are image bytes */
+    } else if (s->engine.zwritten != NULL) {
+        const uint32_t written = s->engine.zwritten(s->engine.ctx);   /* compressed: what the stream wrote */
+        if (written > s->dl_written) {
+            s->dl_written = written;              /* done never shrinks, whatever the engine says */
+        }
+    }
     s->progress_block = true;
     s->next_bsc = (uint8_t)(bsc + 1u);            /* 0xFF wraps to 0x00 */
     s->last_dl.bytes_received = s->dl_received;
@@ -694,7 +760,8 @@ static size_t dl_block_done(udsota_server_t *s, int result, uint8_t *resp, size_
 /* 0x36: conditions (the STmin monitor, then gate(CONTINUE_TRANSFER)), repeat (76, no rewrite), counter (0x73),
  * overrun (0x71), first-block check (0x31), then the erase (first block) and the write go to the worker;
  * dl_block_done answers. The gate's 0x21 is "retry": the transfer stays open; any other refusal ends it and the
- * session. */
+ * session. A compressed block goes whole to engine.zwrite after the overrun check, which bounds it by
+ * UDSOTA_DL_Z_BOUND; the engine runs the first-block check once enough is inflated. */
 static size_t handle_transfer_data(udsota_server_t *s, const uint8_t *req, size_t req_len,
                                    uint8_t *resp, size_t resp_max, uint32_t now_ms)
 {
@@ -734,9 +801,13 @@ static size_t handle_transfer_data(udsota_server_t *s, const uint8_t *req, size_
         udsota_sat_inc16(&s->counters.seq_errors);
         return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_WRONG_BLOCK_SEQUENCE_COUNTER);
     }
-    if (len > s->dl_announced - s->dl_received) {
+    if (len > dl_limit(s) - s->dl_received) {
         abort_download(s);                        /* iso14229 server.c:1060-1062: 0x71 ends the transfer */
         return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_TRANSFER_DATA_SUSPENDED);
+    }
+    if (DL_Z(s)) {
+        return udsota_job_start(s, sid, false, s->engine.zwrite(s->engine.ctx, data, len), dl_block_done,
+                                ((uint32_t)len << 8) | bsc, resp, resp_max, now_ms);
     }
     if (!s->ota_open) {
         /* First block: check the image before anything is erased. */
@@ -759,7 +830,8 @@ static size_t handle_transfer_data(udsota_server_t *s, const uint8_t *req, size_
 }
 
 /* 0x37: closes the transfer once every announced byte has arrived (else 0x24, still open); 77. The OTA
- * handle stays open for FF01. */
+ * handle stays open for FF01. A compressed transfer closes once engine.zend finds the stream ended at exactly
+ * memorySize with nothing after it; else 0x72, the download ends and F1F1 records UDSOTA_DL_BAD_STREAM. */
 static size_t handle_transfer_exit(udsota_server_t *s, size_t req_len, uint8_t *resp, size_t resp_max)
 {
     const uint8_t sid = UDSOTA_SID_TRANSFER_EXIT;
@@ -770,11 +842,23 @@ static size_t handle_transfer_exit(udsota_server_t *s, size_t req_len, uint8_t *
     if (req_len != 1u) {
         return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_INCORRECT_LENGTH);
     }
-    if (!s->download_active || s->dl_received != s->dl_announced) {
+    if (!s->download_active || (!DL_Z(s) && s->dl_received != s->dl_announced)) {
         return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_REQUEST_SEQUENCE_ERROR);
     }
     if (resp_max < 1u) {
         return 0;
+    }
+    if (DL_Z(s)) {
+        const int rc = s->engine.zend(s->engine.ctx);
+        if (rc != 0) {
+            abort_download(s);
+            s->last_dl.reason_code = dl_reason(rc, UDSOTA_DL_BAD_STREAM);
+            return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE);
+        }
+        if (s->dl_written != s->dl_announced) {   /* the stream ended at memorySize: every byte is written */
+            s->dl_written = s->dl_announced;
+            s->progress_block = true;
+        }
     }
     s->download_active = false;
     s->dl_complete = true;                        /* FF01 may now verify the open handle */
@@ -1063,7 +1147,7 @@ static udsota_progress_t progress_of(const udsota_server_t *s)
     } else if (s->job_running && s->job_done == check_done) {
         p.stage = UDSOTA_STAGE_VERIFYING;              /* engines report no hash progress: 0 of 0 */
     } else if (s->download_active || (s->dl_complete && s->ota_open)) {
-        const bool erasing = s->download_active && s->dl_written == 0u;
+        const bool erasing = s->download_active && s->dl_received == 0u;   /* no 36 accepted yet */
         p.stage = erasing ? UDSOTA_STAGE_ERASING : UDSOTA_STAGE_WRITING;
         p.total = s->dl_announced;
         p.done = (s->dl_written < p.total) ? s->dl_written : p.total;
@@ -1071,17 +1155,18 @@ static udsota_progress_t progress_of(const udsota_server_t *s)
     return p;
 }
 
-/* Reports progress to hooks.progress, once, at the end of the server call that changed the stage or wrote a
- * block. */
+/* Reports progress to hooks.progress, once, at the end of the server call that changed the stage or the last reason,
+ * or wrote a block. */
 static void progress_sync(udsota_server_t *s)
 {
     const udsota_progress_t p = progress_of(s);
     const bool block = s->progress_block;
     s->progress_block = false;
-    if ((uint8_t)p.stage == s->progress_stage && !block) {
+    if ((uint8_t)p.stage == s->progress_stage && !block && p.last_reason == s->progress_reason) {
         return;
     }
     s->progress_stage = (uint8_t)p.stage;
+    s->progress_reason = p.last_reason;
     if (s->hooks.progress != NULL) {
         s->hooks.progress(s->hooks.ctx, &p);
     }

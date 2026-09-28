@@ -13,11 +13,15 @@
  * iso14229's fuzz_server.cc idea (MIT, Nick James Kirkby & Co-Operators): a stream of requests with
  * fuzzed waits between them. No iso14229 code is copied.
  *
- * Built three times: fuzz_udsota with the app hooks NULL; fuzz_udsota_app_hooks (UDSOTA_FUZZ_APP_HOOKS=1) with
- * did_write, routine and routine_poll set, where it also checks that an app routine has exactly one owner; and
+ * Built four times: fuzz_udsota with the app hooks NULL; fuzz_udsota_app_hooks (UDSOTA_FUZZ_APP_HOOKS=1) with
+ * did_write, routine and routine_poll set, where it also checks that an app routine has exactly one owner;
  * fuzz_udsota_progress (UDSOTA_FUZZ_PROGRESS=1) with the progress hook set, where it also checks that done never
  * passes total nor shrinks within a download, and that the hook runs at most once per call and reports every
- * change of stage. Its answers, and so its PASS line, are fuzz_udsota's.
+ * change of stage (its answers, and so its PASS line, are fuzz_udsota's); and fuzz_udsota_z (UDSOTA_FUZZ_Z=1 and
+ * UDSOTA_FUZZ_PROGRESS=1), where the engine also serves compressed downloads (DFI 0x10) through udsota_zstream and
+ * the real tinfl, the download states are reached with a compressed preamble, the generated inputs add raw DEFLATE
+ * streams of random images, intact and mutated, sent as whole 34/36/37/FF01 sequences, and the progress checks
+ * hold on the compressed path too.
  *
  * libFuzzer, on a machine with clang:
  *   clang -g -O1 -fsanitize=fuzzer,address,undefined -DUDSOTA_LIBFUZZER <includes> fuzz_udsota.c
@@ -40,6 +44,12 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include "udsota.h"
+#ifdef UDSOTA_FUZZ_Z
+#include "udsota_image.h"
+#include "udsota_tinfl.h"
+#include "udsota_zstream.h"
+#include "miniz/miniz.h"   /* tdefl, to make the generated streams */
+#endif
 
 #ifndef UDSOTA_FUZZ_APP_HOOKS
 #define UDSOTA_FUZZ_APP_HOOKS 0   /* 1: FUZZ_HOOKS also sets did_write, routine and routine_poll */
@@ -51,6 +61,8 @@
 /* Every engine and hook callback is mocked; these trip if the API structs gain a callback. */
 _Static_assert(offsetof(udsota_engine_t, slot_size) == 12u * sizeof(void (*)(void)),
                "udsota_engine_t gained a callback: mock it in FUZZ_ENGINE and update this count");
+_Static_assert(offsetof(udsota_engine_t, zwritten) + sizeof(void (*)(void)) == sizeof(udsota_engine_t),
+               "udsota_engine_t gained a member after zwritten: mock it in FUZZ_ENGINE and move this check");
 _Static_assert(offsetof(udsota_hooks_t, ctx) == 7u * sizeof(void (*)(void)),
                "udsota_hooks_t gained a callback: mock it in FUZZ_HOOKS and update this count");
 _Static_assert(offsetof(udsota_hooks_t, progress) + sizeof(void (*)(void)) == sizeof(udsota_hooks_t),
@@ -109,12 +121,18 @@ typedef struct {                               /* the mock platform behind the e
     unsigned progress_calls;                   /* hooks.progress calls in the current server call */
     udsota_progress_t progress;                /* what hooks.progress last got (IDLE, 0 of 0 after init) */
 #endif
+#ifdef UDSOTA_FUZZ_Z
+    int      job_result;                       /* async: the first failure of the queued zwrites, for engine.poll */
+#endif
 } mock_t;
 
 typedef enum {                                 /* platform ops whose fuzz-phase calls the coverage floor counts */
     OP_BEGIN, OP_WRITE, OP_END, OP_ABORT, OP_ACTIVATE, OP_CONFIRM, OP_IMAGE_CHECK, OP_RESET, OP_UNVERIFY,
 #if UDSOTA_FUZZ_APP_HOOKS
     OP_DID_WRITE, OP_ROUTINE, OP_ROUTINE_POLL,
+#endif
+#ifdef UDSOTA_FUZZ_Z
+    OP_ZBEGIN, OP_ZWRITE, OP_ZEND,
 #endif
     OP_COUNT
 } op_id_t;
@@ -228,6 +246,11 @@ static int queue_job(void)
     if (!M.async) {
         return 0;
     }
+#ifdef UDSOTA_FUZZ_Z
+    if (!M.busy || (int32_t)(M.now - M.busy_until) >= 0) {
+        M.job_result = 0;                      /* a new batch */
+    }
+#endif
     const uint32_t start = M.busy ? M.busy_until : M.now;
     M.busy_until = start + JOB_MS;
     M.busy = true;
@@ -291,8 +314,20 @@ static int mock_ota_end(void *ctx)
     return queue_job();
 }
 
-/* Mock engine.abort: queued; the server never waits on it. */
-static void mock_ota_abort(void *ctx) { count_op(OP_ABORT); (void)queue_job(); }
+#ifdef UDSOTA_FUZZ_Z
+static udsota_zstream_t g_zs;                  /* the compressed download the z ops run */
+static void z_close(void);
+#endif
+
+/* Mock engine.abort: queued; the server never waits on it. The z build also frees any open stream. */
+static void mock_ota_abort(void *ctx)
+{
+    count_op(OP_ABORT);
+    (void)queue_job();
+#ifdef UDSOTA_FUZZ_Z
+    z_close();
+#endif
+}
 
 /* Mock ota_activate (F001's set_boot): queued; the job result is 0. */
 static int mock_ota_activate(void *ctx)
@@ -364,14 +399,19 @@ static uint32_t mock_tx_pending(void *ctx)
     return 0;
 }
 
-/* Mock engine.poll: UDSOTA_PENDING until the async worker's queue drains, then 0. */
+/* Mock engine.poll: UDSOTA_PENDING until the async worker's queue drains, then 0 (the z build: the batch's first
+ * zwrite failure). */
 static int mock_job_poll(void *ctx)
 {
     if (M.busy && (int32_t)(M.now - M.busy_until) < 0) {
         return UDSOTA_PENDING;
     }
     M.busy = false;
+#ifdef UDSOTA_FUZZ_Z
+    return M.job_result;
+#else
     return 0;
+#endif
 }
 
 #define FUZZ_GATE_NRC 0x88u   /* vehicleSpeedTooHigh: variant 2's NRC, one the core never sends itself */
@@ -559,6 +599,137 @@ static void mock_dtc_setting(void *ctx, bool on)
     (void)on;
 }
 
+#ifdef UDSOTA_FUZZ_Z
+/* ---- Compressed downloads: udsota_zstream over the real tinfl, into the mock flash ops ---- */
+
+#define Z_OUT_LEN   512u                        /* a small stream buffer, so an image takes many writes */
+#define Z_MAPS      4u                          /* inflater allocations live at once: the state and the dictionary */
+static udsota_tinfl_t g_tinfl;
+static arena_t        g_zarena;                 /* holds g_zout flush against its end guard page */
+static uint8_t       *g_zout;                   /* Z_OUT_LEN bytes; a write past them faults */
+static long           g_z_live;                 /* inflater allocations not yet freed */
+static unsigned long  g_z_allocs;
+static struct { uint8_t *p, *base; size_t len; } g_zmaps[Z_MAPS];   /* each allocation's own guarded mapping */
+static const uint8_t *g_z_expect;               /* an intact generated stream's image, for the output oracle */
+static size_t         g_z_expect_len;
+
+/* The inflater's allocations, each flush against a PROT_NONE page (16-byte aligned, so an overrun of up to 15 bytes
+ * goes unseen); every 5th fails once the preamble is done, for 34's 0x22 path. */
+static void *z_alloc(void *ctx, size_t n)
+{
+    if (!g_in_preamble && ++g_z_allocs % 5u == 0u) {
+        return NULL;
+    }
+    const size_t ps = (size_t)sysconf(_SC_PAGESIZE);
+    const size_t used = (n + 15u) & ~(size_t)15u;
+    const size_t len = ((used + ps - 1u) / ps + 1u) * ps;
+    for (size_t i = 0; i < Z_MAPS; i++) {
+        if (g_zmaps[i].p == NULL) {
+            uint8_t *base = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (base == MAP_FAILED || mprotect(base + len - ps, ps, PROT_NONE) != 0) {
+                die("mmap/mprotect of an inflater allocation failed");
+            }
+            g_zmaps[i].base = base;
+            g_zmaps[i].len = len;
+            g_zmaps[i].p = base + len - ps - used;
+            g_z_live++;
+            return g_zmaps[i].p;
+        }
+    }
+    fail("the inflater holds more than Z_MAPS allocations", NULL, 0, NULL, 0);
+    return NULL;
+}
+
+/* Frees one inflater allocation: unmaps it, so a later use faults. */
+static void z_free(void *ctx, void *p)
+{
+    for (size_t i = 0; i < Z_MAPS; i++) {
+        if (g_zmaps[i].p == p) {
+            munmap(g_zmaps[i].base, g_zmaps[i].len);
+            g_zmaps[i].p = NULL;
+            g_z_live--;
+            return;
+        }
+    }
+    fail("the inflater freed memory it was never given", NULL, 0, NULL, 0);
+}
+
+/* Closes the open stream, if any, and checks nothing is left allocated. */
+static void z_close(void)
+{
+    udsota_zstream_close(&g_zs);
+    if (g_z_live != 0) {
+        fail("the inflater leaked or double-freed memory", NULL, 0, NULL, 0);
+    }
+}
+
+/* Sink begin: the erase, synchronous on the worker. */
+static int z_sink_begin(void *ctx, uint32_t size)
+{
+    count_op(OP_BEGIN);
+    return 0;
+}
+
+/* Sink write: reads every byte it is handed, which must fit the stream's buffer and, for an intact generated stream,
+ * be the image's own bytes at that offset. */
+static int z_sink_write(void *ctx, uint32_t off, const uint8_t *d, size_t n)
+{
+    count_op(OP_WRITE);
+    if (n > Z_OUT_LEN) {
+        fail("the stream wrote more than its buffer holds", NULL, 0, NULL, 0);
+    }
+    touch(d, n);
+    if (g_z_expect != NULL && !g_in_preamble && g_zs.size == g_z_expect_len &&
+        ((size_t)off + n > g_z_expect_len || memcmp(d, g_z_expect + off, n) != 0)) {
+        fail("the stream wrote bytes the image does not hold at that offset", NULL, 0, d, n);
+    }
+    return 0;
+}
+
+/* engine.zbegin: opens a stream over tinfl and the mock sink. */
+static int mock_zbegin(void *ctx, uint32_t size)
+{
+    count_op(OP_ZBEGIN);
+    z_close();                                  /* the server released the last one: nothing may be open */
+    g_tinfl.alloc = z_alloc;
+    g_tinfl.free = z_free;
+    const udsota_inflate_t inf = udsota_tinfl_inflate(&g_tinfl);
+    const udsota_zsink_t sink = {.check_first = mock_image_check, .begin = z_sink_begin, .write = z_sink_write};
+    return (int)udsota_zstream_open(&g_zs, &inf, &sink, g_zout, Z_OUT_LEN, size);
+}
+
+/* engine.zwrite: inflates on the "worker": at once, or queued with its result kept for engine.poll. */
+static int mock_zwrite(void *ctx, const uint8_t *d, size_t n)
+{
+    count_op(OP_ZWRITE);
+    touch(d, n);
+    const int r = (int)udsota_zstream_feed(&g_zs, d, n);
+    if (!M.async) {
+        return r;
+    }
+    const int q = queue_job();
+    if (r != 0 && M.job_result == 0) {
+        M.job_result = r;
+    }
+    return q;
+}
+
+/* engine.zwritten: the image bytes the stream has written, for progress. */
+static uint32_t mock_zwritten(void *ctx)
+{
+    return g_zs.written;
+}
+
+/* engine.zend: the 37 check; frees the stream. */
+static int mock_zend(void *ctx)
+{
+    count_op(OP_ZEND);
+    const int r = (int)udsota_zstream_end(&g_zs);
+    z_close();
+    return r;
+}
+#endif
+
 static const uint8_t FUZZ_SERIAL[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
 static const udsota_config_t FUZZ_CFG = {
     .stmin_monitor = true, .device_id = FUZZ_SERIAL, .device_id_len = sizeof FUZZ_SERIAL,
@@ -568,6 +739,9 @@ static const udsota_engine_t FUZZ_ENGINE = {
     .activate = mock_ota_activate, .confirm = mock_ota_confirm, .abort = mock_ota_abort,
     .unverify = mock_ota_unverify, .poll = mock_job_poll, .status = mock_status,
     .running_sha = mock_running_sha, .version = mock_version, .slot_size = 0u, .ctx = NULL,
+#ifdef UDSOTA_FUZZ_Z
+    .zbegin = mock_zbegin, .zwrite = mock_zwrite, .zend = mock_zend, .zwritten = mock_zwritten,
+#endif
 };
 static const udsota_security_t FUZZ_SECURITY = {.rng16 = mock_rng16, .key = mock_key, .ctx = NULL};
 static const udsota_hooks_t FUZZ_HOOKS = {
@@ -893,18 +1067,42 @@ static void unlock(uint32_t *now, state_t st, uint8_t level)
     (void)pre_exchange(now, st, key_req, sizeof key_req);
 }
 
-/* Sends one 32-byte preamble TransferData block; block 1 starts with the ESP image magic 0xE9. */
-static void send_block(uint32_t *now, state_t st, uint8_t bsc)
+#ifdef UDSOTA_FUZZ_Z
+#define PRE_HDR 5u   /* the z build's preamble blocks each carry one stored DEFLATE block: a 5-byte header, then data */
+#else
+#define PRE_HDR 0u
+#endif
+
+#define PRE_BLOCK_LEN (2u + PRE_HDR + DL_SIZE / 2u)
+
+/* Fills blk with the preamble's 32-byte TransferData block bsc (1 or 2); block 1 starts with the ESP image magic
+ * 0xE9. The z build wraps each in a stored block (the second final), so block 1 inflates short of the check and
+ * is held until block 2. */
+static void fill_block(uint8_t blk[PRE_BLOCK_LEN], uint8_t bsc)
 {
-    uint8_t blk[2 + DL_SIZE / 2u];
     blk[0] = UDSOTA_SID_TRANSFER_DATA;
     blk[1] = bsc;
-    for (size_t i = 2; i < sizeof blk; i++) {
+    for (size_t i = 2 + PRE_HDR; i < PRE_BLOCK_LEN; i++) {
         blk[i] = (uint8_t)(i * 7u + bsc);
     }
     if (bsc == 1u) {
-        blk[2] = 0xE9;
+        blk[2 + PRE_HDR] = 0xE9;
     }
+#ifdef UDSOTA_FUZZ_Z
+    const uint16_t len = DL_SIZE / 2u;
+    blk[2] = (bsc == 2u) ? 0x01 : 0x00;
+    blk[3] = (uint8_t)len;
+    blk[4] = (uint8_t)(len >> 8);
+    blk[5] = (uint8_t)~len;
+    blk[6] = (uint8_t)(~len >> 8);
+#endif
+}
+
+/* Sends the preamble's TransferData block bsc. */
+static void send_block(uint32_t *now, state_t st, uint8_t bsc)
+{
+    uint8_t blk[PRE_BLOCK_LEN];
+    fill_block(blk, bsc);
     (void)pre_exchange(now, st, blk, sizeof blk);
 }
 
@@ -929,7 +1127,11 @@ static void reach(state_t st, uint32_t *now)
     if (st == ST_PROG_UNLOCKED) {
         return;
     }
+#ifdef UDSOTA_FUZZ_Z
+    STEP(now, st, UDSOTA_SID_REQUEST_DOWNLOAD, UDSOTA_DL_DFI_DEFLATE, UDSOTA_DL_ALFID, 0, 0, 0, 0, 0, 0, 0, DL_SIZE);
+#else
     STEP(now, st, UDSOTA_SID_REQUEST_DOWNLOAD, UDSOTA_DL_DFI, UDSOTA_DL_ALFID, 0, 0, 0, 0, 0, 0, 0, DL_SIZE);
+#endif
     if (st == ST_DOWNLOAD) {
         return;
     }
@@ -955,6 +1157,9 @@ static uint32_t start_run(state_t st, unsigned variant, bool async)
     memset(&M, 0, sizeof M);
     M.async = async;
     g_rec = 0;
+#ifdef UDSOTA_FUZZ_Z
+    z_close();                                  /* the last run may have ended mid-download */
+#endif
     udsota_engine_t engine = FUZZ_ENGINE;
     if ((g_stats.runs & 1u) != 0u) {
         engine.unverify = NULL;
@@ -1052,6 +1257,10 @@ static void harness_init(void)
 {
     arena_init(&g_req);
     arena_init(&g_resp);
+#ifdef UDSOTA_FUZZ_Z
+    arena_init(&g_zarena);
+    g_zout = g_zarena.page + g_zarena.size - Z_OUT_LEN;
+#endif
 }
 
 #ifdef UDSOTA_LIBFUZZER
@@ -1163,8 +1372,20 @@ static const seed_t SEEDS[] = {
     SEED(0x31, 0x81, 0x12, 0x35), SEED(0x31, 0x01, 0x12, 0x36), SEED(0x31, 0x01, 0x12, 0x37),
     SEED(0x31, 0x02, 0x12, 0x34),
 #endif
+#ifdef UDSOTA_FUZZ_Z
+    SEED(0x34, 0x10, 0x44, 0, 0, 0, 0, 0, 0, 0, 0x40), SEED(0x34, 0x10, 0x44, 0, 0, 0, 0, 0, 0, 0x01, 0x40),
+    SEED(0x34, 0x10, 0x44, 0, 0, 0, 0, 0, 0, 0, 0x01), SEED(0x34, 0x90, 0x44, 0, 0, 0, 0, 0, 0, 0, 0x40),
+    SEED(0x36, 0x01, 0x01, 0x05, 0x00, 0xFA, 0xFF, 0xE9, 0x01, 0x02, 0x03, 0x04),
+    SEED(0x36, 0x01, 0x00, 0x20, 0x00, 0xDF, 0xFF, 0xE9, 0x01, 0x02),
+    SEED(0x36, 0x02, 0x01, 0x20, 0x00, 0xDF, 0xFF, 0x11, 0x22),
+    SEED(0x36, 0x01, 0x07, 0x00), SEED(0x36, 0x01, 0x03, 0x00), SEED(0x36, 0x02, 0x73, 0x75, 0x03, 0x00),
+#endif
 };
 #define SEED_COUNT (sizeof SEEDS / sizeof SEEDS[0])
+
+#ifdef UDSOTA_FUZZ_Z
+static void replay_z_streams(void);
+#endif
 
 /* Appends a sequence-mode record (dt byte, length, bytes) to buf; returns the new length. */
 static size_t rec(uint8_t *buf, size_t n, uint8_t dt, const uint8_t *b, size_t len)
@@ -1203,10 +1424,8 @@ static void replay_generated(void)
         replay_input("short-block", b, 34u, true);
     }
     /* From mid-transfer: block 2, exit, FF01, ActivateImage. From elsewhere it is just a stream. */
-    uint8_t blk2[2 + DL_SIZE / 2u] = {UDSOTA_SID_TRANSFER_DATA, 0x02};
-    for (size_t i = 2; i < sizeof blk2; i++) {
-        blk2[i] = (uint8_t)(i * 7u + 2u);
-    }
+    uint8_t blk2[PRE_BLOCK_LEN];
+    fill_block(blk2, 2);
     const uint8_t exit_[] = {UDSOTA_SID_TRANSFER_EXIT};
     const uint8_t ff01[] = {UDSOTA_SID_ROUTINE, UDSOTA_RC_START, 0xFF, 0x01};
     const uint8_t act[] = {UDSOTA_SID_ROUTINE, UDSOTA_RC_START, 0xF0, 0x01};
@@ -1268,7 +1487,71 @@ static void replay_generated(void)
     n = rec(seq, n, 0, prog, sizeof prog);                     /* accepted */
     replay_input("seq-app-orphan", seq, n, true);
 #endif
+#ifdef UDSOTA_FUZZ_Z
+    replay_z_streams();
+#endif
 }
+
+#ifdef UDSOTA_FUZZ_Z
+#define Z_IMG_MAX   24000u                      /* largest generated image */
+#define Z_STREAMS   96u                         /* generated streams */
+
+/* Replays Z_STREAMS generated compressed downloads as record streams: 34 10 with the image's size, its raw
+ * DEFLATE stream in 36s of a random size, 37, FF01 and F000. Images mix random and repetitive bytes (so both
+ * stored and Huffman blocks appear), mostly starting with the magic the mock check wants; a quarter of the
+ * streams go intact, the rest get a flipped bit, a cut, bytes after the end, or a wrong memorySize. */
+static void replay_z_streams(void)
+{
+    static uint8_t img[Z_IMG_MAX], z[Z_IMG_MAX * 2u], seq[SEQ_MAX_BYTES], blk[REQ_MAX];
+    for (unsigned k = 0; k < Z_STREAMS; k++) {
+        const size_t len = 1u + rnd() % (k < 8u ? UDSOTA_IMAGE_MIN_LEN : Z_IMG_MAX);
+        const unsigned alphabet = (k % 3u == 0u) ? 256u : 2u + rnd() % 24u;
+        for (size_t i = 0; i < len; i++) {
+            img[i] = (i > 64u && rnd() % 8u != 0u) ? img[i - 1u - rnd() % 64u] : (uint8_t)(rnd() % alphabet);
+        }
+        img[0] = (k % 7u == 3u) ? 0x00 : 0xE9;
+        const int flags = (int)tdefl_create_comp_flags_from_zip_params((int)(k % 10u), -15, MZ_DEFAULT_STRATEGY);
+        size_t zl = tdefl_compress_mem_to_mem(z, sizeof z - 16u, img, len, flags);
+        if (zl == 0u) {
+            die("tdefl could not compress generated stream %u", k);
+        }
+        uint32_t size = (uint32_t)len;
+        switch (k % 8u) {
+        case 0: case 1: break;                                          /* intact */
+        case 2: z[rnd() % zl] ^= (uint8_t)(1u << (rnd() % 8u)); break;  /* a flipped bit */
+        case 3: zl -= 1u + rnd() % (zl < 8u ? zl - 1u : 8u); break;     /* cut short */
+        case 4: for (unsigned a = 1u + rnd() % 8u; a != 0; a--) { z[zl++] = (uint8_t)rnd(); } break;   /* trailing */
+        case 5: size += 1u + rnd() % 64u; break;                        /* memorySize past the image */
+        case 6: size = (size > 1u) ? size - 1u - rnd() % (size - 1u) : size; break;   /* memorySize short of it */
+        default: z[rnd() % zl] = (uint8_t)rnd(); z[rnd() % zl] = (uint8_t)rnd(); break;
+        }
+        size_t n = 0;
+        const uint8_t r34[] = {UDSOTA_SID_REQUEST_DOWNLOAD, UDSOTA_DL_DFI_DEFLATE, UDSOTA_DL_ALFID, 0, 0, 0, 0,
+                               (uint8_t)(size >> 24), (uint8_t)(size >> 16), (uint8_t)(size >> 8), (uint8_t)size};
+        n = rec(seq, n, 0, r34, sizeof r34);
+        const size_t chunk = 1u + rnd() % UDSOTA_DL_MAX_DATA;
+        uint8_t bsc = 1;
+        for (size_t off = 0; off < zl && n + REQ_MAX + 8u < sizeof seq; off += chunk, bsc++) {
+            const size_t c = (zl - off < chunk) ? zl - off : chunk;
+            blk[0] = UDSOTA_SID_TRANSFER_DATA;
+            blk[1] = bsc;
+            memcpy(&blk[2], &z[off], c);
+            n = rec(seq, n, (rnd() % 16u == 0u) ? 0u : 4u, blk, c + 2u);   /* mostly past the 60 ms job */
+        }
+        const uint8_t exit_[] = {UDSOTA_SID_TRANSFER_EXIT};
+        const uint8_t ff01[] = {UDSOTA_SID_ROUTINE, UDSOTA_RC_START, 0xFF, 0x01};
+        const uint8_t f000[] = {UDSOTA_SID_ROUTINE, UDSOTA_RC_START, 0xF0, 0x00};
+        n = rec(seq, n, 1, exit_, sizeof exit_);
+        n = rec(seq, n, 1, ff01, sizeof ff01);
+        n = rec(seq, n, 0, f000, sizeof f000);
+        const bool intact = (k % 8u) < 2u;              /* the oracle knows what these must write */
+        g_z_expect = intact ? img : NULL;
+        g_z_expect_len = intact ? len : 0u;
+        replay_input("z-stream", seq, n, k % 2u == 0u);
+        g_z_expect = NULL;
+    }
+}
+#endif
 
 /* Writes a mutant of seed into out (capacity REQ_MAX) with 1-4 random edits; returns its length. */
 static size_t mutate(const uint8_t *seed, size_t len, uint8_t *out)
@@ -1320,6 +1603,9 @@ static const char *const OP_NAME[OP_COUNT] = {   /* op_id_t names for the covera
     "reset", "ota_unverify",
 #if UDSOTA_FUZZ_APP_HOOKS
     "did_write", "routine", "routine_poll",
+#endif
+#ifdef UDSOTA_FUZZ_Z
+    "zbegin", "zwrite", "zend",
 #endif
 };
 
@@ -1469,6 +1755,23 @@ static void probe_write_past_end(void)
     p[3] = 0;
 }
 
+#ifdef UDSOTA_FUZZ_Z
+/* Child side of a self-test: one byte written just past the stream buffer. */
+static void probe_write_past_zout(void)
+{
+    volatile uint8_t *p = g_zout;
+    p[Z_OUT_LEN] = 0;
+}
+
+/* Child side of a self-test: one byte written just past an inflater allocation of 40 bytes. */
+static void probe_write_past_zalloc(void)
+{
+    g_in_preamble = true;                               /* no forced allocation failure */
+    volatile uint8_t *p = z_alloc(NULL, 40u);
+    p[48] = 0;                                          /* 40 rounds to 48: the first byte of the guard page */
+}
+#endif
+
 /* Child side of a self-test: a write into the read-only request. */
 static void probe_write_request(void)
 {
@@ -1513,6 +1816,10 @@ static void self_test(void)
     expect_death("read before the request", probe_read_before_start, SIGSEGV);
     expect_death("write past resp_max", probe_write_past_end, SIGSEGV);
     expect_death("write into the request", probe_write_request, SIGSEGV);
+#ifdef UDSOTA_FUZZ_Z
+    expect_death("write past the stream buffer", probe_write_past_zout, SIGSEGV);
+    expect_death("write past an inflater allocation", probe_write_past_zalloc, SIGSEGV);
+#endif
 #ifdef UDSOTA_FUZZ_UBSAN_TRAP
     expect_death("UBSan signed overflow", probe_ubsan, SIGILL);
 #else

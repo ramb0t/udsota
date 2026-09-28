@@ -12,6 +12,7 @@ NRC_NOT_SUPPORTED, NRC_BUSY, NRC_CONDITIONS, NRC_SEQUENCE = 0x11, 0x21, 0x22, 0x
 NRC_OUT_OF_RANGE, NRC_TIME_DELAY = 0x31, 0x37
 NRC_PROGRAMMING_FAILURE = 0x72   # generalProgrammingFailure: a flash job failed or passed the 90 s cap
 DL_DFI, DL_ALFID, DL_MAX_DATA = 0x00, 0x44, 4093
+DL_DFI_DEFLATE = 0x10            # dataFormatIdentifier: raw DEFLATE (RFC 1951), memorySize still the image's size
 
 IMG_STATES = {0: "UNDEFINED", 1: "NEW", 2: "PENDING_VERIFY", 3: "VALID", 4: "INVALID", 5: "ABORTED"}
 OTHER_STATES = {0: "EMPTY", 1: "UNVERIFIED", 2: "WRITING", 3: "VERIFIED", 4: "INVALID"}
@@ -19,7 +20,8 @@ IMG_PENDING_VERIFY, OTHER_VERIFIED = 2, 3
 STATUS_FLAGS = {0x01: "signature-checked", 0x02: "boot-ignored-config"}
 DL_REASONS = ("DL_OK", "DL_BAD_HEADER", "DL_BAD_PROJECT", "DL_BAD_BOARD", "DL_BAD_LAYOUT",
               "DL_BAD_DIAG_IDS", "DL_NOT_NEWER", "DL_TOO_BIG", "DL_VERIFY_FAILED", "DL_SIG_FAILED",
-              "DL_WORKER_TIMEOUT", "DL_ABORTED", "DL_FLASH_ERROR")   # udsota_reason_t (udsota_wire.h)
+              "DL_WORKER_TIMEOUT", "DL_ABORTED", "DL_FLASH_ERROR", "DL_BAD_STREAM",
+              "DL_NO_MEMORY")   # udsota_reason_t (udsota_wire.h)
 # 9 (DL_SIG_FAILED) is reserved and not emitted by IDF v6.1: esp_ota_end returns one code for a hash or a
 # signature failure, so FF01 reports both as 8 (DL_VERIFY_FAILED).
 COUNTER_NAMES = ("seq_errors", "ncr_timeouts", "repeated_blocks", "aborts", "withheld_fcs",

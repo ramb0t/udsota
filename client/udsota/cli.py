@@ -40,6 +40,14 @@ def parse_args(argv):
     f.add_argument("file", type=pathlib.Path)
     f.add_argument("--drop-76", type=int, metavar="N",
                    help="fault test: resend block N as if its 76 response were lost")
+    z = f.add_mutually_exclusive_group()
+    z.add_argument("--compress", dest="compress", action="store_const", const="deflate",
+                   help="send the image as raw DEFLATE (DFI 0x10); stop on a server without compressed downloads "
+                        "(default: the profile's [image] compression, else none)")
+    z.add_argument("--compress-auto", dest="compress", action="store_const", const="auto",
+                   help="as --compress, but send the image uncompressed to a server without compressed downloads")
+    z.add_argument("--no-compress", dest="compress", action="store_const", const="none",
+                   help="send the image uncompressed, whatever the profile says")
     sub.add_parser("confirm", help="ConfirmImage for a PENDING_VERIFY image")
     sub.add_parser("reset", help="ECUReset (rolls back an unconfirmed image)")
     c = sub.add_parser("config", help="show or set the profile's writable DIDs")
@@ -119,7 +127,7 @@ def main(argv=None, transport=Transport):
                 return info(uds, prof)
             if args.cmd == "flash":
                 return flash(uds, prof, image, secret, drop_76=args.drop_76, preroll=t.preroll,
-                             quiet=getattr(t, "quiet", contextlib.nullcontext))
+                             quiet=getattr(t, "quiet", contextlib.nullcontext), compress=args.compress)
             if args.cmd == "confirm":
                 return confirm_cmd(uds)
             if args.cmd == "config":

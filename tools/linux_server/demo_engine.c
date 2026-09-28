@@ -126,11 +126,56 @@ static int eng_confirm(void *ctx)
     return job(e, fake_ota_confirm(&e->ota));
 }
 
-/* engine.abort: drops the open write; the partial image stays in the slot. */
+/* engine.abort: drops the open write, and any compressed stream; the partial image stays in the slot. */
 static void eng_abort(void *ctx)
 {
     demo_engine_t *e = ctx;
+    udsota_zstream_close(&e->zs);
     (void)fake_ota_abort(&e->ota);
+}
+
+/* The compressed stream's erase: fake_ota_begin, synchronous (the job wraps the whole zwrite). */
+static int z_begin(void *ctx, uint32_t size)
+{
+    demo_engine_t *e = ctx;
+    return fake_ota_begin(&e->ota, size);
+}
+
+/* The compressed stream's write, at the uncompressed offset where the last one ended. */
+static int z_write(void *ctx, uint32_t off, const uint8_t *d, size_t n)
+{
+    demo_engine_t *e = ctx;
+    return (off == e->ota.written) ? fake_ota_write(&e->ota, d, n) : -1;
+}
+
+/* engine.zbegin: opens a stream for size bytes over the vendored tinfl; UDSOTA_DL_NO_MEMORY when malloc fails. */
+static int eng_zbegin(void *ctx, uint32_t size)
+{
+    demo_engine_t *e = ctx;
+    udsota_zstream_close(&e->zs);
+    const udsota_inflate_t inf = udsota_tinfl_inflate(&e->tinfl);
+    const udsota_zsink_t sink = {.check_first = eng_check_first, .begin = z_begin, .write = z_write, .ctx = e};
+    return (int)udsota_zstream_open(&e->zs, &inf, &sink, e->zout, sizeof e->zout, size);
+}
+
+/* engine.zwrite: inflates one payload into the rules, erase and writes; a job like any other when job_ms is set. */
+static int eng_zwrite(void *ctx, const uint8_t *d, size_t n)
+{
+    demo_engine_t *e = ctx;
+    return job(e, (int)udsota_zstream_feed(&e->zs, d, n));
+}
+
+/* engine.zwritten: the image bytes the stream has written, for progress. */
+static uint32_t eng_zwritten(void *ctx)
+{
+    return ((const demo_engine_t *)ctx)->zs.written;
+}
+
+/* engine.zend: the 37 check; frees the inflater. */
+static int eng_zend(void *ctx)
+{
+    demo_engine_t *e = ctx;
+    return (int)udsota_zstream_end(&e->zs);
 }
 
 /* engine.unverify: an accepted 34 means the inactive slot no longer counts as verified. */
@@ -230,6 +275,7 @@ bool demo_engine_open(demo_engine_t *e, const char *dir, uint32_t slot_size, boo
 /* Simulated reset; see demo_engine.h. */
 void demo_engine_boot(demo_engine_t *e)
 {
+    udsota_zstream_close(&e->zs);
     fake_ota_boot(&e->ota);
     e->job_open = false;
     e->last_result = 0;
@@ -239,6 +285,7 @@ void demo_engine_boot(demo_engine_t *e)
 /* Closes the slot files. */
 void demo_engine_close(demo_engine_t *e)
 {
+    udsota_zstream_close(&e->zs);
     fake_ota_close(&e->ota);
 }
 
@@ -250,6 +297,8 @@ udsota_engine_t demo_engine_ops(demo_engine_t *e)
         .activate = eng_activate, .confirm = eng_confirm, .abort = eng_abort, .unverify = eng_unverify,
         .poll = eng_poll, .status = eng_status, .running_sha = eng_running_sha, .version = eng_version,
         .slot_size = e->rules.slot_size, .ctx = e,
+        .zbegin = e->compress ? eng_zbegin : NULL, .zwrite = e->compress ? eng_zwrite : NULL,
+        .zend = e->compress ? eng_zend : NULL, .zwritten = e->compress ? eng_zwritten : NULL,
     };
 }
 

@@ -4,7 +4,9 @@
  * rules again on the bytes in the slot, as the port does. A simulated reset (demo_engine_boot) runs the
  * boot slot: an activated image boots PENDING_VERIFY, and one rebooted before ConfirmImage rolls back.
  * With job_ms set, begin, verify, activate and confirm (and the writes queued behind an erase) answer
- * UDSOTA_PENDING and finish job_ms later, like the port's flash worker, so the server sends 0x78. Host only. */
+ * UDSOTA_PENDING and finish job_ms later, like the port's flash worker, so the server sends 0x78. With compress set it
+ * also serves compressed downloads (DFI 0x10): zbegin, zwrite and zend run udsota_zstream over the vendored tinfl
+ * into the same first-block rules, erase and writes. Host only. */
 #pragma once
 #include <stdbool.h>
 #include <stddef.h>
@@ -12,8 +14,11 @@
 #include "fake_engine.h"
 #include "udsota.h"
 #include "udsota_image.h"
+#include "udsota_tinfl.h"
+#include "udsota_zstream.h"
 
 #define DEMO_SEED_PAYLOAD 1024u   /* segment 0 bytes of the image seeded into a fresh slot 0 */
+#define DEMO_Z_OUT        4096u   /* the compressed stream's write buffer: one flash sector */
 
 typedef struct {
     fake_ota_t         ota;
@@ -24,6 +29,10 @@ typedef struct {
     uint64_t           job_end_ms;
     int                job_result;    /* 0 or the first failure of the ops in the job */
     int                last_result;   /* engine.poll's answer once no job runs */
+    bool               compress;      /* serve DFI 0x10; set after demo_engine_open, before demo_engine_ops */
+    udsota_zstream_t   zs;            /* the compressed download, from zbegin to zend or abort */
+    udsota_tinfl_t     tinfl;         /* its inflater: malloc'd at zbegin, freed at zend or abort */
+    uint8_t            zout[DEMO_Z_OUT];
 } demo_engine_t;
 
 /* Opens the slots under dir (fresh: wipe them first) and boots. A running slot without an image is seeded
@@ -36,7 +45,7 @@ bool demo_engine_open(demo_engine_t *e, const char *dir, uint32_t slot_size, boo
 void demo_engine_boot(demo_engine_t *e);
 /* Closes the slot files. */
 void demo_engine_close(demo_engine_t *e);
-/* The engine op table for udsota_init, with ctx e and slot_size set. */
+/* The engine op table for udsota_init, with ctx e and slot_size set, and the z ops when e->compress is set. */
 udsota_engine_t demo_engine_ops(demo_engine_t *e);
 /* The running image's esp_app_desc_t version (NUL-terminated) into out[33]; "" when the slot holds none. */
 void demo_engine_version(const demo_engine_t *e, char out[33]);

@@ -15,13 +15,15 @@ udsota         ISO-TP adapter (udsota_isotp) → UDS server (udsota_server) → 
 udsota_esp32   diag task and flash worker · engine on esp_ota_* · PSA ECDSA or HMAC, and RNG · RTC boot-loop storage
 ```
 
-Dependencies point down only. The app owns the CAN bus. udsota transmits through the app's send callback, receives only the frames the app hands it, and never touches the controller. The ISO-TP adapter, on `components/isotp`, is the only CAN-specific code in the core. A port implements the engine (`udsota_engine_t`: check the first block, erase, write, verify, activate, confirm, abort and status), and any other front end that delivers an image can drive the same engine.
+Dependencies point down only. The app owns the CAN bus. udsota transmits through the app's send callback, receives only the frames the app hands it, and never touches the controller. The ISO-TP adapter, on `components/isotp`, is the only CAN-specific code in the core. A port implements the engine (`udsota_engine_t`: check the first block, erase, write, verify, activate, confirm, abort and status, and optionally the three [compressed-download](#compressed-downloads) ops), and any other front end that delivers an image can drive the same engine.
 
 ## Known limits
 
 The transport is classic CAN with 11-bit IDs only: `udsota_can_t.send` takes a `uint16_t` ID and has no extended flag. The image rules assume the ESP-IDF app-image layout (`udsota_image.c` reads `esp_app_desc_t` and the descriptor at fixed offsets), so a port for another platform must produce that layout or bring its own rules. The ISO-TP pad byte is fixed at 0xAA. The adapter defines isotp-c's platform hooks, so no other isotp-c user can link into the same image.
 
-Future work: 29-bit IDs, CAN FD, and a per-link isotp send callback so that another isotp-c user can share the image. The core runs on Linux in [`tools/linux_server`](../../tools/linux_server/README.md), a demo server over SocketCAN or a frame pipe that the client's end-to-end tests drive.
+Downloads do not resume: F000 always answers FF, so a client restarts at offset 0. For a compressed download that stays true even once resume exists, because its offsets count compressed bytes and resuming would need the inflater's state saved alongside the slot.
+
+Future work: 29-bit IDs, CAN FD, resumable downloads (compressed ones included), and a per-link isotp send callback so that another isotp-c user can share the image. The core runs on Linux in [`tools/linux_server`](../../tools/linux_server/README.md), a demo server over SocketCAN or a frame pipe that the client's end-to-end tests drive.
 
 ## Integrating on ESP32
 
@@ -164,14 +166,16 @@ An app that draws an update, with a bar or a percentage, reads the download's st
 | Stage | From | Until | `done` / `total` |
 |---|---|---|---|
 | IDLE | init, and every end below | an accepted 34 | 0 / 0 |
-| ERASING | an accepted 34 | the first block is written; the first-block check and the erase run in that 36's job | 0 / memorySize |
-| WRITING | the first written block | FF01 starts; after the 37, `done` equals `total` | bytes written / memorySize |
+| ERASING | an accepted 34 | the first 36 is accepted; the first-block check and the erase run in that 36's job | 0 / memorySize |
+| WRITING | the first accepted 36 | FF01 starts; after the 37, `done` equals `total` | image bytes written / memorySize |
 | VERIFYING | FF01's job starts | its verdict, then IDLE | 0 / 0: engines report no hash progress, so it is indeterminate |
 | ACTIVATING | a positive ActivateImage | the restart | 0 / 0 |
 
-A download also returns to IDLE when it ends early: an abort, a session change, S3, the 90 s cap, a refused first block or a failed write. `last_reason` then says which, as F1F1 does (reason 11, 10, 1 to 7 or 12). Within a download `done` only grows and never passes `total`: a resent block, a 36 refused for its counter or with 0x21, and a 0x78 leave it where it was. A new 34 starts it at the download's offset, which is 0 while GetResumePoint answers "not available". Between a passed FF01 and a positive ActivateImage the stage reads IDLE with reason 0, so a display that saw VERIFYING can hold at "verified" there rather than treat it as idle.
+A download also returns to IDLE when it ends early: an abort, a session change, S3, the 90 s cap, a refused first block or a failed write. `last_reason` then says which, as F1F1 does (reason 11, 10, 1 to 7 or 12). Within a download `done` only grows and never passes `total`: a resent block, a 36 refused for its counter or with 0x21, and a 0x78 leave it where it was. A new 34 starts it at the download's offset, which is 0 while GetResumePoint answers "not available".
 
-The hook runs at the end of the call that changed the stage or wrote a block, and never more than once per call, so during a transfer of 4 KB blocks it runs about once a second. A 0x78 never calls it. Like every hook, it runs in the server's context and must not block; with it NULL, every answer is the same bytes.
+A [compressed download](#compressed-downloads) counts `done` the same way, in image bytes, not in the compressed bytes its 36s carry. After each 76 the server takes the stream's count of bytes written from the engine's optional `zwritten` (in `udsota_zstream`, its `written`), and once the 37 closes the stream it sets `done` to `total`. The stream holds its first bytes back until the first-block check has 320 of them, so WRITING can start with `done` at 0 and stay there for a block or two; the last 76 already reads `total`, because the stream writes what it held when it ends. An engine without `zwritten` shows `done` at 0 through the 36s and at `total` after the 37. A compressed 34 refused for memory stays IDLE and changes only `last_reason`, to 14, and the hook reports that too. Between a passed FF01 and a positive ActivateImage the stage reads IDLE with reason 0, so a display that saw VERIFYING can hold at "verified" there rather than treat it as idle.
+
+The hook runs at the end of the call that changed the stage or `last_reason`, or wrote a block, and never more than once per call, so during a transfer of 4 KB blocks it runs about once a second. A 0x78 never calls it. Like every hook, it runs in the server's context and must not block; with it NULL, every answer is the same bytes.
 
 How the stages share one bar is the app's policy: erase 0–2 %, write 2–95 %, verify 95–99 % and activate 99–100 %, say. Progress stays off the wire, since a client counts its own; a DID can carry it later if telemetry needs one. After the restart the stage reads IDLE, and whether the client confirmed the new image is F1F0's to say.
 
@@ -231,6 +235,16 @@ The first 36 block is checked before anything is erased, and FF01 checks the who
 - **Version:** a release, meaning the descriptor's release flag and a clean `[v]X.Y.Z` version, must be newer than the running image by SemVer precedence, so `v1.2.3` installs over `v1.2.3-rc1`. A dev build needs at least the running core version (6). A version that doesn't parse, or a flag that disagrees with the version, is refused (1).
 - **Size:** a 34 announcing more than the slot holds answers 0x31 and leaves F1F1 unchanged.
 
+## Compressed downloads
+
+A 34 with dataFormatIdentifier 0x10 opens a download whose 36 blocks carry the image as one raw DEFLATE stream (RFC 1951, no zlib or gzip header). An ESP-IDF app image usually deflates to 50–65 %, and at about 3.2 KB/s on the bus that takes an update of a 1.2 MB image from about 6 minutes to about 3½ to 4. The image itself, its signature, the slot and every rule are unchanged: the device inflates the stream and writes the bytes an uncompressed download would have written.
+
+The 34's memorySize is the uncompressed size, so the slot-size check, the erase and the image rules see the image as before. The block counter, 36 lengths, maxNumberOfBlockLength and the 0x78 pacing are those of any download, and a repeated block is answered without being inflated twice. The server holds the inflated bytes until 320 of them are out, across as many 36s as that takes, then runs the first-block check, and only then erases, so nothing is erased for an image the rules refuse. A block the rules refuse answers 0x31 with their reason in F1F1, as an uncompressed first block does. So does a corrupt stream or one inflating past memorySize, with reason 13, and a stream that ends before 320 bytes are out, with reason 1. The compressed bytes may exceed memorySize by at most an eighth plus 1,024 (`UDSOTA_DL_Z_BOUND`), past which a 36 is an overrun (0x71). The 37 closes the transfer only once the stream has ended at exactly memorySize bytes with nothing after it; otherwise it answers 0x72, the download ends and F1F1 reads reason 13. F1F1's byte count is the compressed bytes accepted.
+
+A server takes DFI 0x10 when its engine sets `zbegin`, `zwrite` and `zend`. With them NULL, a 34 with DFI 0x10 answers 0x31, and every answer is byte for byte what it was before compression existed. A product that never takes compressed downloads can also build `udsota_server.c` with `UDSOTA_COMPRESSION` defined as 0: the server then answers the same way whatever the engine sets, and none of the compressed handling is compiled in. The structs keep their layout either way. The ESP32 port defines it for the core while `UDSOTA_ESP32_COMPRESSION` is off. The core includes no compression library. Instead `udsota_zstream.h` gives an engine the stream logic over any `udsota_inflate_t` (`init`, `feed`, `finish`), and `components/udsota_inflate` supplies one on miniz's tinfl: the ROM's copy under ESP-IDF, which every v6.1 target has, and miniz 3.0.2, vendored unpatched, elsewhere (the host). `zbegin` opens a `udsota_zstream_t` with the engine's synchronous check, erase and write as its sink, `zwrite` feeds it, and `zend` runs its 37 check; the engine decides where the inflating runs, which in the ESP32 port is the flash worker. tinfl needs a 32 KB dictionary and its state, which is 11,008 bytes for the ROM's copy and 8,408 for the vendored miniz on a 64-bit host, both allocated at the 34 and freed at the 37 or abort, never at boot. A 34 that finds no memory answers 0x22 with reason 14 in F1F1. It opens no download, but a finished image that never passed FF01 has already been released by then, so FF01 answers 0x24 and the client downloads the image again. The stream's `written` count is the image bytes written so far, which the optional fourth op, `zwritten`, hands the server for [progress](#progress); F1F1 counts compressed bytes.
+
+Two things differ from an uncompressed download. A 37 sent before the stream has ended answers 0x72 and ends the download, where an uncompressed one sent early answers 0x24 and leaves the transfer open. And `udsota_init()` never calls `engine.abort`, so a `zbegin` must cope with a stream a lost session left open, closing it before it opens the next.
+
 ## Client
 
 [`client/`](../../client/README.md) is a generic PC client for Linux and SocketCAN. A product's TOML profile holds everything product-specific; the built-in `example` profile carries the values used here, and `udsota --profile example flash <image>` runs the whole sequence, from the precheck to ConfirmImage.
@@ -247,9 +261,9 @@ The first 36 block is checked before anything is erased, and FF01 checks the who
 | 27 | SecurityAccess | `level_extended` and the next sub-function in extended, `level_programming` and the next in programming; a sendKey carries exactly 16 key bytes, or 64 in the ECDSA mode | extended, programming | – |
 | 2E | WriteDataByIdentifier | one DID and at least one value byte, through `did_write`; answers `6E <did>` | extended, programming | the app's choice |
 | 31 | RoutineControl | 01 startRoutine | per routine | per routine |
-| 34 | RequestDownload | DFI 00, ALFID 44, address 0, 0 < size ≤ slot; answers `74 20 0F FF` (`cfg.max_block_len`, 4,095 by default) | programming | programming |
-| 36 | TransferData | block counter from 01, wrapping FF to 00, and up to 4,093 data bytes; a repeat of the last counter is answered and not rewritten | programming | programming |
-| 37 | RequestTransferExit | once every announced byte has arrived | programming | programming |
+| 34 | RequestDownload | DFI 00, or 10 (raw DEFLATE) when the engine has `zbegin`; ALFID 44, address 0, 0 < size ≤ slot, size being the uncompressed image; answers `74 20 0F FF` (`cfg.max_block_len`, 4,095 by default) | programming | programming |
+| 36 | TransferData | block counter from 01, wrapping FF to 00, and up to 4,093 data bytes, compressed after a DFI 10; a repeat of the last counter is answered and not rewritten | programming | programming |
+| 37 | RequestTransferExit | once every announced byte has arrived, or after a DFI 10 once the stream has ended at exactly the announced size | programming | programming |
 | 3E | TesterPresent | 00; 80 suppresses the answer | any | – |
 | 28 | CommunicationControl (with `comm_control` only) | controlType 00–03 and a communicationType naming normal or network-management messages; answers `68 xx` | extended, programming | – |
 | 85 | ControlDTCSetting (with `dtc_setting` only) | 01 on, 02 off, with any option record; answers `C5 xx` | extended, programming | – |
@@ -265,7 +279,7 @@ With `cfg.func_id` set (OBD's broadcast ID is 0x7DF), the port hands single fram
 | RID | Routine | Session, key | Does |
 |---|---|---|---|
 | FF01 | CheckProgrammingDependencies | programming, programming | verifies the written image: hash, signature, and the image rules on the bytes in flash. Answers a status byte, 00 or a reason code. A pass marks the slot verified until the next 34 or reboot |
-| F000 | GetResumePoint | programming, programming | reserved for resume; answers status FF, not available |
+| F000 | GetResumePoint | programming, programming | reserved for resume; answers status FF, not available, after any download, compressed or not |
 | F001 | ActivateImage | programming, programming | needs the slot verified (else 0x24); makes it the boot slot, answers, then restarts |
 | F002 | ConfirmImage | extended, none | needs the boot slot; confirms a pending-verify image, answers positive for one already valid or undefined, else 0x22 |
 
@@ -294,15 +308,15 @@ Every other DID goes to `did_read`, and so does any of these whose source is NUL
 | 0x12 | subFunctionNotSupported | an unknown sub-function |
 | 0x13 | incorrectMessageLengthOrInvalidFormat | a wrong length, or more than one DID in a 22 |
 | 0x21 | busyRepeatRequest | any request but 3E while a flash job or a pending app routine runs; or the gate's choice |
-| 0x22 | conditionsNotCorrect | a core-owned condition, or the gate |
+| 0x22 | conditionsNotCorrect | a core-owned condition, the gate, or no memory for a compressed download's inflater |
 | 0x24 | requestSequenceError | a step out of order: 36 with no download open, 37 before the last byte, FF01 before 37, F001 before FF01, or a key with no live seed |
-| 0x31 | requestOutOfRange | an unknown DID or RID, 34 parameters or size, or a first block the image rules refuse |
+| 0x31 | requestOutOfRange | an unknown DID or RID, 34 parameters or size (DFI 10 on a server without compressed downloads among them), a first block the image rules refuse, or a compressed block that is corrupt or inflates past the announced size |
 | 0x33 | securityAccessDenied | a keyed service while locked |
 | 0x35 | invalidKey | a wrong key |
 | 0x36 | exceedNumberOfAttempts | the third wrong key |
 | 0x37 | requiredTimeDelayNotExpired | 27 within 10 s of boot or of a lockout |
-| 0x71 | transferDataSuspended | a 36 that would overrun the announced size; the download ends |
-| 0x72 | generalProgrammingFailure | an erase, write, activate or confirm failure, or a flash job or app routine past 90 s |
+| 0x71 | transferDataSuspended | a 36 that would overrun the announced size (for a compressed download, `UDSOTA_DL_Z_BOUND` of it); the download ends |
+| 0x72 | generalProgrammingFailure | an erase, write, activate or confirm failure, a flash job or app routine past 90 s, or a 37 whose compressed stream did not end at exactly the announced size |
 | 0x73 | wrongBlockSequenceCounter | a 36 counter that is neither the next nor a repeat |
 | 0x78 | responsePending | a flash job or app routine still running after 40 ms, repeated every 1.5 s |
 | 0x7E | subFunctionNotSupportedInActiveSession | a 27 level that belongs to the other session |
@@ -333,7 +347,7 @@ ISO-TP flow control uses a block size of 64 (`cfg.block_size`) and an STmin of 2
 | Byte | Field | Values |
 |---|---|---|
 | 0 | `reason_code` | a [reason code](#reason-codes) |
-| 1–4 | `bytes_received` | data bytes accepted by 36, big-endian |
+| 1–4 | `bytes_received` | data bytes accepted by 36, big-endian; compressed bytes for a compressed download |
 
 ### Counters (F1F2)
 
@@ -369,6 +383,8 @@ The FF01 status byte and F1F1 byte 0.
 | 10 | `UDSOTA_DL_WORKER_TIMEOUT` | a flash job passed 90 s |
 | 11 | `UDSOTA_DL_ABORTED` | ended early: a session change or S3, a gate deny mid-transfer, or an overrun (0x71) |
 | 12 | `UDSOTA_DL_FLASH_ERROR` | an erase or write failed, or at the first block there was no slot or worker |
+| 13 | `UDSOTA_DL_BAD_STREAM` | a compressed download's stream was corrupt, inflated past the announced size, or at 37 had not ended at exactly that size or carried bytes after its end |
+| 14 | `UDSOTA_DL_NO_MEMORY` | a 34 with DFI 10 found no memory for the inflater |
 
 ### Image descriptor
 
@@ -387,4 +403,4 @@ The FF01 status byte and F1F1 byte 0.
 
 ## Third-party code
 
-`components/isotp` vendors SimonCahill's isotp-c v1.9.3 (commit 1fc19e2, unpatched), which is MIT-licensed; its `LICENSE` sits beside it, and `isotp_port.c` gives each link its own block size and STmin. The UDS server is udsota's own. driftregion's iso14229 (MIT) was the model for the fuzz harness and the 0x78 cadence, but none of its code is copied. udsota itself is MIT-licensed; see the repository's `LICENSE` and `THIRD_PARTY.md`.
+`components/isotp` vendors SimonCahill's isotp-c v1.9.3 (commit 1fc19e2, unpatched), which is MIT-licensed; its `LICENSE` sits beside it, and `isotp_port.c` gives each link its own block size and STmin. `components/udsota_inflate/miniz` vendors miniz 3.0.2 (unpatched, MIT), used only where no ROM copy of tinfl exists. The UDS server is udsota's own. driftregion's iso14229 (MIT) was the model for the fuzz harness and the 0x78 cadence, but none of its code is copied. udsota itself is MIT-licensed; see the repository's `LICENSE` and `THIRD_PARTY.md`.

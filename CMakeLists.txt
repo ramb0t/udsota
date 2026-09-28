@@ -27,6 +27,7 @@ set(CORE_INC   ${CORE_DIR}/include)
 set(CORE_PRIV  ${CORE_DIR}/priv)
 set(ISOTP_DIR  ${ROOT}/components/isotp)
 set(ESP32_DIR  ${ROOT}/components/udsota_esp32)
+set(INFLATE_DIR ${ROOT}/components/udsota_inflate)
 
 # ---- Libraries: isotp (vendored isotp-c v1.9.3, unpatched, plus the per-link BS/STmin port) and
 # udsota_core, the portability target. udsota_core is every core .c, compiled with nothing on its
@@ -34,6 +35,7 @@ set(ESP32_DIR  ${ROOT}/components/udsota_esp32)
 # FreeRTOS include fails this build. isotp-c is upstream code, so it also gets -Wno-unused-parameter.
 add_subdirectory(components/isotp)
 add_subdirectory(components/udsota)
+add_subdirectory(components/udsota_inflate)
 target_compile_options(isotp PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter)
 target_compile_options(udsota_core PRIVATE -Wall -Wextra -Werror)
 
@@ -122,6 +124,31 @@ udsota_test(test_udsota_server_functional
 udsota_test(test_udsota_server_progress
     SOURCES  test/test_udsota_server_progress.c ${SERVER_SRCS}
     INCLUDES ${CORE_INC} ${CORE_PRIV})
+
+# Compressed downloads: the stream and the real tinfl behind an engine's z ops, with the core image rules. The test
+# compiles its own miniz with deflate on, to make the streams it sends.
+set(ZSTREAM_SRCS ${CORE_DIR}/udsota_zstream.c ${INFLATE_DIR}/udsota_tinfl.c ${INFLATE_DIR}/miniz/miniz.c)
+udsota_test(test_udsota_server_compress
+    SOURCES  test/test_udsota_server_compress.c ${SERVER_SRCS} ${ZSTREAM_SRCS} ${CORE_DIR}/udsota_image.c
+    INCLUDES ${CORE_INC} ${CORE_PRIV} ${TEST_DIR} ${INFLATE_DIR}/include ${INFLATE_DIR})
+target_compile_definitions(test_udsota_server_compress PRIVATE MINIZ_NO_STDIO MINIZ_NO_TIME MINIZ_NO_ARCHIVE_APIS
+                                                               MINIZ_NO_ZLIB_APIS)
+
+# The server with compressed downloads compiled out (UDSOTA_COMPRESSION=0): its own test, and the download and progress
+# tests again, which must pass unchanged.
+udsota_test(test_udsota_server_nocompress
+    SOURCES  test/test_udsota_server_nocompress.c ${SERVER_SRCS}
+    INCLUDES ${CORE_INC} ${CORE_PRIV})
+udsota_test(test_udsota_server_download_nocompress
+    SOURCES  test/test_udsota_server_download.c ${SERVER_SRCS} ${CORE_DIR}/udsota_image.c
+    INCLUDES ${CORE_INC} ${CORE_PRIV} ${TEST_DIR})
+udsota_test(test_udsota_server_progress_nocompress
+    SOURCES  test/test_udsota_server_progress.c ${SERVER_SRCS}
+    INCLUDES ${CORE_INC} ${CORE_PRIV})
+foreach(t IN ITEMS test_udsota_server_nocompress test_udsota_server_download_nocompress
+                   test_udsota_server_progress_nocompress)
+    target_compile_definitions(${t} PRIVATE UDSOTA_COMPRESSION=0)
+endforeach()
 
 # ---- Image descriptor: one UDSOTA_ESP32_IMAGE_DESC instance per variant, as a dev image for two
 # boards and as a release image. On target, udsota_esp32_image_desc() sets UDSOTA_ESP32_IMG_RELEASE
@@ -244,6 +271,18 @@ if(UDSOTA_FUZZ AND UDSOTA_FUZZ_SAN_OK)
         add_test(NAME fuzz_udsota_corpus COMMAND fuzz_udsota ${UDSOTA_FUZZ_CORPUS})
         set_tests_properties(fuzz_udsota_corpus PROPERTIES TIMEOUT 1800)
     endif()
+    # The same harness with compressed downloads served: the z ops over udsota_zstream and the real tinfl, a
+    # compressed preamble, and generated DEFLATE streams (miniz built with deflate on, to make them), with the progress
+    # hook set so that its checks hold on the compressed path too.
+    udsota_test(fuzz_udsota_z
+        SOURCES  ${CORE_DIR}/test/fuzz_udsota.c ${SERVER_SRCS} ${ZSTREAM_SRCS}
+        INCLUDES ${CORE_INC} ${CORE_PRIV} ${INFLATE_DIR}/include ${INFLATE_DIR})
+    target_compile_options(fuzz_udsota_z PRIVATE ${FUZZ_SAN})
+    target_link_options(fuzz_udsota_z PRIVATE ${FUZZ_SAN})
+    target_compile_definitions(fuzz_udsota_z PRIVATE UDSOTA_FUZZ_UBSAN_TRAP=1 UDSOTA_FUZZ_Z=1 UDSOTA_FUZZ_PROGRESS=1
+                                                     MINIZ_NO_STDIO
+                                                     MINIZ_NO_TIME MINIZ_NO_ARCHIVE_APIS MINIZ_NO_ZLIB_APIS)
+    set_tests_properties(fuzz_udsota_z PROPERTIES TIMEOUT 600)
 endif()
 
 # ---- tools/image_check: the ESP32 port's first-block check as a host program, for checking a real

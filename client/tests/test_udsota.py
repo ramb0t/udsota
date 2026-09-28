@@ -13,6 +13,7 @@ import struct
 import threading
 import time
 import tomllib
+import zlib
 from collections import deque
 
 import can
@@ -167,7 +168,7 @@ class FakeServer:
                  board=b"devkit", other_state=0, other_sha=bytes(32), lose_76_once=None, mute_block=None,
                  nrc_once=None, activate_refusals=0, ff01_status=0, config=None, lose_77_once=False,
                  lose_ff01_once=False, activate_nrcs=None, activate_fail=None, no_fc=None, security=True,
-                 pubkey=None, cfg_keys=None, commit_status=0):
+                 pubkey=None, cfg_keys=None, commit_status=0, compress=False, z_nomem=False):
         self.max_block, self.boot_silence, self.confirm_refusals = max_block, boot_silence, confirm_refusals
         self.running_state, self.sha, self.board = running_state, sha, board
         self.other_state, self.other_sha = other_state, other_sha
@@ -184,6 +185,9 @@ class FakeServer:
         self.cfg_keys = None if cfg_keys is None else dict(cfg_keys)   # {DID: running value}; None: no config writes
         self.nvs = None if cfg_keys is None else dict(cfg_keys)        # the stored values a restart serves
         self.staged, self.commit_status, self.last_commit = {}, commit_status, 0
+        self.compress = compress                # serves DFI 0x10: the blocks carry raw DEFLATE, inflated at 37
+        self.z_nomem = z_nomem                  # a DFI 0x10 34 finds no memory: 0x22, F1F1 DL_NO_MEMORY
+        self.dfi, self.zin = 0x00, bytearray()  # the open download's format, and its compressed bytes
         self.log, self.written, self.writes = [], bytearray(), 0
         self.silence, self.announced, self.next_bsc, self.last_bsc = 0, None, 1, None
         self.session, self.unlocked, self.last_t, self.clock = 1, 0, 0.0, lambda: 0.0
@@ -305,11 +309,15 @@ class FakeServer:
         self.unlocked = sub - 1
         return [bytes([0x67, sub])]
 
-    # 0x34 RequestDownload: DFI 00, ALFID 44, address 0; answers 74 20 <max_block> and starts a fresh
-    # download, which also ends any earlier FF01 pass.
+    # 0x34 RequestDownload: DFI 00 (or 10 with compress), ALFID 44, address 0; answers 74 20 <max_block> and starts
+    # a fresh download, which also ends any earlier FF01 pass.
     def s34(self, req, _):
-        if req[1:3] != b"\x00\x44" or req[3:7] != bytes(4):
+        if req[1] not in ((0x00, 0x10) if self.compress else (0x00,)) or req[2] != 0x44 or req[3:7] != bytes(4):
             return self.nrc(0x34, 0x31)
+        if req[1] == 0x10 and self.z_nomem:
+            self.last_dl = (14, 0)                      # DL_NO_MEMORY
+            return self.nrc(0x34, 0x22)
+        self.dfi, self.zin = req[1], bytearray()
         self.announced = int.from_bytes(req[7:11], "big")
         self.written, self.next_bsc, self.last_bsc = bytearray(), 1, None
         self.dl_open, self.dl_complete, self.verified, self.last_dl = True, False, False, (0, 0)
@@ -325,9 +333,12 @@ class FakeServer:
             return [bytes([0x76, bsc])]
         if bsc != self.next_bsc:
             return self.nrc(0x36, 0x73)
-        self.written += req[2:]
+        if self.dfi == 0x10:
+            self.zin += req[2:]
+        else:
+            self.written += req[2:]
         self.writes += 1
-        self.last_dl = (0, len(self.written))
+        self.last_dl = (0, len(self.zin) if self.dfi == 0x10 else len(self.written))
         self.last_bsc, self.next_bsc = bsc, (bsc + 1) & 0xFF
         if self.writes == self.lose_76_once:
             self.lose_76_once = None
@@ -337,6 +348,16 @@ class FakeServer:
 
     # 0x37 RequestTransferExit: an open transfer holding every announced byte closes (77), else 0x24.
     def s37(self, req, _):
+        if self.dl_open and self.dfi == 0x10:
+            z = zlib.decompressobj(-15)
+            try:
+                out = z.decompress(bytes(self.zin))
+            except zlib.error:
+                out = b""
+            if not z.eof or z.unused_data or len(out) != self.announced:
+                self.dl_open, self.last_dl = False, (13, len(self.zin))    # DL_BAD_STREAM
+                return self.nrc(0x37, 0x72)
+            self.written = bytearray(out)
         if not self.dl_open or len(self.written) != self.announced:
             return self.nrc(0x37, 0x24)
         self.dl_open, self.dl_complete = False, True
@@ -1022,7 +1043,8 @@ WIRE_DEFINES = {"UDSOTA_DID_ACTIVE_SESSION": "DID_SESSION", "UDSOTA_DID_SW_VERSI
                 "UDSOTA_DID_RESULT": "DID_RESULT", "UDSOTA_DID_COUNTERS": "DID_COUNTERS",
                 "UDSOTA_DID_RUNNING_SHA": "DID_RUNNING_SHA", "UDSOTA_RID_CHECK_PROG_DEPS": "RID_CHECK_DEPS",
                 "UDSOTA_RID_ACTIVATE_IMAGE": "RID_ACTIVATE", "UDSOTA_RID_CONFIRM_IMAGE": "RID_CONFIRM",
-                "UDSOTA_DL_DFI": "DL_DFI", "UDSOTA_DL_ALFID": "DL_ALFID", "UDSOTA_NRC_BUSY_REPEAT": "NRC_BUSY",
+                "UDSOTA_DL_DFI": "DL_DFI", "UDSOTA_DL_DFI_DEFLATE": "DL_DFI_DEFLATE",
+                "UDSOTA_DL_ALFID": "DL_ALFID", "UDSOTA_NRC_BUSY_REPEAT": "NRC_BUSY",
                 "UDSOTA_NRC_SERVICE_NOT_SUPPORTED": "NRC_NOT_SUPPORTED",
                 "UDSOTA_NRC_CONDITIONS_NOT_CORRECT": "NRC_CONDITIONS",
                 "UDSOTA_NRC_REQUEST_SEQUENCE_ERROR": "NRC_SEQUENCE",
@@ -2246,3 +2268,164 @@ def test_config_set_commit_sequence_error():
                                                   r"changed\); run config set again") as e:
         run_config_set(d, ["mode=2"])
     assert e.value.exit_code == 1 and d.nvs == CFG_VALUES
+
+# ---- compressed downloads (DFI 0x10) ----
+
+# The raw DEFLATE stream at level 9, made here rather than by update.deflate, so a change of level there shows.
+def deflate9(image):
+    c = zlib.compressobj(9, zlib.DEFLATED, -15)
+    return c.compress(image) + c.flush()
+
+
+# Check flash with compress "deflate" sends 34 10 44 announcing the image's own size, then the level-9 raw DEFLATE
+# stream in fewer blocks, counting progress in compressed bytes, and the server's slot ends up holding the image.
+def test_flash_compressed_sends_a_deflate_stream():
+    d, lines = FakeServer(compress=True), []
+    ft = FakeTime()
+    rc = update.flash(uds_for(d, ft), P, make_image(), MASTER, sleep=ft.sleep, clock=ft.clock, log=lines.append,
+                      compress="deflate")
+    z = deflate9(make_image())
+    assert rc == 0 and d.dfi == 0x10 and d.announced == 4800
+    assert bytes(d.zin) == z
+    assert bytes(d.written) == make_image() and d.writes == (len(z) + 15) // 16 < 300
+    assert "sent %d of %d bytes" % (len(z), len(z)) in lines
+    assert not any("of 4800 bytes" in ln for ln in lines)
+
+
+# Check the ratio line and the time-saved line, exactly, over a download that took 2 s by the clock.
+def test_compressed_download_reports_ratio_and_time_saved():
+    d, lines = FakeServer(compress=True, security=False), []
+    uds = uds_for(d, FakeTime())
+    uds.session(2)
+    update.download(uds, make_image(), log=lines.append, compress="deflate", clock=iter([100.0, 102.0]).__next__)
+    z = len(deflate9(make_image()))
+    assert lines[0] == "compressed with raw DEFLATE: 4800 -> %d bytes (%.0f%%)" % (z, 100.0 * z / 4800)
+    assert lines[-1] == ("sent %d compressed bytes in 2.0 s; the 4800-byte image would take about %.1f s, so about "
+                         "%.1f s saved" % (z, 2.0 * 4800 / z, 2.0 * (4800 - z) / z))
+    assert 2.0 * (4800 - z) / z > 0
+
+
+# Check a lost 77 on a compressed download: the resent 37 meets 0x24, F1F1 reads DL_OK with every compressed byte,
+# and the update completes.
+def test_compressed_lost_77_resend_reads_result_and_continues():
+    d = FakeServer(compress=True, lose_77_once=True)
+    assert run_flash(d, compress="deflate")[0] == 0
+    assert [e for e in d.log if e[0] == 0x37] == [(0x37, None)] * 2
+    assert bytes(d.written) == make_image()
+
+
+# Check "deflate" against a server without compressed downloads stops before any 0x36, naming both causes a 0x31 can
+# have (Refused: exit 2).
+def test_compress_on_a_server_without_it_is_refused():
+    d = FakeServer()
+    with pytest.raises(errors.Refused, match="the server has no compressed downloads, or the image is larger than its "
+                                             "slot"):
+        run_flash(d, compress="deflate")
+    assert not any(e[0] == 0x36 for e in d.log)
+
+
+# Check "auto" against a server without compressed downloads falls back to the uncompressed download, says why, and
+# prints no ratio for a stream it never sent.
+def test_compress_auto_falls_back_to_uncompressed():
+    d, lines = FakeServer(), []
+    ft = FakeTime()
+    assert update.flash(uds_for(d, ft), P, make_image(), MASTER, sleep=ft.sleep, clock=ft.clock, log=lines.append,
+                        compress="auto") == 0
+    assert [e for e in d.log if e[0] == 0x34] == [(0x34, None)] * 2
+    assert bytes(d.written) == make_image() and d.writes == 300
+    assert ("the server has no compressed downloads, or the image is larger than its slot: sending the image "
+            "uncompressed") in lines
+    assert not any(ln.startswith("compressed with raw DEFLATE") for ln in lines)
+
+
+# Check a 0x22 at the compressed 34 with F1F1 DL_NO_MEMORY: "deflate" stops naming it and hinting at a plain flash,
+# and "auto" falls back to the uncompressed download.
+def test_compressed_34_without_memory():
+    d = FakeServer(compress=True, z_nomem=True)
+    with pytest.raises(errors.UpdateFailed, match="0x22, F1F1 DL_NO_MEMORY.*a plain flash"):
+        run_flash(d, compress="deflate")
+    assert not any(e[0] == 0x36 for e in d.log)
+    d, lines = FakeServer(compress=True, z_nomem=True), []
+    ft = FakeTime()
+    assert update.flash(uds_for(d, ft), P, make_image(), MASTER, sleep=ft.sleep, clock=ft.clock, log=lines.append,
+                        compress="auto") == 0
+    assert d.dfi == 0x00 and bytes(d.written) == make_image()
+    assert "the server has no memory for a compressed download now: sending the image uncompressed" in lines
+
+
+# Check "auto" falls back only for those refusals: a gate's 0x22 at the compressed 34 (F1F1 not DL_NO_MEMORY) stops
+# the run with that NRC.
+def test_compress_auto_does_not_fall_back_on_other_refusals():
+    d = FakeServer(compress=True, nrc_once={(0x34, None): 0x22})
+    with pytest.raises(errors.Nrc) as e:
+        run_flash(d, compress="auto")
+    assert (e.value.sid, e.value.code) == (0x34, 0x22)
+    assert [x for x in d.log if x[0] == 0x34] == [(0x34, None)]
+
+
+# Check a lost 76 mid-stream is resent once and the server takes the repeat without adding it to the stream.
+def test_compressed_lost_76_is_resent_once():
+    d = FakeServer(compress=True, lose_76_once=3)
+    assert run_flash(d, compress="deflate")[0] == 0
+    assert [e for e in d.log if e[0] == 0x36].count((0x36, 3)) == 2
+    assert bytes(d.written) == make_image()
+
+
+# Check --drop-76 past the last compressed block is refused naming the download's block count, not the image's.
+def test_compressed_drop_76_past_the_last_block_is_refused():
+    d = FakeServer(compress=True)
+    blocks_ = (len(deflate9(make_image())) + 15) // 16
+    with pytest.raises(errors.Refused, match="the download is only %d blocks of 16 bytes" % blocks_):
+        run_flash(d, compress="deflate", drop_76=blocks_ + 1)
+
+
+# Check a stream the server cannot inflate to the announced size fails at 37 (0x72), and the error names F1F1's reason.
+def test_compressed_stream_failure_names_the_reason(monkeypatch):
+    monkeypatch.setattr(update, "deflate", lambda image: zlib.compress(image)[2:-10])   # cut short
+    d = FakeServer(compress=True)
+    with pytest.raises(errors.UpdateFailed, match="0x72.*DL_BAD_STREAM"):
+        run_flash(d, compress="deflate")
+
+
+# Check the profile's [image] compression picks the mode when no flag is given, and --no-compress's "none" wins.
+def test_profile_compression_is_the_default(tmp_path):
+    prof = profile.from_dict("z", tomllib.loads(FULL.replace("[image]\n", '[image]\ncompression = "deflate"\n')))
+    assert prof.compression == "deflate"
+    d = FakeServer(compress=True)
+    assert run_flash(d, prof=prof)[0] == 0 and d.dfi == 0x10
+    d = FakeServer(compress=True)
+    assert run_flash(d, prof=prof, compress="none")[0] == 0 and d.dfi == 0x00
+    auto = profile.from_dict("a", tomllib.loads(FULL.replace("[image]\n", '[image]\ncompression = "auto"\n')))
+    assert auto.compression == "auto" and P.compression == "none"
+    with pytest.raises(errors.Refused, match="compression must be one of none, deflate, auto"):
+        profile.from_dict("b", tomllib.loads(FULL.replace("[image]\n", '[image]\ncompression = "on"\n')))
+
+
+# Check the flags: --compress, --compress-auto and --no-compress give deflate, auto and none, none of them takes the
+# file name as its value, and without one the profile decides (None).
+@pytest.mark.parametrize("argv, mode", [(["flash", "x.bin"], None),
+                                        (["flash", "--compress", "x.bin"], "deflate"),
+                                        (["flash", "x.bin", "--compress"], "deflate"),
+                                        (["flash", "--compress-auto", "x.bin"], "auto"),
+                                        (["flash", "--no-compress", "x.bin"], "none")])
+def test_compress_flags(argv, mode):
+    args = cli.parse_args(["--profile", "example", *argv])
+    assert (args.compress, str(args.file)) == (mode, "x.bin")
+
+
+# Check the three flags exclude each other.
+def test_compress_flags_exclude_each_other(capsys):
+    with pytest.raises(SystemExit):
+        cli.parse_args(["--profile", "example", "flash", "x.bin", "--compress", "--no-compress"])
+    assert "not allowed with" in capsys.readouterr().err
+
+
+# Check main exits 2 with the server's missing compression named when --compress meets a server without it.
+def test_main_compress_on_a_server_without_it_exits_2(tmp_path, full_path, capsys):
+    img, master = tmp_path / "i.bin", tmp_path / "m.bin"
+    img.write_bytes(make_image())
+    master.write_bytes(MASTER)
+    d = FakeServer()
+    rc = cli.main(["--profile", full_path, "--master", str(master), "flash", "--compress", str(img)],
+                  transport=lambda prof, interface: FakeTransport(d, interface))
+    assert rc == 2 and "the server has no compressed downloads" in capsys.readouterr().err

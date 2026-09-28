@@ -46,7 +46,7 @@ typedef struct {
     const char *board;                /* F191 */
     const char *master_file;
     uint32_t    boot_ms, job_ms, soak_ms;
-    bool        skip_boot_delay, no_rollback, verbose;
+    bool        skip_boot_delay, no_rollback, no_compress, verbose;
     uint16_t    chip_id;
     const char *make_image, *version; /* --make-image OUT --version V */
     uint32_t    payload;
@@ -295,7 +295,8 @@ static void usage(FILE *out)
           "bus:      --socketcan IFACE (default: frames on stdin/stdout; vcan only unless --allow-real-bus),\n"
           "          --req-id 0x710, --resp-id 0x718\n"
           "identity: --product example, --hw-id 1, --layout-id 1, --board devkit (F191), --chip-id 0x0009\n"
-          "slots:    --state-dir DIR, --fresh, --slot-size 0x1E0000, --running-version v0.1.0, --no-rollback\n"
+          "slots:    --state-dir DIR, --fresh, --slot-size 0x1E0000, --running-version v0.1.0, --no-rollback,\n"
+          "          --no-compress (refuse DFI 0x10 downloads)\n"
           "security: --label LABEL [--master FILE (32 bytes)], --device-id 02:00:00:00:00:01, --skip-boot-delay\n"
           "timing:   --boot-ms 500, --job-ms 0, --soak-ms 0, --stmin-us 2000, --block-size 64, --stmin-monitor\n"
           "          -v logs every frame on stderr\n", out);
@@ -307,7 +308,7 @@ static bool parse_args(int argc, char **argv)
     enum {
         O_SOCKETCAN = 256, O_REQ, O_RESP, O_PRODUCT, O_HW, O_LAYOUT, O_BOARD, O_CHIP, O_DIR, O_FRESH, O_SLOT, O_RUNNING,
         O_NO_ROLLBACK, O_LABEL, O_MASTER, O_DEVID, O_SKIP_DELAY, O_BOOT_MS, O_JOB_MS, O_SOAK_MS, O_STMIN, O_BS,
-        O_MONITOR, O_MAKE, O_VERSION, O_PAYLOAD, O_SELF_TEST, O_HELP, O_REAL_BUS,
+        O_MONITOR, O_MAKE, O_VERSION, O_PAYLOAD, O_SELF_TEST, O_HELP, O_REAL_BUS, O_NO_COMPRESS,
     };
     static const struct option longopts[] = {
         {"socketcan", required_argument, NULL, O_SOCKETCAN}, {"req-id", required_argument, NULL, O_REQ},
@@ -324,7 +325,7 @@ static bool parse_args(int argc, char **argv)
         {"stmin-monitor", no_argument, NULL, O_MONITOR}, {"make-image", required_argument, NULL, O_MAKE},
         {"version", required_argument, NULL, O_VERSION}, {"payload", required_argument, NULL, O_PAYLOAD},
         {"self-test", no_argument, NULL, O_SELF_TEST}, {"help", no_argument, NULL, O_HELP},
-        {"allow-real-bus", no_argument, NULL, O_REAL_BUS},
+        {"allow-real-bus", no_argument, NULL, O_REAL_BUS}, {"no-compress", no_argument, NULL, O_NO_COMPRESS},
         {NULL, 0, NULL, 0},
     };
     d.o = (opts_t){
@@ -356,6 +357,7 @@ static bool parse_args(int argc, char **argv)
                             d.o.slot_size = (uint32_t)v; break;
         case O_RUNNING:     d.o.running_version = optarg; break;
         case O_NO_ROLLBACK: d.o.no_rollback = true; break;
+        case O_NO_COMPRESS: d.o.no_compress = true; break;
         case O_LABEL:       label = optarg; break;
         case O_MASTER:      d.o.master_file = optarg; break;
         case O_DEVID:       ok = parse_device_id(optarg); break;
@@ -525,15 +527,17 @@ int main(int argc, char **argv)
         return 1;
     }
     d.eng.ota.no_rollback = d.o.no_rollback;
+    d.eng.compress = !d.o.no_compress;
     struct sigaction sa = { .sa_handler = on_signal };
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
     fprintf(stderr, "udsota_demo_server: %s%s, IDs 0x%03X/0x%03X, %s hw_id %u layout %u, slots of 0x%X in %s, "
-            "security %s\n", d.o.iface != NULL ? "SocketCAN " : "pipe on stdin/stdout",
+            "security %s, compressed downloads %s\n", d.o.iface != NULL ? "SocketCAN " : "pipe on stdin/stdout",
             d.o.iface != NULL ? d.o.iface : "", d.cfg.req_id, d.cfg.resp_id, d.cfg.product, d.cfg.hw_id,
             d.cfg.layout_id, d.o.slot_size, d.dir,
-            !d.secured ? "off" : d.have_kdev ? "on" : "on, no master (every key refused)");
+            !d.secured ? "off" : d.have_kdev ? "on" : "on, no master (every key refused)",
+            d.o.no_compress ? "off" : "on");
     const int rc = serve();
     demo_can_close(&d.can);
     demo_engine_close(&d.eng);
