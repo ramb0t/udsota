@@ -353,9 +353,15 @@ udsota_phase_t udsota_esp32_phase(void)
 
 /* See udsota_esp32_priv.h. The engine checks a first block only once the server runs, after start() has set
  * the control block's lock. */
-void udsota_esp32_set_incoming_version(const char *v, size_t max)
+void udsota_esp32_first_block_checked(udsota_reason_t r, const uint8_t *first, size_t len)
 {
-    udsota_esp32_ctl_set_version(&s_ctl, v, max);
+    udsota_esp32_ctl_first_block(&s_ctl, r, first, len);
+}
+
+/* See udsota_esp32_priv.h; zbegin runs only inside a 34, once the server runs. */
+void udsota_esp32_zbegin_refused(void)
+{
+    udsota_esp32_ctl_clear_version(&s_ctl);
 }
 
 /* Any task: the control block's version once the port runs, else "". */
