@@ -32,6 +32,11 @@ LABEL = "udsota-example"
 ISOTP_PARAMS = {"tx_padding": transport.PAD, "tx_data_min_length": 8, "blocking_send": True,
                 "stmin": 0, "blocksize": 0, "rx_flowcontrol_timeout": 1000, "rx_consecutive_frame_timeout": 1000}
 
+# PipeTransport's default P2, in place of the client's 150 ms (transport.P2_S). A shared CI runner can stall the
+# demo or the client's threads past 150 ms, and the late answer then fails the next request too. A test of the
+# test whose client must resend during a 1 s job, to meet the server's 0x21, passes p2_s=transport.P2_S.
+PIPE_P2_S = 1.0
+
 
 # The demo server binary: $UDSOTA_DEMO_SERVER, else build/tools/linux_server/ or the PATH; None when absent.
 def find_binary():
@@ -215,10 +220,11 @@ class PipeIsoTpConnection(PythonIsoTpConnection):
 # transport.Transport over a DemoServer: the same guarded bus, pre-flight, pre-roll, second-tester monitor and
 # udsoncan client config, with can-isotp's Python stack in place of the kernel ISO-TP socket.
 class PipeTransport:
-    # Open the transport for profile on server (unread frames from an earlier transport are dropped).
-    def __init__(self, profile, server, listen_s=0.3):
+    # Open the transport for profile on server with client P2 p2_s (unread frames from an earlier transport are
+    # dropped).
+    def __init__(self, profile, server, listen_s=0.3, p2_s=PIPE_P2_S):
         server.drain()
-        self.profile, self.server, self.listen_s = profile, server, listen_s
+        self.profile, self.server, self.listen_s, self.p2_s = profile, server, listen_s, p2_s
         self.raw = transport.GuardedBus(PipeBus(server), profile)
         self.monitor = transport.SecondTesterMonitor(profile.resp_id)
         self.layer = self.client = None
@@ -250,7 +256,7 @@ class PipeTransport:
         self.layer = isotp.TransportLayer(rxfn=self._rxfn, txfn=self._txfn,
                                           address=transport.isotp_address(self.profile), params=ISOTP_PARAMS)
         conn = transport.GuardedConnection(PipeIsoTpConnection(self.layer), self.monitor)
-        self.client = Client(conn, config=transport.client_config())
+        self.client = Client(conn, config=dict(transport.client_config(), p2_timeout=self.p2_s))
         self.client.open()
         return Uds(self.client)
 
