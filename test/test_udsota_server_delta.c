@@ -230,28 +230,12 @@ static const udsota_engine_t ENGINE = {
 
 /* ---- the server ---- */
 
-/* Fixed non-zero seed pattern 01..10. */
-static bool mock_rng16(void *ctx, uint8_t out[16])
-{
-    for (int i = 0; i < 16; i++) out[i] = (uint8_t)(i + 1);
-    return true;
-}
-
-/* security.key stand-in: expected key = seed XOR 0x5A. */
-static bool mock_key(void *ctx, const uint8_t seed[16], uint8_t level, uint8_t out[16])
-{
-    for (int i = 0; i < 16; i++) out[i] = (uint8_t)(seed[i] ^ 0x5A);
-    return true;
-}
-
-static const udsota_security_t SECURITY = {.rng16 = mock_rng16, .key = mock_key};
-
 /* Boots the server on engine with the mock's config and hooks. */
 static void boot(const udsota_engine_t *engine)
 {
     const udsota_config_t cfg = udsota_mock_cfg();
     const udsota_hooks_t hooks = udsota_mock_hooks(&g_mock);
-    udsota_init(&srv, &cfg, engine, &SECURITY, &hooks);
+    udsota_init(&srv, &cfg, engine, udsota_mock_security(), &hooks);
 }
 
 /* Copies n bytes of p into g_p. */
@@ -310,7 +294,7 @@ static void enter_programming(void)
     const uint8_t seed_req[] = {UDSOTA_SID_SECURITY, UDSOTA_SA_SEED_PROGRAMMING};
     send(seed_req, sizeof seed_req);
     uint8_t key[2u + UDSOTA_KEY_LEN] = {UDSOTA_SID_SECURITY, UDSOTA_SA_KEY_PROGRAMMING};
-    for (size_t i = 0; i < UDSOTA_KEY_LEN; i++) key[2u + i] = (uint8_t)(g_resp[2u + i] ^ 0x5A);
+    udsota_mock_key_for(&g_resp[2], UDSOTA_SA_SEED_PROGRAMMING, &key[2]);
     send(key, sizeof key);
     EXPECT(0x67, 0x04);
 }

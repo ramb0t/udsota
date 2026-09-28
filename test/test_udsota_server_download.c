@@ -51,20 +51,6 @@ static void log_call(char c)
     }
 }
 
-/* Fixed non-zero seed pattern 01..10. */
-static bool mock_rng16(void *ctx, uint8_t out[16])
-{
-    for (int i = 0; i < 16; i++) out[i] = (uint8_t)(i + 1);
-    return true;
-}
-
-/* security.key stand-in: expected key = seed XOR 0x5A; the level is ignored. */
-static bool mock_key(void *ctx, const uint8_t seed[16], uint8_t level, uint8_t out[16])
-{
-    for (int i = 0; i < 16; i++) out[i] = (uint8_t)(seed[i] ^ 0x5A);
-    return true;
-}
-
 /* Queues the slot erase (UDSOTA_PENDING): the worker is busy for erase_ms, unless begin_ret refuses it. */
 static int mock_begin(void *ctx, uint32_t size)
 {
@@ -139,14 +125,13 @@ static const udsota_engine_t ENGINE = {
     .activate = mock_ok, .confirm = mock_ok, .abort = mock_abort, .unverify = mock_unverify,
     .poll = mock_poll, .status = udsota_mock_status, .ctx = &g_mock,
 };
-static const udsota_security_t SECURITY = {.rng16 = mock_rng16, .key = mock_key};
 
 /* Boots the server on engine (ENGINE or a copy) with the mock's config and hooks. */
 static void boot(const udsota_engine_t *engine)
 {
     const udsota_config_t cfg = udsota_mock_cfg();
     const udsota_hooks_t hooks = udsota_mock_hooks(&g_mock);
-    udsota_init(&srv, &cfg, engine, &SECURITY, &hooks);
+    udsota_init(&srv, &cfg, engine, udsota_mock_security(), &hooks);
 }
 
 /* Fresh server and mock at T0; the erase takes 3.3 s (1.34 MB) and a block write 15 ms; the gate allows. */
@@ -227,7 +212,7 @@ static void enter_programming(void)
     TEST_ASSERT_EQUAL_UINT(2u + UDSOTA_SEED_LEN, g_resp_len);
     TEST_ASSERT_EQUAL_HEX8(0x67, g_resp[0]);
     uint8_t key[2u + UDSOTA_KEY_LEN] = {UDSOTA_SID_SECURITY, UDSOTA_SA_KEY_PROGRAMMING};
-    for (size_t i = 0; i < UDSOTA_KEY_LEN; i++) key[2u + i] = (uint8_t)(g_resp[2u + i] ^ 0x5A);
+    udsota_mock_key_for(&g_resp[2], UDSOTA_SA_SEED_PROGRAMMING, &key[2]);
     send(key, sizeof key);
     EXPECT(0x67, 0x04);
 }

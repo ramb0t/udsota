@@ -36,24 +36,6 @@ static int mock_queue(int j)
     return UDSOTA_PENDING;
 }
 
-/* Fixed, non-zero seed so the key below is predictable. */
-static bool mock_rng16(void *ctx, uint8_t out[16])
-{
-    for (int i = 0; i < 16; i++) {
-        out[i] = (uint8_t)(0xA0 + i);
-    }
-    return true;
-}
-
-/* Expected key = seed ^ level ^ 0x5A per byte; unlock_programming() computes the same. */
-static bool mock_key(void *ctx, const uint8_t seed[16], uint8_t level, uint8_t out[16])
-{
-    for (int i = 0; i < 16; i++) {
-        out[i] = (uint8_t)(seed[i] ^ level ^ 0x5A);
-    }
-    return true;
-}
-
 /* Erase-and-begin, queued. */
 static int mock_ota_begin(void *ctx, uint32_t size) { return mock_queue(JOB_FLASH); }
 /* Block write, queued. */
@@ -103,14 +85,13 @@ static const udsota_engine_t ENGINE = {
     .activate = mock_ota_activate, .confirm = mock_ota_confirm, .abort = mock_ota_abort,
     .unverify = mock_ota_unverify, .poll = mock_job_poll, .status = udsota_mock_status, .ctx = &g_mock,
 };
-static const udsota_security_t SECURITY = {.rng16 = mock_rng16, .key = mock_key};
 
 /* A newly booted server: the mock's config and hooks (restarts counted in g_mock.resets) and the TX source. */
 static void boot(void)
 {
     const udsota_config_t cfg = udsota_mock_cfg();
     const udsota_hooks_t hooks = udsota_mock_hooks(&g_mock);
-    udsota_init(&srv, &cfg, &ENGINE, &SECURITY, &hooks);
+    udsota_init(&srv, &cfg, &ENGINE, udsota_mock_security(), &hooks);
     udsota_set_tx_pending(&srv, mock_tx_pending, NULL);
 }
 
@@ -186,9 +167,7 @@ static void unlock_programming(void)
     TEST_ASSERT_EQUAL_UINT(2 + UDSOTA_SEED_LEN, n);
     TEST_ASSERT_EQUAL_HEX8(0x67, resp[0]);
     uint8_t key[2 + UDSOTA_KEY_LEN] = {0x27, 0x04};
-    for (size_t i = 0; i < UDSOTA_KEY_LEN; i++) {
-        key[2 + i] = (uint8_t)(resp[2 + i] ^ 0x03 ^ 0x5A);
-    }
+    udsota_mock_key_for(&resp[2], 0x03, &key[2]);
     n = send(key, sizeof key);
     TEST_ASSERT_EQUAL_UINT(2, n);
     TEST_ASSERT_EQUAL_HEX8(0x67, resp[0]);
@@ -320,7 +299,7 @@ static void boot_app(bool with_poll)
     udsota_hooks_t hooks = udsota_mock_hooks(&g_mock);
     hooks.routine = app_routine;
     hooks.routine_poll = with_poll ? app_routine_poll : NULL;
-    udsota_init(&srv, &cfg, &ENGINE, &SECURITY, &hooks);
+    udsota_init(&srv, &cfg, &ENGINE, udsota_mock_security(), &hooks);
     udsota_set_tx_pending(&srv, mock_tx_pending, NULL);
 }
 
@@ -330,9 +309,7 @@ static void unlock_extended(void)
     size_t n = REQ(0x27, 0x01);
     TEST_ASSERT_EQUAL_UINT(2 + UDSOTA_SEED_LEN, n);
     uint8_t key[2 + UDSOTA_KEY_LEN] = {0x27, 0x02};
-    for (size_t i = 0; i < UDSOTA_KEY_LEN; i++) {
-        key[2 + i] = (uint8_t)(resp[2 + i] ^ 0x01 ^ 0x5A);
-    }
+    udsota_mock_key_for(&resp[2], 0x01, &key[2]);
     n = send(key, sizeof key);
     TEST_ASSERT_EQUAL_UINT(2, n);
     TEST_ASSERT_EQUAL_HEX8(0x67, resp[0]);

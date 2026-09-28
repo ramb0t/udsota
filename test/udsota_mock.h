@@ -1,6 +1,7 @@
 /* Shared host-test mock for the udsota server: a gate that answers per op and counts what it was
- * asked, a phase recorder, a reset hook, an app DID hook and the engine's status source. Header-only and all
- * static inline, so a test that uses part of it still builds under -Werror. */
+ * asked, a phase recorder, a reset hook, an app DID hook, the engine's status source and a SecurityAccess
+ * with a known key. Header-only and all static inline, so a test that uses part of it still builds under
+ * -Werror. */
 #pragma once
 #include <stdbool.h>
 #include <stddef.h>
@@ -104,4 +105,35 @@ static inline udsota_config_t udsota_mock_cfg(void)
     c.device_id = serial;
     c.device_id_len = sizeof serial;
     return c;
+}
+
+/* The tests' stand-in for the port's HMAC: key[i] = seed[i] ^ level ^ 0xA5. */
+static inline void udsota_mock_key_for(const uint8_t *seed, uint8_t level, uint8_t *out)
+{
+    for (int i = 0; i < 16; i++) {
+        out[i] = (uint8_t)(seed[i] ^ level ^ 0xA5u);
+    }
+}
+
+/* security.rng16: always 10 11 .. 1F (non-zero, so SecurityAccess accepts it). */
+static inline bool udsota_mock_rng16(void *ctx, uint8_t out[16])
+{
+    for (int i = 0; i < 16; i++) {
+        out[i] = (uint8_t)(0x10 + i);
+    }
+    return true;
+}
+
+/* security.key: udsota_mock_key_for. */
+static inline bool udsota_mock_key(void *ctx, const uint8_t seed[16], uint8_t level, uint8_t out[16])
+{
+    udsota_mock_key_for(seed, level, out);
+    return true;
+}
+
+/* The tests' security: udsota_mock_rng16 and udsota_mock_key, no ctx. */
+static inline const udsota_security_t *udsota_mock_security(void)
+{
+    static const udsota_security_t sec = {.rng16 = udsota_mock_rng16, .key = udsota_mock_key};
+    return &sec;
 }
