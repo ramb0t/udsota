@@ -519,12 +519,6 @@ def run_flash(server, image=None, prof=P, master=MASTER, **kw):
     return rc, ft, len(prerolls)
 
 
-PRECHECK = [(0x22, 0xF1F0), (0x22, 0xF1F3), (0x22, 0xF191), (0x22, 0xF18C)]
-UNLOCK_PROG = [(0x10, 2), (0x27, 3), (0x27, 4)]
-DOWNLOAD_TAIL = [(0x37, None), (0x31, 0xFF01), (0x31, 0xF001)]
-AFTER_ACTIVATE = [(0x22, 0xF1F3)] * 3 + [(0x10, 3)] + [(0x31, 0xF002)] * 3 + [(0x22, 0xF1F0)]
-
-
 # Expected 0x36 log for a 4800-byte image in 16-byte blocks: 300 blocks, counter wrapping 0xFF -> 0x00.
 def blocks(repeat=None):
     out = []
@@ -533,6 +527,15 @@ def blocks(repeat=None):
         if n == repeat:
             out.append((0x36, n & 0xFF))
     return out
+
+
+PRECHECK = [(0x22, 0xF1F0), (0x22, 0xF1F3), (0x22, 0xF191), (0x22, 0xF18C)]
+UNLOCK_PROG = [(0x10, 2), (0x27, 3), (0x27, 4)]
+UNLOCK_EXT = [(0x22, 0xF18C), (0x10, 3), (0x27, 1), (0x27, 2)]
+RESET = UNLOCK_EXT + [(0x11, 1)]
+DOWNLOAD_TAIL = [(0x37, None), (0x31, 0xFF01), (0x31, 0xF001)]
+DOWNLOAD = [(0x34, None)] + blocks() + DOWNLOAD_TAIL
+AFTER_ACTIVATE = [(0x22, 0xF1F3)] * 3 + [(0x10, 3)] + [(0x31, 0xF002)] * 3 + [(0x22, 0xF1F0)]
 
 
 # ---- keys: the udsota-example vectors and the core's KAT ----
@@ -1163,9 +1166,7 @@ def test_flash_runs_the_update_sequence_in_order():
     d = FakeServer()
     rc, ft, prerolls = run_flash(d)
     assert rc == 0
-    assert d.log == (PRECHECK + UNLOCK_PROG + [(0x34, None)] + blocks()
-                     + [(0x37, None), (0x31, 0xFF01), (0x31, 0xF001)]
-                     + [(0x22, 0xF1F3)] * 3 + [(0x10, 3)] + [(0x31, 0xF002)] * 3 + [(0x22, 0xF1F0)])
+    assert d.log == PRECHECK + UNLOCK_PROG + DOWNLOAD + AFTER_ACTIVATE
     assert bytes(d.written) == make_image() and d.writes == 300
     assert prerolls == 3
     assert ft.sleeps[0] == update.REBOOT_WAIT_S and ft.sleeps.count(update.CONFIRM_RETRY_S) == 2
@@ -1474,9 +1475,8 @@ def test_lost_ff01_failure_names_the_result_reason():
 def test_activate_sequence_error_downloads_again():
     d = FakeServer(activate_nrcs=[0x24])
     assert run_flash(d, drop_76=2)[0] == 0
-    once = [(0x34, None)] + blocks() + DOWNLOAD_TAIL
     assert d.log == (PRECHECK + UNLOCK_PROG + [(0x34, None)] + blocks(repeat=2) + DOWNLOAD_TAIL
-                     + once + AFTER_ACTIVATE)
+                     + DOWNLOAD + AFTER_ACTIVATE)
     assert d.writes == 600 and d.sha == NEW_SHA
 
 
@@ -1484,8 +1484,7 @@ def test_activate_sequence_error_downloads_again():
 def test_activate_sequence_error_on_the_skip_path_downloads():
     d = FakeServer(other_state=3, other_sha=NEW_SHA, activate_nrcs=[0x24])
     assert run_flash(d)[0] == 0
-    assert d.log == (PRECHECK + UNLOCK_PROG + [(0x31, 0xF001), (0x34, None)] + blocks() + DOWNLOAD_TAIL
-                     + AFTER_ACTIVATE)
+    assert d.log == PRECHECK + UNLOCK_PROG + [(0x31, 0xF001)] + DOWNLOAD + AFTER_ACTIVATE
 
 
 # Check a second 0x24 to ActivateImage stops: the tool recovers once per run.
@@ -1502,8 +1501,8 @@ def test_activate_failure_with_set_boot_landed_resets_and_confirms():
     d = FakeServer(activate_fail="set_boot")
     rc, _, prerolls = run_flash(d)
     assert rc == 0
-    assert d.log == (PRECHECK + UNLOCK_PROG + [(0x34, None)] + blocks() + DOWNLOAD_TAIL
-                     + [(0x22, 0xF1F0), (0x10, 3), (0x27, 1), (0x27, 2), (0x11, 1)] + AFTER_ACTIVATE)
+    assert d.log == (PRECHECK + UNLOCK_PROG + DOWNLOAD + [(0x22, 0xF1F0), (0x10, 3), (0x27, 1), (0x27, 2), (0x11, 1)]
+                     + AFTER_ACTIVATE)
     assert d.sha == NEW_SHA and d.running_state == 3 and prerolls == 3
 
 
@@ -1512,7 +1511,7 @@ def test_activate_failure_not_landed_stops():
     d = FakeServer(activate_fail="clean")
     with pytest.raises(errors.UpdateFailed, match="did not land"):
         run_flash(d)
-    assert d.log == PRECHECK + UNLOCK_PROG + [(0x34, None)] + blocks() + DOWNLOAD_TAIL + [(0x22, 0xF1F0)]
+    assert d.log == PRECHECK + UNLOCK_PROG + DOWNLOAD + [(0x22, 0xF1F0)]
     assert d.sha == OLD_SHA
 
 
@@ -1548,7 +1547,7 @@ def test_confirm_gives_up_after_timeout():
 def test_reset_is_keyed():
     ft, d = FakeTime(), FakeServer()
     assert update.reset(uds_for(d, ft), P, MASTER, log=lambda *a: None) == 0
-    assert d.log == [(0x22, 0xF18C), (0x10, 3), (0x27, 1), (0x27, 2), (0x11, 1)]
+    assert d.log == RESET
 
 
 # Check reset just after a boot waits out the server's 10 s 0x27 delay (NRC 0x37) instead of failing.
@@ -1564,7 +1563,7 @@ def test_reset_waits_out_the_post_boot_delay():
 def test_reset_ecdsa_is_keyed():
     ft, d = FakeTime(), FakeServer(pubkey=TESTER_PUB)
     assert update.reset(uds_for(d, ft), PE, TESTER_KEY, log=lambda *a: None) == 0
-    assert d.log == [(0x22, 0xF18C), (0x10, 3), (0x27, 1), (0x27, 2), (0x11, 1)]
+    assert d.log == RESET
 
 
 # Check info reads the identity DIDs and config DIDs up to the first absent one, without a session change.
@@ -1804,7 +1803,7 @@ def test_main_ecdsa_reset(tmp_path):
     d = FakeServer(pubkey=keys.public_point(keys.load_private_key(private)))
     assert cli.main(["--profile", str(p), "--private-key", str(private), "reset"],
                     transport=lambda prof, i: FakeTransport(d, i)) == 0
-    assert d.log == [(0x22, 0xF18C), (0x10, 3), (0x27, 1), (0x27, 2), (0x11, 1)]
+    assert d.log == RESET
     assert cli.main(["--profile", str(p), "--private-key", str(tmp_path / "absent.pem"), "reset"],
                     transport=no_transport) == 2
 
@@ -1890,9 +1889,7 @@ def test_generic_flash_has_no_security(generic):
     d = FakeServer(security=False)
     rc, _, prerolls = run_flash(d, image=widget_image(), prof=generic, master=None)
     assert rc == 0
-    assert d.log == ([(0x22, 0xF1F0), (0x22, 0xF1F3), (0x10, 2), (0x34, None)] + blocks()
-                     + [(0x37, None), (0x31, 0xFF01), (0x31, 0xF001)]
-                     + [(0x22, 0xF1F3)] * 3 + [(0x10, 3)] + [(0x31, 0xF002)] * 3 + [(0x22, 0xF1F0)])
+    assert d.log == [(0x22, 0xF1F0), (0x22, 0xF1F3), (0x10, 2)] + DOWNLOAD + AFTER_ACTIVATE
     assert bytes(d.written) == widget_image() and d.sha == NEW_SHA and d.running_state == 3
 
 
@@ -2044,7 +2041,6 @@ def test_info_decodes_u8_and_u16():
 
 # ---- config writes: set and show ----
 
-UNLOCK_EXT = [(0x22, 0xF18C), (0x10, 3), (0x27, 1), (0x27, 2)]
 HASH_READS = [(0x22, did) for did in range(0x0200, 0x0210)] + [(0x22, CFG_HASH_DID)]
 
 
