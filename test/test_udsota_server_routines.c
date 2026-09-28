@@ -251,6 +251,114 @@ static void confirm_ready(void)
     g_mock.status.running_state = UDSOTA_IMG_PENDING_VERIFY;
 }
 
+/* ---- App routines: hooks.routine and hooks.routine_poll ---- */
+
+#define APP_RID  0x1234u   /* a RID the core does not own */
+
+/* What the app routine fakes answer and what they were handed. */
+typedef struct {
+    int      rc;               /* hooks.routine's return: 0, an NRC, UDSOTA_PENDING, or a value outside those */
+    int      poll_rc;          /* hooks.routine_poll's return once hold is clear */
+    bool     hold;             /* hooks.routine_poll answers UDSOTA_PENDING while set */
+    uint8_t  out[4];           /* the out record both fakes write on success */
+    size_t   out_len;          /* its reported length; past out_max or sizeof out, nothing is written */
+    unsigned n_routine, n_poll;
+    uint16_t rid;              /* what the last hooks.routine call got */
+    uint8_t  in[8];
+    size_t   in_len, out_max;
+    udsota_access_t access;
+    void    *ctx;
+} app_mock_t;
+
+static app_mock_t app;
+
+/* Writes app.out into out when it fits and reports app.out_len (a longer report tests the core's check). */
+static void app_write_out(uint8_t *out, size_t out_max, size_t *out_len)
+{
+    if (app.out_len <= out_max && app.out_len <= sizeof app.out) {
+        memcpy(out, app.out, app.out_len);
+    }
+    *out_len = app.out_len;
+}
+
+/* hooks.routine fake: records the call and returns app.rc, writing the out record when that is 0. */
+static int app_routine(void *ctx, uint16_t rid, const uint8_t *in, size_t in_len,
+                       uint8_t *out, size_t out_max, size_t *out_len, udsota_access_t access)
+{
+    app.n_routine++;
+    app.ctx = ctx;
+    app.rid = rid;
+    app.in_len = in_len;
+    memcpy(app.in, in, in_len < sizeof app.in ? in_len : sizeof app.in);
+    app.out_max = out_max;
+    app.access = access;
+    if (app.rc == 0) {
+        app_write_out(out, out_max, out_len);
+    }
+    return app.rc;
+}
+
+/* hooks.routine_poll fake: UDSOTA_PENDING while app.hold, else app.poll_rc with the out record when that is 0. */
+static int app_routine_poll(void *ctx, uint8_t *out, size_t out_max, size_t *out_len)
+{
+    app.n_poll++;
+    if (app.hold) {
+        return UDSOTA_PENDING;
+    }
+    if (app.poll_rc == 0) {
+        app_write_out(out, out_max, out_len);
+    }
+    return app.poll_rc;
+}
+
+/* A newly booted server with the mock's hooks plus hooks.routine, and hooks.routine_poll when with_poll is set;
+ * the app fakes start cleared. */
+static void boot_app(bool with_poll)
+{
+    memset(&app, 0, sizeof app);
+    const udsota_config_t cfg = udsota_mock_cfg();
+    udsota_hooks_t hooks = udsota_mock_hooks(&g_mock);
+    hooks.routine = app_routine;
+    hooks.routine_poll = with_poll ? app_routine_poll : NULL;
+    udsota_init(&srv, &cfg, &ENGINE, &SECURITY, &hooks);
+    udsota_set_tx_pending(&srv, mock_tx_pending, NULL);
+}
+
+/* 27 01 then 27 02 with the mock's key; the server must already be in the extended session. */
+static void unlock_extended(void)
+{
+    size_t n = REQ(0x27, 0x01);
+    TEST_ASSERT_EQUAL_UINT(2 + UDSOTA_SEED_LEN, n);
+    uint8_t key[2 + UDSOTA_KEY_LEN] = {0x27, 0x02};
+    for (size_t i = 0; i < UDSOTA_KEY_LEN; i++) {
+        key[2 + i] = (uint8_t)(resp[2 + i] ^ 0x01 ^ 0x5A);
+    }
+    n = send(key, sizeof key);
+    TEST_ASSERT_EQUAL_UINT(2, n);
+    TEST_ASSERT_EQUAL_HEX8(0x67, resp[0]);
+    TEST_ASSERT_EQUAL_HEX8(0x02, resp[1]);
+}
+
+/* Asserts the answer is exactly 7F <sid> <nrc>. */
+static void expect_nrc_sid(size_t n, uint8_t sid, uint8_t nrc)
+{
+    TEST_ASSERT_EQUAL_UINT(3, n);
+    TEST_ASSERT_EQUAL_HEX8(0x7F, resp[0]);
+    TEST_ASSERT_EQUAL_HEX8(sid, resp[1]);
+    TEST_ASSERT_EQUAL_HEX8(nrc, resp[2]);
+}
+
+/* Polls every 10 ms from a job started at t0, accepting only silence or 0x78, then once at the 90 s cap;
+ * returns that poll's answer length. */
+static size_t poll_to_cap(uint32_t t0)
+{
+    while (now + 10u < t0 + UDSOTA_JOB_CAP_MS) {
+        const size_t n = poll_after(10);
+        TEST_ASSERT_TRUE(n == 0 || is_pending(n));
+    }
+    return poll_after(t0 + UDSOTA_JOB_CAP_MS - now);
+}
+
 /* 0x31 is not served in the default session at all. */
 static void test_default_session_is_7f(void)
 {
@@ -747,6 +855,240 @@ static void test_sprmib(void)
 }
 
 /* Runs every RoutineControl test. */
+/* A RID the core does not own goes to hooks.routine with the option record, the room after 71 01 <rid>, the
+ * hooks' ctx and the access state; 0 answers 71 01 <rid> and the out record at once, with no job. */
+static void test_app_routine_answers_at_once(void)
+{
+    boot_app(true);
+    enter_extended();
+    app.out[0] = 0x00;
+    app.out[1] = 0x7B;
+    app.out_len = 2;
+    const size_t n = REQ_RAW(0x31, 0x01, 0x12, 0x34, 0xAA, 0xBB, 0xCC);
+    const uint8_t want[] = {0x71, 0x01, 0x12, 0x34, 0x00, 0x7B};
+    TEST_ASSERT_EQUAL_UINT(sizeof want, n);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(want, resp, sizeof want);
+    TEST_ASSERT_FALSE(srv.job_running);
+    TEST_ASSERT_EQUAL_UINT(1, app.n_routine);
+    TEST_ASSERT_EQUAL_UINT(0, app.n_poll);
+    TEST_ASSERT_EQUAL_HEX16(APP_RID, app.rid);
+    const uint8_t in[] = {0xAA, 0xBB, 0xCC};
+    TEST_ASSERT_EQUAL_UINT(sizeof in, app.in_len);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(in, app.in, sizeof in);
+    TEST_ASSERT_EQUAL_UINT(sizeof resp - 4u, app.out_max);
+    TEST_ASSERT_EQUAL_PTR(&g_mock, app.ctx);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_EXTENDED, app.access.session);
+    TEST_ASSERT_EQUAL_UINT8(0, app.access.unlocked_level);
+    TEST_ASSERT_EQUAL_UINT32(srv.session_epoch, app.access.epoch);
+}
+
+/* access carries the unlocked level and the epoch in force: a repeat 10 03 relocks and bumps the epoch, and in
+ * programming with level 03 the app sees that session and level. The core leaves both to the app. */
+static void test_app_routine_access_follows_session(void)
+{
+    boot_app(true);
+    enter_extended();
+    unlock_extended();
+    expect_pos(REQ(0x31, 0x01, 0x12, 0x34), APP_RID, -1);
+    TEST_ASSERT_EQUAL_UINT8(0x01, app.access.unlocked_level);
+    const uint32_t e0 = app.access.epoch;
+    enter_extended();
+    expect_pos(REQ(0x31, 0x01, 0x12, 0x34), APP_RID, -1);
+    TEST_ASSERT_EQUAL_UINT8(0, app.access.unlocked_level);
+    TEST_ASSERT_EQUAL_UINT32(e0 + 1u, app.access.epoch);
+    enter_programming(true);
+    expect_pos(REQ(0x31, 0x01, 0x12, 0x34), APP_RID, -1);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_PROGRAMMING, app.access.session);
+    TEST_ASSERT_EQUAL_UINT8(0x03, app.access.unlocked_level);
+}
+
+/* The core's own checks still come first and never reach the app: 0x7F in default, 0x13 under 4 bytes, 0x12 for
+ * a sub-function other than 01. Its own RIDs keep their session, key and exact-length rules with the hook set. */
+static void test_core_checks_come_before_the_app(void)
+{
+    boot_app(true);
+    expect_nrc(REQ(0x31, 0x01, 0x12, 0x34), UDSOTA_NRC_SERVICE_NOT_SUPPORTED_IN_SESSION);
+    enter_extended();
+    expect_nrc(REQ(0x31, 0x01, 0x12), UDSOTA_NRC_INCORRECT_LENGTH);
+    expect_nrc(REQ(0x31, 0x02, 0x12, 0x34), UDSOTA_NRC_SUBFUNC_NOT_SUPPORTED);
+    expect_nrc(REQ(0x31, 0x03, 0x12, 0x34), UDSOTA_NRC_SUBFUNC_NOT_SUPPORTED);
+    expect_nrc(REQ(0x31, 0x01, 0xFF, 0x01), UDSOTA_NRC_REQUEST_OUT_OF_RANGE);    /* FF01 outside programming */
+    enter_programming(false);
+    mark_transfer_exited();
+    expect_nrc(REQ(0x31, 0x01, 0xFF, 0x01), UDSOTA_NRC_SECURITY_ACCESS_DENIED);
+    unlock_programming();
+    expect_nrc(REQ(0x31, 0x01, 0xFF, 0x01, 0x00), UDSOTA_NRC_INCORRECT_LENGTH);
+    TEST_ASSERT_EQUAL_UINT(0, app.n_routine);
+    TEST_ASSERT_EQUAL_UINT(0, m.n_end);
+}
+
+/* An NRC from the app is sent verbatim; a return that is neither 0, an NRC nor UDSOTA_PENDING, and an out record
+ * longer than its room, are 0x10. */
+static void test_app_nrc_passes_through(void)
+{
+    boot_app(true);
+    enter_extended();
+    app.rc = UDSOTA_NRC_CONDITIONS_NOT_CORRECT;
+    expect_nrc(REQ(0x31, 0x01, 0x12, 0x34), UDSOTA_NRC_CONDITIONS_NOT_CORRECT);
+    app.rc = UDSOTA_NRC_SECURITY_ACCESS_DENIED;
+    expect_nrc(REQ(0x31, 0x01, 0x12, 0x34), UDSOTA_NRC_SECURITY_ACCESS_DENIED);
+    app.rc = 0x100;
+    expect_nrc(REQ(0x31, 0x01, 0x12, 0x34), UDSOTA_NRC_GENERAL_REJECT);
+    app.rc = -1;
+    expect_nrc(REQ(0x31, 0x01, 0x12, 0x34), UDSOTA_NRC_GENERAL_REJECT);
+    app.rc = 0;
+    app.out_len = sizeof resp - 3u;                          /* one byte more than the room after 71 01 <rid> */
+    expect_nrc(REQ(0x31, 0x01, 0x12, 0x34), UDSOTA_NRC_GENERAL_REJECT);
+    TEST_ASSERT_EQUAL_UINT(5, app.n_routine);
+    TEST_ASSERT_FALSE(srv.job_running);
+}
+
+/* UDSOTA_PENDING makes the app routine a job: nothing at once, 0x78 by 50 ms, 0x21 for anything but 3E, and the
+ * final answer from routine_poll even while engine.poll still reports work of its own. */
+static void test_app_pending_answers_through_routine_poll(void)
+{
+    boot_app(true);
+    enter_extended();
+    app.rc = UDSOTA_PENDING;
+    app.hold = true;
+    TEST_ASSERT_EQUAL_UINT(0, REQ_RAW(0x31, 0x01, 0x12, 0x34));
+    TEST_ASSERT_TRUE(srv.job_running);
+    TEST_ASSERT_TRUE(srv.job_app);
+    TEST_ASSERT_EQUAL_UINT32(UDSOTA_JOB_POLL_MS, udsota_ms_to_deadline(&srv, now));
+    TEST_ASSERT_EQUAL_UINT(0, poll_after(10));
+    TEST_ASSERT_TRUE(is_pending(poll_after(40)));
+    TEST_ASSERT_EQUAL_HEX8(0x31, resp[1]);
+    expect_nrc_sid(REQ_RAW(0x22, 0xF1, 0x86), 0x22, UDSOTA_NRC_BUSY_REPEAT);
+    TEST_ASSERT_EQUAL_UINT(2, REQ_RAW(0x3E, 0x00));
+    TEST_ASSERT_EQUAL_HEX8(0x7E, resp[0]);
+    m.hold = true;                                           /* engine.poll says pending: it must not matter */
+    app.hold = false;
+    app.out[0] = 0x00;
+    app.out_len = 1;
+    expect_pos(poll_after(10), APP_RID, 0x00);
+    TEST_ASSERT_FALSE(srv.job_running);
+    TEST_ASSERT_FALSE(srv.job_app);
+    TEST_ASSERT_EQUAL_UINT(1, app.n_routine);
+}
+
+/* A pending app routine's final NRC is sent. With SPRMIB a positive final answer is dropped unless a 0x78 went
+ * out first, as for the core's own jobs, and a synchronous positive answer is dropped. */
+static void test_app_pending_final_nrc_and_sprmib(void)
+{
+    boot_app(true);
+    enter_extended();
+    app.rc = UDSOTA_PENDING;
+    app.poll_rc = UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE;
+    expect_nrc(REQ(0x31, 0x01, 0x12, 0x34), UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE);
+    app.poll_rc = 0;
+    TEST_ASSERT_EQUAL_UINT(0, REQ_RAW(0x31, 0x81, 0x12, 0x34));
+    TEST_ASSERT_EQUAL_UINT(0, poll_after(10));               /* finished before any 0x78: silent */
+    TEST_ASSERT_FALSE(srv.job_running);
+    app.hold = true;
+    TEST_ASSERT_EQUAL_UINT(0, REQ_RAW(0x31, 0x81, 0x12, 0x34));
+    TEST_ASSERT_TRUE(is_pending(poll_after(50)));
+    app.hold = false;
+    expect_pos(poll_after(10), APP_RID, -1);                  /* after a 0x78 the answer is sent */
+    app.rc = 0;
+    TEST_ASSERT_EQUAL_UINT(0, REQ_RAW(0x31, 0x81, 0x12, 0x34));
+}
+
+/* An app routine still pending at the 90 s cap ends in 0x72 and the default session. The core keeps it as an app
+ * orphan: an idle engine.poll never clears it, 10 02 and 11 01 are 0x22, and a second app routine is 0x22 without
+ * a call, until routine_poll stops returning pending. The orphan's own answer is never sent. */
+static void test_app_cap_orphans_until_routine_poll(void)
+{
+    boot_app(true);
+    enter_extended();
+    app.rc = UDSOTA_PENDING;
+    app.hold = true;
+    TEST_ASSERT_EQUAL_UINT(0, REQ_RAW(0x31, 0x01, 0x12, 0x34));
+    expect_nrc(poll_to_cap(now), UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_DEFAULT, srv.session);
+    TEST_ASSERT_FALSE(srv.job_running);
+    TEST_ASSERT_TRUE(srv.app_orphan);
+    TEST_ASSERT_FALSE(srv.worker_orphan);
+    TEST_ASSERT_EQUAL_HEX16(1, srv.counters.resp_pending_caps);
+    TEST_ASSERT_EQUAL_UINT32(UDSOTA_JOB_POLL_MS, udsota_ms_to_deadline(&srv, now));   /* watched in default too */
+
+    TEST_ASSERT_EQUAL_UINT(0, poll_after(10));                /* engine.poll is idle: still the app's orphan */
+    TEST_ASSERT_TRUE(srv.app_orphan);
+    expect_nrc_sid(REQ(0x10, 0x02), 0x10, UDSOTA_NRC_CONDITIONS_NOT_CORRECT);
+    enter_extended();
+    unlock_extended();
+    expect_nrc_sid(REQ(0x11, 0x01), 0x11, UDSOTA_NRC_CONDITIONS_NOT_CORRECT);
+    TEST_ASSERT_EQUAL_UINT(0, g_mock.resets);
+    expect_nrc(REQ(0x31, 0x01, 0x12, 0x34), UDSOTA_NRC_CONDITIONS_NOT_CORRECT);
+    TEST_ASSERT_EQUAL_UINT(1, app.n_routine);                 /* refused before the hook */
+
+    app.hold = false;
+    TEST_ASSERT_EQUAL_UINT(0, poll_after(10));                /* finished: cleared, nothing sent */
+    TEST_ASSERT_FALSE(srv.app_orphan);
+    const unsigned polls = app.n_poll;
+    TEST_ASSERT_EQUAL_UINT(0, poll_after(10));
+    TEST_ASSERT_EQUAL_UINT(polls, app.n_poll);                /* no orphan left: routine_poll is not asked again */
+    enter_programming(false);                                 /* 10 02 is accepted again */
+}
+
+/* The converse: an FF01 orphaned at the cap belongs to engine.poll. routine_poll is never asked about it, app
+ * routines still run beside it, and it clears when engine.poll goes idle. */
+static void test_engine_orphan_is_not_the_apps(void)
+{
+    boot_app(true);
+    enter_programming(true);
+    mark_transfer_exited();
+    m.hold = true;
+    TEST_ASSERT_EQUAL_UINT(0, REQ_RAW(0x31, 0x01, 0xFF, 0x01));
+    expect_nrc(poll_to_cap(now), UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE);
+    TEST_ASSERT_TRUE(srv.worker_orphan);
+    TEST_ASSERT_FALSE(srv.app_orphan);
+    enter_extended();
+    expect_pos(REQ(0x31, 0x01, 0x12, 0x34), APP_RID, -1);   /* answered beside the engine's orphan */
+    m.hold = false;
+    TEST_ASSERT_EQUAL_UINT(0, poll_after(10));
+    TEST_ASSERT_FALSE(srv.worker_orphan);
+    TEST_ASSERT_EQUAL_UINT(0, app.n_poll);
+}
+
+/* An app routine capped while a download is open ends that download as UDSOTA_DL_ABORTED (the session ended),
+ * not UDSOTA_DL_WORKER_TIMEOUT, which reports the flash worker. */
+static void test_app_cap_during_download_is_aborted(void)
+{
+    boot_app(true);
+    enter_programming(true);
+    request_download();
+    app.rc = UDSOTA_PENDING;
+    app.hold = true;
+    TEST_ASSERT_EQUAL_UINT(0, REQ_RAW(0x31, 0x01, 0x12, 0x34));
+    expect_nrc(poll_to_cap(now), UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE);
+    TEST_ASSERT_FALSE(srv.download_active);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_ABORTED, srv.last_dl.reason_code);
+    TEST_ASSERT_TRUE(srv.app_orphan);
+}
+
+/* A routine that returns UDSOTA_PENDING with no routine_poll registered cannot be polled: the first poll ends it
+ * with 0x10 and leaves no orphan. */
+static void test_app_pending_without_routine_poll_is_10(void)
+{
+    boot_app(false);
+    enter_extended();
+    app.rc = UDSOTA_PENDING;
+    expect_nrc(REQ(0x31, 0x01, 0x12, 0x34), UDSOTA_NRC_GENERAL_REJECT);
+    TEST_ASSERT_FALSE(srv.job_running);
+    TEST_ASSERT_FALSE(srv.app_orphan);
+}
+
+/* With under 4 bytes of response room the app is not called, as 0x34 starts nothing it cannot answer. */
+static void test_app_routine_no_room_starts_nothing(void)
+{
+    boot_app(true);
+    enter_extended();
+    const uint8_t req[] = {0x31, 0x01, 0x12, 0x34};
+    TEST_ASSERT_EQUAL_UINT(0, udsota_on_request(&srv, req, sizeof req, resp, 3, now));
+    TEST_ASSERT_EQUAL_UINT(0, app.n_routine);
+    TEST_ASSERT_FALSE(srv.job_running);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -787,5 +1129,16 @@ int main(void)
     RUN_TEST(test_no_confirm_without_client_request);
     RUN_TEST(test_resume_point_reserved);
     RUN_TEST(test_sprmib);
+    RUN_TEST(test_app_routine_answers_at_once);
+    RUN_TEST(test_app_routine_access_follows_session);
+    RUN_TEST(test_core_checks_come_before_the_app);
+    RUN_TEST(test_app_nrc_passes_through);
+    RUN_TEST(test_app_pending_answers_through_routine_poll);
+    RUN_TEST(test_app_pending_final_nrc_and_sprmib);
+    RUN_TEST(test_app_cap_orphans_until_routine_poll);
+    RUN_TEST(test_engine_orphan_is_not_the_apps);
+    RUN_TEST(test_app_cap_during_download_is_aborted);
+    RUN_TEST(test_app_pending_without_routine_poll_is_10);
+    RUN_TEST(test_app_routine_no_room_starts_nothing);
     return UNITY_END();
 }

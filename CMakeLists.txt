@@ -217,6 +217,15 @@ if(UDSOTA_FUZZ AND UDSOTA_FUZZ_SAN_OK)
     target_link_options(fuzz_udsota PRIVATE ${FUZZ_SAN})   # trap mode must reach the link line too, or gcc wants libubsan
     target_compile_definitions(fuzz_udsota PRIVATE UDSOTA_FUZZ_UBSAN_TRAP=1)
     set_tests_properties(fuzz_udsota PROPERTIES TIMEOUT 300)
+    # The same harness with did_write, routine and routine_poll set: 0x2E served, app routines answered at once,
+    # after 0x78s and orphaned at the 90 s cap, each with exactly one owner.
+    udsota_test(fuzz_udsota_app_hooks
+        SOURCES  ${CORE_DIR}/test/fuzz_udsota.c ${SERVER_SRCS}
+        INCLUDES ${CORE_INC} ${CORE_PRIV})
+    target_compile_options(fuzz_udsota_app_hooks PRIVATE ${FUZZ_SAN})
+    target_link_options(fuzz_udsota_app_hooks PRIVATE ${FUZZ_SAN})
+    target_compile_definitions(fuzz_udsota_app_hooks PRIVATE UDSOTA_FUZZ_UBSAN_TRAP=1 UDSOTA_FUZZ_APP_HOOKS=1)
+    set_tests_properties(fuzz_udsota_app_hooks PROPERTIES TIMEOUT 300)
     if(UDSOTA_FUZZ_CORPUS)
         add_test(NAME fuzz_udsota_corpus COMMAND fuzz_udsota ${UDSOTA_FUZZ_CORPUS})
         set_tests_properties(fuzz_udsota_corpus PROPERTIES TIMEOUT 1800)

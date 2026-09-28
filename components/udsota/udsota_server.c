@@ -228,11 +228,11 @@ static udsota_access_t access_of(const udsota_server_t *s)
     return a;
 }
 
-/* True while the worker owns a job: one the server waits on, an orphan, or anything engine.poll() still reports
- * queued (a fire-and-forget abort included). */
+/* True while the worker owns a job: one the server waits on, an orphan (the engine's or an app routine's), or
+ * anything engine.poll() still reports queued (a fire-and-forget abort included). */
 static bool worker_busy(const udsota_server_t *s)
 {
-    return s->job_running || s->worker_orphan || s->engine.poll(s->engine.ctx) == UDSOTA_PENDING;
+    return s->job_running || s->worker_orphan || s->app_orphan || s->engine.poll(s->engine.ctx) == UDSOTA_PENDING;
 }
 
 /* engine.status into *st, zeroed first; only called when engine.status is set. */
@@ -359,13 +359,18 @@ static void phase_sync(udsota_server_t *s)
     }
 }
 
-/* Stops waiting on the running job; the worker keeps it as an orphan until engine.poll() stops reporting
- * UDSOTA_PENDING. No answer for it is ever sent. */
+/* Stops waiting on the running job; its owner keeps it as an orphan: the engine's until engine.poll() stops
+ * reporting UDSOTA_PENDING, an app routine's until hooks.routine_poll() does. No answer for it is ever sent. */
 static void orphan_job(udsota_server_t *s)
 {
+    if (s->job_app) {
+        s->app_orphan = true;
+    } else {
+        s->worker_orphan = true;
+    }
     s->job_running = false;
     s->job_done = NULL;
-    s->worker_orphan = true;
+    s->job_app = false;
 }
 
 /* Applies an udsota_end_session latched while a job ran, once no job runs: abort, relock, default session
@@ -446,9 +451,10 @@ static void restore_default_comm(udsota_server_t *s)
     }
 }
 
-/* Enters `session` (an accepted 10 xx, S3, the 90 s cap, the restart or an app's end_session request): any open
- * download is aborted, security relocks and the session epoch advances, the same session included (ISO 14229-1
- * re-initialises it). slot_verified survives, so ActivateImage can follow in a later session. */
+/* Enters `session`: every session entry comes through here (an accepted 10 xx, S3, the 90 s cap, the restart, an
+ * app's end_session request, a refused 36 and a withheld FC point). Any open download is aborted, security relocks
+ * and the session epoch advances, the same session included (ISO 14229-1 re-initialises it); udsota_init restarts
+ * the epoch at 0. slot_verified survives, so ActivateImage can follow in a later session. */
 static void enter_session(udsota_server_t *s, uint8_t session)
 {
     abort_download(s);
@@ -812,7 +818,7 @@ typedef struct {
     bool     keyed;     /* needs cfg.level_programming unlocked */
 } routine_rule_t;
 
-/* Every RID udsota serves. Any other RID answers 0x31. */
+/* Every RID udsota serves itself. Any other RID goes to hooks.routine, or answers 0x31 without one. */
 static const routine_rule_t ROUTINE_RULES[] = {
     {UDSOTA_RID_CHECK_PROG_DEPS,  UDSOTA_SESSION_PROGRAMMING, true},
     {UDSOTA_RID_GET_RESUME_POINT, UDSOTA_SESSION_PROGRAMMING, true},
@@ -908,8 +914,63 @@ static size_t confirm_done(udsota_server_t *s, int result, uint8_t *resp, size_t
     return routine_pos(resp, resp_max, UDSOTA_RID_CONFIRM_IMAGE, NULL, 0);
 }
 
-/* 0x31 startRoutine. Check order: session 7F, length 13, sub-function 12, RID in this session 31, key 33,
- * exact length 13, then per RID the sequence (24) before the conditions (22). */
+/* hooks.routine_poll with the room after 71 01 <rid> (resp and 0 when resp_max < 4, so no pointer runs past the
+ * buffer); its out_len lands in job_out_len. UDSOTA_NRC_GENERAL_REJECT when the app registered none. */
+static int app_poll(udsota_server_t *s, uint8_t *resp, size_t resp_max)
+{
+    s->job_out_len = 0u;
+    if (s->hooks.routine_poll == NULL) {
+        return UDSOTA_NRC_GENERAL_REJECT;
+    }
+    const bool room = resp_max >= 4u;
+    return s->hooks.routine_poll(s->hooks.ctx, room ? &resp[4] : resp, room ? resp_max - 4u : 0u, &s->job_out_len);
+}
+
+/* An app routine's result (udsota_job_done_fn): 0 is 71 01 <rid> and the job_out_len bytes the app wrote at
+ * resp[4]; 1..0xFF is that NRC; anything else, or an out record longer than its room, is 0x10. job_arg is the RID. */
+static size_t app_routine_done(udsota_server_t *s, int result, uint8_t *resp, size_t resp_max, uint32_t now_ms)
+{
+    (void)now_ms;
+    if (result > 0 && result <= 0xFF) {
+        return udsota_nrc(resp, resp_max, UDSOTA_SID_ROUTINE, (uint8_t)result);
+    }
+    if (result != 0 || resp_max < 4u || s->job_out_len > resp_max - 4u) {
+        return udsota_nrc(resp, resp_max, UDSOTA_SID_ROUTINE, UDSOTA_NRC_GENERAL_REJECT);
+    }
+    resp[0] = UDSOTA_POS(UDSOTA_SID_ROUTINE);
+    resp[1] = UDSOTA_RC_START;
+    udsota_put_u16be(&resp[2], (uint16_t)s->job_arg);
+    return 4u + s->job_out_len;
+}
+
+/* 31 01 for a RID the core does not own, after the session, length and sub-function checks: 0x31 without
+ * hooks.routine; 0x22 while an app orphan runs (routine_poll speaks for one routine at a time); nothing when
+ * there is no room for 71 01 <rid>; else the app's answer, now or, for UDSOTA_PENDING, from udsota_poll after
+ * 0x78s. The option record after the RID is the app's to check. */
+static size_t handle_app_routine(udsota_server_t *s, uint16_t rid, const uint8_t *req, size_t len, bool spr,
+                                 uint8_t *resp, size_t resp_max, uint32_t now_ms)
+{
+    const uint8_t sid = UDSOTA_SID_ROUTINE;
+    if (s->hooks.routine == NULL) {
+        return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_REQUEST_OUT_OF_RANGE);
+    }
+    if (s->app_orphan) {
+        return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_CONDITIONS_NOT_CORRECT);
+    }
+    if (resp_max < 4u) {
+        return 0;
+    }
+    const udsota_access_t access = access_of(s);   /* the same access state did_write gets */
+    size_t out_len = 0u;
+    const int rc = s->hooks.routine(s->hooks.ctx, rid, &req[4], len - 4u, &resp[4], resp_max - 4u, &out_len, access);
+    s->job_out_len = out_len;
+    s->job_app = (rc == UDSOTA_PENDING);
+    return udsota_job_start(s, sid, spr, rc, app_routine_done, rid, resp, resp_max, now_ms);
+}
+
+/* 0x31 startRoutine. Check order: session 7F, length 13, sub-function 12; a RID the core does not own then goes
+ * to handle_app_routine. For the core's own: RID in this session 31, key 33, exact length 13, then per RID the
+ * sequence (24) before the conditions (22). */
 static size_t handle_routine(udsota_server_t *s, const uint8_t *req, size_t len, uint8_t *resp, size_t resp_max,
                              uint32_t now_ms)
 {
@@ -926,7 +987,10 @@ static size_t handle_routine(udsota_server_t *s, const uint8_t *req, size_t len,
     }
     const uint16_t rid = udsota_get_u16be(&req[2]);
     const routine_rule_t *rule = routine_rule(rid);
-    if (rule == NULL || rule->session != s->session) {
+    if (rule == NULL) {
+        return handle_app_routine(s, rid, req, len, spr, resp, resp_max, now_ms);
+    }
+    if (rule->session != s->session) {
         return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_REQUEST_OUT_OF_RANGE);
     }
     if (rule->keyed && s->secured && s->security != s->cfg.level_programming) {
@@ -1322,18 +1386,20 @@ static size_t finish_job(udsota_server_t *s, int rc, uint8_t *resp, size_t resp_
     return (drop_pos && is_positive(resp, n)) ? 0 : n;
 }
 
-/* Advances a running job: its final answer, the 90 s cap (0x72, session ends), or the 0x78 cadence. */
+/* Advances a running job through its own poll (engine.poll, or routine_poll for an app routine): its final answer,
+ * the 90 s cap (0x72, session ends), or the 0x78 cadence. */
 static size_t poll_job(udsota_server_t *s, uint8_t *resp, size_t resp_max, uint32_t now_ms)
 {
-    const int rc = s->engine.poll(s->engine.ctx);
+    const int rc = s->job_app ? app_poll(s, resp, resp_max) : s->engine.poll(s->engine.ctx);
     if (rc != UDSOTA_PENDING) {
+        s->job_app = false;
         return finish_job(s, rc, resp, resp_max, now_ms);
     }
     const uint32_t elapsed = now_ms - s->job_start_ms;
     if (elapsed >= UDSOTA_JOB_CAP_MS) {
         const uint8_t sid = s->job_sid;
-        const bool was_download = s->download_active || s->ota_open;
-        orphan_job(s);   /* the worker still owns the job; 10 02 waits for it */
+        const bool was_download = !s->job_app && (s->download_active || s->ota_open);
+        orphan_job(s);   /* its owner still runs it; 10 02 waits for it */
         udsota_sat_inc16(&s->counters.resp_pending_caps);
         enter_session(s, UDSOTA_SESSION_DEFAULT);
         if (was_download) {
@@ -1360,6 +1426,9 @@ static size_t poll_step(udsota_server_t *s, uint8_t *resp, size_t resp_max, uint
     }
     if (s->worker_orphan && !s->job_running && s->engine.poll(s->engine.ctx) != UDSOTA_PENDING) {
         s->worker_orphan = false;
+    }
+    if (s->app_orphan && app_poll(s, resp, resp_max) != UDSOTA_PENDING) {
+        s->app_orphan = false;                        /* only routine_poll ends an app orphan, never engine.poll */
     }
     if (s->job_running) {
         return poll_job(s, resp, resp_max, now_ms);   /* a job's final answer is built and sent here first */
@@ -1413,7 +1482,7 @@ uint32_t udsota_ms_to_deadline(const udsota_server_t *s, uint32_t now_ms)
     if (s->reset_phase != RESET_IDLE) {
         return s->reset_phase == RESET_ARMED ? UDSOTA_JOB_POLL_MS : UINT32_MAX;
     }
-    if (s->job_running || s->worker_orphan) {
+    if (s->job_running || s->worker_orphan || s->app_orphan) {
         return UDSOTA_JOB_POLL_MS;
     }
     if (s->session == UDSOTA_SESSION_DEFAULT) {

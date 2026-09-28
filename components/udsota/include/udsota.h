@@ -78,9 +78,11 @@ typedef struct {   /* udsota_init() with security == NULL: 27 answers 0x11, and 
 typedef struct {
     uint8_t  session;         /* UDSOTA_SESSION_* now in force */
     uint8_t  unlocked_level;  /* the requestSeed level unlocked in this session; 0 = none (always 0 without security) */
-    uint32_t epoch;           /* 0 after init, +1 on every session entry: 10 0x including a repeat, S3, udsota_end_session
-                                 (at once or latched), the 90 s cap and the restart. A value an app saved in one
-                                 session never matches in a later one */
+    uint32_t epoch;           /* +1 on every session entry, whatever causes it: 10 0x including a repeat, S3,
+                                 udsota_end_session (at once or latched), the 90 s cap, the restart, a refused 36
+                                 and a withheld FC point. A value an app saved in one session never matches in a
+                                 later one. udsota_init restarts it at 0, so an app must not keep staged state
+                                 across a re-init */
 } udsota_access_t;
 
 typedef struct {   /* all optional */
@@ -106,7 +108,24 @@ typedef struct {   /* all optional */
                                                       default session, then 0x13 when the request is under 4 bytes;
                                                       else data/len are the bytes after the DID (len >= 1, valid only
                                                       during the call) and the hook returns 0 to answer 6E <did>, or
-                                                      the NRC to send. It answers at once: never 0x78 */
+                                                      the NRC to send. It answers at once: never 0x78. It may read
+                                                      udsota_phase() but must not call other udsota functions */
+    int      (*routine)(void *ctx, uint16_t rid, const uint8_t *in, size_t in_len,
+                        uint8_t *out, size_t out_max, size_t *out_len, udsota_access_t access);
+                                                   /* 31 01 for a RID the core doesn't own; in is the option record
+                                                      after the RID and out the room after 71 01 <rid>. NULL: 0x31,
+                                                      as for any RID nobody serves. Returns 0 (71 01 <rid> out), an NRC
+                                                      (1..0xFF), or UDSOTA_PENDING (0x78 until routine_poll stops
+                                                      returning pending; 0x72 at the 90 s cap, and the routine is
+                                                      then an orphan until routine_poll finishes it). Any other
+                                                      value, or *out_len > out_max, is 0x10. While an orphan runs, a
+                                                      31 01 for an app RID is 0x22 without a call. It may read
+                                                      udsota_phase() but must not call other udsota functions */
+    int      (*routine_poll)(void *ctx, uint8_t *out, size_t out_max, size_t *out_len);
+                                                   /* on every udsota_poll while an app routine is pending or
+                                                      orphaned; returns as routine does. NULL: a routine that
+                                                      returns UDSOTA_PENDING ends in 0x10 at the first poll. It may
+                                                      read udsota_phase() but must not call other udsota functions */
 } udsota_hooks_t;
 
 typedef struct {
@@ -169,7 +188,7 @@ typedef struct udsota_server {
     bool              comm_changed;      /* hooks.comm_control accepted a 28 other than 00 03 in this session */
     bool              dtc_off;           /* an 85 02 was accepted in this session */
     uint32_t          s3_start_ms;       /* S3 restarts when a request is answered */
-    uint32_t          session_epoch;     /* udsota_access_t.epoch: 0 after init, +1 in every session entry */
+    uint32_t          session_epoch;     /* udsota_access_t.epoch: 0 after init, +1 on every session entry */
     /* The worker-job wait. */
     bool              job_running;       /* a worker job owns the pending response */
     bool              job_pending_sent;  /* at least one 0x78 has gone out for this job */
@@ -178,8 +197,14 @@ typedef struct udsota_server {
     uint32_t          job_start_ms;      /* for the first 0x78 and the 90 s cap */
     uint32_t          last_pending_ms;   /* last 0x78 sent */
     uint32_t          job_arg;           /* handler data for job_done, e.g. the BSC to echo */
-    udsota_job_done_fn job_done;         /* builds the final answer when engine.poll reports a result */
+    udsota_job_done_fn job_done;         /* builds the final answer when the job's poll (engine.poll, or
+                                            hooks.routine_poll for an app routine) reports a result */
     bool              worker_orphan;     /* a job the server stopped waiting on at the 90 s cap still runs */
+    bool              job_app;           /* the running job is an app routine: polled through hooks.routine_poll,
+                                            never engine.poll */
+    bool              app_orphan;        /* an app routine the server stopped waiting on at the 90 s cap still
+                                            runs; only hooks.routine_poll clears it */
+    size_t            job_out_len;       /* app routine: bytes of its out record, written at resp[4] */
     bool              end_pending;       /* udsota_end_session arrived during a job: applied once the job has answered */
     /* Download. */
     bool              download_active;   /* between an accepted 0x34 and 0x37 or an abort */

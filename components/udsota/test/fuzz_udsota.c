@@ -13,6 +13,9 @@
  * iso14229's fuzz_server.cc idea (MIT, Nick James Kirkby & Co-Operators): a stream of requests with
  * fuzzed waits between them. No iso14229 code is copied.
  *
+ * Built twice: fuzz_udsota with the app hooks NULL, and fuzz_udsota_app_hooks (UDSOTA_FUZZ_APP_HOOKS=1) with
+ * did_write, routine and routine_poll set, where it also checks that an app routine has exactly one owner.
+ *
  * libFuzzer, on a machine with clang:
  *   clang -g -O1 -fsanitize=fuzzer,address,undefined -DUDSOTA_LIBFUZZER <includes> fuzz_udsota.c
  *         udsota_server.c udsota_codec.c -o fuzz_udsota_lf && ./fuzz_udsota_lf -max_len=8192 <corpus>
@@ -35,11 +38,17 @@
 #include <unistd.h>
 #include "udsota.h"
 
+#ifndef UDSOTA_FUZZ_APP_HOOKS
+#define UDSOTA_FUZZ_APP_HOOKS 0   /* 1: FUZZ_HOOKS also sets did_write, routine and routine_poll */
+#endif
+
 /* Every engine and hook callback is mocked; these trip if the API structs gain a callback. */
 _Static_assert(offsetof(udsota_engine_t, slot_size) == 12u * sizeof(void (*)(void)),
                "udsota_engine_t gained a callback: mock it in FUZZ_ENGINE and update this count");
 _Static_assert(offsetof(udsota_hooks_t, ctx) == 7u * sizeof(void (*)(void)),
                "udsota_hooks_t gained a callback: mock it in FUZZ_HOOKS and update this count");
+_Static_assert(offsetof(udsota_hooks_t, routine_poll) + sizeof(void (*)(void)) == sizeof(udsota_hooks_t),
+               "udsota_hooks_t gained a member after routine_poll: mock it in FUZZ_HOOKS and move this check");
 
 #define REQ_MAX          UDSOTA_DL_MAX_BLOCK_LEN  /* the ISO-TP link never delivers a longer request */
 #define RESP_FULL        256u                  /* UDSOTA_ISOTP_RESP_MAX: the transport's response buffer */
@@ -86,10 +95,17 @@ typedef struct {                               /* the mock platform behind the e
     unsigned variant;                          /* this run's variant (VARIANT_COUNT of them) */
     bool     live;                             /* the preamble is done, so the variant applies */
     int      last_phase;                       /* the last phase the hook saw */
+#if UDSOTA_FUZZ_APP_HOOKS
+    bool     app_outstanding;                  /* routine returned UDSOTA_PENDING and routine_poll has not finished it */
+    uint32_t app_until;                        /* when the outstanding app routine finishes */
+#endif
 } mock_t;
 
 typedef enum {                                 /* platform ops whose fuzz-phase calls the coverage floor counts */
     OP_BEGIN, OP_WRITE, OP_END, OP_ABORT, OP_ACTIVATE, OP_CONFIRM, OP_IMAGE_CHECK, OP_RESET, OP_UNVERIFY,
+#if UDSOTA_FUZZ_APP_HOOKS
+    OP_DID_WRITE, OP_ROUTINE, OP_ROUTINE_POLL,
+#endif
     OP_COUNT
 } op_id_t;
 
@@ -97,6 +113,9 @@ typedef struct {                               /* counted outside the preamble o
     unsigned long inputs, runs, requests, positive, nrc, silent, poll_answers;
     unsigned long op_calls[OP_COUNT];
     bool pos_sid[256], nrc_sid[256], nrc_code[256], reached[ST_COUNT];
+#if UDSOTA_FUZZ_APP_HOOKS
+    bool app_orphaned;                         /* a fuzzed app routine reached the 90 s cap */
+#endif
 } stats_t;
 
 static arena_t      g_req, g_resp;
@@ -397,6 +416,95 @@ static void mock_phase(void *ctx, udsota_phase_t p)
     M.last_phase = (int)p;
 }
 
+#if UDSOTA_FUZZ_APP_HOOKS
+#define APP_RID_SYNC     0x1234u   /* answers 71 01 12 34 00 at once */
+#define APP_RID_PENDING  0x1235u   /* pending for JOB_MS, then 71 01 12 35 00 */
+#define APP_RID_HOLD     0x1236u   /* pending for APP_HOLD_MS: past the 90 s cap, so the core orphans it */
+#define APP_RID_REFUSE   0x1237u   /* NRC 0x22 */
+#define APP_HOLD_MS      100000u
+
+/* Fails unless access is the server's own session, lock and epoch, and not the default session (the core
+ * answers 0x7F there before any hook). */
+static void check_access(udsota_access_t access)
+{
+    if (access.session == UDSOTA_SESSION_DEFAULT || access.session != S.session ||
+        access.unlocked_level != S.security || access.epoch != S.session_epoch) {
+        fail("app hook handed an access state that is not the server's", NULL, 0, NULL, 0);
+    }
+}
+
+/* Mock hooks.did_write: reads every byte it was handed; 0x0200 takes 1 byte and 0x0202 takes 2, else 0x31. */
+static uint8_t mock_did_write(void *ctx, uint16_t did, const uint8_t *data, size_t len, udsota_access_t access)
+{
+    count_op(OP_DID_WRITE);
+    check_access(access);
+    touch(data, len);
+    if ((did == 0x0200u && len == 1u) || (did == 0x0202u && len == 2u)) {
+        return 0u;
+    }
+    return UDSOTA_NRC_REQUEST_OUT_OF_RANGE;
+}
+
+/* Writes the app's one status byte 00 into out when it has room; returns the record length. */
+static size_t app_status(uint8_t *out, size_t out_max)
+{
+    if (out_max == 0u) {
+        return 0u;
+    }
+    out[0] = 0x00u;
+    return 1u;
+}
+
+/* Mock hooks.routine: reads the whole option record and writes all of out_max (an oversized one faults on a guard
+ * page), then answers by RID. Never called for a core RID or while an app routine is outstanding. */
+static int mock_routine(void *ctx, uint16_t rid, const uint8_t *in, size_t in_len,
+                        uint8_t *out, size_t out_max, size_t *out_len, udsota_access_t access)
+{
+    count_op(OP_ROUTINE);
+    check_access(access);
+    if (M.app_outstanding) {
+        fail("routine called while an app routine was outstanding", NULL, 0, NULL, 0);
+    }
+    if (rid == UDSOTA_RID_CHECK_PROG_DEPS || rid == UDSOTA_RID_GET_RESUME_POINT ||
+        rid == UDSOTA_RID_ACTIVATE_IMAGE || rid == UDSOTA_RID_CONFIRM_IMAGE) {
+        fail("routine handed a RID the core owns", NULL, 0, NULL, 0);
+    }
+    touch(in, in_len);
+    memset(out, 0xDD, out_max);
+    switch (rid) {
+    case APP_RID_SYNC:
+        *out_len = app_status(out, out_max);
+        return 0;
+    case APP_RID_PENDING:
+    case APP_RID_HOLD:
+        M.app_outstanding = true;
+        M.app_until = M.now + (rid == APP_RID_HOLD ? APP_HOLD_MS : JOB_MS);
+        return UDSOTA_PENDING;
+    case APP_RID_REFUSE:
+        return UDSOTA_NRC_CONDITIONS_NOT_CORRECT;
+    default:
+        return UDSOTA_NRC_REQUEST_OUT_OF_RANGE;
+    }
+}
+
+/* Mock hooks.routine_poll: writes all of out_max, then UDSOTA_PENDING until app_until, else finishes with status
+ * 00. Only ever called while an app routine is outstanding. */
+static int mock_routine_poll(void *ctx, uint8_t *out, size_t out_max, size_t *out_len)
+{
+    count_op(OP_ROUTINE_POLL);
+    if (!M.app_outstanding) {
+        fail("routine_poll called with no app routine outstanding", NULL, 0, NULL, 0);
+    }
+    memset(out, 0xDD, out_max);
+    if ((int32_t)(M.now - M.app_until) < 0) {
+        return UDSOTA_PENDING;
+    }
+    M.app_outstanding = false;
+    *out_len = app_status(out, out_max);
+    return 0;
+}
+#endif
+
 /* hooks.comm_control: refuses disableRxAndTx with 0x22, allows the rest. */
 static uint8_t mock_comm_control(void *ctx, uint8_t control, uint8_t comm_type)
 {
@@ -426,6 +534,9 @@ static const udsota_security_t FUZZ_SECURITY = {.rng16 = mock_rng16, .key = mock
 static const udsota_hooks_t FUZZ_HOOKS = {
     .gate = mock_gate, .phase = mock_phase, .did_read = mock_did_read, .stmin_us = NULL, .reset = mock_reset,
     .comm_control = mock_comm_control, .dtc_setting = mock_dtc_setting, .ctx = NULL,
+#if UDSOTA_FUZZ_APP_HOOKS
+    .did_write = mock_did_write, .routine = mock_routine, .routine_poll = mock_routine_poll,
+#endif
 };
 
 /* True for the SIDs the server serves; every other SID must get NRC 0x11 or 0x7F. */
@@ -436,6 +547,9 @@ static bool sid_served(uint8_t sid)
     case UDSOTA_SID_ROUTINE: case UDSOTA_SID_REQUEST_DOWNLOAD: case UDSOTA_SID_TRANSFER_DATA:
     case UDSOTA_SID_TRANSFER_EXIT: case UDSOTA_SID_TESTER_PRESENT: case UDSOTA_SID_COMM_CONTROL:
     case UDSOTA_SID_DTC_SETTING:
+#if UDSOTA_FUZZ_APP_HOOKS
+    case UDSOTA_SID_WRITE_DID:
+#endif
         return true;
     default:
         return false;
@@ -493,6 +607,10 @@ static bool positive_shape_ok(const uint8_t *req, size_t rl, const uint8_t *r, s
         return n == 2 && rl == 3 && r[1] == sub && sub <= UDSOTA_CC_DISABLE_RX_TX;
     case UDSOTA_SID_DTC_SETTING:        /* C5 01 or C5 02 */
         return n == 2 && r[1] == sub && (sub == UDSOTA_DTC_ON || sub == UDSOTA_DTC_OFF);
+#if UDSOTA_FUZZ_APP_HOOKS
+    case UDSOTA_SID_WRITE_DID:          /* 6E did-hi did-lo */
+        return n == 3 && rl >= 4 && r[1] == req[1] && r[2] == req[2];
+#endif
     default:
         return false;
     }
@@ -572,6 +690,21 @@ static void check_phase(void)
     }
 }
 
+#if UDSOTA_FUZZ_APP_HOOKS
+/* An app routine has exactly one owner: the job the server waits on, or the orphan that only routine_poll clears.
+ * The server's view must match the hook's after every request and poll. */
+static void check_app_owner(void)
+{
+    const bool owned = S.app_orphan || (S.job_running && S.job_app);
+    if (owned != M.app_outstanding) {
+        fail("app routine ownership differs from the hook's view", NULL, 0, NULL, 0);
+    }
+    if (S.app_orphan && !g_in_preamble) {
+        g_stats.app_orphaned = true;
+    }
+}
+#endif
+
 /* Returns the guarded response buffer for resp_max, with its canary armed. */
 static uint8_t *resp_buf(size_t resp_max)
 {
@@ -606,6 +739,9 @@ static size_t fuzz_request(const uint8_t *in, size_t len, layout_t lay, size_t r
     check_canary(resp, req, len);
     check_request_answer(req, len, resp, n, resp_max);
     check_phase();
+#if UDSOTA_FUZZ_APP_HOOKS
+    check_app_owner();
+#endif
     return n;
 }
 
@@ -621,6 +757,9 @@ static void fuzz_poll(size_t resp_max, uint32_t now)
     check_canary(resp, NULL, 0);
     check_poll_answer(resp, n, resp_max);
     check_phase();
+#if UDSOTA_FUZZ_APP_HOOKS
+    check_app_owner();
+#endif
 }
 
 /* Sends one preamble request (plain buffers) and waits out any worker job; fails unless the final answer is positive. */
@@ -926,6 +1065,13 @@ static const seed_t SEEDS[] = {
     SEED(0x28, 0x00, 0x01), SEED(0x28, 0x03, 0x01), SEED(0x28, 0x81, 0x03), SEED(0x28, 0x01, 0x00),
     SEED(0x28, 0x04, 0x01), SEED(0x28, 0x03), SEED(0x28, 0x03, 0x01, 0x00), SEED(0x85, 0x82), SEED(0x85, 0x02, 0xFF),
     SEED(0x85, 0x03), SEED(0x85), SEED(0x7F, 0x10, 0x11), SEED(0x50, 0x01), SEED(0x00), SEED(0xFF), SEED(0x3F, 0x00),
+#if UDSOTA_FUZZ_APP_HOOKS
+    SEED(0x2E, 0x02, 0x00, 0x05), SEED(0x2E, 0x02, 0x02, 0x0B, 0xB8), SEED(0x2E, 0x02, 0x00, 0x05, 0x00),
+    SEED(0x2E, 0x02, 0x00), SEED(0x2E, 0x02, 0x02, 0x0B),
+    SEED(0x31, 0x01, 0x12, 0x34, 0xAA, 0xBB), SEED(0x31, 0x81, 0x12, 0x34), SEED(0x31, 0x01, 0x12, 0x35),
+    SEED(0x31, 0x81, 0x12, 0x35), SEED(0x31, 0x01, 0x12, 0x36), SEED(0x31, 0x01, 0x12, 0x37),
+    SEED(0x31, 0x02, 0x12, 0x34),
+#endif
 };
 #define SEED_COUNT (sizeof SEEDS / sizeof SEEDS[0])
 
@@ -1011,6 +1157,21 @@ static void replay_generated(void)
         n = rec(seq, n, 4, seed_req, sizeof seed_req);
         replay_input("seq-sa-lockout", seq, n, true);
     }
+#if UDSOTA_FUZZ_APP_HOOKS
+    /* An app routine past the 90 s cap: 0x72, then its orphan holds 10 02 at 0x22 until routine_poll finishes it
+     * at 100 s, and 10 02 is accepted after. From a default-session state it is just a stream. */
+    const uint8_t hold[] = {UDSOTA_SID_ROUTINE, UDSOTA_RC_START, 0x12, 0x36};
+    const uint8_t prog[] = {UDSOTA_SID_SESSION, UDSOTA_SESSION_PROGRAMMING};
+    n = 0;
+    n = rec(seq, n, 0, hold, sizeof hold);
+    for (unsigned k = 0; k < 15u; k++) {
+        n = rec(seq, n, 255, tp, sizeof tp);                   /* 15 x 6.375 s = 95.6 s: past the cap */
+    }
+    n = rec(seq, n, 0, prog, sizeof prog);                     /* the orphan still runs: 0x22 */
+    n = rec(seq, n, 255, tp, sizeof tp);                       /* 102 s: routine_poll finishes it */
+    n = rec(seq, n, 0, prog, sizeof prog);                     /* accepted */
+    replay_input("seq-app-orphan", seq, n, true);
+#endif
 }
 
 /* Writes a mutant of seed into out (capacity REQ_MAX) with 1-4 random edits; returns its length. */
@@ -1061,6 +1222,9 @@ static void replay_seeds(unsigned mutations)
 static const char *const OP_NAME[OP_COUNT] = {   /* op_id_t names for the coverage report */
     "ota_begin", "ota_write", "ota_end", "ota_abort", "ota_activate", "ota_confirm", "image_check",
     "reset", "ota_unverify",
+#if UDSOTA_FUZZ_APP_HOOKS
+    "did_write", "routine", "routine_poll",
+#endif
 };
 
 /* The replay's own positive control, from fuzzed requests only (preamble answers never count): every
@@ -1068,7 +1232,11 @@ static const char *const OP_NAME[OP_COUNT] = {   /* op_id_t names for the covera
  * a call, so accepted 0x34s and written 0x36 blocks were reached, not just refusals. */
 static void check_coverage(void)
 {
+#if UDSOTA_FUZZ_APP_HOOKS
+    static const uint8_t SERVED[] = {0x10, 0x11, 0x22, 0x27, 0x2E, 0x31, 0x34, 0x36, 0x37, 0x3E};
+#else
     static const uint8_t SERVED[] = {0x10, 0x11, 0x22, 0x27, 0x31, 0x34, 0x36, 0x37, 0x3E};
+#endif
     bool ok = g_stats.nrc_code[UDSOTA_NRC_INCORRECT_LENGTH] && g_stats.nrc_code[UDSOTA_NRC_INVALID_KEY];
     for (size_t i = 0; i < sizeof SERVED; i++) {
         if (!g_stats.pos_sid[SERVED[i]] || !g_stats.nrc_sid[SERVED[i]]) {
@@ -1083,6 +1251,12 @@ static void check_coverage(void)
             ok = false;
         }
     }
+#if UDSOTA_FUZZ_APP_HOOKS
+    if (!g_stats.app_orphaned) {
+        fprintf(stderr, "fuzz_udsota: COVERAGE: no fuzzed app routine reached the 90 s cap\n");
+        ok = false;
+    }
+#endif
     for (int st = 0; st < ST_COUNT; st++) {
         ok = ok && g_stats.reached[st];
     }
