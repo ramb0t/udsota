@@ -226,6 +226,15 @@ static void stored_block(const uint8_t *data, uint16_t n, bool final)
     g_z_len += n;
 }
 
+/* The image as stored blocks of 95 bytes, each sent as one 100-byte 36, so the first three hold their bytes back. */
+static void stored_stream(void)
+{
+    for (size_t off = 0; off < IMG_LEN; off += 95u) {
+        const uint16_t n = (uint16_t)((IMG_LEN - off < 95u) ? IMG_LEN - off : 95u);
+        stored_block(&g_img[off], n, off + n == IMG_LEN);
+    }
+}
+
 /* ---- the server ---- */
 
 /* Boots the server on engine with the mock's config and hooks. */
@@ -324,17 +333,20 @@ static size_t send_36(uint8_t bsc, size_t off, size_t n)
     return send(g_req, n + 2u) != 0u ? g_resp_len : finish_job(NULL);
 }
 
-/* Sends g_z in blocks of chunk bytes, asserting 76 <bsc> for each; returns the next counter. */
-static uint8_t send_stream(size_t chunk)
+/* Sends g_z from off on in blocks of chunk bytes, counters from bsc, asserting 76 <bsc> for each; returns the next
+ * counter. */
+static uint8_t send_stream_from(uint8_t bsc, size_t off, size_t chunk)
 {
-    uint8_t bsc = 1;
-    for (size_t off = 0; off < g_z_len; off += chunk, bsc++) {
+    for (; off < g_z_len; off += chunk, bsc++) {
         const size_t n = (g_z_len - off < chunk) ? g_z_len - off : chunk;
         send_36(bsc, off, n);
         EXPECT(0x76, bsc);
     }
     return bsc;
 }
+
+/* Sends all of g_z in blocks of chunk bytes, from counter 1. */
+static uint8_t send_stream(size_t chunk) { return send_stream_from(1, 0, chunk); }
 
 /* Sends 37. */
 static size_t send_37(void)
@@ -392,10 +404,7 @@ static void test_compressed_happy_path(void)
  * then the erase, then the writes from offset 0. */
 static void test_first_block_buffered_across_blocks(void)
 {
-    for (size_t off = 0; off < IMG_LEN; off += 95u) {
-        const uint16_t n = (uint16_t)((IMG_LEN - off < 95u) ? IMG_LEN - off : 95u);
-        stored_block(&g_img[off], n, off + n == IMG_LEN);
-    }
+    stored_stream();
     enter_programming();
     send_34(UDSOTA_DL_DFI_DEFLATE, IMG_LEN);
     EXPECT(0x74, 0x20, 0x0F, 0xFF);
@@ -412,11 +421,7 @@ static void test_first_block_buffered_across_blocks(void)
     TEST_ASSERT_EQUAL_UINT(1u, e.checks);
     TEST_ASSERT_EQUAL_UINT(380u, e.check_len);
     TEST_ASSERT_EQUAL_UINT(1u, e.begins);
-    uint8_t bsc = 5;
-    for (size_t off = 400u; off < g_z_len; off += BLOCK, bsc++) {
-        send_36(bsc, off, (g_z_len - off < BLOCK) ? g_z_len - off : BLOCK);
-        EXPECT(0x76, bsc);
-    }
+    send_stream_from(5, 400u, BLOCK);
     send_37();
     EXPECT(0x77);
     TEST_ASSERT_TRUE(e.offsets_ok);
@@ -628,11 +633,7 @@ static void test_repeated_block_is_not_fed_twice(void)
     send_36(1, 0u, 2000u);
     EXPECT(0x76, 0x01);
     TEST_ASSERT_EQUAL_UINT(1u, e.zwrites);
-    uint8_t bsc = 2;
-    for (size_t off = 2000u; off < g_z_len; off += BLOCK, bsc++) {
-        send_36(bsc, off, (g_z_len - off < BLOCK) ? g_z_len - off : BLOCK);
-        EXPECT(0x76, bsc);
-    }
+    send_stream_from(2, 2000u, BLOCK);
     send_37();
     EXPECT(0x77);
     TEST_ASSERT_EQUAL_MEMORY(g_img, e.flash, IMG_LEN);
@@ -756,15 +757,6 @@ static void expect_progress(udsota_stage_t stage, uint32_t done, uint32_t total)
     TEST_ASSERT_EQUAL_INT(stage, p.stage);
     TEST_ASSERT_EQUAL_UINT32(done, p.done);
     TEST_ASSERT_EQUAL_UINT32(total, p.total);
-}
-
-/* The image as stored blocks of 95 bytes, each sent as one 100-byte 36, so the first three hold their bytes back. */
-static void stored_stream(void)
-{
-    for (size_t off = 0; off < IMG_LEN; off += 95u) {
-        const uint16_t n = (uint16_t)((IMG_LEN - off < 95u) ? IMG_LEN - off : 95u);
-        stored_block(&g_img[off], n, off + n == IMG_LEN);
-    }
 }
 
 /* Progress on a compressed download counts image bytes. ERASING from the 34 through the first 36's job; WRITING
