@@ -44,6 +44,20 @@ static bool w_reset(void *ctx)
     return ctl->default_reset(ctl->app.ctx);
 }
 
+/* comm_control hook: the app's with the app's ctx (installed only when the app has one). */
+static uint8_t w_comm_control(void *ctx, uint8_t control, uint8_t comm_type)
+{
+    const udsota_esp32_ctl_t *ctl = ctx;
+    return ctl->app.comm_control(ctl->app.ctx, control, comm_type);
+}
+
+/* dtc_setting hook: the app's with the app's ctx (installed only when the app has one). */
+static void w_dtc_setting(void *ctx, bool on)
+{
+    const udsota_esp32_ctl_t *ctl = ctx;
+    ctl->app.dtc_setting(ctl->app.ctx, on);
+}
+
 /* Copies the app's hooks and builds the wrapped set (see the header). */
 void udsota_esp32_ctl_init(udsota_esp32_ctl_t *ctl, const udsota_hooks_t *app,
                            bool (*default_reset)(void *ctx), udsota_hooks_t *out)
@@ -59,6 +73,8 @@ void udsota_esp32_ctl_init(udsota_esp32_ctl_t *ctl, const udsota_hooks_t *app,
         .did_read = (ctl->app.did_read != NULL) ? w_did_read : NULL,
         .stmin_us = (ctl->app.stmin_us != NULL) ? w_stmin_us : NULL,
         .reset    = (ctl->app.reset != NULL || default_reset != NULL) ? w_reset : NULL,
+        .comm_control = (ctl->app.comm_control != NULL) ? w_comm_control : NULL,
+        .dtc_setting  = (ctl->app.dtc_setting != NULL) ? w_dtc_setting : NULL,
         .ctx      = ctl,
     };
 }
@@ -83,4 +99,17 @@ bool udsota_esp32_ctl_run_end(udsota_esp32_ctl_t *ctl, udsota_server_t *s, uint3
     }
     udsota_end_session(s, now_ms);
     return true;
+}
+
+/* Milliseconds to ticks, rounded down but never to 0 for a real wait; see udsota_esp32_ctl.h. */
+uint32_t udsota_esp32_ctl_ticks(uint32_t ms, uint32_t tick_hz)
+{
+    if (ms == 0u) {
+        return 0u;
+    }
+    const uint64_t t = (uint64_t)ms * tick_hz / 1000u;
+    if (t == 0u) {
+        return 1u;
+    }
+    return (t > UINT32_MAX) ? UINT32_MAX : (uint32_t)t;
 }

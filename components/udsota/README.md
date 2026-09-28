@@ -12,7 +12,7 @@ app            CAN driver · gate and phase hooks · its own DIDs · product pol
 udsota         ISO-TP adapter (udsota_isotp) → UDS server (udsota_server) → engine interface
                image rules (descriptor, version) · key derivation · boot-loop counter
   │
-udsota_esp32   diag task and flash worker · engine on esp_ota_* · PSA HMAC and RNG · RTC boot-loop storage
+udsota_esp32   diag task and flash worker · engine on esp_ota_* · PSA ECDSA or HMAC, and RNG · RTC boot-loop storage
 ```
 
 Dependencies point down only. The app owns the CAN bus. udsota transmits through the app's send callback, receives only the frames the app hands it, and never touches the controller. The ISO-TP adapter, on `components/isotp`, is the only CAN-specific code in the core. A port implements the engine (`udsota_engine_t`: check the first block, erase, write, verify, activate, confirm, abort and status), and any other front end that delivers an image can drive the same engine.
@@ -21,7 +21,7 @@ Dependencies point down only. The app owns the CAN bus. udsota transmits through
 
 The transport is classic CAN with 11-bit IDs only: `udsota_can_t.send` takes a `uint16_t` ID and has no extended flag. The image rules assume the ESP-IDF app-image layout (`udsota_image.c` reads `esp_app_desc_t` and the descriptor at fixed offsets), so a port for another platform must produce that layout or bring its own rules. The ISO-TP pad byte is fixed at 0xAA. The adapter defines isotp-c's platform hooks, so no other isotp-c user can link into the same image.
 
-Future work: 29-bit IDs, CAN FD, a per-link isotp send callback so that another isotp-c user can share the image, and a Linux SocketCAN demo server for end-to-end client tests.
+Future work: 29-bit IDs, CAN FD, and a per-link isotp send callback so that another isotp-c user can share the image. The core runs on Linux in [`tools/linux_server`](../../tools/linux_server/README.md), a demo server over SocketCAN or a frame pipe that the client's end-to-end tests drive.
 
 ## Integrating on ESP32
 
@@ -32,7 +32,7 @@ An integration is one C file and two build lines. This is all of it for a produc
 #include "udsota_wire.h"
 #include "udsota_esp32.h"
 
-extern const uint8_t app_key_master[32];   /* 0x27 master key, embedded from a git-ignored file */
+#include "udsota_pubkey.h"   /* the tester's 0x27 public key, from `udsota keygen`; it unlocks nothing */
 
 /* Allows each update step only while parked; confirming needs the app's own self-test instead. */
 static uint8_t app_gate(void *ctx, udsota_op_t op)
@@ -70,7 +70,7 @@ esp_err_t app_updater_start(void)
 {
     static const udsota_config_t cfg = {
         .req_id = 0x710, .resp_id = 0x718,
-        .key_label = "udsota-example", .key_master = app_key_master, .key_master_len = sizeof app_key_master,
+        .key_pubkey = udsota_pubkey, .key_pubkey_len = sizeof udsota_pubkey,   /* the ECDSA mode (Security) */
         .product = "example", .hw_id = 1, .layout_id = 1,
         .stmin_monitor = true,
     };
@@ -128,6 +128,8 @@ Every struct carries its own `ctx`, which is passed back to its callbacks. A NUL
 | `did_read(ctx, did, buf, max)` | for a 22 on any DID the core does not serve; returns the bytes written, 0 for "no such DID" | every such DID answers 0x31 |
 | `stmin_us(ctx)` | when a request's first frame arrives, for that message's flow control | `cfg.stmin_us` (2 ms) |
 | `reset(ctx)` | once the answer to 11 01 or ActivateImage has left (the transport's `tx_pending` reads 0, or after 100 ms); it returns only on failure, and the server then re-opens | in the core, 11 01 answers 0x11 and ActivateImage answers positive without a restart, so the new image boots at the next power cycle. The ESP32 port uses `esp_restart()` |
+| `comm_control(ctx, control, comm_type)` | for a 28 that passed the core's checks; returns 0 once the app has stopped or resumed its own frames as asked, else the NRC. Called again with 00 and 03 (enable everything) when the session returns to default after a change | 28 answers 0x11 |
+| `dtc_setting(ctx, on)` | after an accepted 85 01 or 85 02, and with `true` when the session returns to default after 85 02 | 85 answers 0x11, as before |
 
 The gate returns 0 to allow, or the NRC to send: 0x22 conditionsNotCorrect in general, a specific code where one fits (0x88 vehicleSpeedTooHigh, 0x90 shifterLeverNotInPark, 0x92/0x93 voltage too high or too low, all ISO 14229-1), or 0x21 busyRepeatRequest for a condition that clears by itself shortly.
 
@@ -159,19 +161,28 @@ udsota enforces its own sequence and nothing else: with no gate, every step is a
 
 **Frames in.** Hand udsota only standard (11-bit) frames on `cfg.req_id`. `udsota_esp32_on_frame()` takes a 16-bit ID, so an extended ID would be truncated and could alias the request ID. Take `rx_us` in the receive path, as close to the driver as possible, because the STmin monitor measures the gaps between those stamps.
 
-**Frames out.** udsota transmits only on `cfg.resp_id`. `ESP_ERR_NO_MEM` from `can_send` means retry: an answer is parked and resent, and a flow-control frame is retried at each service (1 ms apart) for `cfg.fc_retry_ms` (10 ms by default), then dropped. Set it to two token intervals of the driver's rate cap, or an FC refused just after an answer never reaches the next token. Any other error drops the frame. The port logs these losses; F1F2's `resp_frames_dropped` reports only what the app's `tx_dropped` counts. The app's CAN driver is the place for a rate cap or an allowlist that bounds what a fault could put on the bus.
+**Frames out.** udsota transmits only on `cfg.resp_id`. `ESP_ERR_NO_MEM` from `can_send` means retry: an answer is parked and resent for up to 1 s (`UDSOTA_ISOTP_PARK_MAX_MS`), so a bus that acknowledges nothing cannot hold a session open, and a flow-control frame is retried at each service (1 ms apart) for `cfg.fc_retry_ms` (10 ms by default), then dropped. Set it to two token intervals of the driver's rate cap, or an FC refused just after an answer never reaches the next token. Any other error drops the frame. The port logs these losses; F1F2's `resp_frames_dropped` reports only what the app's `tx_dropped` counts. The app's CAN driver is the place for a rate cap or an allowlist that bounds what a fault could put on the bus.
 
-**Pace.** STmin is the client's minimum gap between frames. Pick one the bus can carry beside its normal traffic, either `cfg.stmin_us` or a per-message value from `stmin_us`. Set `stmin_monitor` to stop a client whose median gap is under 0.8 × STmin.
+**Pace.** STmin is the client's minimum gap between frames. Pick one the bus can carry beside its normal traffic, either `cfg.stmin_us` or a per-message value from `stmin_us`. The adapter rounds it up to a value a flow-control frame can carry (100–900 µs in 100 µs steps, else whole milliseconds up to 127 ms), and the monitor judges that value. Set `stmin_monitor` to stop a client whose median gap is under 0.8 × STmin.
 
 **Keys and signing** are covered below. Without either, any node that can send on `cfg.req_id` can install any image the image rules accept.
 
 ## Security
 
-With security on (the ESP32 port turns it on when `cfg.key_label` is set), SecurityAccess (27) guards programming. `cfg.level_programming` (default 0x03) unlocks 34, 36, 37, FF01, ActivateImage and 11 01, and `cfg.level_extended` (default 0x01) unlocks 11 01. ConfirmImage needs no key, because it can only keep an image that passed FF01 and ActivateImage.
+With security on (the ESP32 port turns it on when `cfg.key_pubkey` or `cfg.key_label` is set), SecurityAccess (27) guards programming. `cfg.level_programming` (default 0x03) unlocks 34, 36, 37, FF01, ActivateImage and 11 01, and `cfg.level_extended` (default 0x01) unlocks 11 01. ConfirmImage needs no key, because it can only keep an image that passed FF01 and ActivateImage.
 
-Each 16-byte seed is single-use and valid for 30 s. The key is the first 16 bytes of HMAC-SHA256(K_dev, seed ‖ level ‖ device_id), where K_dev = HMAC-SHA256(K_master, label ‖ device_id); `level` is the requestSeed sub-function, `device_id` is what F18C returns, and the server compares keys in constant time. The ESP32 port serves and hashes `cfg.device_id` when it is set (1 to 16 bytes), otherwise the 6-byte base MAC. Three wrong keys answer 0x36, then 0x37 for 10 s, and the same 10 s delay follows every boot. An unlock ends at a session change, an S3 timeout or a reset. With a label but no master (a CI build, say), security stays on and no key can match: sendKey answers 0x22 and counts no attempt.
+Each 16-byte seed is single-use and valid for 30 s. What the tester sends back in 27 02 or 27 04 depends on the mode. In both, `level` is the requestSeed sub-function and `device_id` is what F18C returns.
 
-With `security` NULL, or `cfg.key_label` NULL in the port, 27 answers 0x11, and the programming session, the download, activation and reset need no key.
+- **ECDSA** (recommended for production). The key is a 64-byte ECDSA P-256 signature, r ‖ s with 32 big-endian bytes each, over SHA-256("udsota-27-ecdsa-v1" ‖ seed ‖ level ‖ id_len ‖ device_id), where `id_len` is one byte; `udsota_keys_sig_msg()` builds the message. The tester signs with a private key that never leaves it, and the device holds only the public key. The server asks `security.verify` with `security.key_len` set to 64, so a sendKey is exactly 66 bytes. A high S is accepted as well as a low one: a seed is used once, so a second valid signature for it gains nothing. This follows SAE paper 2022-01-0132, as driftregion's iso14229 fwupdate example does with RSA.
+- **HMAC** (the default, as in 0.1.0). The key is the first 16 bytes of HMAC-SHA256(K_dev, seed ‖ level ‖ device_id), where K_dev = HMAC-SHA256(K_master, label ‖ device_id). The server asks `security.key` for the expected key and compares the two in constant time.
+
+Use ECDSA for a product. In the HMAC mode every device must be able to compute its own keys, so the port builds the fleet's master key into every image, and one leaked image or one flash dump unlocks every device. In the ECDSA mode a device stores nothing that makes a key: a dump yields a public key, and a signature for one seed only unlocks one level of one device, once. So keep the private key in an HSM or a signing service that answers seeds for authorised testers, never in a repository or an image. `udsota keygen` makes a key pair. The HMAC mode still suits a bench, or a fleet whose images and flash are protected (flash encryption) and whose master can be rotated.
+
+The ESP32 port serves `cfg.device_id` as F18C and binds the keys to it when it is set (1 to 16 bytes), otherwise to the 6-byte base MAC. It picks the ECDSA mode when `cfg.key_pubkey` is set (65 bytes, 04 ‖ X ‖ Y), and the HMAC mode when only `cfg.key_label` is. A software P-256 verify takes tens of milliseconds on chips without an ECC accelerator, such as the ESP32 and ESP32-S3, so a sendKey answer may come after P2 (50 ms). The udsota client waits 150 ms. For a tester that holds the server to its announced P2, raise `cfg.p2_prog_ms` for `level_programming`, whose 27 03/04 run in the programming session, and `cfg.p2_ms` only for `level_extended`. A port for another platform sets `verify` to its own P-256 verify over the same message.
+
+Three wrong keys answer 0x36, then 0x37 for 10 s, and the same 10 s delay follows every boot. An unlock ends at a session change, an S3 timeout or a reset. When no key can be checked, security stays on and no key matches: sendKey answers 0x22 and counts no attempt. That happens with a label but no master (a CI build, say), with a public key that PSA refuses, when the port's start-up self-test of its HMAC or ECDSA fails, or when `udsota_init()` was given a `security` with neither `key` nor `verify`, which it also reports by returning false. A `security` with no `rng16` is refused the same way: requestSeed answers 0x22, so no seed is ever issued.
+
+With `security` NULL, or both `cfg.key_pubkey` and `cfg.key_label` NULL in the port, 27 answers 0x11, and the programming session, the download, activation and reset need no key.
 
 ## Rollback and confirm
 
@@ -207,14 +218,20 @@ The first 36 block is checked before anything is erased, and FF01 checks the who
 | 10 | DiagnosticSessionControl | 01 default, 02 programming, 03 extended; answers `50 xx` then P2 and P2*/10 as two big-endian words (`00 32 01 F4` by default) | any | – |
 | 11 | ECUReset | 01 hardReset: answers, then restarts through `reset` | extended, programming | either level |
 | 22 | ReadDataByIdentifier | one DID per request | any | – |
-| 27 | SecurityAccess | `level_extended` and the next sub-function in extended, `level_programming` and the next in programming | extended, programming | – |
+| 27 | SecurityAccess | `level_extended` and the next sub-function in extended, `level_programming` and the next in programming; a sendKey carries exactly 16 key bytes, or 64 in the ECDSA mode | extended, programming | – |
 | 31 | RoutineControl | 01 startRoutine | per routine | per routine |
 | 34 | RequestDownload | DFI 00, ALFID 44, address 0, 0 < size ≤ slot; answers `74 20 0F FF` (`cfg.max_block_len`, 4,095 by default) | programming | programming |
 | 36 | TransferData | block counter from 01, wrapping FF to 00, and up to 4,093 data bytes; a repeat of the last counter is answered and not rewritten | programming | programming |
 | 37 | RequestTransferExit | once every announced byte has arrived | programming | programming |
 | 3E | TesterPresent | 00; 80 suppresses the answer | any | – |
+| 28 | CommunicationControl (with `comm_control` only) | controlType 00–03 and a communicationType naming normal or network-management messages; answers `68 xx` | extended, programming | – |
+| 85 | ControlDTCSetting (with `dtc_setting` only) | 01 on, 02 off, with any option record; answers `C5 xx` | extended, programming | – |
 
-Any other SID answers 0x11. While a flash job runs, every request but 3E answers 0x21. The key column applies only with security on.
+Any other SID answers 0x11. While a flash job runs, every request but 3E answers 0x21. The key column applies only with security on. A return to the default session, by 10 01, S3 or an end of session, undoes 28 and 85 through their hooks.
+
+### Functional addressing
+
+With `cfg.func_id` set (OBD's broadcast ID is 0x7DF), the port hands single frames on that ID to `udsota_isotp_on_func_frame()`, and the answers go out on `cfg.resp_id` as usual. This lets a tester send 3E 80 to every device on the bus, or switch them all to the extended session and quiet them with 85 02 and 28 03 before it programs one of them. A functional request is served only when it is 10 01, 10 03, 3E, 22, 28 or 85, as a single frame, and while no other request or answer is in progress; anything else gets no answer at all, including a 10 02, since the programming session is entered physically on the one device being programmed. NRCs 0x11, 0x12, 0x31, 0x7E and 0x7F are suppressed for a functional request, as ISO 14229-1 asks, so a device that serves none of a request stays silent. While a flash job runs only a functional 3E is answered.
 
 ### Routines
 
@@ -245,7 +262,7 @@ Every other DID goes to `did_read`, and so does any of these whose source is NUL
 
 | NRC | Name | udsota sends it for |
 |---|---|---|
-| 0x11 | serviceNotSupported | an unknown SID; 27 with security off; 11 01 with no `reset` hook |
+| 0x11 | serviceNotSupported | an unknown SID; 27 with security off; 11 01 with no `reset` hook; 28 with no `comm_control` hook; 85 with no `dtc_setting` hook |
 | 0x12 | subFunctionNotSupported | an unknown sub-function |
 | 0x13 | incorrectMessageLengthOrInvalidFormat | a wrong length, or more than one DID in a 22 |
 | 0x21 | busyRepeatRequest | any request but 3E while a flash job runs; or the gate's choice |
@@ -261,11 +278,11 @@ Every other DID goes to `did_read`, and so does any of these whose source is NUL
 | 0x73 | wrongBlockSequenceCounter | a 36 counter that is neither the next nor a repeat |
 | 0x78 | responsePending | a flash job still running after 40 ms, repeated every 1.5 s |
 | 0x7E | subFunctionNotSupportedInActiveSession | a 27 level that belongs to the other session |
-| 0x7F | serviceNotSupportedInActiveSession | 11, 27 or 31 in the default session; 34, 36 or 37 outside programming |
+| 0x7F | serviceNotSupportedInActiveSession | 11, 27, 28, 31 or 85 in the default session; 34, 36 or 37 outside programming |
 
 ### Timing
 
-P2 is 50 ms and P2\* 5,000 ms (`cfg.p2_ms`, `cfg.p2star_ms`). S3 is 5 s after the last answer (`cfg.s3_ms`); it pauses while a multi-frame request arrives, and its expiry returns the server to the default session, which aborts a download. A flash job not done within 40 ms gets 0x78, repeated every 1.5 s, and at 90 s the server answers 0x72 and ends the session.
+P2 is 50 ms and P2\* 5,000 ms (`cfg.p2_ms`, `cfg.p2star_ms`); the programming session can have its own (`cfg.p2_prog_ms`, `cfg.p2star_prog_ms`), which its 10 02 answer carries and its 0x78 cadence follows. S3 is 5 s after the last answer (`cfg.s3_ms`); it pauses while a multi-frame request arrives, and its expiry returns the server to the default session, which aborts a download. A flash job not done within four fifths of P2 (40 ms) gets 0x78, repeated every three tenths of P2\* (1.5 s), and at 90 s the server answers 0x72 and ends the session.
 
 ISO-TP flow control uses a block size of 64 (`cfg.block_size`) and an STmin of 2 ms, with frames padded with 0xAA. N_Cr is 1 s. The receive limit is 256 bytes, or 4,095 while a download is open.
 

@@ -27,6 +27,7 @@ static const char *TAG = "example";
  * from this project is accepted only by a unit running it with these values. */
 #define EXAMPLE_REQ_ID      0x710u   /* the tester's request ID */
 #define EXAMPLE_RESP_ID     0x718u   /* this unit's response ID */
+#define EXAMPLE_FUNC_ID     0x7DFu   /* functional requests (OBD's broadcast ID): 3E, 10 01, 10 03 and 22 */
 #define EXAMPLE_HW_ID       1u       /* the board this image is for: the product's to allocate */
 #define EXAMPLE_LAYOUT_ID   1u       /* the partition layout: bump it whenever partitions.csv moves */
 #define EXAMPLE_BOARD_NAME  "devkit" /* this board's name, served as DID F191 */
@@ -102,7 +103,7 @@ static void can_rx_task(void *arg)
         if (xQueueReceive(s_rxq, &f, portMAX_DELAY) != pdTRUE) {
             continue;
         }
-        if (f.id == EXAMPLE_REQ_ID) {
+        if (f.id == EXAMPLE_REQ_ID || f.id == EXAMPLE_FUNC_ID) {
             udsota_esp32_on_frame((uint16_t)f.id, f.data, f.dlc, f.t_us);
             continue;
         }
@@ -201,15 +202,22 @@ static esp_err_t updater_start(void)
     static const udsota_config_t cfg = {
         .req_id = EXAMPLE_REQ_ID,
         .resp_id = EXAMPLE_RESP_ID,
+        .func_id = EXAMPLE_FUNC_ID,
         .product = "example",           /* must equal project() in CMakeLists.txt: esp_app_desc_t's project name */
         .hw_id = EXAMPLE_HW_ID,
         .layout_id = EXAMPLE_LAYOUT_ID,
         .device_id = NULL,              /* the port serves the base MAC as F18C */
-        /* Security is off: key_label is NULL, so 0x27 answers 0x11 and any tester on the bus may program the
-         * unit. To turn it on, set .key_label (for example "udsota-example") and point .key_master and
-         * .key_master_len at a master key the app embeds from a git-ignored file at build time. Never commit
-         * the master. Also turn on signed updates (CONFIG_SECURE_SIGNED_ON_UPDATE), so FF01 checks a
-         * signature and not only a SHA-256. */
+        /* Security is off: key_pubkey and key_label are NULL, so 0x27 answers 0x11 and any tester on the bus
+         * may program the unit. To turn it on, prefer the ECDSA mode: run `udsota keygen --out keys` (keys/ is
+         * git-ignored), move keys/udsota_private.pem into the signing service (never into the repository or
+         * the image), copy the public keys/udsota_pubkey.h next to this file, include it and set
+         * .key_pubkey = udsota_pubkey and .key_pubkey_len = sizeof udsota_pubkey. The image then holds only
+         * the public key, which unlocks nothing, and the client's profile sets [security] mode = "ecdsa".
+         * The HMAC mode instead sets .key_label (for example "udsota-example") and points .key_master and
+         * .key_master_len at a master key the app embeds from a git-ignored file at build time; every image
+         * then carries the fleet's secret. Never commit either secret. Also turn on signed updates
+         * (CONFIG_SECURE_SIGNED_ON_UPDATE), so FF01 checks a signature and not only a SHA-256. */
+        .key_pubkey = NULL,
         .key_label = NULL,
     };
     const udsota_esp32_can_t can = {
@@ -218,7 +226,10 @@ static esp_err_t updater_start(void)
     /* Only did_read is set. With no gate every step is allowed at any time; a real app adds .gate here, which
      * refuses each step (UDSOTA_NRC_CONDITIONS_NOT_CORRECT) while updating is unsafe and holds
      * UDSOTA_OP_CONFIRM until the app's own self-test has passed. With no reset, a restart over UDS is
-     * the port's esp_restart(). The port copies the struct. */
+     * the port's esp_restart(). A product whose app sends its own frames adds .comm_control, which stops them
+     * for 28 01/03 (a tester sends it to the whole bus before programming) until 28 00 or the default
+     * session, and one that records DTCs adds .dtc_setting for 85; without them, 28 and 85 answer 0x11
+     * (nothing, functionally). The port copies the struct. */
     const udsota_hooks_t hooks = { .did_read = did_read, .ctx = NULL };
     return udsota_esp32_start(&cfg, &hooks, &can);
 }

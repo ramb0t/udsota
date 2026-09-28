@@ -18,11 +18,17 @@ slot_size = 0x1E0000                  # largest image in bytes: examples/esp32's
 did = 0xF191                          # a DID the server answers with its board name (ASCII)
 names = { 1 = "devkit" }              # board name for each hw_id; flash refuses an image for another board
 
-# [security] turns on SecurityAccess (0x27): without it the tool never unlocks. The key for each seed is
-# derived from a 32-byte master key file, the label and the device ID, as udsota_keys.c does.
+# [security] turns on SecurityAccess (0x27): without it the tool never unlocks. It has two modes, which must match
+# the server's. In mode "hmac" (the default) the key for each seed is derived from a 32-byte master key file, the
+# label and the device ID, as udsota_keys.c does; every device holds that master too. In mode "ecdsa" (recommended)
+# the key is a P-256 signature over the seed, level and device ID made with a private key only the tester holds;
+# the device holds just the public key (`udsota keygen --out DIR` makes the pair).
 # [security]
-# label = "udsota-example"            # the key-derivation label the server was built with (ASCII)
-# master_file = "master.bin"          # 32 raw bytes; relative to the current directory, or pass --master
+# mode = "hmac"                       # "hmac" or "ecdsa"
+# label = "udsota-example"            # hmac: the key-derivation label the server was built with (ASCII)
+# master_file = "master.bin"          # hmac: 32 raw bytes; relative to the current directory, or pass --master
+# private_key_file = "udsota_private.pem"   # ecdsa instead of label and master_file: an unencrypted P-256 PEM,
+#                                     # or pass --private-key; keep it out of the repository
 # device_id_did = 0xF18C              # the DID holding the device ID (default 0xF18C)
 # level_extended = 0x01               # requestSeed level for the extended session (odd, 0x01 to 0x7D)
 # level_programming = 0x03            # requestSeed level for the programming session (odd, 0x01 to 0x7D)
@@ -36,6 +42,13 @@ names = { 1 = "devkit" }              # board name for each hw_id; flash refuses
 # [preroll] wakes a server whose CAN driver waits to hear traffic before it transmits.
 # [preroll]
 # tester_present_frames = 5           # TesterPresent frames sent first when the bus is quiet (0 to 64)
+
+# [functional] names the functional ID, the only other ID the tool may send on. With quiet_bus, flash tells every
+# node on the bus to stop its normal messages (10 83, 85 82, 28 83 03, then 3E 80 every 2 s) and releases them at
+# the end. Only for a bench or a vehicle at rest, where every node may go quiet.
+# [functional]
+# id = 0x7DF                          # the functional request ID
+# quiet_bus = false
 
 # [dids] lists extra DIDs `info` reads after the server's own, decoded as hex, ascii or version3.
 # A range stops at its first absent DID.

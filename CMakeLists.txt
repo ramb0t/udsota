@@ -1,5 +1,6 @@
-# Host build for udsota: the Unity unit tests, the UDS request-parser fuzz harness and the core
-# portability probe. ESP-IDF builds the components through examples/esp32, not through this file.
+# Host build for udsota: the Unity unit tests, the UDS request-parser fuzz harness, the core portability
+# probe and, on Linux, the demo server. ESP-IDF builds the components through examples/esp32, not through
+# this file.
 #   cmake -S . -B build && cmake --build build -j && ctest --test-dir build --output-on-failure
 cmake_minimum_required(VERSION 3.20)
 project(udsota C)
@@ -69,9 +70,10 @@ udsota_test(test_udsota_image
     SOURCES  test/test_udsota_image.c ${CORE_DIR}/udsota_image.c
     INCLUDES ${CORE_INC} ${TEST_DIR})
 
+# With the host SHA-256, for the digest of the ECDSA mode's known-answer message.
 udsota_test(test_udsota_keys
-    SOURCES  test/test_udsota_keys.c ${CORE_DIR}/udsota_keys.c
-    INCLUDES ${CORE_INC})
+    SOURCES  test/test_udsota_keys.c ${CORE_DIR}/udsota_keys.c ${CORE_DIR}/test/sha256_host.c
+    INCLUDES ${CORE_INC} ${CORE_DIR}/test)
 
 udsota_test(test_udsota_rxwatch
     SOURCES  test/test_udsota_rxwatch.c ${CORE_DIR}/udsota_rxwatch.c
@@ -107,6 +109,10 @@ udsota_test(test_udsota_server_hooks
     SOURCES  test/test_udsota_server_hooks.c ${SERVER_SRCS}
     INCLUDES ${CORE_INC} ${CORE_PRIV})
 
+udsota_test(test_udsota_server_functional
+    SOURCES  test/test_udsota_server_functional.c ${SERVER_SRCS}
+    INCLUDES ${CORE_INC} ${CORE_PRIV})
+
 # ---- Image descriptor: one UDSOTA_ESP32_IMAGE_DESC instance per variant, as a dev image for two
 # boards and as a release image. On target, udsota_esp32_image_desc() sets UDSOTA_ESP32_IMG_RELEASE
 # from PROJECT_VER.
@@ -136,7 +142,14 @@ udsota_test(test_udsota_esp32_devid
     SOURCES  test/test_udsota_esp32_devid.c ${ESP32_DIR}/udsota_esp32_devid.c ${CORE_DIR}/udsota_keys.c ${SERVER_SRCS}
     INCLUDES ${CORE_INC} ${CORE_PRIV} ${ESP32_DIR}/include ${ESP32_DIR}/priv)
 
-# ---- Host fake of a two-slot OTA engine (file-backed, POSIX), kept for a future SocketCAN demo
+# The 0x27 mode the port's config selects and the ECDSA key check over the device ID, with the real server, key
+# messages and device ID, and a stand-in verify on the host SHA-256.
+udsota_test(test_udsota_esp32_sa
+    SOURCES  test/test_udsota_esp32_sa.c ${ESP32_DIR}/udsota_esp32_sa.c ${ESP32_DIR}/udsota_esp32_devid.c
+             ${CORE_DIR}/udsota_keys.c ${CORE_DIR}/test/sha256_host.c ${SERVER_SRCS}
+    INCLUDES ${CORE_INC} ${CORE_PRIV} ${CORE_DIR}/test ${ESP32_DIR}/include ${ESP32_DIR}/priv)
+
+# ---- Host fake of a two-slot OTA engine (file-backed, POSIX), the engine behind tools/linux_server's demo
 # server. Its test checks the fake and its SHA-256 against known answers.
 if(UNIX)
     set(FAKE_DIR ${CORE_DIR}/test)
@@ -210,3 +223,9 @@ endif()
 add_executable(udsota_image_check tools/image_check.c ${ESP32_DIR}/udsota_esp32_image.c ${CORE_DIR}/udsota_image.c)
 target_include_directories(udsota_image_check PRIVATE ${CORE_INC} ${ESP32_DIR}/include)
 target_compile_options(udsota_image_check PRIVATE -Wall -Wextra -Werror)
+
+# ---- tools/linux_server: the core on Linux (SocketCAN or a stdin/stdout frame pipe) with a file-backed A/B
+# engine, for the client's end-to-end tests (client/tests/test_e2e_*.py). Linux only: it opens CAN_RAW sockets.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_subdirectory(tools/linux_server)
+endif()

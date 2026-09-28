@@ -25,10 +25,11 @@
 #define UDSOTA_ISOTP_WAIT_OPEN_MS      10u    /* longest wait in a non-default session or mid-message */
 #define UDSOTA_ISOTP_WAIT_IDLE_MS      100u   /* longest wait otherwise */
 #define UDSOTA_ISOTP_FC_RETRY_MS       10u    /* default FC retry window while cfg.fc_retry_ms is 0 */
+#define UDSOTA_ISOTP_PARK_MAX_MS       1000u  /* a parked answer the bus keeps refusing is dropped after this long */
 
 typedef struct {
     int      (*send)(void *ctx, uint16_t id, const uint8_t data[8], uint8_t len);   /* 0 queued, UDSOTA_TX_RETRY, else dropped */
-    uint32_t (*tx_pending)(void *ctx);       /* nullable: frames still queued in the app's CAN driver */
+    uint32_t (*tx_pending)(void *ctx);       /* nullable: frames still queued in the app's CAN driver; NULL = unknown, so a restart waits the full 100 ms */
     uint32_t (*now_us)(void *ctx);           /* monotonic microseconds (isotp_user_get_us) */
     void     *ctx;
 } udsota_can_t;
@@ -51,15 +52,16 @@ struct udsota_isotp {
     udsota_can_t         can;                /* copied at init */
     uint32_t           (*stmin_us)(void *ctx);   /* hooks.stmin_us, copied at init; NULL = stmin_default_us */
     void                *stmin_ctx;          /* hooks.ctx */
-    uint32_t             stmin_default_us;   /* cfg.stmin_us, 0 = UDSOTA_STMIN_DEFAULT_US (udsota.h) */
+    uint32_t             stmin_default_us;   /* cfg.stmin_us (0 = UDSOTA_STMIN_DEFAULT_US), rounded up to what an FC carries */
     uint16_t             resp_id;
     uint32_t             rx_limit_dl;        /* receive limit while a download is open: cfg.max_block_len */
     uint32_t             rx_limit_idle;      /* receive limit otherwise */
     uint32_t             rx_limit;           /* the link's current receive buffer size */
     udsota_rxwatch_t     rxw;                /* isotp-c's receive state, mirrored from the raw frames */
-    uint32_t             msg_stmin_us;       /* STmin sent in the current message's first FC */
+    uint32_t             msg_stmin_us;       /* STmin sent in the current message's first FC, as encoded (the monitor judges this) */
     bool                 rx_orphan;          /* isotp-c still holds a message dropped at a withheld FC */
     size_t               park_len;           /* bytes in buf->park; 0 = nothing parked */
+    uint32_t             park_ms;            /* when the parked answer was parked */
     uint32_t             resp_lost;          /* answers refused outright by can.send, or replaced unsent */
     bool                 fc_parked;          /* an FC can.send refused with UDSOTA_TX_RETRY waits in fc_frame */
     uint16_t             fc_id;
@@ -81,10 +83,15 @@ void     udsota_isotp_init(udsota_isotp_t *t, udsota_server_t *s, const udsota_c
 /* One request frame already filtered to cfg.req_id; rx_us is its arrival (for the STmin median). May send an
  * FC or an answer through can.send before it returns. */
 void     udsota_isotp_on_frame(udsota_isotp_t *t, const uint8_t *data, uint8_t dlc, uint32_t rx_us, uint32_t now_ms);
+/* One frame already filtered to cfg.func_id (functional addressing). Only a Single Frame is served, through
+ * udsota_on_functional_request(), and never with an FC; it is dropped while an answer is going out or a physical
+ * request is being received or waits, since the server answers one request at a time. May send the answer through
+ * can.send before it returns. */
+void     udsota_isotp_on_func_frame(udsota_isotp_t *t, const uint8_t *data, uint8_t dlc, uint32_t now_ms);
 /* Runs after every wake: isotp-c's timers and CFs, a parked FC or answer, the server's poll, a waiting
  * request and the receive-limit switch. Returns the milliseconds the caller may sleep (a frame wakes it sooner). */
 uint32_t udsota_isotp_service(udsota_isotp_t *t, uint32_t now_ms);
-/* Answers dropped: refused outright by can.send, or replaced before they left. */
+/* Answers dropped: refused outright by can.send, still refused after UDSOTA_ISOTP_PARK_MAX_MS, or replaced before they left. */
 uint32_t udsota_isotp_resp_lost(const udsota_isotp_t *t);
 /* Flow-control frames dropped: refused outright, still refused after the cfg.fc_retry_ms window, superseded by a
  * newer FC, or dropped with their message (link re-init, withheld message). */

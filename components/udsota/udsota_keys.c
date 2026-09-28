@@ -1,5 +1,5 @@
-/* Default 0x27 key derivation (see udsota_keys.h): K_dev, the expected key and a known-answer self-test.
- * Pure: the HMAC is injected. */
+/* 0x27 keys (see udsota_keys.h): the HMAC mode's K_dev, expected key and known-answer self-test, and the ECDSA
+ * mode's signed message and self-test. Pure: the HMAC and the ECDSA verify are injected. */
 #include "udsota_keys.h"
 
 #include <string.h>
@@ -28,6 +28,23 @@ static const uint8_t KAT_KEY_L3[UDSOTA_KEYS_KEY_LEN] = {
     0x27, 0xe8, 0x91, 0xcd, 0x8c, 0x86, 0xac, 0x41,
     0xa7, 0x88, 0x2a, 0x4f, 0x81, 0xd6, 0x66, 0xf3,
 };
+/* The ECDSA self-test: the public key of the test private scalar 01 02 .. 20 (never a real key), and its
+ * signature over the level-0x03 message for seed 0x10..0x1F and KAT_ID. client/tests pins the same bytes. */
+static const uint8_t KAT_SIG_PUB[UDSOTA_KEYS_PUBKEY_LEN] = {
+    0x04,
+    0x51, 0x5c, 0x3d, 0x6e, 0xb9, 0xe3, 0x96, 0xb9, 0x04, 0xd3, 0xfe, 0xca, 0x7f, 0x54, 0xfd, 0xcd,
+    0x0c, 0xc1, 0xe9, 0x97, 0xbf, 0x37, 0x5d, 0xca, 0x51, 0x5a, 0xd0, 0xa6, 0xc3, 0xb4, 0x03, 0x5f,
+    0x45, 0x36, 0xbe, 0x3a, 0x50, 0xf3, 0x18, 0xfb, 0xf9, 0xa5, 0x47, 0x59, 0x02, 0xa2, 0x21, 0x50,
+    0x2b, 0xef, 0x0d, 0x57, 0xe0, 0x8c, 0x53, 0xb2, 0xcc, 0x0a, 0x56, 0xf1, 0x7d, 0x9f, 0x93, 0x54,
+};
+static const uint8_t KAT_SIG_L3[UDSOTA_KEYS_SIG_LEN] = {
+    0x34, 0x43, 0x5c, 0x64, 0x5a, 0x77, 0xfb, 0xc2, 0x2f, 0xc5, 0x3e, 0x78, 0xec, 0x4f, 0x57, 0x9c,
+    0x9c, 0x79, 0x45, 0x63, 0xd9, 0x39, 0x91, 0x24, 0x66, 0xbb, 0xea, 0x9a, 0x74, 0x28, 0x7c, 0x1f,
+    0xe3, 0x32, 0x92, 0x51, 0x81, 0xf3, 0x19, 0xe2, 0xfa, 0xb6, 0x75, 0x68, 0x81, 0x5c, 0x93, 0xc4,
+    0x75, 0x1d, 0x82, 0x23, 0xec, 0x8c, 0xa3, 0x35, 0x9e, 0x68, 0x15, 0xbc, 0x2f, 0x65, 0xd5, 0xa8,
+};
+
+_Static_assert(sizeof UDSOTA_KEYS_SIG_TAG - 1u == UDSOTA_KEYS_SIG_TAG_LEN, "the tag length matches the tag");
 
 /* Zeroes n bytes through a volatile pointer so the compiler cannot drop the wipe of key material. */
 static void wipe(void *p, size_t n)
@@ -137,4 +154,41 @@ bool udsota_keys_self_test(udsota_hmac_fn hmac)
     wipe(kdev, sizeof kdev);
     wipe(key, sizeof key);
     return ok;
+}
+
+/* Builds the ECDSA mode's signed message for one seed, level and device ID; see udsota_keys.h. */
+size_t udsota_keys_sig_msg(const uint8_t seed[UDSOTA_KEYS_SEED_LEN], uint8_t level, const uint8_t *id,
+                           size_t id_len, uint8_t out[UDSOTA_KEYS_SIG_MSG_MAX])
+{
+    if (seed == NULL || id == NULL || out == NULL || id_len > UDSOTA_KEYS_ID_MAX || !seed_level_ok(level)) {
+        return 0;
+    }
+    size_t n = 0;
+    memcpy(&out[n], UDSOTA_KEYS_SIG_TAG, UDSOTA_KEYS_SIG_TAG_LEN);
+    n += UDSOTA_KEYS_SIG_TAG_LEN;
+    memcpy(&out[n], seed, UDSOTA_KEYS_SEED_LEN);
+    n += UDSOTA_KEYS_SEED_LEN;
+    out[n++] = level;
+    out[n++] = (uint8_t)id_len;
+    memcpy(&out[n], id, id_len);
+    return n + id_len;
+}
+
+/* Verifies the known-answer signature through verify, and checks it fails for another level; true only if both hold. */
+bool udsota_keys_sig_self_test(udsota_ecdsa_verify_fn verify)
+{
+    if (verify == NULL) {
+        return false;
+    }
+    uint8_t seed[UDSOTA_KEYS_SEED_LEN];
+    for (size_t i = 0; i < sizeof seed; i++) {
+        seed[i] = (uint8_t)(0x10 + i);
+    }
+    uint8_t msg[UDSOTA_KEYS_SIG_MSG_MAX];
+    size_t n = udsota_keys_sig_msg(seed, 0x03u, KAT_ID, sizeof KAT_ID, msg);
+    if (n == 0u || verify(KAT_SIG_PUB, msg, n, KAT_SIG_L3) != 1) {
+        return false;
+    }
+    n = udsota_keys_sig_msg(seed, 0x01u, KAT_ID, sizeof KAT_ID, msg);   /* a level-0x03 signature must not unlock 0x01 */
+    return n != 0u && verify(KAT_SIG_PUB, msg, n, KAT_SIG_L3) == 0;
 }

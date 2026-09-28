@@ -1,7 +1,7 @@
 /* udsota ESP32 port (ESP-IDF v6.1): the diag task that owns the ISO-TP link and the UDS server
  * (udsota_esp32_start), the update engine on esp_ota_* (flash worker and OTA state cache), 0x27 security
- * on PSA HMAC-SHA256 and the hardware RNG, the PSA lock they share with the app, the boot-loop counter in
- * RTC memory and the image descriptor placement. Host code may include it: it needs only the core
+ * on PSA HMAC-SHA256 or PSA ECDSA and the hardware RNG, the PSA lock they share with the app, the boot-loop
+ * counter in RTC memory and the image descriptor placement. Host code may include it: it needs only the core
  * headers and esp_err.h (test/stubs has one). */
 #pragma once
 #include <stdbool.h>
@@ -41,12 +41,24 @@ bool udsota_esp32_engine_busy(void);
  * The device ID is id (id_len bytes, 1 to UDSOTA_KEYS_ID_MAX) or, with id NULL, the base MAC; an ID that
  * udsota_esp32_start() or an earlier call already fixed wins. Serve the same bytes as F18C
  * (udsota_esp32_device_id() returns them); start does. The first call switches the SAR-ADC entropy source
- * on for good, fixes the device ID, self-tests PSA HMAC and derives K_dev. Later calls return the same
- * struct and ignore their arguments. label NULL: returns NULL (no security). A bad id_len, a failed MAC
+ * on for good, fixes the device ID, self-tests PSA HMAC and derives K_dev. Later calls of this or
+ * udsota_esp32_security_ecdsa() return the struct the first built and ignore their arguments. label NULL:
+ * returns NULL (no security). A bad id_len, a failed MAC
  * read for a MAC ID, master NULL or master_len 0, or a failed self-test: security is on and no key matches.
  * Call it from start code, before the server's task runs. */
 const udsota_security_t *udsota_esp32_security(const char *label, const uint8_t *master, size_t master_len,
                                                const uint8_t *id, size_t id_len);
+/* 0x27 security in the ECDSA mode (udsota_keys.h): seeds from the hardware RNG, and the key a sendKey carries
+ * is a UDSOTA_KEYS_SIG_LEN-byte P-256 signature over the seed, level and device ID, verified with PSA under
+ * pubkey, the tester's public key (UDSOTA_KEYS_PUBKEY_LEN bytes, 04 || X || Y; the device needs no secret).
+ * The device ID is chosen as for udsota_esp32_security(). The first call switches the SAR-ADC entropy source
+ * on for good, fixes the device ID, self-tests PSA ECDSA (two P-256 verifies) and imports pubkey once as a
+ * volatile key. The first call of this or udsota_esp32_security() fixes the mode: later calls of either
+ * return the same struct and ignore their arguments. pubkey NULL: returns NULL (no security). A bad id_len, a
+ * failed MAC read for a MAC ID, a pubkey that is not a P-256 point or a failed self-test: security is on and
+ * no key matches (sendKey answers 0x22). Call it from start code, before the server's task runs. */
+const udsota_security_t *udsota_esp32_security_ecdsa(const uint8_t *pubkey, size_t pubkey_len, const uint8_t *id,
+                                                     size_t id_len);
 /* The device ID the port serves as F18C and the keys hash, with its length in *len (len may be NULL). Until
  * udsota_esp32_start() or udsota_esp32_security() fixes it, this is the base MAC (UDSOTA_ESP32_DEVICE_ID_LEN
  * bytes), and calling it fixes nothing. The MAC is all-zero if its read failed. Any task may call it. */
@@ -112,18 +124,24 @@ typedef struct {
 
 /* Starts udsota once. It copies *cfg (the strings and arrays cfg points to must outlive the port), fixes
  * the device ID (a copy of cfg->device_id when set, else the base MAC) and serves it as F18C, turns security
- * on when cfg->key_label is set, with keys over that same ID, starts the engine, and creates the buffers,
- * the frame queue and the diag task (Kconfig UDSOTA_ESP32_*). hooks may be NULL; a NULL hooks->reset
+ * on with keys over that same ID, starts the engine, and creates the buffers,
+ * the frame queue and the diag task (Kconfig UDSOTA_ESP32_*). Security is the ECDSA mode
+ * (udsota_esp32_security_ecdsa) when cfg->key_pubkey is set, else the HMAC mode (udsota_esp32_security)
+ * when cfg->key_label is set, else off; a key_master given with a key_pubkey is ignored, with a warning,
+ * and should be left out of the image. hooks may be NULL; a NULL hooks->reset
  * restarts with esp_restart(). Returns ESP_ERR_INVALID_ARG for a NULL cfg, can or can_send, or a set
- * device_id whose device_id_len is not 1 to UDSOTA_KEYS_ID_MAX (16); ESP_ERR_INVALID_STATE on a second
+ * device_id whose device_id_len is not 1 to UDSOTA_KEYS_ID_MAX (16), a set key_pubkey that is not a 65-byte
+ * uncompressed point (04 || X || Y), or a set func_id equal to req_id or resp_id; ESP_ERR_INVALID_STATE on a second
  * call; and ESP_ERR_NO_MEM when an allocation or the task fails. Only a bad-argument failure may be
  * retried: after ESP_ERR_NO_MEM the updater stays off for this boot, and a second call returns
  * ESP_ERR_INVALID_STATE. When the buffers or frame queue cannot be allocated nothing else was started; when
  * the diag task cannot be created, what start already set up stays behind: the flash worker with its
- * buffer and queue and, with key_label set, the derived key in RAM and the SAR-ADC entropy source, left on. */
+ * buffer and queue and, with security on, the derived key or the imported public key in RAM and the SAR-ADC
+ * entropy source, left on. */
 esp_err_t udsota_esp32_start(const udsota_config_t *cfg, const udsota_hooks_t *hooks, const udsota_esp32_can_t *can);
-/* Any task: queues one frame on cfg->req_id with its receive time in microseconds; never blocks.
- * Other IDs, frames before start and frames past a full queue are dropped (the last counted). */
+/* Any task: queues one frame on cfg->req_id, or on cfg->func_id when set (a functional request), with its receive
+ * time in microseconds; never blocks. Other IDs, frames before start and frames past a full queue are dropped (the
+ * last counted). */
 void udsota_esp32_on_frame(uint16_t id, const uint8_t *data, uint8_t dlc, uint32_t rx_us);
 /* Any task, an app hook included: asks the diag task to end the session (udsota_end_session) after the
  * request it is serving, or after a running job's answer; requests before it runs count once. No-op

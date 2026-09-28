@@ -17,6 +17,23 @@ _Static_assert(UDSOTA_ISOTP_RX_MAX == UDSOTA_DL_MAX_BLOCK_LEN, "the receive buff
 
 static const udsota_can_t *s_clock;   /* isotp_user_get_us has no link: the last adapter initialised serves the clock */
 
+/* The STmin an FC can carry for us microseconds, rounded up so the client is never told a shorter gap than asked:
+ * 0; 100-900 us in 100 us steps (F1-F9); else whole milliseconds, 127 ms at most (00-7F). The FC sends it and the
+ * STmin monitor judges against it, so the two always agree. */
+static uint32_t stmin_sendable(uint32_t us)
+{
+    if (us == 0u) {
+        return 0u;
+    }
+    if (us <= 900u) {
+        return (us + 99u) / 100u * 100u;
+    }
+    if (us >= 127000u) {
+        return 127000u;
+    }
+    return (us + 999u) / 1000u * 1000u;
+}
+
 /* Drops a parked FC, counted lost: it belongs to a message that is gone or has a newer FC. */
 static void fc_drop(udsota_isotp_t *t)
 {
@@ -55,14 +72,17 @@ static bool tx_busy(const udsota_isotp_t *t)
 }
 
 /* Hands the parked answer to isotp-c. NOSPACE (the bus said retry) or INPROGRESS keeps it for the next
- * service; a hard refusal drops it, counted, and the client retries. */
+ * service, for UDSOTA_ISOTP_PARK_MAX_MS at most; a hard refusal or that limit drops it, counted, and the
+ * client retries. The limit keeps a bus that acknowledges nothing from freezing the server, whose poll (S3
+ * among it) waits while an answer is parked. */
 static void tx_flush(udsota_isotp_t *t)
 {
     if (t->park_len == 0u || t->link.send_status == ISOTP_SEND_STATUS_INPROGRESS) {
         return;
     }
     const int ret = isotp_send(&t->link, t->buf->park, (uint32_t)t->park_len);
-    if (ret == ISOTP_RET_NOSPACE || ret == ISOTP_RET_INPROGRESS) {
+    if ((ret == ISOTP_RET_NOSPACE || ret == ISOTP_RET_INPROGRESS) &&
+        (uint32_t)(t->now_ms - t->park_ms) < UDSOTA_ISOTP_PARK_MAX_MS) {
         return;
     }
     if (ret != ISOTP_RET_OK) {
@@ -85,6 +105,7 @@ static void tx_response(udsota_isotp_t *t, size_t n)
     }
     memcpy(t->buf->park, t->buf->resp, n);
     t->park_len = n;
+    t->park_ms = t->now_ms;
     tx_flush(t);
 }
 
@@ -172,11 +193,12 @@ static uint32_t next_wait_ms(const udsota_isotp_t *t, uint32_t now_ms)
 }
 
 /* Installed on the server: frames still to leave, the app's driver queue plus a parked answer and a
- * multi-frame send in progress, so a restart never overtakes its own answer. */
+ * multi-frame send in progress, so a restart never overtakes its own answer. Without can.tx_pending the driver
+ * queue is unknown and counts as one frame, so a restart waits the full UDSOTA_RESET_TX_WAIT_MS. */
 static uint32_t tp_tx_pending(void *ctx)
 {
     const udsota_isotp_t *t = (const udsota_isotp_t *)ctx;
-    uint32_t n = (t->can.tx_pending != NULL) ? t->can.tx_pending(t->can.ctx) : 0u;
+    uint32_t n = (t->can.tx_pending != NULL) ? t->can.tx_pending(t->can.ctx) : 1u;
     n += (t->park_len != 0u) ? 1u : 0u;
     n += (t->link.send_status == ISOTP_SEND_STATUS_INPROGRESS) ? 1u : 0u;
     return n;
@@ -195,7 +217,7 @@ void udsota_isotp_init(udsota_isotp_t *t, udsota_server_t *s, const udsota_confi
         t->stmin_us = hooks->stmin_us;
         t->stmin_ctx = hooks->ctx;
     }
-    t->stmin_default_us = (cfg->stmin_us != 0u) ? cfg->stmin_us : UDSOTA_STMIN_DEFAULT_US;
+    t->stmin_default_us = stmin_sendable((cfg->stmin_us != 0u) ? cfg->stmin_us : UDSOTA_STMIN_DEFAULT_US);
     t->link_cfg.bs = (cfg->block_size != 0u) ? cfg->block_size : (uint8_t)UDSOTA_BLOCK_SIZE_DEFAULT;
     t->link_cfg.st_min_us = t->stmin_default_us;
     t->fc_retry_ms = (cfg->fc_retry_ms != 0u) ? cfg->fc_retry_ms : UDSOTA_ISOTP_FC_RETRY_MS;
@@ -220,7 +242,7 @@ void udsota_isotp_on_frame(udsota_isotp_t *t, const uint8_t *data, uint8_t dlc, 
     const udsota_rxw_kind_t k = udsota_rxwatch_frame(&t->rxw, data, dlc, rx_us, t->rx_limit, t->link_cfg.bs);
     switch (k) {
     case UDSOTA_RXW_FIRST:
-        t->msg_stmin_us = (t->stmin_us != NULL) ? t->stmin_us(t->stmin_ctx) : t->stmin_default_us;
+        t->msg_stmin_us = (t->stmin_us != NULL) ? stmin_sendable(t->stmin_us(t->stmin_ctx)) : t->stmin_default_us;
         t->link_cfg.st_min_us = t->msg_stmin_us;          /* fixed for the whole message */
         udsota_on_rx_first_frame(t->srv, now_ms);
         if (!fc_point_ok(t, now_ms)) {
@@ -255,6 +277,26 @@ void udsota_isotp_on_frame(udsota_isotp_t *t, const uint8_t *data, uint8_t dlc, 
     take_request(t, now_ms);
 }
 
+/* One functional frame (see udsota_isotp.h): a Single Frame of 1 to 7 bytes goes to the server's functional path
+ * while both directions are idle; anything else, or anything while the link is busy, is dropped without an FC. */
+void udsota_isotp_on_func_frame(udsota_isotp_t *t, const uint8_t *data, uint8_t dlc, uint32_t now_ms)
+{
+    if (data == NULL || dlc < 2u || dlc > CAN_DL || (data[0] >> 4) != 0u) {
+        return;                                           /* only an SF: functional requests never segment */
+    }
+    const uint8_t n = data[0] & 0x0Fu;
+    if (n == 0u || n > dlc - 1u) {
+        return;
+    }
+    t->now_ms = now_ms;
+    if (tx_busy(t) || t->link.receive_status != ISOTP_RECEIVE_STATUS_IDLE) {
+        return;                                           /* a physical request or answer owns the server */
+    }
+    uint8_t req[CAN_DL - 1u];
+    memcpy(req, &data[1], n);
+    tx_response(t, udsota_on_functional_request(t->srv, req, n, t->buf->resp, UDSOTA_ISOTP_RESP_MAX, now_ms));
+}
+
 /* isotp-c's timers and CFs, N_Cr, the parked FC and answer, the server's poll, a waiting request and the limit switch. */
 uint32_t udsota_isotp_service(udsota_isotp_t *t, uint32_t now_ms)
 {
@@ -280,7 +322,7 @@ uint32_t udsota_isotp_service(udsota_isotp_t *t, uint32_t now_ms)
     return next_wait_ms(t, now_ms);
 }
 
-/* Answers dropped: refused outright by can.send, or replaced before they left. */
+/* Answers dropped: refused outright by can.send, still refused after UDSOTA_ISOTP_PARK_MAX_MS, or replaced before they left. */
 uint32_t udsota_isotp_resp_lost(const udsota_isotp_t *t)
 {
     return t->resp_lost;

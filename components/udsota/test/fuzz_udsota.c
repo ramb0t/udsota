@@ -38,7 +38,7 @@
 /* Every engine and hook callback is mocked; these trip if the API structs gain a callback. */
 _Static_assert(offsetof(udsota_engine_t, slot_size) == 12u * sizeof(void (*)(void)),
                "udsota_engine_t gained a callback: mock it in FUZZ_ENGINE and update this count");
-_Static_assert(offsetof(udsota_hooks_t, ctx) == 5u * sizeof(void (*)(void)),
+_Static_assert(offsetof(udsota_hooks_t, ctx) == 7u * sizeof(void (*)(void)),
                "udsota_hooks_t gained a callback: mock it in FUZZ_HOOKS and update this count");
 
 #define REQ_MAX          UDSOTA_DL_MAX_BLOCK_LEN  /* the ISO-TP link never delivers a longer request */
@@ -397,6 +397,21 @@ static void mock_phase(void *ctx, udsota_phase_t p)
     M.last_phase = (int)p;
 }
 
+/* hooks.comm_control: refuses disableRxAndTx with 0x22, allows the rest. */
+static uint8_t mock_comm_control(void *ctx, uint8_t control, uint8_t comm_type)
+{
+    (void)ctx;
+    (void)comm_type;
+    return control == UDSOTA_CC_DISABLE_RX_TX ? UDSOTA_NRC_CONDITIONS_NOT_CORRECT : 0u;
+}
+
+/* hooks.dtc_setting: nothing to record. */
+static void mock_dtc_setting(void *ctx, bool on)
+{
+    (void)ctx;
+    (void)on;
+}
+
 static const uint8_t FUZZ_SERIAL[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
 static const udsota_config_t FUZZ_CFG = {
     .stmin_monitor = true, .device_id = FUZZ_SERIAL, .device_id_len = sizeof FUZZ_SERIAL,
@@ -410,7 +425,7 @@ static const udsota_engine_t FUZZ_ENGINE = {
 static const udsota_security_t FUZZ_SECURITY = {.rng16 = mock_rng16, .key = mock_key, .ctx = NULL};
 static const udsota_hooks_t FUZZ_HOOKS = {
     .gate = mock_gate, .phase = mock_phase, .did_read = mock_did_read, .stmin_us = NULL, .reset = mock_reset,
-    .ctx = NULL,
+    .comm_control = mock_comm_control, .dtc_setting = mock_dtc_setting, .ctx = NULL,
 };
 
 /* True for the SIDs the server serves; every other SID must get NRC 0x11 or 0x7F. */
@@ -419,7 +434,8 @@ static bool sid_served(uint8_t sid)
     switch (sid) {
     case UDSOTA_SID_SESSION: case UDSOTA_SID_RESET: case UDSOTA_SID_READ_DID: case UDSOTA_SID_SECURITY:
     case UDSOTA_SID_ROUTINE: case UDSOTA_SID_REQUEST_DOWNLOAD: case UDSOTA_SID_TRANSFER_DATA:
-    case UDSOTA_SID_TRANSFER_EXIT: case UDSOTA_SID_TESTER_PRESENT:
+    case UDSOTA_SID_TRANSFER_EXIT: case UDSOTA_SID_TESTER_PRESENT: case UDSOTA_SID_COMM_CONTROL:
+    case UDSOTA_SID_DTC_SETTING:
         return true;
     default:
         return false;
@@ -473,6 +489,10 @@ static bool positive_shape_ok(const uint8_t *req, size_t rl, const uint8_t *r, s
         return n == 1;
     case UDSOTA_SID_TESTER_PRESENT:     /* 7E 00 */
         return n == 2 && r[1] == UDSOTA_TP_ZERO_SUBFUNC;
+    case UDSOTA_SID_COMM_CONTROL:       /* 68 ct, ct 00-03 */
+        return n == 2 && rl == 3 && r[1] == sub && sub <= UDSOTA_CC_DISABLE_RX_TX;
+    case UDSOTA_SID_DTC_SETTING:        /* C5 01 or C5 02 */
+        return n == 2 && r[1] == sub && (sub == UDSOTA_DTC_ON || sub == UDSOTA_DTC_OFF);
     default:
         return false;
     }
@@ -903,7 +923,9 @@ static const seed_t SEEDS[] = {
     SEED(0x31, 0x01, 0xFF, 0x01, 0x00), SEED(0x31),
     SEED(0x11, 0x01), SEED(0x11, 0x81), SEED(0x11, 0x02), SEED(0x11, 0x03), SEED(0x11), SEED(0x11, 0x01, 0x00),
     SEED(0x2E, 0x01, 0x00, 0x00), SEED(0x19, 0x02, 0xFF), SEED(0x14, 0xFF, 0xFF, 0xFF), SEED(0x85, 0x01),
-    SEED(0x28, 0x00, 0x01), SEED(0x7F, 0x10, 0x11), SEED(0x50, 0x01), SEED(0x00), SEED(0xFF), SEED(0x3F, 0x00),
+    SEED(0x28, 0x00, 0x01), SEED(0x28, 0x03, 0x01), SEED(0x28, 0x81, 0x03), SEED(0x28, 0x01, 0x00),
+    SEED(0x28, 0x04, 0x01), SEED(0x28, 0x03), SEED(0x28, 0x03, 0x01, 0x00), SEED(0x85, 0x82), SEED(0x85, 0x02, 0xFF),
+    SEED(0x85, 0x03), SEED(0x85), SEED(0x7F, 0x10, 0x11), SEED(0x50, 0x01), SEED(0x00), SEED(0xFF), SEED(0x3F, 0x00),
 };
 #define SEED_COUNT (sizeof SEEDS / sizeof SEEDS[0])
 

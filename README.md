@@ -14,6 +14,7 @@ It exists so that any product with a CAN bus can take field updates from a stand
 | [`examples/esp32`](examples/esp32/README.md) | A minimal app that serves updates over the on-chip TWAI controller, all in one `main.c`. |
 | [`client`](client/README.md) | The `udsota` command (Python 3.11+, Linux SocketCAN). Product specifics live in TOML profiles. |
 | `test`, `tools` | Host unit tests and the portability probes (the request-parser fuzz harness is in `components/udsota/test`), plus `tools/image_check`, which runs the port's first-block check on a built image. |
+| [`tools/linux_server`](tools/linux_server/README.md) | A Linux demo server: the core over SocketCAN or a stdin/stdout frame pipe, with file-backed A/B slots and emulated rollback, for testing the client end to end. |
 
 ## Quick start
 
@@ -26,7 +27,7 @@ udsota --profile example --interface can0 info
 udsota --profile example --interface can0 flash examples/esp32/build/example.bin
 ```
 
-The example has security off and no gate, so any node on the bus can reprogram it. Before a real product ships, add a gate and a key, as the core README describes. The example builds as a dev image (`0.1.0-dev`), which installs over any image whose version core is the same or lower. A release build must be newer than the running image, and the client skips an image the unit already runs.
+The example has security off and no gate, so any node on the bus can reprogram it. Before a real product ships, add a gate and a key (the ECDSA mode, whose image holds only a public key), as the core README describes. The example builds as a dev image (`0.1.0-dev`), which installs over any image whose version core is the same or lower. A release build must be newer than the running image, and the client skips an image the unit already runs.
 
 To run the host tests (they fetch Unity):
 

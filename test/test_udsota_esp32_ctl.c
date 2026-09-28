@@ -233,6 +233,21 @@ static void test_requests_coalesce_and_phase_tracks_without_app_hooks(void)
     TEST_ASSERT_FALSE(udsota_esp32_ctl_run_end(&s_ctl, &s_srv, NOW + 2u));
 }
 
+/* The app's comm_control: records its ctx and refuses disableRxAndTx with 0x22. */
+static uint8_t app_comm_control(void *ctx, uint8_t control, uint8_t comm_type)
+{
+    (void)comm_type;
+    s_ctx_seen = ctx;
+    return control == 0x03u ? 0x22u : 0u;
+}
+
+/* The app's dtc_setting: records its ctx. */
+static void app_dtc_setting(void *ctx, bool on)
+{
+    (void)on;
+    s_ctx_seen = ctx;
+}
+
 /* The wrapped hooks pass the app's ctx, keep a NULL gate, did_read or stmin_us NULL so the core's
  * default holds, and reset falls back to the port's default only when the app has none. */
 static void test_wrapped_hooks_forward_app_ctx_and_keep_nulls(void)
@@ -260,6 +275,29 @@ static void test_wrapped_hooks_forward_app_ctx_and_keep_nulls(void)
 
     udsota_esp32_ctl_init(&s_ctl, NULL, NULL, &s_hooks);
     TEST_ASSERT_TRUE(s_hooks.reset == NULL && s_hooks.gate == NULL && s_hooks.phase != NULL);
+    TEST_ASSERT_TRUE(s_hooks.comm_control == NULL && s_hooks.dtc_setting == NULL);
+
+    const udsota_hooks_t app3 = { .comm_control = app_comm_control, .dtc_setting = app_dtc_setting, .ctx = &s_marker };
+    udsota_esp32_ctl_init(&s_ctl, &app3, NULL, &s_hooks);
+    s_ctx_seen = NULL;
+    TEST_ASSERT_EQUAL_HEX8(0x22, s_hooks.comm_control(s_hooks.ctx, 0x03, 0x01));
+    TEST_ASSERT_EQUAL_PTR(&s_marker, s_ctx_seen);
+    s_ctx_seen = NULL;
+    s_hooks.dtc_setting(s_hooks.ctx, false);
+    TEST_ASSERT_EQUAL_PTR(&s_marker, s_ctx_seen);
+}
+
+/* Waits become ticks rounded down, never 0 for a real wait: 5 ms is 1 tick at 100 Hz (not 0, which spun the
+ * diag task) and 5 at 1 kHz; 0 stays 0 and a huge wait saturates. */
+static void test_wait_ticks_never_round_a_wait_to_zero(void)
+{
+    TEST_ASSERT_EQUAL_UINT32(1u, udsota_esp32_ctl_ticks(5u, 100u));
+    TEST_ASSERT_EQUAL_UINT32(1u, udsota_esp32_ctl_ticks(1u, 100u));
+    TEST_ASSERT_EQUAL_UINT32(4u, udsota_esp32_ctl_ticks(45u, 100u));
+    TEST_ASSERT_EQUAL_UINT32(5u, udsota_esp32_ctl_ticks(5u, 1000u));
+    TEST_ASSERT_EQUAL_UINT32(100u, udsota_esp32_ctl_ticks(100u, 1000u));
+    TEST_ASSERT_EQUAL_UINT32(0u, udsota_esp32_ctl_ticks(0u, 100u));
+    TEST_ASSERT_EQUAL_UINT32(UINT32_MAX, udsota_esp32_ctl_ticks(UINT32_MAX, 10000000u));
 }
 
 /* Runs every udsota_esp32_ctl test. */
@@ -270,5 +308,6 @@ int main(void)
     RUN_TEST(test_end_requested_during_a_job_applies_after_its_answer);
     RUN_TEST(test_requests_coalesce_and_phase_tracks_without_app_hooks);
     RUN_TEST(test_wrapped_hooks_forward_app_ctx_and_keep_nulls);
+    RUN_TEST(test_wait_ticks_never_round_a_wait_to_zero);
     return UNITY_END();
 }

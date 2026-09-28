@@ -11,22 +11,31 @@ PROFILE_DIR = pathlib.Path(__file__).resolve().parent / "profiles"
 DECODERS = ("hex", "ascii", "version3")
 SLOT_SIZE_DEFAULT = 0x400000   # UDSOTA_SLOT_SIZE_DEFAULT
 KEYS = {"can": {"interface", "req_id", "resp_id", "deny_tx"},
-        "security": {"label", "master_file", "device_id_did", "level_extended", "level_programming"},
+        "security": {"mode", "label", "master_file", "private_key_file", "device_id_did", "level_extended",
+                     "level_programming"},
         "image": {"product", "hw_ids", "layout_id", "slot_size"},
         "board": {"did", "names"},
         "busy": {"id", "byte", "values"},
         "preroll": {"tester_present_frames"},
+        "functional": {"id", "quiet_bus"},
         "dids": None}
 
 
-# [security]: the 0x27 key derivation (K_dev = HMAC(master, label || device ID)) and the seed levels.
+SECURITY_MODES = {"hmac": ("label", "master_file"), "ecdsa": ("private_key_file",)}   # mode: its required keys
+
+
+# [security]: the 0x27 keys and the seed levels. Mode "hmac" (the default) derives the keys, K_dev = HMAC(master,
+# label || device ID), and has label and master_file; mode "ecdsa" signs each seed with private_key_file. The
+# other mode's fields are None.
 @dataclass(frozen=True)
 class Security:
-    label: bytes
-    master_file: str
+    label: bytes | None
+    master_file: str | None
     device_id_did: int
     level_extended: int
     level_programming: int
+    mode: str = "hmac"
+    private_key_file: str | None = None
 
 
 # [busy]: a frame whose byte `byte` in `values` means another tester holds a session.
@@ -64,6 +73,8 @@ class Profile:
     busy: BusyDetector | None
     preroll_frames: int
     dids: tuple
+    func_id: int | None = None      # [functional] id: the only other ID the tool may transmit on
+    quiet_bus: bool = False         # [functional] quiet_bus: silence the bus's other nodes while flashing
 
 
 # Raise Refused naming the profile and the problem.
@@ -110,6 +121,14 @@ def _str(name, t, key, required=False):
     return t[key]
 
 
+# t[key] as a bool, or default when absent.
+def _bool(name, t, key, default):
+    v = t.get(key, default)
+    if not isinstance(v, bool):
+        _bad(name, "%s must be true or false" % key)
+    return v
+
+
 # "0xF191" or "0x0200-0x02FF" to (first, last).
 def _did_range(name, key):
     m = re.fullmatch(r"0x([0-9A-Fa-f]{1,4})(?:-0x([0-9A-Fa-f]{1,4}))?", key)
@@ -136,16 +155,30 @@ def from_dict(name, d):
         _bad(name, "req_id 0x%03X is in deny_tx" % req_id)
     if req_id == resp_id:
         _bad(name, "req_id and resp_id are both 0x%03X" % req_id)
+    func_t, func_id = d.get("functional"), None
+    if func_t is not None:
+        func_id = _int(name, func_t, "id", 0, 0x7FF, required=True)
+        if func_id in deny_tx or func_id in (req_id, resp_id):
+            _bad(name, "[functional] id 0x%03X is the request or response ID, or in deny_tx" % func_id)
     sec_t, security = d.get("security"), None
     if sec_t is not None:
-        label = _str(name, sec_t, "label", required=True)
-        if not label.isascii():
+        mode = _str(name, sec_t, "mode") or "hmac"
+        if mode not in SECURITY_MODES:
+            _bad(name, "[security] mode must be one of %s" % ", ".join(SECURITY_MODES))
+        for other, keys in SECURITY_MODES.items():
+            for key in keys:
+                if other != mode and key in sec_t:
+                    _bad(name, "[security] %s is for mode = \"%s\", not \"%s\"" % (key, other, mode))
+        label = _str(name, sec_t, "label", required=True) if mode == "hmac" else None
+        if label is not None and not label.isascii():
             _bad(name, "[security] label must be ASCII")
-        security = Security(label.encode("ascii"),
-                            _str(name, sec_t, "master_file", required=True),
+        security = Security(None if label is None else label.encode("ascii"),
+                            _str(name, sec_t, "master_file", required=mode == "hmac"),
                             _int(name, sec_t, "device_id_did", 0, 0xFFFF, default=0xF18C),
                             _level(name, sec_t, "level_extended", 0x01),
-                            _level(name, sec_t, "level_programming", 0x03))
+                            _level(name, sec_t, "level_programming", 0x03),
+                            mode=mode,
+                            private_key_file=_str(name, sec_t, "private_key_file", required=mode == "ecdsa"))
     img_t, board_t, busy_t = d.get("image", {}), d.get("board"), d.get("busy")
     board_names = {}
     if board_t is not None:
@@ -174,7 +207,8 @@ def from_dict(name, d):
                    board_did=None if board_t is None else _int(name, board_t, "did", 0, 0xFFFF, required=True),
                    board_names=board_names, busy=busy,
                    preroll_frames=_int(name, d.get("preroll", {}), "tester_present_frames", 0, 64, default=0),
-                   dids=tuple(dids))
+                   dids=tuple(dids), func_id=func_id,
+                   quiet_bus=func_t is not None and _bool(name, func_t, "quiet_bus", False))
 
 
 # Load a profile by name (a file in udsota/profiles) or by path (anything with a / or ending .toml).

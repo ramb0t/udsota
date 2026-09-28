@@ -61,8 +61,17 @@ typedef struct {   /* required; only unverify, status, running_sha and version m
 
 typedef struct {   /* udsota_init() with security == NULL: 27 answers 0x11, and nothing needs a key */
     bool  (*rng16)(void *ctx, uint8_t out[16]);
-    bool  (*key)(void *ctx, const uint8_t seed[16], uint8_t level, uint8_t out[16]);  /* false = no key available now (0x22; not an attempt) */
+    bool  (*key)(void *ctx, const uint8_t seed[16], uint8_t level, uint8_t out[16]);  /* false = no key available now (0x22; not an attempt);
+                                                                                          unused (may be NULL) when verify is set */
     void  *ctx;
+    /* Optional verifier, for a key the server cannot compute (the ECDSA mode: a signature over the seed, udsota_keys.h).
+     * When set, the server asks it instead of calling key and comparing: 1 = the key is right, -1 = no verdict
+     * now (0x22; not an attempt), anything else = wrong. Counting, lockout, single use and expiry are the same. */
+    int   (*verify)(void *ctx, const uint8_t seed[16], uint8_t level, const uint8_t *key, size_t key_len);
+    uint16_t key_len;   /* with verify set, the exact key length a sendKey carries (0 = 16; at most 254, the ISO-TP
+                           receive limit outside a download less 27 xx, and at most cfg.max_block_len - 2, which caps
+                           that limit; a longer key can never arrive, so no key unlocks); ignored without verify,
+                           whose key is 16 bytes */
 } udsota_security_t;
 
 typedef struct {   /* all optional */
@@ -74,12 +83,22 @@ typedef struct {   /* all optional */
     bool     (*reset)(void *ctx);                  /* restart; returns only on failure (false), then the server re-opens.
                                                       NULL: 11 01 answers 0x11 and ActivateImage answers positive
                                                       without a restart (the new image boots on the next power cycle) */
+    uint8_t  (*comm_control)(void *ctx, uint8_t control, uint8_t comm_type);
+                                                   /* 28 <control 00-03> <comm_type>: 0 = done, else the NRC. Called
+                                                      again with 00 and UDSOTA_CC_TYPE_ALL when the session returns to
+                                                      default after a change. NULL: 28 answers 0x11 */
+    void     (*dtc_setting)(void *ctx, bool on);   /* after an accepted 85 01 / 85 02, and with true when the session
+                                                      returns to default after 85 02. NULL: 85 answers 0x11, as
+                                                      before */
     void     *ctx;
 } udsota_hooks_t;
 
 typedef struct {
     uint16_t    req_id, resp_id;       /* ISO-TP adapter; the server ignores them */
+    uint16_t    func_id;               /* the port: functional request ID (OBD's is 0x7DF), whose single frames go to
+                                          udsota_isotp_on_func_frame(); 0 = no functional addressing */
     uint16_t    p2_ms, p2star_ms, s3_ms;   /* 0 = 50 / 5000 / 5000 */
+    uint16_t    p2_prog_ms, p2star_prog_ms;   /* P2 and P2* in the programming session; 0 = p2_ms and p2star_ms */
     uint16_t    max_block_len;         /* 34's maxNumberOfBlockLength and the 36 length limit; 0 = 4095, and more is
                                           clamped to 4095 (UDSOTA_DL_MAX_BLOCK_LEN, as the ISO-TP adapter). With
                                           udsota_image_check behind check_first, at least 322: the first block
@@ -104,6 +123,11 @@ typedef struct {
     size_t      device_id_len;
     const char *product;               /* port: image identity, esp_app_desc project name; NULL = not checked */
     uint8_t     hw_id, layout_id;      /* port: descriptor values the image must carry */
+    const uint8_t *key_pubkey;         /* port: security on in the ECDSA mode (udsota_keys.h): the tester's P-256 public
+                                          key, an uncompressed SEC1 point (04 || X || Y). It wins over key_label and
+                                          key_master. udsota_esp32_start() refuses a malformed one (ESP_ERR_INVALID_ARG);
+                                          one PSA refuses leaves security on with no key that matches */
+    size_t      key_pubkey_len;        /* port: UDSOTA_KEYS_PUBKEY_LEN (65) */
 } udsota_config_t;
 
 struct udsota_server;
@@ -126,6 +150,8 @@ typedef struct udsota_server {
     uint8_t           phase;             /* udsota_phase_t last reported to hooks.phase */
     bool              activating;        /* ActivateImage answered positive and a restart follows */
     bool              s3_running;        /* false in default, during a request and during a job */
+    bool              comm_changed;      /* hooks.comm_control accepted a 28 other than 00 03 in this session */
+    bool              dtc_off;           /* an 85 02 was accepted in this session */
     uint32_t          s3_start_ms;       /* S3 restarts when a request is answered */
     /* The worker-job wait. */
     bool              job_running;       /* a worker job owns the pending response */
@@ -165,9 +191,11 @@ typedef struct udsota_server {
 
 /* Resets s to the default session, locked and idle, and copies cfg (NULL = every default), engine (required),
  * security (NULL = none: 0x27 answers 0x11 and nothing needs a key) and hooks (NULL = none). Silent: no phase call.
+ * Returns false for a security with no rng16, or with neither key nor verify; s is still initialised, with
+ * security on and every requestSeed (no rng16) or sendKey (no key or verify) answered 0x22, so nothing unlocks.
  * Every now_ms below is milliseconds since boot (wrapping at 2^32): the post-boot 0x27 delay is measured from
  * now_ms 0, so a clock that starts elsewhere shortens or skips it. */
-void   udsota_init(udsota_server_t *s, const udsota_config_t *cfg, const udsota_engine_t *engine,
+bool   udsota_init(udsota_server_t *s, const udsota_config_t *cfg, const udsota_engine_t *engine,
                    const udsota_security_t *security, const udsota_hooks_t *hooks);
 /* The transport installs its tx_pending source after udsota_init (which clears it); NULL = a restart waits the full
  * UDSOTA_RESET_TX_WAIT_MS (100 ms). */
@@ -180,6 +208,12 @@ void   udsota_end_session(udsota_server_t *s, uint32_t now_ms);
 udsota_phase_t udsota_phase(const udsota_server_t *s);
 /* Handles one reassembled request; returns the response length written to resp (0 = no response). */
 size_t udsota_on_request(udsota_server_t *s, const uint8_t *req, size_t len, uint8_t *resp, size_t max, uint32_t now_ms);
+/* Handles one functionally addressed request (a single frame on cfg.func_id), answered on the response ID like
+ * any other. Only 10 01, 10 03, 3E, 22, 28 and 85 are served that way; anything else, and anything while a job
+ * runs (3E aside), gets no answer. NRCs 0x11, 0x12, 0x31, 0x7E and 0x7F are suppressed, as ISO 14229-1 asks for
+ * functional requests, and the suppress bit applies as usual. Returns the response length (0 = none). */
+size_t udsota_on_functional_request(udsota_server_t *s, const uint8_t *req, size_t len, uint8_t *resp, size_t max,
+                                    uint32_t now_ms);
 /* Advances S3, the 0x78 cadence, job completion and an armed restart; returns a response length to send, or 0. */
 size_t udsota_poll(udsota_server_t *s, uint8_t *resp, size_t max, uint32_t now_ms);
 /* Milliseconds until udsota_poll next has work (0 = now); UDSOTA_JOB_POLL_MS while a job runs or a restart is
