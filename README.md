@@ -199,6 +199,8 @@ See [`tools/linux_server`](tools/linux_server/README.md) for its options.
 
 ## Status
 
-Version 0.2.0 is in progress; see the [changelog](CHANGELOG.md). udsota was developed and bench-tested on an ESP32-S3 in a CAN-connected product. It only supports classic CAN with 11-bit IDs for now. The rest of its limits are under [Known limits](components/udsota/README.md#known-limits).
+What has changed, and what is not released yet, is in the [changelog](CHANGELOG.md). udsota was developed and bench-tested on an ESP32-S3 in a CAN-connected product. It only supports classic CAN with 11-bit IDs for now. The rest of its limits are under [Known limits](components/udsota/README.md#known-limits).
+
+Releases follow [RELEASING.md](RELEASING.md).
 
 MIT licence. Third-party code is listed in [THIRD_PARTY.md](THIRD_PARTY.md).
