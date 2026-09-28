@@ -897,32 +897,6 @@ bool udsota_fc_check(udsota_server_t *s, uint32_t median_cf_us, uint32_t stmin_u
 #define RESET_ARMED  1u   /* the answer is built; restart once tx_pending()==0 or UDSOTA_RESET_TX_WAIT_MS passed */
 #define RESET_FIRED  2u   /* hooks.reset called (it returns on the host): stay silent from here on */
 
-/* Where a routine is served: its session and whether it needs the programming level (when security is on). */
-typedef struct {
-    uint16_t rid;
-    uint8_t  session;   /* udsota_session_t */
-    bool     keyed;     /* needs cfg.level_programming unlocked */
-} routine_rule_t;
-
-/* Every RID udsota serves itself. Any other RID goes to hooks.routine, or answers 0x31 without one. */
-static const routine_rule_t ROUTINE_RULES[] = {
-    {UDSOTA_RID_CHECK_PROG_DEPS,  UDSOTA_SESSION_PROGRAMMING, true},
-    {UDSOTA_RID_GET_RESUME_POINT, UDSOTA_SESSION_PROGRAMMING, true},
-    {UDSOTA_RID_ACTIVATE_IMAGE,   UDSOTA_SESSION_PROGRAMMING, true},
-    {UDSOTA_RID_CONFIRM_IMAGE,    UDSOTA_SESSION_EXTENDED,    false},
-};
-
-/* Returns the rule for rid, or NULL when udsota does not serve it. */
-static const routine_rule_t *routine_rule(uint16_t rid)
-{
-    for (size_t i = 0; i < sizeof ROUTINE_RULES / sizeof ROUTINE_RULES[0]; i++) {
-        if (ROUTINE_RULES[i].rid == rid) {
-            return &ROUTINE_RULES[i];
-        }
-    }
-    return NULL;
-}
-
 /* Writes 71 01 <rid> then status_len status bytes; returns the length, or 0 when resp is too small. */
 static size_t routine_pos(uint8_t *resp, size_t resp_max, uint16_t rid, const uint8_t *status, size_t status_len)
 {
@@ -1072,14 +1046,16 @@ static size_t handle_routine(udsota_server_t *s, const uint8_t *req, size_t len,
         return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_SUBFUNC_NOT_SUPPORTED);
     }
     const uint16_t rid = udsota_get_u16be(&req[2]);
-    const routine_rule_t *rule = routine_rule(rid);
-    if (rule == NULL) {
+    /* udsota serves four RIDs; any other goes to hooks.routine, or answers 0x31 without one. */
+    const bool confirm = (rid == UDSOTA_RID_CONFIRM_IMAGE);   /* extended, no key; the other three programming, keyed */
+    if (!confirm && rid != UDSOTA_RID_CHECK_PROG_DEPS && rid != UDSOTA_RID_GET_RESUME_POINT &&
+        rid != UDSOTA_RID_ACTIVATE_IMAGE) {
         return handle_app_routine(s, rid, req, len, spr, resp, resp_max, now_ms);
     }
-    if (rule->session != s->session) {
+    if (s->session != (confirm ? UDSOTA_SESSION_EXTENDED : UDSOTA_SESSION_PROGRAMMING)) {
         return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_REQUEST_OUT_OF_RANGE);
     }
-    if (rule->keyed && s->secured && s->security != s->cfg.level_programming) {
+    if (!confirm && s->secured && s->security != s->cfg.level_programming) {
         return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_SECURITY_ACCESS_DENIED);
     }
     if (len != 4u) {
