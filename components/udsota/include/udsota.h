@@ -55,7 +55,7 @@ typedef enum {
     UDSOTA_STAGE_IDLE = 0,          /* everything below does not hold: no download, or it ended (last_reason says how) */
     UDSOTA_STAGE_ERASING,           /* from an accepted 34 until the first 36 is accepted: the first-block check and
                                        the erase run in that 36's job (a coded one may write nothing yet) */
-    UDSOTA_STAGE_WRITING,           /* from the first written block until FF01 starts; done == total after the 37 */
+    UDSOTA_STAGE_WRITING,           /* from the first accepted 36 until FF01 starts; done == total after the 37 */
     UDSOTA_STAGE_VERIFYING,         /* while the FF01 job runs */
     UDSOTA_STAGE_ACTIVATING,        /* the phase of the same name: from a positive ActivateImage until the restart */
 } udsota_stage_t;

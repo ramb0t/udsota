@@ -52,10 +52,10 @@ static void sa_forget_seed(udsota_server_t *s)
     s->sa_seed_level = 0;
 }
 
-/* Relocks (level and seed cleared; attempt count and delay kept); call before every session change. */
+/* Relocks: level and seed cleared; the attempt count and delay survive, so hopping sessions cannot reset a lockout.
+ * Call before every session change. */
 static void sa_relock(udsota_server_t *s)
 {
-    /* The count and delay survive so that hopping sessions cannot reset a lockout. */
     s->security = 0;
     sa_forget_seed(s);
 }
@@ -435,7 +435,7 @@ static void restore_default_comm(udsota_server_t *s)
 static void enter_session(udsota_server_t *s, uint8_t session)
 {
     abort_download(s);
-    sa_relock(s);              /* level and pending seed cleared; attempt count and delay kept */
+    sa_relock(s);
     s->session_epoch++;        /* app state tied to the old epoch is stale from here on */
     s->end_pending = false;   /* any session change fulfils a latched end_session */
     s->session = session;
@@ -877,7 +877,7 @@ bool udsota_fc_check(udsota_server_t *s, uint32_t median_cf_us, uint32_t stmin_u
     if (!s->download_active || s->job_running) {
         return true;
     }
-    if (!s->end_pending) {                        /* latched: the job answered but no poll has applied the end yet */
+    if (!s->end_pending) {                        /* latched (answered, no poll yet): withhold without the gate */
         s->cf_median_us = median_cf_us;
         s->cf_stmin_us = stmin_us;
         if (transfer_nrc(s) == 0u) {
