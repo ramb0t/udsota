@@ -4,7 +4,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>
 #include "sha256_host.h"
 #include "udsota_esp32_image.h"
 #include "udsota_image_desc.h"
@@ -78,18 +77,31 @@ static int eng_check_first(void *ctx, const uint8_t *first, size_t len, udsota_r
     return r == UDSOTA_DL_OK ? 0 : 1;
 }
 
+/* The coded download's erase: fake_ota_begin, synchronous (the job wraps the whole zwrite). */
+static int z_begin(void *ctx, uint32_t size)
+{
+    demo_engine_t *e = ctx;
+    return fake_ota_begin(&e->ota, size);
+}
+
+/* The coded download's write, at the image offset where the last one ended. */
+static int z_write(void *ctx, uint32_t off, const uint8_t *d, size_t n)
+{
+    demo_engine_t *e = ctx;
+    return (off == e->ota.written) ? fake_ota_write(&e->ota, d, n) : -1;
+}
+
 /* engine.begin: erases the inactive slot's image extent. */
 static int eng_begin(void *ctx, uint32_t size)
 {
-    demo_engine_t *e = ctx;
-    return job(e, fake_ota_begin(&e->ota, size));
+    return job(ctx, z_begin(ctx, size));
 }
 
 /* engine.write: appends at off, which must be where the last write ended; joins a running job (the erase). */
 static int eng_write(void *ctx, uint32_t off, const uint8_t *d, size_t n)
 {
     demo_engine_t *e = ctx;
-    const int rc = (off == e->ota.written) ? fake_ota_write(&e->ota, d, n) : -1;
+    const int rc = z_write(ctx, off, d, n);
     if (e->job_open) {
         return job(e, rc);
     }
@@ -104,8 +116,7 @@ static int eng_verify(void *ctx)
     int r = fake_ota_end(&e->ota);
     if (r == UDSOTA_DL_OK) {
         uint8_t first[UDSOTA_IMAGE_MIN_LEN];
-        const int fd = e->ota.fd[fake_ota_other(&e->ota)];
-        const bool got = pread(fd, first, sizeof first, 0) == (ssize_t)sizeof first;
+        const bool got = fake_ota_slot_read(&e->ota, fake_ota_other(&e->ota), 0, first, sizeof first) == 0;
         r = got ? (int)first_block_rules(e, first, sizeof first) : (int)UDSOTA_DL_VERIFY_FAILED;
         e->ota.verified = (r == UDSOTA_DL_OK);
     }
@@ -132,20 +143,6 @@ static void eng_abort(void *ctx)
     demo_engine_t *e = ctx;
     udsota_coded_close(&e->cd);
     (void)fake_ota_abort(&e->ota);
-}
-
-/* The coded download's erase: fake_ota_begin, synchronous (the job wraps the whole zwrite). */
-static int z_begin(void *ctx, uint32_t size)
-{
-    demo_engine_t *e = ctx;
-    return fake_ota_begin(&e->ota, size);
-}
-
-/* The coded download's write, at the image offset where the last one ended. */
-static int z_write(void *ctx, uint32_t off, const uint8_t *d, size_t n)
-{
-    demo_engine_t *e = ctx;
-    return (off == e->ota.written) ? fake_ota_write(&e->ota, d, n) : -1;
 }
 
 /* A delta download's base: n bytes of the running slot at off; a read past the slot is refused. */
