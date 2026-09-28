@@ -13,8 +13,11 @@
  * iso14229's fuzz_server.cc idea (MIT, Nick James Kirkby & Co-Operators): a stream of requests with
  * fuzzed waits between them. No iso14229 code is copied.
  *
- * Built twice: fuzz_udsota with the app hooks NULL, and fuzz_udsota_app_hooks (UDSOTA_FUZZ_APP_HOOKS=1) with
- * did_write, routine and routine_poll set, where it also checks that an app routine has exactly one owner.
+ * Built three times: fuzz_udsota with the app hooks NULL; fuzz_udsota_app_hooks (UDSOTA_FUZZ_APP_HOOKS=1) with
+ * did_write, routine and routine_poll set, where it also checks that an app routine has exactly one owner; and
+ * fuzz_udsota_progress (UDSOTA_FUZZ_PROGRESS=1) with the progress hook set, where it also checks that done never
+ * passes total nor shrinks within a download, and that the hook runs at most once per call and reports every
+ * change of stage. Its answers, and so its PASS line, are fuzz_udsota's.
  *
  * libFuzzer, on a machine with clang:
  *   clang -g -O1 -fsanitize=fuzzer,address,undefined -DUDSOTA_LIBFUZZER <includes> fuzz_udsota.c
@@ -41,14 +44,17 @@
 #ifndef UDSOTA_FUZZ_APP_HOOKS
 #define UDSOTA_FUZZ_APP_HOOKS 0   /* 1: FUZZ_HOOKS also sets did_write, routine and routine_poll */
 #endif
+#ifndef UDSOTA_FUZZ_PROGRESS
+#define UDSOTA_FUZZ_PROGRESS 0    /* 1: FUZZ_HOOKS also sets progress */
+#endif
 
 /* Every engine and hook callback is mocked; these trip if the API structs gain a callback. */
 _Static_assert(offsetof(udsota_engine_t, slot_size) == 12u * sizeof(void (*)(void)),
                "udsota_engine_t gained a callback: mock it in FUZZ_ENGINE and update this count");
 _Static_assert(offsetof(udsota_hooks_t, ctx) == 7u * sizeof(void (*)(void)),
                "udsota_hooks_t gained a callback: mock it in FUZZ_HOOKS and update this count");
-_Static_assert(offsetof(udsota_hooks_t, routine_poll) + sizeof(void (*)(void)) == sizeof(udsota_hooks_t),
-               "udsota_hooks_t gained a member after routine_poll: mock it in FUZZ_HOOKS and move this check");
+_Static_assert(offsetof(udsota_hooks_t, progress) + sizeof(void (*)(void)) == sizeof(udsota_hooks_t),
+               "udsota_hooks_t gained a member after progress: mock it in FUZZ_HOOKS and move this check");
 
 #define REQ_MAX          UDSOTA_DL_MAX_BLOCK_LEN  /* the ISO-TP link never delivers a longer request */
 #define RESP_FULL        256u                  /* UDSOTA_ISOTP_RESP_MAX: the transport's response buffer */
@@ -99,6 +105,10 @@ typedef struct {                               /* the mock platform behind the e
     bool     app_outstanding;                  /* routine returned UDSOTA_PENDING and routine_poll has not finished it */
     uint32_t app_until;                        /* when the outstanding app routine finishes */
 #endif
+#if UDSOTA_FUZZ_PROGRESS
+    unsigned progress_calls;                   /* hooks.progress calls in the current server call */
+    udsota_progress_t progress;                /* what hooks.progress last got (IDLE, 0 of 0 after init) */
+#endif
 } mock_t;
 
 typedef enum {                                 /* platform ops whose fuzz-phase calls the coverage floor counts */
@@ -115,6 +125,10 @@ typedef struct {                               /* counted outside the preamble o
     bool pos_sid[256], nrc_sid[256], nrc_code[256], reached[ST_COUNT];
 #if UDSOTA_FUZZ_APP_HOOKS
     bool app_orphaned;                         /* a fuzzed app routine reached the 90 s cap */
+#endif
+#if UDSOTA_FUZZ_PROGRESS
+    bool stage_seen[UDSOTA_STAGE_ACTIVATING + 1];   /* stages hooks.progress reported from fuzzed calls */
+    bool written_seen;                         /* a fuzzed block moved done past 0 */
 #endif
 } stats_t;
 
@@ -416,6 +430,31 @@ static void mock_phase(void *ctx, udsota_phase_t p)
     M.last_phase = (int)p;
 }
 
+#if UDSOTA_FUZZ_PROGRESS
+/* Mock hooks.progress: a known stage, done <= total, 0 of 0 outside ERASING and WRITING, and within one download
+ * a done that never shrinks. Consecutive WRITING reports belong to one download, since a new 34 is reported as
+ * ERASING first. */
+static void mock_progress(void *ctx, const udsota_progress_t *p)
+{
+    const udsota_progress_t last = M.progress;
+    M.progress_calls++;
+    M.progress = *p;
+    if ((unsigned)p->stage > (unsigned)UDSOTA_STAGE_ACTIVATING || p->done > p->total ||
+        (p->total != 0u && p->stage != UDSOTA_STAGE_ERASING && p->stage != UDSOTA_STAGE_WRITING) ||
+        (p->stage == UDSOTA_STAGE_ERASING && p->done != 0u)) {
+        fail("progress hook got an unknown stage, done past total, or bytes outside a transfer", NULL, 0, NULL, 0);
+    }
+    if (p->stage == UDSOTA_STAGE_WRITING && last.stage == UDSOTA_STAGE_WRITING &&
+        (p->done < last.done || p->total != last.total)) {
+        fail("progress done shrank, or total changed, within one download", NULL, 0, NULL, 0);
+    }
+    if (!g_in_preamble) {
+        g_stats.stage_seen[p->stage] = true;
+        g_stats.written_seen = g_stats.written_seen || p->done != 0u;
+    }
+}
+#endif
+
 #if UDSOTA_FUZZ_APP_HOOKS
 #define APP_RID_SYNC     0x1234u   /* answers 71 01 12 34 00 at once */
 #define APP_RID_PENDING  0x1235u   /* pending for JOB_MS, then 71 01 12 35 00 */
@@ -536,6 +575,9 @@ static const udsota_hooks_t FUZZ_HOOKS = {
     .comm_control = mock_comm_control, .dtc_setting = mock_dtc_setting, .ctx = NULL,
 #if UDSOTA_FUZZ_APP_HOOKS
     .did_write = mock_did_write, .routine = mock_routine, .routine_poll = mock_routine_poll,
+#endif
+#if UDSOTA_FUZZ_PROGRESS
+    .progress = mock_progress,
 #endif
 };
 
@@ -690,6 +732,28 @@ static void check_phase(void)
     }
 }
 
+#if UDSOTA_FUZZ_PROGRESS
+/* After one server call: the hook ran at most once, and udsota_progress() reads what it last got, so every change
+ * of stage and every written block was reported. Clears the call count for the next call. */
+static void check_progress(void)
+{
+    udsota_progress_t now;
+    udsota_progress(&S, &now);
+    const unsigned calls = M.progress_calls;
+    M.progress_calls = 0u;
+    if (calls > 1u) {
+        fail("progress hook ran more than once in one server call", NULL, 0, NULL, 0);
+    }
+    if (now.stage != M.progress.stage || now.done != M.progress.done || now.total != M.progress.total ||
+        now.done > now.total) {
+        fail("udsota_progress() differs from what the progress hook last got", NULL, 0, NULL, 0);
+    }
+}
+#else
+/* Without the progress hook there is nothing to check. */
+static void check_progress(void) {}
+#endif
+
 #if UDSOTA_FUZZ_APP_HOOKS
 /* An app routine has exactly one owner: the job the server waits on, or the orphan that only routine_poll clears.
  * The server's view must match the hook's after every request and poll. */
@@ -753,6 +817,7 @@ static size_t fuzz_request(const uint8_t *in, size_t len, layout_t lay, size_t r
     check_canary(resp, req, len);
     check_request_answer(req, len, resp, n, resp_max);
     check_phase();
+    check_progress();
 #if UDSOTA_FUZZ_APP_HOOKS
     check_app_owner();
     check_orphan_held(orphan_before, session_before, req, len);
@@ -767,6 +832,7 @@ static void fuzz_poll(size_t resp_max, uint32_t now)
     M.now = now;
     if (M.live && M.variant == 1u) {
         udsota_end_session(&S, now);   /* variant 1 is the second device: fuzz the end_pending latch */
+        check_progress();
     }
 #if UDSOTA_FUZZ_APP_HOOKS
     const bool job_before = S.job_running;
@@ -775,6 +841,7 @@ static void fuzz_poll(size_t resp_max, uint32_t now)
     check_canary(resp, NULL, 0);
     check_poll_answer(resp, n, resp_max);
     check_phase();
+    check_progress();
 #if UDSOTA_FUZZ_APP_HOOKS
     check_app_owner();
     if (n != 0 && !job_before) {   /* only a job the server waits on is answered; an orphan's answer never is */
@@ -790,12 +857,14 @@ static size_t pre_exchange(uint32_t *now, state_t st, const uint8_t *req, size_t
     M.now = *now;
     size_t n = udsota_on_request(&S, req, len, g_pre_resp, sizeof g_pre_resp, *now);
     check_request_answer(req, len, g_pre_resp, n, sizeof g_pre_resp);
+    check_progress();
     for (unsigned k = 0; k < 1000u && (n == 0 || (g_pre_resp[0] == UDSOTA_NEG_RESPONSE &&
                                                    g_pre_resp[2] == UDSOTA_NRC_RESPONSE_PENDING)); k++) {
         *now += 5u;
         M.now = *now;
         n = udsota_poll(&S, g_pre_resp, sizeof g_pre_resp, *now);
         check_poll_answer(g_pre_resp, n, sizeof g_pre_resp);
+        check_progress();
     }
     if (n == 0 || g_pre_resp[0] != UDSOTA_POS(req[0])) {
         fprintf(stderr, "fuzz_udsota: PREAMBLE to state '%s' refused a step, so that state cannot be fuzzed\n",
@@ -1280,6 +1349,18 @@ static void check_coverage(void)
 #if UDSOTA_FUZZ_APP_HOOKS
     if (!g_stats.app_orphaned) {
         fprintf(stderr, "fuzz_udsota: COVERAGE: no fuzzed app routine reached the 90 s cap\n");
+        ok = false;
+    }
+#endif
+#if UDSOTA_FUZZ_PROGRESS
+    for (int st = 0; st <= (int)UDSOTA_STAGE_ACTIVATING; st++) {
+        if (!g_stats.stage_seen[st]) {
+            fprintf(stderr, "fuzz_udsota: COVERAGE: no fuzzed call reported progress stage %d\n", st);
+            ok = false;
+        }
+    }
+    if (!g_stats.written_seen) {
+        fprintf(stderr, "fuzz_udsota: COVERAGE: no fuzzed block moved progress past 0\n");
         ok = false;
     }
 #endif

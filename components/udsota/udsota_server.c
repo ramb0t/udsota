@@ -213,6 +213,7 @@ static bool is_positive(const uint8_t *resp, size_t n)
 }
 
 static void enter_session(udsota_server_t *s, uint8_t session);
+static void progress_sync(udsota_server_t *s);
 
 /* Asks hooks.gate about op: 0 = allow (also when no gate is registered), else the NRC to send. */
 static uint8_t gate(const udsota_server_t *s, udsota_op_t op)
@@ -656,6 +657,7 @@ static size_t handle_request_download(udsota_server_t *s, const uint8_t *req, si
     s->next_bsc = 1u;
     s->dl_announced = size;
     s->dl_received = 0u;
+    s->dl_written = 0u;                           /* where done starts: a resumed download would start it at its offset */
     s->cf_median_us = UDSOTA_CF_MEDIAN_NONE;
     s->cf_stmin_us = 0u;
     s->last_dl.reason_code = UDSOTA_DL_OK;
@@ -677,6 +679,8 @@ static size_t dl_block_done(udsota_server_t *s, int result, uint8_t *resp, size_
         return udsota_nrc(resp, resp_max, UDSOTA_SID_TRANSFER_DATA, UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE);
     }
     s->dl_received += s->job_arg >> 8;
+    s->dl_written += s->job_arg >> 8;             /* the block's bytes are image bytes */
+    s->progress_block = true;
     s->next_bsc = (uint8_t)(bsc + 1u);            /* 0xFF wraps to 0x00 */
     s->last_dl.bytes_received = s->dl_received;
     if (resp_max < 2u) {
@@ -792,6 +796,7 @@ bool udsota_fc_check(udsota_server_t *s, uint32_t median_cf_us, uint32_t stmin_u
         udsota_sat_inc16(&s->counters.withheld_fcs);
         apply_end_pending(s);
         phase_sync(s);
+        progress_sync(s);
         return false;
     }
     s->cf_median_us = median_cf_us;
@@ -802,6 +807,7 @@ bool udsota_fc_check(udsota_server_t *s, uint32_t median_cf_us, uint32_t stmin_u
     udsota_sat_inc16(&s->counters.withheld_fcs);
     enter_session(s, UDSOTA_SESSION_DEFAULT);
     phase_sync(s);
+    progress_sync(s);
     return false;
 }
 
@@ -1045,6 +1051,58 @@ static size_t handle_routine(udsota_server_t *s, const uint8_t *req, size_t len,
     }
 }
 
+/* ---- Progress: the stage and bytes udsota_progress reads and hooks.progress gets ---- */
+
+/* The progress the server's state implies (see udsota_stage_t); reads nothing but s. */
+static udsota_progress_t progress_of(const udsota_server_t *s)
+{
+    udsota_progress_t p = {.stage = UDSOTA_STAGE_IDLE, .done = 0u, .total = 0u,
+                           .last_reason = s->last_dl.reason_code};
+    if (s->activating) {
+        p.stage = UDSOTA_STAGE_ACTIVATING;
+    } else if (s->job_running && s->job_done == check_done) {
+        p.stage = UDSOTA_STAGE_VERIFYING;              /* engines report no hash progress: 0 of 0 */
+    } else if (s->download_active || (s->dl_complete && s->ota_open)) {
+        const bool erasing = s->download_active && s->dl_written == 0u;
+        p.stage = erasing ? UDSOTA_STAGE_ERASING : UDSOTA_STAGE_WRITING;
+        p.total = s->dl_announced;
+        p.done = (s->dl_written < p.total) ? s->dl_written : p.total;
+    }
+    return p;
+}
+
+/* Reports progress to hooks.progress, once, at the end of the server call that changed the stage or wrote a
+ * block. */
+static void progress_sync(udsota_server_t *s)
+{
+    const udsota_progress_t p = progress_of(s);
+    const bool block = s->progress_block;
+    s->progress_block = false;
+    if ((uint8_t)p.stage == s->progress_stage && !block) {
+        return;
+    }
+    s->progress_stage = (uint8_t)p.stage;
+    if (s->hooks.progress != NULL) {
+        s->hooks.progress(s->hooks.ctx, &p);
+    }
+}
+
+/* See udsota.h: the progress of the server's state as it is now. */
+void udsota_progress(const udsota_server_t *s, udsota_progress_t *out)
+{
+    *out = progress_of(s);
+}
+
+/* See udsota.h: done / total in permille, 0 without a total. */
+uint16_t udsota_progress_permille(const udsota_progress_t *p)
+{
+    if (p->total == 0u) {
+        return 0u;
+    }
+    const uint64_t done = (p->done < p->total) ? p->done : p->total;
+    return (uint16_t)(done * 1000u / p->total);
+}
+
 /* ---- 0x11 ECUReset ---- */
 
 /* 11 01 hardReset, keyed: extended or programming with either level unlocked, then the reset rule: the core's
@@ -1232,6 +1290,7 @@ bool udsota_init(udsota_server_t *s, const udsota_config_t *cfg, const udsota_en
     }
     s->session = UDSOTA_SESSION_DEFAULT;
     s->phase = UDSOTA_PHASE_IDLE;
+    s->progress_stage = UDSOTA_STAGE_IDLE;
     s->next_bsc = 1;
     sa_init(s);
     return security == NULL || (security->rng16 != NULL && (security->key != NULL || security->verify != NULL));
@@ -1258,6 +1317,7 @@ void udsota_end_session(udsota_server_t *s, uint32_t now_ms)
     }
     enter_session(s, UDSOTA_SESSION_DEFAULT);
     phase_sync(s);
+    progress_sync(s);
 }
 
 /* The phase last reported to hooks.phase. */
@@ -1318,6 +1378,7 @@ size_t udsota_on_request(udsota_server_t *s, const uint8_t *req, size_t req_len,
         answered(s, now_ms);
     }
     phase_sync(s);
+    progress_sync(s);
     return n;
 }
 
@@ -1444,11 +1505,13 @@ static size_t poll_step(udsota_server_t *s, uint8_t *resp, size_t resp_max, uint
     return 0;
 }
 
-/* See udsota.h: one poll step, then the phase hook if the phase changed. */
+/* See udsota.h: one poll step, then the phase hook if the phase changed and the progress hook if the stage changed
+ * or a block was written. */
 size_t udsota_poll(udsota_server_t *s, uint8_t *resp, size_t resp_max, uint32_t now_ms)
 {
     const size_t n = poll_step(s, resp, resp_max, now_ms);
     phase_sync(s);
+    progress_sync(s);
     return n;
 }
 
