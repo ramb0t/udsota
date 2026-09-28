@@ -813,23 +813,30 @@ def test_isotp_connection_socket_options(monkeypatch):
 
 
 # A kernel ISO-TP socket stand-in over a local datagram pair: recv() raises ECOMM (a TX timeout's error) errors
-# times first, then returns what the peer sent. select() sees a real descriptor.
+# times first, then returns what the peer sent. select() sees a real descriptor. With stolen, the first read
+# finds the datagram that woke select() already gone, as when sendmsg() takes a TX timeout's error first: it
+# raises EAGAIN for a non-blocking read, and a blocking one waits for the next datagram.
 class EcommSocket:
     # A bound socket whose first `errors` reads fail.
-    def __init__(self, errors=1):
+    def __init__(self, errors=1, stolen=False):
         self._socket, self.peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
-        self.errors, self.bound, self.closed = errors, True, False
+        self.errors, self.stolen, self.bound, self.closed = errors, stolen, True, False
+        self.woken = threading.Event()
 
     # Nothing to bind: the pair is already connected.
     def bind(self, interface, address):
         pass
 
-    # Fail with ECOMM while errors remain (leaving the datagram queued), then read one datagram.
-    def recv(self):
+    # Fail with ECOMM while errors remain (leaving the datagram queued), then read one datagram with flags.
+    def recv(self, bufsize=4095, flags=0):
+        if self.stolen:
+            self.stolen = False
+            self._socket.recv(bufsize)            # the wakeup, gone before this read
+            self.woken.set()
         if self.errors:
             self.errors -= 1
             raise OSError(errno.ECOMM, os.strerror(errno.ECOMM))
-        return self._socket.recv(4095)
+        return self._socket.recv(bufsize, flags)
 
     # Close both ends.
     def close(self):
@@ -839,9 +846,9 @@ class EcommSocket:
 
 
 # Open cls (a udsoncan ISO-TP socket connection) over an EcommSocket and send payload from the peer.
-def open_over_ecomm(cls, payload):
+def open_over_ecomm(cls, payload, errors=1, stolen=False):
     import isotp
-    sock = EcommSocket()
+    sock = EcommSocket(errors=errors, stolen=stolen)
     conn = cls("vcan0", isotp.Address(isotp.AddressingMode.Normal_11bits, txid=0x710, rxid=0x718), tpsock=sock)
     conn.open()
     sock.peer.send(payload)
@@ -864,6 +871,29 @@ def test_rx_thread_survives_a_socket_error():
         assert not stock.rxthread.is_alive() and stock.rxqueue.empty() and sock.errors == 0
     finally:
         stock.close()
+
+
+# Check a receive-thread wakeup whose error sendmsg() took first (the refused-download hang): the thread reads
+# nothing and selects again, so close() returns promptly with no frame after it, and on a second connection a
+# later answer still reaches the queue. Before, its blocking recv() waited for the next frame, and close(), which
+# joins the thread, never returned when none came.
+def test_rx_thread_wakeup_without_data_does_not_block_close():
+    for answer in (None, b"\x76\x2f"):
+        conn, sock = open_over_ecomm(transport.RxResilientIsoTPConnection, b"wakeup", errors=0, stolen=True)
+        closer = threading.Thread(target=conn.close, daemon=True)
+        try:
+            woken = sock.woken.wait(timeout=1.0)
+            got = None
+            if woken and answer is not None:
+                time.sleep(0.3)                   # the thread is back in select(), not stuck in recv()
+                sock.peer.send(answer)
+                got = conn.rxqueue.get(timeout=1.0)
+        finally:
+            t0 = time.monotonic()
+            closer.start()
+            closer.join(timeout=2.0)
+        assert woken and got == answer
+        assert not closer.is_alive() and time.monotonic() - t0 < 1.0 and not conn.rxthread.is_alive()
 
 
 # ---- pre-flight: listen, busy guard, pre-roll ----
@@ -1114,12 +1144,14 @@ def test_lost_76_is_resent_once():
     assert d.writes == 300 and bytes(d.written) == make_image()
 
 
-# Check a block that times out twice stops the update before 0x37.
+# Check a block that times out twice stops the update before 0x37, naming the block. F1F1 is not read: the
+# download may still be open, so it would describe the previous one.
 def test_second_timeout_stops_the_transfer():
     d = FakeServer(mute_block=5)
-    with pytest.raises(errors.NoResponse):
+    with pytest.raises(errors.NoResponse, match=r"^block 5: ") as e:
         run_flash(d)
-    assert d.log.count((0x36, 5)) == 2 and (0x37, None) not in d.log
+    assert "F1F1" not in str(e.value)
+    assert d.log.count((0x36, 5)) == 2 and (0x37, None) not in d.log and d.log[-1] == (0x36, 5)
 
 
 # Check one ISO-TP send error (no FC for the multi-frame 27 04 key, kernel ECOMM) is resent once and the update completes.
@@ -1140,12 +1172,29 @@ def test_second_send_error_stops_with_no_flow_control():
     assert d.no_fc[(0x27, 4)] == 0 and (0x34, None) not in d.log
 
 
-# Check a send error on a 0x36 block is resent inside the request, so send_block adds no third send.
+# Check a send error on a 0x36 block is resent inside the request, so send_block adds no third send, and the error
+# names the block and F1F1's reason.
 def test_send_errors_on_a_block_send_it_twice_only():
     d = FakeServer(no_fc={(0x36, 5): 3})
-    with pytest.raises(errors.SendFailed):
+    with pytest.raises(errors.SendFailed,
+                       match=r"^block 5: .*; the last-result DID F1F1 reads DL_OK, \d+ bytes received$"):
         run_flash(d)
-    assert d.no_fc[(0x36, 5)] == 1 and (0x36, 5) not in d.log
+    assert d.no_fc[(0x36, 5)] == 1 and (0x36, 5) not in d.log and d.log[-1] == (0x22, 0xF1F1)
+
+
+# Check --drop-76's resend fails the same way as a block's first send: the error names the block and F1F1.
+def test_drop_76_resend_failure_names_the_block():
+    # A server that stops sending FCs for block 5 once it has taken it.
+    class RefusesTheResend(FakeServer):
+        # 0x36, then no FC for the next two sends of block 5.
+        def s36(self, req, bsc):
+            if bsc == 5:
+                self.no_fc[(0x36, 5)] = 2
+            return super().s36(req, bsc)
+
+    d = RefusesTheResend()
+    with pytest.raises(errors.SendFailed, match=r"^block 5: .*; the last-result DID F1F1 reads"):
+        run_flash(d, drop_76=5)
 
 
 # Check the reboot wait after ActivateImage keeps polling through send errors, as through timeouts.

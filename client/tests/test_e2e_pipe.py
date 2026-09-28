@@ -4,14 +4,16 @@ stdout. No vcan or kernel ISO-TP needed; skipped when the demo is not built."""
 import random
 import subprocess
 import threading
+import time
 import tomllib
 
 import pytest
 
-from udsota import cli, profile, update, wire
+from udsota import cli, profile, transport, update, wire
 from udsota.errors import NoResponse, Nrc
 
-from .demo_server import LABEL, MASTER, DemoServer, PipeTransport, binary_or_skip, build_image, elf_sha
+from .demo_server import (LABEL, MASTER, PIPE_P2_S, DemoServer, PipeTransport, binary_or_skip, build_image,
+                          elf_sha)
 
 EXAMPLE = profile.load("example")
 OLD = "v0.1.0"                     # the demo's seeded running image
@@ -43,9 +45,9 @@ def write_profile(tmp_path, text, name="e2e"):
     return profile.from_dict(name, tomllib.loads(text)), str(p)
 
 
-# cli.main with argv, its transport the pipe to server.
-def run_cli(server, argv):
-    return cli.main(argv, transport=lambda prof, interface: PipeTransport(prof, server))
+# cli.main with argv, its transport the pipe to server with client P2 p2_s.
+def run_cli(server, argv, p2_s=PIPE_P2_S):
+    return cli.main(argv, transport=lambda prof, interface: PipeTransport(prof, server, p2_s=p2_s))
 
 
 # An image file under tmp_path.
@@ -240,7 +242,7 @@ def test_unconfirmed_image_rolls_back(demo):
         update.check_image(uds)
         try:
             uds.routine(wire.RID_ACTIVATE)
-        except NoResponse:   # a slow runner can miss the 150 ms P2 as the server restarts; flash tolerates it too
+        except NoResponse:   # a slow runner can miss P2 as the server restarts; flash tolerates it too
             assert update.activation_landed(uds, elf_sha(image), log=lambda *a: None)
         update.wait_for_image(uds, elf_sha(image), t.preroll)
         status = wire.decode_status(uds.read_did(wire.DID_STATUS))
@@ -279,6 +281,30 @@ def test_drop_76_resends_one_block(demo, tmp_path):
                        image_file(tmp_path, build_image("v0.2.0")), "--drop-76", "2"]) == 0
     answers = [bytes(m.data[:3]) for m in s.sent if m.data[1] == 0x76]
     assert answers.count(b"\x02\x76\x02") == 2
+    assert read_state(s)[2] == "v0.2.0"
+
+
+# Check a server that withholds the FC after the first block of CFs of block 1, then ignores the resent FF: `flash`
+# exits 1 within seconds, naming the block and the server's own reason from F1F1 (DL_ABORTED), and the old image
+# still runs.
+def test_withheld_flow_control_exits_1_with_the_servers_reason(demo, tmp_path, capsys):
+    s = demo("--withhold-fc-after", "64")
+    t0 = time.monotonic()
+    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash",
+                       image_file(tmp_path, build_image("v0.2.0"))]) == 1
+    assert time.monotonic() - t0 < 15.0
+    err = capsys.readouterr().err
+    assert "block 1:" in err and "F1F1 reads DL_ABORTED" in err, err
+    assert read_state(s)[2] == OLD
+
+
+# Check one FC lost on the bus (after the first block of CFs of block 1): the client's N_Bs timeout resends the block
+# from a new FF, the server takes it in place of the message it was still receiving, and the update completes.
+def test_lost_flow_control_is_resent_and_the_update_completes(demo, tmp_path):
+    s = demo("--drop-fc-after", "64")
+    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash",
+                       image_file(tmp_path, build_image("v0.2.0"))]) == 0
+    assert "--drop-fc-after: losing the FC" in s.log_path.read_text()
     assert read_state(s)[2] == "v0.2.0"
 
 
@@ -328,7 +354,7 @@ def test_busy_resends_outlast_a_short_job(demo, tmp_path):
     s = demo("--job-ms", "1000")
     s.drop = lambda m: (is_nrc(m, 0x36, 0x78) or is_block_answer(m, 1)) and len(s.dropped) < 2
     assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash",
-                       image_file(tmp_path, build_image("v0.2.0"))]) == 0
+                       image_file(tmp_path, build_image("v0.2.0"))], p2_s=transport.P2_S) == 0
     assert any(is_nrc(m, 0x36, wire.NRC_BUSY) for m in s.sent)
     assert len(s.dropped) == 2 and is_block_answer(s.dropped[1], 1)
 
@@ -464,7 +490,7 @@ def test_compressed_lost_answers_on_a_slow_job(demo, tmp_path):
     s.drop = lambda m: (is_nrc(m, 0x36, 0x78) or is_block_answer(m, 2)) and len(s.dropped) < 2 and \
         any(is_block_answer(x, 1) for x in s.sent)
     assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash", image_file(tmp_path, z_image()),
-                       "--compress"]) == 0
+                       "--compress"], p2_s=transport.P2_S) == 0
     assert len(s.dropped) == 2
     assert read_state(s)[2] == "v0.2.0"
 

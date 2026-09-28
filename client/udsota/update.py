@@ -25,7 +25,7 @@ CORE_DIDS = ((DID_SESSION, "active session", lambda d: d.hex(" ")),
              (DID_DEVICE_ID, "device ID", lambda d: ":".join("%02x" % b for b in d)),
              (DID_RUNNING_SHA, "running app_elf_sha256", lambda d: d.hex(" ")),
              (DID_STATUS, "update status", lambda d: describe_status(decode_status(d))),
-             (DID_RESULT, "last download", lambda d: "%s, %d bytes received" % decode_result(d)),
+             (DID_RESULT, "last download", lambda d: describe_result(d)),
              (DID_COUNTERS, "ISO-TP/UDS counters",
               lambda d: " ".join("%s=%d" % kv for kv in decode_counters(d).items())))
 DECODE = {"hex": lambda d: d.hex(" "), "ascii": cstr,
@@ -63,6 +63,28 @@ def send_block(uds, bsc, chunk):
         uds.transfer(bsc, chunk)
     except NoResponse:
         uds.transfer(bsc, chunk)
+
+
+# F1F1's value d as `info` and the errors show it: "DL_ABORTED, 0 bytes received".
+def describe_result(d):
+    return "%s, %d bytes received" % decode_result(d)
+
+
+# F1F1 as an error quotes it, or that it could not be read, so a failed read never hides the error being reported.
+def last_result(uds):
+    try:
+        return "the last-result DID F1F1 reads %s" % describe_result(uds.read_did(DID_RESULT))
+    except UpdateFailed:
+        return "the last-result DID F1F1 could not be read"
+
+
+# Block n's failure e as the same error naming the block. After a send the server stopped (SendFailed), with F1F1:
+# a server that withheld flow control has ended the download (DL_ABORTED). After no answer the download may still
+# be open, so F1F1 would describe the previous one; it is not read.
+def block_failed(uds, n, e):
+    if isinstance(e, SendFailed):
+        return type(e)("block %d: %s; %s" % (n, e, last_result(uds)))
+    return type(e)("block %d: %s" % (n, e))
 
 
 # The image as a raw DEFLATE stream (RFC 1951, no zlib header), level 9: what a 34 with DFI 0x10 announces.
@@ -120,18 +142,20 @@ def download(uds, image, drop_76=None, log=print, compress="none", clock=time.mo
     try:
         for n in range(1, total + 1):
             chunk = payload[(n - 1) * max_data:n * max_data]
-            send_block(uds, n & 0xFF, chunk)
-            if n == drop_76:
-                log("--drop-76: resending block %d as if its 76 were lost" % n)
+            try:
                 send_block(uds, n & 0xFF, chunk)
+                if n == drop_76:
+                    log("--drop-76: resending block %d as if its 76 were lost" % n)
+                    send_block(uds, n & 0xFF, chunk)
+            except (NoResponse, SendFailed) as e:
+                raise block_failed(uds, n, e) from e
             if n % 32 == 0 or n == total:
                 log("sent %d of %d bytes" % (min(n * max_data, len(payload)), len(payload)))
         transfer_exit(uds, len(payload), log=log)
     except Nrc as e:
         if payload is image:
             raise
-        raise UpdateFailed("%s; the last-result DID F1F1 reads %s" % (e, decode_result(uds.read_did(DID_RESULT))[0])) \
-            from e
+        raise UpdateFailed("%s; %s" % (e, last_result(uds))) from e
     if payload is not image:
         took = clock() - start
         log("sent %d compressed bytes in %.1f s; the %d-byte image would take about %.1f s, so about %.1f s saved"

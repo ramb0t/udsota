@@ -4,6 +4,10 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-09-28
+
+Fixed: a refused download now exits 1 instead of hanging. When a server withheld its flow control mid-block and ignored the resent block, `udsota flash` over the kernel's ISO-TP socket could hang for ever after the failed resend. A block that fails after its resend now names the block, and after a send the server stopped also F1F1's reason, such as `block 1: ... F1F1 reads DL_ABORTED, 0 bytes received`. The demo server gains `--withhold-fc-after N` and `--drop-fc-after N` to inject both faults. Not breaking.
+
 ## [0.5.0] - 2026-09-28
 
 The ESP32 port says which image is arriving: the new `udsota_esp32_incoming_version()` copies out the version from the image's `esp_app_desc_t`, so an update screen can say "Installing v0.3.1" and, after a failure, name the version next to `last_reason`. It is set when the first-block check accepts the image, compressed downloads included, kept after the download ends, and cleared by the next accepted 34 in the same locked copy as that 34's ERASING report, or by a compressed 34 refused for memory, so that refusal never names the previous image. A display that pairs the version with `last_reason` reads the progress, the version, then the progress again, and retries if they changed. It holds at most 31 characters, with non-printable bytes shown as `?`, and lives in RAM only. Additive and not breaking: the port gains one function and `UDSOTA_ESP32_VERSION_MAX`, and the core, its structs and the wire are unchanged.
