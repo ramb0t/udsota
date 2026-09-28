@@ -1,2 +1,3 @@
 # Vendored upstream code: keep its bytes (isotp.c ships with CRLF line endings).
 components/isotp/isotp-c/** -text
+components/udsota_inflate/miniz/** -text
