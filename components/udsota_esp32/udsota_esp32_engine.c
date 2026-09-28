@@ -77,7 +77,7 @@ _Static_assert(sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t) +
                UDSOTA_IMG_DESC_OFFSET, "udsota_image_desc_t sits right after esp_app_desc_t");
 
 typedef enum {
-    JOB_REFRESH, JOB_BEGIN, JOB_WRITE, JOB_END, JOB_ABORT, JOB_ACTIVATE, JOB_CONFIRM, JOB_ZWRITE, JOB_ZEND
+    JOB_BEGIN, JOB_WRITE, JOB_END, JOB_ABORT, JOB_ACTIVATE, JOB_CONFIRM, JOB_ZWRITE, JOB_ZEND
 } job_kind_t;
 
 typedef struct {
@@ -95,7 +95,6 @@ typedef struct {
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 static ota_cache_t s_cache = {.st = {.running_slot = UDSOTA_SLOT_NONE, .boot_slot = UDSOTA_SLOT_NONE}};
 static uint32_t s_pending;          /* ops jobs queued and not finished */
-static uint32_t s_refreshing;       /* refresh jobs queued and not finished */
 static int s_batch_result;          /* first failure since s_pending was last 0 */
 static bool s_buf_busy;             /* s_buf holds a block the worker has not written yet */
 static bool s_verified;             /* FF01 passed on s_target since the last BEGIN, eng_unverify or boot */
@@ -203,9 +202,9 @@ static void set_other(uint8_t state)
     cache_put(&c);
 }
 
-/* Worker: reads every cached field from otadata and the partitions, at boot. The only caller of
- * esp_ota_get_last_invalid_partition(), which verifies a whole image (:1272). A download in progress or
- * a verified slot keeps its in-RAM state. */
+/* Worker: reads every cached field from otadata and the partitions, once at boot before any job, so no download
+ * is open and no slot verified yet. The only caller of esp_ota_get_last_invalid_partition(), which verifies a whole
+ * image (:1272). */
 static void refresh_all(void)
 {
     ota_cache_t c = {.st = {.running_slot = UDSOTA_SLOT_NONE, .boot_slot = UDSOTA_SLOT_NONE}};
@@ -222,11 +221,7 @@ static void refresh_all(void)
     }
 #endif
     uint8_t other = UDSOTA_OTHER_UNVERIFIED;
-    if (s_handle_open) {
-        other = UDSOTA_OTHER_WRITING;
-    } else if (verified_get()) {
-        other = UDSOTA_OTHER_VERIFIED;
-    } else if (s_target != NULL) {
+    if (s_target != NULL) {
         (void)udsota_esp32_psa_lock(UDSOTA_ESP32_PSA_WAIT_FOREVER);   /* verifies the invalid image (:1272): PSA hash */
         const esp_partition_t *inv = esp_ota_get_last_invalid_partition();
         udsota_esp32_psa_unlock();
@@ -684,20 +679,14 @@ static int job_confirm(void)
 }
 
 /* Worker: records a finished job. */
-static void finish(job_kind_t kind, int result)
+static void finish(int result)
 {
     taskENTER_CRITICAL(&s_mux);
-    if (kind == JOB_REFRESH) {
-        if (s_refreshing > 0) {
-            s_refreshing--;
-        }
-    } else {
-        if (result != UDSOTA_DL_OK && s_batch_result == UDSOTA_DL_OK) {
-            s_batch_result = result;
-        }
-        if (s_pending > 0) {
-            s_pending--;
-        }
+    if (result != UDSOTA_DL_OK && s_batch_result == UDSOTA_DL_OK) {
+        s_batch_result = result;
+    }
+    if (s_pending > 0) {
+        s_pending--;
     }
     taskEXIT_CRITICAL(&s_mux);
 }
@@ -711,11 +700,12 @@ void udsota_esp32_engine_set_wake(void (*wake)(void))
     s_wake = wake;
 }
 
-/* The flash worker: runs queued jobs one at a time, forever. Not on the task watchdog: an erase
- * busy-waits for up to ~43 s, yielding only between flash commands. */
+/* The flash worker: reads the OTA state, then runs queued jobs one at a time, forever. Not on the task
+ * watchdog: an erase busy-waits for up to ~43 s, yielding only between flash commands. */
 static void worker_task(void *arg)
 {
     (void)arg;
+    refresh_all();                              /* before any job: jobs queued meanwhile wait for it */
     for (;;) {
         job_t j;
         if (xQueueReceive(s_q, &j, portMAX_DELAY) != pdTRUE) {
@@ -723,7 +713,6 @@ static void worker_task(void *arg)
         }
         int r;
         switch ((job_kind_t)j.kind) {
-        case JOB_REFRESH:  refresh_all(); r = UDSOTA_DL_OK; break;
         case JOB_BEGIN:    r = job_begin(j.arg); break;
         case JOB_WRITE:    r = job_write(j.arg); break;
         case JOB_END:      r = job_end(); break;
@@ -736,38 +725,29 @@ static void worker_task(void *arg)
         case JOB_CONFIRM:  r = job_confirm(); break;
         default:           r = UDSOTA_DL_ABORTED; break;
         }
-        finish((job_kind_t)j.kind, r);
+        finish(r);
         if (s_wake != NULL) {
             s_wake();
         }
     }
 }
 
-/* Queues one job without blocking: UDSOTA_PENDING when queued, ERR_* when refused. Ops jobs join the
+/* Queues one job without blocking: UDSOTA_PENDING when queued, ERR_* when refused. Every job joins the
  * batch that eng_poll() reports; only the server's task queues them. */
 static int submit(job_kind_t kind, uint32_t arg)
 {
-    if (s_q == NULL || (kind != JOB_REFRESH && s_target == NULL)) {
+    if (s_q == NULL || s_target == NULL) {
         return ERR_NOT_STARTED;
     }
     taskENTER_CRITICAL(&s_mux);
-    if (kind == JOB_REFRESH) {
-        s_refreshing++;
-    } else {
-        if (s_pending == 0) {
-            s_batch_result = UDSOTA_DL_OK;
-        }
-        s_pending++;
+    if (s_pending++ == 0) {
+        s_batch_result = UDSOTA_DL_OK;
     }
     taskEXIT_CRITICAL(&s_mux);
     const job_t j = {.kind = (uint8_t)kind, .arg = arg};
     if (xQueueSend(s_q, &j, 0) != pdTRUE) {
         taskENTER_CRITICAL(&s_mux);
-        if (kind == JOB_REFRESH) {
-            s_refreshing--;
-        } else {
-            s_pending--;
-        }
+        s_pending--;
         taskEXIT_CRITICAL(&s_mux);
         return ERR_BUSY;
     }
@@ -807,11 +787,11 @@ bool udsota_esp32_image_unconfirmed(void)
     return pending_confirm(&c);
 }
 
-/* True while an ops job or the boot-time refresh is queued or running. */
+/* True while an ops job is queued or running, or the started worker's boot read has not finished. */
 bool udsota_esp32_engine_busy(void)
 {
     taskENTER_CRITICAL(&s_mux);
-    const bool busy = s_pending != 0 || s_refreshing != 0;
+    const bool busy = s_pending != 0 || (s_q != NULL && !s_cache.ready);
     taskEXIT_CRITICAL(&s_mux);
     return busy;
 }
@@ -1099,8 +1079,8 @@ const udsota_engine_t *udsota_esp32_engine(void)
     return &s_engine;
 }
 
-/* Creates the worker, its buffer and queue in internal RAM, fills the image rules from cfg and the running
- * image, and queues the boot-time cache read; see udsota_esp32_priv.h. */
+/* Creates the worker, its buffer and queue in internal RAM, and fills the image rules from cfg and the running
+ * image; the worker reads the OTA state before its first job. See udsota_esp32_priv.h. */
 void udsota_esp32_engine_start(const udsota_config_t *cfg)
 {
     if (s_q != NULL || cfg == NULL) {
@@ -1147,7 +1127,6 @@ void udsota_esp32_engine_start(const udsota_config_t *cfg)
         s_buf = NULL;
         return;
     }
-    (void)submit(JOB_REFRESH, 0);
     ESP_LOGD(TAG, "flash worker up: target %s (%" PRIu32 " B), running v%u.%u.%u (%s), hw_id %u",
              (s_target != NULL) ? s_target->label : "none", s_ctx.slot_size, s_ctx.running_version[0],
              s_ctx.running_version[1], s_ctx.running_version[2], s_ctx.running_is_release ? "release" : "dev",
