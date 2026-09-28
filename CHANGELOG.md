@@ -4,6 +4,8 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-28
+
 Releases have a written process, [RELEASING.md](RELEASING.md): semantic versioning where, while udsota is 0.x, anything new or breaking is a minor bump and a patch is for fixes only; one version shared by the tag, the dated CHANGELOG heading and the client's `__version__`; and a release workflow that checks those agree, then publishes the client's wheel and the example's images as a GitHub Release. `tools/release.py` does the check and extracts the notes. 0.1.0 is dated and tagged: it is the initial import, `da16abf`.
 
 Apps can show an update's progress. `udsota_progress()` reads the download's stage (IDLE, ERASING, WRITING, VERIFYING or ACTIVATING), the image bytes written of the size the 34 announced, and the last download's F1F1 reason, so a display can show a failure rather than just falling back to idle. The new optional `hooks.progress` gets the same at each change of stage and after each written block, at most once per server call, and `udsota_progress_permille()` turns the bytes into permille. The ESP32 port keeps the last report in a snapshot under a spinlock, which any task reads with the new `udsota_esp32_progress()`, and forwards the hook to the app's with its `ctx`.

@@ -1,2 +1,2 @@
 """udsota: PC client for the udsota UDS firmware updater. Product specifics live in a TOML profile."""
-__version__ = "0.3.0"
+__version__ = "0.4.0"
