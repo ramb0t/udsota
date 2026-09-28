@@ -1,0 +1,2 @@
+# Compressed downloads (DFI 0x10): list this file after sdkconfig.defaults in SDKCONFIG_DEFAULTS (see README.md).
+CONFIG_UDSOTA_ESP32_COMPRESSION=y
