@@ -854,7 +854,6 @@ static void test_sprmib(void)
     expect_pos(poll_after(10), UDSOTA_RID_CHECK_PROG_DEPS, UDSOTA_DL_OK);   /* echoes 01, without the bit */
 }
 
-/* Runs every RoutineControl test. */
 /* A RID the core does not own goes to hooks.routine with the option record, the room after 71 01 <rid>, the
  * hooks' ctx and the access state; 0 answers 71 01 <rid> and the out record at once, with no job. */
 static void test_app_routine_answers_at_once(void)
@@ -1089,6 +1088,7 @@ static void test_app_routine_no_room_starts_nothing(void)
     TEST_ASSERT_FALSE(srv.job_running);
 }
 
+/* Runs every RoutineControl test. */
 int main(void)
 {
     UNITY_BEGIN();

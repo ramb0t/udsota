@@ -17,7 +17,8 @@
 #define UDSOTA_SLOT_SIZE_DEFAULT  0x400000u  /* bytes a 34 may announce while engine.slot_size is 0 */
 
 /* An engine op that queued work on the flash worker returns UDSOTA_PENDING instead of a result; the server
- * then waits on engine.poll. INT32_MAX: never an esp_err_t, never 0. */
+ * then waits on engine.poll. hooks.routine and hooks.routine_poll return it too, for an app routine still
+ * running; the server then waits on routine_poll. INT32_MAX: never an esp_err_t, never 0. */
 #define UDSOTA_PENDING  0x7FFFFFFF
 
 #define UDSOTA_STMIN_DEFAULT_US    2000u      /* the transport's FC STmin while cfg.stmin_us is 0 */
@@ -113,19 +114,22 @@ typedef struct {   /* all optional */
     int      (*routine)(void *ctx, uint16_t rid, const uint8_t *in, size_t in_len,
                         uint8_t *out, size_t out_max, size_t *out_len, udsota_access_t access);
                                                    /* 31 01 for a RID the core doesn't own; in is the option record
-                                                      after the RID and out the room after 71 01 <rid>. NULL: 0x31,
-                                                      as for any RID nobody serves. Returns 0 (71 01 <rid> out), an NRC
-                                                      (1..0xFF), or UDSOTA_PENDING (0x78 until routine_poll stops
-                                                      returning pending; 0x72 at the 90 s cap, and the routine is
-                                                      then an orphan until routine_poll finishes it). Any other
-                                                      value, or *out_len > out_max, is 0x10. While an orphan runs, a
-                                                      31 01 for an app RID is 0x22 without a call. It may read
-                                                      udsota_phase() but must not call other udsota functions */
+                                                      after the RID and out the room after 71 01 <rid>, both valid
+                                                      only during the call (a pending routine copies what it needs).
+                                                      NULL: 0x31, as for any RID nobody serves. Returns 0 (71 01 <rid>
+                                                      out), an NRC (1..0xFF, never 0x78), or UDSOTA_PENDING (0x78
+                                                      until routine_poll stops returning pending; 0x72 at the 90 s
+                                                      cap, and the routine is then an orphan until routine_poll
+                                                      finishes it). Any other value, or *out_len > out_max, is 0x10.
+                                                      While an orphan runs, a 31 01 for an app RID is 0x22 without a
+                                                      call. It may read udsota_phase() but must not call other udsota
+                                                      functions */
     int      (*routine_poll)(void *ctx, uint8_t *out, size_t out_max, size_t *out_len);
                                                    /* on every udsota_poll while an app routine is pending or
-                                                      orphaned; returns as routine does. NULL: a routine that
-                                                      returns UDSOTA_PENDING ends in 0x10 at the first poll. It may
-                                                      read udsota_phase() but must not call other udsota functions */
+                                                      orphaned; returns as routine does, and out is again valid only
+                                                      during the call. NULL: a routine that returns UDSOTA_PENDING
+                                                      ends in 0x10 at the first poll. It may read udsota_phase() but
+                                                      must not call other udsota functions */
 } udsota_hooks_t;
 
 typedef struct {
@@ -258,8 +262,9 @@ size_t udsota_on_functional_request(udsota_server_t *s, const uint8_t *req, size
                                     uint32_t now_ms);
 /* Advances S3, the 0x78 cadence, job completion and an armed restart; returns a response length to send, or 0. */
 size_t udsota_poll(udsota_server_t *s, uint8_t *resp, size_t max, uint32_t now_ms);
-/* Milliseconds until udsota_poll next has work (0 = now); UDSOTA_JOB_POLL_MS while a job runs or a restart is
- * armed; UINT32_MAX when idle in the default session or once the restart has fired. */
+/* Milliseconds until udsota_poll next has work (0 = now); UDSOTA_JOB_POLL_MS while a job runs, a worker or app
+ * orphan runs (in any session) or a restart is armed; UINT32_MAX when idle in the default session with no orphan,
+ * or once the restart has fired. */
 uint32_t udsota_ms_to_deadline(const udsota_server_t *s, uint32_t now_ms);
 /* A First Frame arrived on the request ID: S3 stops until that request is answered or abandoned. */
 void   udsota_on_rx_first_frame(udsota_server_t *s, uint32_t now_ms);

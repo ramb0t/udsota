@@ -703,6 +703,16 @@ static void check_app_owner(void)
         g_stats.app_orphaned = true;
     }
 }
+
+/* An app orphan keeps the worker busy: a request answered while one ran must not have entered programming or armed
+ * a restart (10 02, 11 01 and ActivateImage are 0x22 until routine_poll finishes it). */
+static void check_orphan_held(bool orphan_before, uint8_t session_before, const uint8_t *req, size_t rl)
+{
+    if (orphan_before && ((S.session == UDSOTA_SESSION_PROGRAMMING && session_before != UDSOTA_SESSION_PROGRAMMING) ||
+                          udsota_restart_armed(&S))) {
+        fail("10 02, 11 01 or ActivateImage accepted while an app orphan ran", req, rl, NULL, 0);
+    }
+}
 #endif
 
 /* Returns the guarded response buffer for resp_max, with its canary armed. */
@@ -735,12 +745,17 @@ static size_t fuzz_request(const uint8_t *in, size_t len, layout_t lay, size_t r
     if (len > 7u) {
         udsota_on_rx_first_frame(&S, now);   /* what the shim does for a multi-frame request */
     }
+#if UDSOTA_FUZZ_APP_HOOKS
+    const bool orphan_before = S.app_orphan;
+    const uint8_t session_before = S.session;
+#endif
     const size_t n = udsota_on_request(&S, req, len, resp, resp_max, now);
     check_canary(resp, req, len);
     check_request_answer(req, len, resp, n, resp_max);
     check_phase();
 #if UDSOTA_FUZZ_APP_HOOKS
     check_app_owner();
+    check_orphan_held(orphan_before, session_before, req, len);
 #endif
     return n;
 }
@@ -753,12 +768,18 @@ static void fuzz_poll(size_t resp_max, uint32_t now)
     if (M.live && M.variant == 1u) {
         udsota_end_session(&S, now);   /* variant 1 is the second device: fuzz the end_pending latch */
     }
+#if UDSOTA_FUZZ_APP_HOOKS
+    const bool job_before = S.job_running;
+#endif
     const size_t n = udsota_poll(&S, resp, resp_max, now);
     check_canary(resp, NULL, 0);
     check_poll_answer(resp, n, resp_max);
     check_phase();
 #if UDSOTA_FUZZ_APP_HOOKS
     check_app_owner();
+    if (n != 0 && !job_before) {   /* only a job the server waits on is answered; an orphan's answer never is */
+        fail("poll answered with no job running (a leaked orphan answer)", NULL, 0, resp, n);
+    }
 #endif
 }
 
@@ -1158,15 +1179,20 @@ static void replay_generated(void)
         replay_input("seq-sa-lockout", seq, n, true);
     }
 #if UDSOTA_FUZZ_APP_HOOKS
-    /* An app routine past the 90 s cap: 0x72, then its orphan holds 10 02 at 0x22 until routine_poll finishes it
-     * at 100 s, and 10 02 is accepted after. From a default-session state it is just a stream. */
+    /* An app routine past the 90 s cap: 0x72, then its orphan refuses another app routine (0x22, no hook call) and
+     * holds 10 02 at 0x22 until routine_poll finishes it at 100 s, and 10 02 is accepted after. From a
+     * default-session state it is just a stream. */
     const uint8_t hold[] = {UDSOTA_SID_ROUTINE, UDSOTA_RC_START, 0x12, 0x36};
+    const uint8_t ext[] = {UDSOTA_SID_SESSION, UDSOTA_SESSION_EXTENDED};
+    const uint8_t sync[] = {UDSOTA_SID_ROUTINE, UDSOTA_RC_START, 0x12, 0x34};
     const uint8_t prog[] = {UDSOTA_SID_SESSION, UDSOTA_SESSION_PROGRAMMING};
     n = 0;
     n = rec(seq, n, 0, hold, sizeof hold);
     for (unsigned k = 0; k < 15u; k++) {
         n = rec(seq, n, 255, tp, sizeof tp);                   /* 15 x 6.375 s = 95.6 s: past the cap */
     }
+    n = rec(seq, n, 0, ext, sizeof ext);                       /* back out of default, as a tester would */
+    n = rec(seq, n, 0, sync, sizeof sync);                     /* the orphan still runs: 0x22, routine not called */
     n = rec(seq, n, 0, prog, sizeof prog);                     /* the orphan still runs: 0x22 */
     n = rec(seq, n, 255, tp, sizeof tp);                       /* 102 s: routine_poll finishes it */
     n = rec(seq, n, 0, prog, sizeof prog);                     /* accepted */
