@@ -82,22 +82,6 @@ static int test_verify(void *ctx, const uint8_t seed[UDSOTA_KEYS_SEED_LEN], uint
     return udsota_esp32_sa_check(ctx, fake_verify, &s_key_ctx, seed, level, key, key_len);
 }
 
-/* Engine op that succeeds at once; no test here reaches the engine. */
-static int noop(void *ctx) { return 0; }
-/* Engine begin stub. */
-static int noop_begin(void *ctx, uint32_t size) { return 0; }
-/* Engine write stub. */
-static int noop_write(void *ctx, uint32_t off, const uint8_t *d, size_t n) { return 0; }
-/* Engine abort stub. */
-static void noop_abort(void *ctx) {}
-/* Engine first-block stub. */
-static int noop_check(void *ctx, const uint8_t *f, size_t n, udsota_reason_t *r) { *r = UDSOTA_DL_OK; return 0; }
-
-static const udsota_engine_t ENGINE = {
-    .check_first = noop_check, .begin = noop_begin, .write = noop_write, .verify = noop, .activate = noop,
-    .confirm = noop, .abort = noop_abort, .poll = noop, .status = udsota_mock_status, .ctx = &s_mock,
-};
-
 /* Unity hook: an empty device ID, a cleared mock and a checking verify. */
 void setUp(void)
 {
@@ -122,7 +106,8 @@ static void port_start(const uint8_t *id, size_t id_len)
     static udsota_security_t sec;
     sec = (udsota_security_t){.rng16 = test_rng16, .key = NULL, .ctx = &s_dev,
                               .verify = test_verify, .key_len = UDSOTA_KEYS_SIG_LEN};
-    udsota_init(&s_srv, &cfg, &ENGINE, &sec, &hooks);
+    const udsota_engine_t eng = udsota_mock_engine(&s_mock);   /* no test here reaches the engine */
+    udsota_init(&s_srv, &cfg, &eng, &sec, &hooks);
 }
 
 /* Sends one request at now; the response is left in R/RL. */

@@ -61,22 +61,6 @@ static bool test_key(void *ctx, const uint8_t seed[UDSOTA_KEYS_SEED_LEN], uint8_
     return udsota_esp32_devid_key(ctx, mix_hmac, seed, level, out);
 }
 
-/* Engine op that succeeds at once; no test here reaches the engine. */
-static int noop(void *ctx) { return 0; }
-/* Engine begin stub. */
-static int noop_begin(void *ctx, uint32_t size) { return 0; }
-/* Engine write stub. */
-static int noop_write(void *ctx, uint32_t off, const uint8_t *d, size_t n) { return 0; }
-/* Engine abort stub. */
-static void noop_abort(void *ctx) {}
-/* Engine first-block stub. */
-static int noop_check(void *ctx, const uint8_t *f, size_t n, udsota_reason_t *r) { *r = UDSOTA_DL_OK; return 0; }
-
-static const udsota_engine_t ENGINE = {
-    .check_first = noop_check, .begin = noop_begin, .write = noop_write, .verify = noop, .activate = noop,
-    .confirm = noop, .abort = noop_abort, .poll = noop, .status = udsota_mock_status, .ctx = &s_mock,
-};
-
 /* Unity hook: master 00..1F, an empty device ID and a cleared mock. */
 void setUp(void)
 {
@@ -113,7 +97,8 @@ static udsota_esp32_devid_fix_t port_start(const uint8_t *id, size_t id_len)
     const udsota_hooks_t hooks = udsota_mock_hooks(&s_mock);
     static udsota_security_t sec;
     sec = (udsota_security_t){.rng16 = test_rng16, .key = test_key, .ctx = &s_dev};
-    udsota_init(&s_srv, &cfg, &ENGINE, &sec, &hooks);
+    const udsota_engine_t eng = udsota_mock_engine(&s_mock);   /* no test here reaches the engine */
+    udsota_init(&s_srv, &cfg, &eng, &sec, &hooks);
     return r;
 }
 

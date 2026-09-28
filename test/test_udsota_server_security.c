@@ -84,22 +84,7 @@ static int mock_verify(void *ctx, const uint8_t seed[16], uint8_t level, const u
 }
 
 static udsota_mock_t g_mock;
-
-/* Engine op that completes at once with success; no test here reaches the engine. */
-static int noop(void *ctx) { return 0; }
-/* Engine erase stub. */
-static int noop_begin(void *ctx, uint32_t size) { return 0; }
-/* Engine write stub. */
-static int noop_write(void *ctx, uint32_t off, const uint8_t *d, size_t n) { return 0; }
-/* Engine abort stub. */
-static void noop_abort(void *ctx) {}
-/* Engine first-block stub. */
-static int noop_check(void *ctx, const uint8_t *f, size_t n, udsota_reason_t *r) { *r = UDSOTA_DL_OK; return 0; }
-
-static const udsota_engine_t ENGINE = {
-    .check_first = noop_check, .begin = noop_begin, .write = noop_write, .verify = noop, .activate = noop,
-    .confirm = noop, .abort = noop_abort, .poll = noop, .status = udsota_mock_status, .ctx = &g_mock,
-};
+static udsota_engine_t g_eng;   /* udsota_mock_engine: no test here reaches the engine */
 static const udsota_security_t SECURITY = {.rng16 = mock_rng16, .key = mock_key, .ctx = &M};
 
 /* Rebuilds the server as a chip restart does, with the mock's config and hooks (the gate allows 10 02). */
@@ -107,7 +92,7 @@ static void fresh_server(void)
 {
     const udsota_config_t cfg = udsota_mock_cfg();
     const udsota_hooks_t hooks = udsota_mock_hooks(&g_mock);
-    udsota_init(&S, &cfg, &ENGINE, &SECURITY, &hooks);
+    udsota_init(&S, &cfg, &g_eng, &SECURITY, &hooks);
 }
 
 /* Unity hook: a healthy mock and a freshly booted server for every test. */
@@ -119,6 +104,7 @@ void setUp(void)
     M.seed_base = 0x10;
     memset(&S, 0, sizeof S);
     udsota_mock_clear(&g_mock);
+    g_eng = udsota_mock_engine(&g_mock);
     fresh_server();
 }
 
@@ -551,7 +537,7 @@ static void boot_verifier(uint16_t key_len)
     const udsota_hooks_t hooks = udsota_mock_hooks(&g_mock);
     const udsota_security_t sec = {.rng16 = mock_rng16, .key = mock_key, .ctx = &M,
                                    .verify = mock_verify, .key_len = key_len};
-    udsota_init(&S, &cfg, &ENGINE, &sec, &hooks);
+    udsota_init(&S, &cfg, &g_eng, &sec, &hooks);
 }
 
 /* Sends 27 <sub> with n key bytes (a sendKey). */
@@ -625,7 +611,7 @@ static void test_key_len_defaults_and_is_ignored_without_verifier(void)
     const udsota_config_t cfg = udsota_mock_cfg();
     const udsota_hooks_t hooks = udsota_mock_hooks(&g_mock);
     const udsota_security_t sec = {.rng16 = mock_rng16, .key = mock_key, .ctx = &M, .key_len = SIG_LEN};
-    udsota_init(&S, &cfg, &ENGINE, &sec, &hooks);
+    udsota_init(&S, &cfg, &g_eng, &sec, &hooks);
     enter(UDSOTA_SESSION_EXTENDED, T0);
     unlock(0x01, T0 + 1);                                           /* 18-byte sendKey, HMAC compare */
     TEST_ASSERT_EQUAL_INT(1, M.verify_calls);                       /* only the first server's */
@@ -689,7 +675,7 @@ static void test_init_refuses_security_without_key_or_verify(void)
     const udsota_config_t cfg = udsota_mock_cfg();
     const udsota_hooks_t hooks = udsota_mock_hooks(&g_mock);
     const udsota_security_t none = {.rng16 = mock_rng16, .ctx = &M};
-    TEST_ASSERT_FALSE(udsota_init(&S, &cfg, &ENGINE, &none, &hooks));
+    TEST_ASSERT_FALSE(udsota_init(&S, &cfg, &g_eng, &none, &hooks));
     TEST_ASSERT_TRUE(S.secured);
     uint8_t seed[16], key[16];
     memset(key, 0, sizeof key);
@@ -707,8 +693,8 @@ static void test_init_refuses_security_without_key_or_verify(void)
     TEST_ASSERT_EQUAL_HEX8(0x7F, R[0]);
     TEST_ASSERT_EQUAL_HEX8(0x34, R[1]);
     TEST_ASSERT_EQUAL_HEX8(0x33, R[2]);
-    TEST_ASSERT_TRUE(udsota_init(&S, &cfg, &ENGINE, &SECURITY, &hooks));
-    TEST_ASSERT_TRUE(udsota_init(&S, &cfg, &ENGINE, NULL, &hooks));
+    TEST_ASSERT_TRUE(udsota_init(&S, &cfg, &g_eng, &SECURITY, &hooks));
+    TEST_ASSERT_TRUE(udsota_init(&S, &cfg, &g_eng, NULL, &hooks));
 }
 
 /* init refuses a security without rng16 (false), with key or verify set or not, yet keeps security on: every
@@ -719,8 +705,8 @@ static void test_init_refuses_security_without_rng16(void)
     const udsota_hooks_t hooks = udsota_mock_hooks(&g_mock);
     const udsota_security_t no_rng = {.key = mock_key, .ctx = &M};
     const udsota_security_t nothing = {.ctx = &M};
-    TEST_ASSERT_FALSE(udsota_init(&S, &cfg, &ENGINE, &nothing, &hooks));
-    TEST_ASSERT_FALSE(udsota_init(&S, &cfg, &ENGINE, &no_rng, &hooks));
+    TEST_ASSERT_FALSE(udsota_init(&S, &cfg, &g_eng, &nothing, &hooks));
+    TEST_ASSERT_FALSE(udsota_init(&S, &cfg, &g_eng, &no_rng, &hooks));
     TEST_ASSERT_TRUE(S.secured);
     uint8_t key[16];
     memset(key, 0, sizeof key);

@@ -1,7 +1,7 @@
 /* Shared host-test mock for the udsota server: a gate that answers per op and counts what it was
- * asked, a phase recorder, a reset hook, an app DID hook, the engine's status source and a SecurityAccess
- * with a known key. Header-only and all static inline, so a test that uses part of it still builds under
- * -Werror. */
+ * asked, a phase recorder, a reset hook, an app DID hook, the engine's status source, an engine whose ops all
+ * succeed at once and a SecurityAccess with a known key. Header-only and all static inline, so a test that uses
+ * part of it still builds under -Werror. */
 #pragma once
 #include <stdbool.h>
 #include <stddef.h>
@@ -136,4 +136,26 @@ static inline const udsota_security_t *udsota_mock_security(void)
 {
     static const udsota_security_t sec = {.rng16 = udsota_mock_rng16, .key = udsota_mock_key};
     return &sec;
+}
+
+/* The inert engine's ops: each succeeds at once, and the first block always passes. */
+static inline int udsota_mock_op_ok(void *ctx) { return 0; }
+static inline int udsota_mock_begin_ok(void *ctx, uint32_t size) { return 0; }
+static inline int udsota_mock_write_ok(void *ctx, uint32_t off, const uint8_t *d, size_t n) { return 0; }
+static inline void udsota_mock_abort_nop(void *ctx) {}
+static inline int udsota_mock_check_ok(void *ctx, const uint8_t *f, size_t n, udsota_reason_t *r)
+{
+    *r = UDSOTA_DL_OK;
+    return 0;
+}
+
+/* An engine for tests that never reach it: every op succeeds at once, status is m's (ctx = m). */
+static inline udsota_engine_t udsota_mock_engine(udsota_mock_t *m)
+{
+    udsota_engine_t e = {
+        .check_first = udsota_mock_check_ok, .begin = udsota_mock_begin_ok, .write = udsota_mock_write_ok,
+        .verify = udsota_mock_op_ok, .activate = udsota_mock_op_ok, .confirm = udsota_mock_op_ok,
+        .abort = udsota_mock_abort_nop, .poll = udsota_mock_op_ok, .status = udsota_mock_status, .ctx = m,
+    };
+    return e;
 }
