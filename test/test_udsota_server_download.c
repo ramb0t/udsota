@@ -5,7 +5,7 @@
 #include <string.h>
 #include "unity.h"
 #include "udsota.h"
-#include "udsota_mock.h"
+#include "udsota_dl_harness.h"
 #include "udsota_rxwatch.h"   /* UDSOTA_CF_MEDIAN_NONE */
 #include "udsota_image.h"
 #include "fixtures/example_first_block.h"   /* example_first_block() */
@@ -36,10 +36,6 @@ typedef struct {
 } mock_t;
 
 static mock_t       m;
-static uint32_t     g_now;
-static udsota_server_t srv;
-static uint8_t      g_resp[64];
-static size_t       g_resp_len;
 static uint8_t      g_blk[UDSOTA_DL_MAX_BLOCK_LEN + 1u];   /* one byte spare for the too-long case */
 
 /* Appends one call letter to the mock's call log, keeping it NUL-terminated. */
@@ -119,20 +115,11 @@ static int mock_poll(void *ctx)
     return m.job_result;
 }
 
-static udsota_mock_t g_mock;
 static const udsota_engine_t ENGINE = {
     .check_first = mock_check_first, .begin = mock_begin, .write = mock_write, .verify = mock_ok,
     .activate = mock_ok, .confirm = mock_ok, .abort = mock_abort, .unverify = mock_unverify,
     .poll = mock_poll, .status = udsota_mock_status, .ctx = &g_mock,
 };
-
-/* Boots the server on engine (ENGINE or a copy) with the mock's config and hooks. */
-static void boot(const udsota_engine_t *engine)
-{
-    const udsota_config_t cfg = udsota_mock_cfg();
-    const udsota_hooks_t hooks = udsota_mock_hooks(&g_mock);
-    udsota_init(&srv, &cfg, engine, udsota_mock_security(), &hooks);
-}
 
 /* Fresh server and mock at T0; the erase takes 3.3 s (1.34 MB) and a block write 15 ms; the gate allows. */
 void setUp(void)
@@ -148,42 +135,6 @@ void setUp(void)
 /* Unity hook: nothing to undo. */
 void tearDown(void) {}
 
-/* Asserts the last response is exactly the bytes listed. */
-#define EXPECT(...) do {                                                       \
-        const uint8_t e_[] = {__VA_ARGS__};                                    \
-        TEST_ASSERT_EQUAL_UINT(sizeof e_, g_resp_len);                         \
-        TEST_ASSERT_EQUAL_HEX8_ARRAY(e_, g_resp, sizeof e_);                   \
-    } while (0)
-
-/* Sends one request at g_now; returns the immediate response length (0 = none yet) and keeps it in g_resp. */
-static size_t send(const uint8_t *req, size_t len)
-{
-    g_resp_len = udsota_on_request(&srv, req, len, g_resp, sizeof g_resp, g_now);
-    return g_resp_len;
-}
-
-/* Polls every 10 ms until a final response, asserting each interim one is 7F 36 78; fails after 100 s. */
-static size_t finish_job(unsigned *pending_out)
-{
-    unsigned pending = 0;
-    for (uint32_t waited = 0; waited < 100000u; waited += 10u) {
-        g_now += 10u;
-        const size_t n = udsota_poll(&srv, g_resp, sizeof g_resp, g_now);
-        if (n == 3u && g_resp[0] == UDSOTA_NEG_RESPONSE && g_resp[2] == UDSOTA_NRC_RESPONSE_PENDING) {
-            TEST_ASSERT_EQUAL_HEX8(UDSOTA_SID_TRANSFER_DATA, g_resp[1]);
-            pending++;
-            continue;
-        }
-        if (n > 0u) {
-            g_resp_len = n;
-            if (pending_out != NULL) *pending_out = pending;
-            return n;
-        }
-    }
-    TEST_FAIL_MESSAGE("the 0x36 job never finished");
-    return 0;
-}
-
 /* Sends 36 <bsc> with len pattern bytes (byte i = bsc*7 + i); returns the immediate response length. */
 static size_t send_block(uint8_t bsc, size_t len)
 {
@@ -197,24 +148,7 @@ static size_t send_block(uint8_t bsc, size_t len)
 static size_t transfer(uint8_t bsc, size_t len, unsigned *pending_out)
 {
     if (pending_out != NULL) *pending_out = 0;
-    return send_block(bsc, len) != 0u ? g_resp_len : finish_job(pending_out);
-}
-
-/* 10 02, then 27 03 / 27 04 with the mock key: programming session, level 03 unlocked. */
-static void enter_programming(void)
-{
-    const uint8_t sess[] = {UDSOTA_SID_SESSION, UDSOTA_SESSION_PROGRAMMING};
-    send(sess, sizeof sess);
-    TEST_ASSERT_EQUAL_HEX8(0x50, g_resp[0]);
-    TEST_ASSERT_EQUAL_HEX8(0x02, g_resp[1]);
-    const uint8_t seed_req[] = {UDSOTA_SID_SECURITY, UDSOTA_SA_SEED_PROGRAMMING};
-    send(seed_req, sizeof seed_req);
-    TEST_ASSERT_EQUAL_UINT(2u + UDSOTA_SEED_LEN, g_resp_len);
-    TEST_ASSERT_EQUAL_HEX8(0x67, g_resp[0]);
-    uint8_t key[2u + UDSOTA_KEY_LEN] = {UDSOTA_SID_SECURITY, UDSOTA_SA_KEY_PROGRAMMING};
-    udsota_mock_key_for(&g_resp[2], UDSOTA_SA_SEED_PROGRAMMING, &key[2]);
-    send(key, sizeof key);
-    EXPECT(0x67, 0x04);
+    return send_block(bsc, len) != 0u ? g_resp_len : finish_job(pending_out, UDSOTA_SID_TRANSFER_DATA);
 }
 
 /* Builds a 34 request with the given DFI, ALFID, address and size into r (UDSOTA_DL_REQ_LEN bytes). */
@@ -230,17 +164,8 @@ static void build_34(uint8_t *r, uint8_t dfi, uint8_t alfid, uint32_t addr, uint
 /* Sends 34 00 44 <addr 0> <size> and asserts 74 20 0F FF. */
 static void request_download(uint32_t size)
 {
-    uint8_t r[UDSOTA_DL_REQ_LEN];
-    build_34(r, UDSOTA_DL_DFI, UDSOTA_DL_ALFID, 0u, size);
-    send(r, sizeof r);
+    send_34(UDSOTA_DL_DFI, size);
     EXPECT(0x74, 0x20, 0x0F, 0xFF);
-}
-
-/* Sends 37 and returns the immediate response length. */
-static size_t send_exit(void)
-{
-    const uint8_t r[] = {UDSOTA_SID_TRANSFER_EXIT};
-    return send(r, sizeof r);
 }
 
 /* 34 opens a download: 74 20 0F FF, counter 1, nothing received, verified cleared, F1F1 reset, flash untouched. */
@@ -285,7 +210,7 @@ static void test_download_needs_programming_and_key(void)
     build_34(r, UDSOTA_DL_DFI, UDSOTA_DL_ALFID, 0u, 4096u);
     send(r, sizeof r);  EXPECT(0x7F, 0x34, 0x7F);
     send_block(1, 16);  EXPECT(0x7F, 0x36, 0x7F);
-    send_exit();        EXPECT(0x7F, 0x37, 0x7F);
+    send_37();          EXPECT(0x7F, 0x37, 0x7F);
     const uint8_t sess[] = {UDSOTA_SID_SESSION, UDSOTA_SESSION_PROGRAMMING};
     send(sess, sizeof sess);
     send(r, sizeof r);  EXPECT(0x7F, 0x34, 0x33);
@@ -427,7 +352,7 @@ static void test_example_first_block_accepted(void)
     enter_programming();
     request_download(TWO_BLOCKS);
     TEST_ASSERT_EQUAL_UINT(0, send_example_first_block(UDSOTA_IMG_DESC_MAGIC));   /* a job: erase, then write */
-    finish_job(NULL);
+    finish_job(NULL, UDSOTA_SID_TRANSFER_DATA);
     EXPECT(0x76, 0x01);
     TEST_ASSERT_EQUAL_STRING("CBW", m.log);
     TEST_ASSERT_EQUAL_UINT(1, m.writes);
@@ -475,7 +400,7 @@ static void test_repeat_of_final_block_is_not_overrun(void)
     EXPECT(0x76, 0x02);
     TEST_ASSERT_EQUAL_UINT(2, m.writes);
     TEST_ASSERT_TRUE(srv.download_active);
-    send_exit();
+    send_37();
     EXPECT(0x77);
 }
 
@@ -585,12 +510,12 @@ static void test_transfer_exit_checks_byte_count(void)
     enter_programming();
     request_download(UDSOTA_DL_MAX_DATA + 50u);
     transfer(0x01, UDSOTA_DL_MAX_DATA, NULL);
-    send_exit();
+    send_37();
     EXPECT(0x7F, 0x37, 0x24);
     TEST_ASSERT_TRUE(srv.download_active);
     transfer(0x02, 50u, NULL);
     EXPECT(0x76, 0x02);
-    send_exit();
+    send_37();
     EXPECT(0x77);
     TEST_ASSERT_FALSE(srv.download_active);
     TEST_ASSERT_TRUE(srv.ota_open);                       /* FF01 closes the handle with engine.verify */
@@ -598,7 +523,7 @@ static void test_transfer_exit_checks_byte_count(void)
     TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_OK, srv.last_dl.reason_code);
     TEST_ASSERT_EQUAL_UINT32(UDSOTA_DL_MAX_DATA + 50u, srv.last_dl.bytes_received);
     TEST_ASSERT_EQUAL_UINT(0, m.aborts);
-    send_exit();
+    send_37();
     EXPECT(0x7F, 0x37, 0x24);                             /* nothing open any more */
 }
 
@@ -620,7 +545,7 @@ static void test_new_download_releases_unverified_image(void)
     enter_programming();
     request_download(16u);
     transfer(0x01, 16u, NULL);
-    send_exit();
+    send_37();
     EXPECT(0x77);
     TEST_ASSERT_TRUE(srv.ota_open);
     request_download(32u);
@@ -646,7 +571,7 @@ static void test_requests_during_job(void)
     EXPECT(0x7E, 0x00);
     send_block(0x01, UDSOTA_DL_MAX_DATA);                    /* an impatient resend of the same block */
     EXPECT(0x7F, 0x36, 0x21);
-    finish_job(NULL);
+    finish_job(NULL, UDSOTA_SID_TRANSFER_DATA);
     EXPECT(0x76, 0x01);
     TEST_ASSERT_EQUAL_UINT(1, m.writes);
 }
@@ -857,7 +782,7 @@ static void test_unverify_precedes_old_handle_abort(void)
     enter_programming();
     request_download(16u);
     transfer(0x01, 16u, NULL);
-    send_exit();
+    send_37();
     EXPECT(0x77);
     request_download(32u);
     TEST_ASSERT_EQUAL_UINT(2, m.unverifies);
@@ -904,7 +829,7 @@ static void test_null_unverify_op_is_safe(void)
     TEST_ASSERT_FALSE(srv.slot_verified);
     transfer(0x01, 16u, NULL);
     EXPECT(0x76, 0x01);
-    send_exit();
+    send_37();
     EXPECT(0x77);
     TEST_ASSERT_EQUAL_UINT(0, m.unverifies);
 }
