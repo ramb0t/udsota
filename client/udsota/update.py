@@ -2,9 +2,8 @@
 the keyed reset. Every product-specific step comes from the profile."""
 import contextlib
 import time
-import zlib
 
-from .delta import build as build_delta, validation_hash
+from .delta import build as build_delta, deflate, validation_hash
 from .errors import NoResponse, Nrc, Refused, SendFailed, UpdateFailed
 from .image import parse_image
 from .keys import DeviceKeys, SigningKeys
@@ -100,12 +99,6 @@ def block_failed(uds, n, e):
     if isinstance(e, SendFailed):
         return type(e)("block %d: %s; %s" % (n, e, last_result(uds)))
     return type(e)("block %d: %s" % (n, e))
-
-
-# The image as a raw DEFLATE stream (RFC 1951, no zlib header), level 9: what a 34 with DFI 0x10 announces.
-def deflate(image):
-    c = zlib.compressobj(9, zlib.DEFLATED, -15)
-    return c.compress(image) + c.flush()
 
 
 # Why the server refused a compressed RequestDownload with nrc: (reason, the error a "deflate" run raises). 0x31 is a
