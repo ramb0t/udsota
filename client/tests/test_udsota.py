@@ -1585,6 +1585,11 @@ class FakeTransport:
     def __init__(self, server, interface):
         self.server, self.interface = server, interface
 
+    # A cli.main transport factory that opens this class on server.
+    @classmethod
+    def on(cls, server):
+        return lambda prof, interface: cls(server, interface)
+
     # Enter the with-block.
     def __enter__(self):
         return self
@@ -1636,19 +1641,18 @@ def test_main_refuses_before_opening_the_bus(tmp_path, full_path):
 # Check `info` runs end to end through main with the built-in example profile and exits 0.
 def test_main_info_end_to_end(capsys):
     d = FakeServer(security=False)
-    assert cli.main(["--profile", "example", "--interface", "vcan0", "info"],
-                    transport=lambda p, i: FakeTransport(d, i)) == 0
+    assert cli.main(["--profile", "example", "--interface", "vcan0", "info"], transport=FakeTransport.on(d)) == 0
     assert "F191 board: devkit" in capsys.readouterr().out
 
 
 # Check a short DID record or an answer for another service ends in exit 1 with a message, not a traceback.
 def test_main_maps_malformed_answers_to_exit_1(capsys):
     d = FakeServer(config={0xF1F0: b"\x01"})     # F1F0 too short for its 16-byte layout
-    assert cli.main(["--profile", "example", "info"], transport=lambda p, i: FakeTransport(d, i)) == 1
+    assert cli.main(["--profile", "example", "info"], transport=FakeTransport.on(d)) == 1
     assert "F1F0 is 1 bytes" in capsys.readouterr().err
     d = FakeServer()
     d.s22 = lambda req, did: [b"\x51\x01"]        # an ECUReset answer to a ReadDataByIdentifier
-    assert cli.main(["--profile", "example", "info"], transport=lambda p, i: FakeTransport(d, i)) == 1
+    assert cli.main(["--profile", "example", "info"], transport=FakeTransport.on(d)) == 1
     assert "unexpected answer" in capsys.readouterr().err
 
 
@@ -1801,8 +1805,7 @@ def test_main_ecdsa_reset(tmp_path):
     p.write_text(FULL_ECDSA)
     private, _ = keys.keygen(tmp_path / "keys")
     d = FakeServer(pubkey=keys.public_point(keys.load_private_key(private)))
-    assert cli.main(["--profile", str(p), "--private-key", str(private), "reset"],
-                    transport=lambda prof, i: FakeTransport(d, i)) == 0
+    assert cli.main(["--profile", str(p), "--private-key", str(private), "reset"], transport=FakeTransport.on(d)) == 0
     assert d.log == RESET
     assert cli.main(["--profile", str(p), "--private-key", str(tmp_path / "absent.pem"), "reset"],
                     transport=no_transport) == 2
@@ -2246,7 +2249,7 @@ def test_main_config_set_exit_codes(conf_path, capsys, server_kw, args, rc, text
     d = FakeServer(**server_kw)
     master = str(pathlib.Path(conf_path).parent / "master.bin")
     assert cli.main(["--profile", conf_path, "--master", master, "config", "set"] + args,
-                    transport=lambda p, i: FakeTransport(d, i)) == rc
+                    transport=FakeTransport.on(d)) == rc
     assert re.search(text, capsys.readouterr().err) and d.log[-1] == last
     assert d.nvs is None or d.nvs == CFG_VALUES
 
@@ -2254,7 +2257,7 @@ def test_main_config_set_exit_codes(conf_path, capsys, server_kw, args, rc, text
 # Check config show runs end to end through main without any master file and exits 0.
 def test_main_config_show_end_to_end(conf_path, capsys):
     d = FakeServer(cfg_keys=CFG_VALUES)
-    assert cli.main(["--profile", conf_path, "config", "show"], transport=lambda p, i: FakeTransport(d, i)) == 0
+    assert cli.main(["--profile", conf_path, "config", "show"], transport=FakeTransport.on(d)) == 0
     assert "0201 timeout_ms: 2000 (1000..5000)" in capsys.readouterr().out
 
 
@@ -2273,7 +2276,7 @@ def test_main_ecdsa_config_set(tmp_path, capsys):
     private, _ = keys.keygen(tmp_path / "keys")
     d = FakeServer(pubkey=keys.public_point(keys.load_private_key(private)), cfg_keys=CFG_VALUES)
     assert cli.main(["--profile", str(p), "--private-key", str(private), "config", "set", "mode=2", "--commit"],
-                    transport=lambda prof, i: FakeTransport(d, i)) == 0
+                    transport=FakeTransport.on(d)) == 0
     assert d.nvs[0x0200] == b"\x02" and d.log[:4] == UNLOCK_EXT
     master = tmp_path / "master.bin"
     master.write_bytes(MASTER)
@@ -2287,7 +2290,7 @@ def test_main_ecdsa_config_set(tmp_path, capsys):
 # the keys, not from a failed hash or status read.
 def test_main_config_show_without_config_writes(conf_path, capsys):
     d = FakeServer()
-    assert cli.main(["--profile", conf_path, "config", "show"], transport=lambda p, i: FakeTransport(d, i)) == 2
+    assert cli.main(["--profile", conf_path, "config", "show"], transport=FakeTransport.on(d)) == 2
     assert "this firmware has no config writes" in capsys.readouterr().err
     assert d.log == [(0x22, did) for did in (0x0200, 0x0201, 0x0202, 0x0203)]
 
@@ -2325,7 +2328,7 @@ def test_main_config_set_prerolls_the_restart(conf_path, monkeypatch):
 
     master = str(pathlib.Path(conf_path).parent / "master.bin")
     assert cli.main(["--profile", conf_path, "--master", master, "config", "set", "mode=2", "--commit", "--reset"],
-                    transport=lambda p, i: Counting(d, i)) == 0
+                    transport=Counting.on(d)) == 0
     assert len(prerolls) == 3 and d.cfg_keys[0x0200] == b"\x02"
 
 
@@ -2509,7 +2512,7 @@ def test_main_compress_on_a_server_without_it_exits_2(tmp_path, full_path, capsy
     master.write_bytes(MASTER)
     d = FakeServer()
     rc = cli.main(["--profile", full_path, "--master", str(master), "flash", "--compress", str(img)],
-                  transport=lambda prof, interface: FakeTransport(d, interface))
+                  transport=FakeTransport.on(d))
     assert rc == 2 and "the server has no compressed downloads" in capsys.readouterr().err
 
 
@@ -2660,7 +2663,7 @@ def test_main_diff_flag_misuse(tmp_path, full_path, capsys):
     img.write_bytes(DELTA_NEW)
     (tmp_path / "empty").mkdir()
     d = delta_server()
-    tr = lambda prof, interface: FakeTransport(d, interface)   # noqa: E731
+    tr = FakeTransport.on(d)
     assert cli.main(["--profile", full_path, "flash", str(img), "--diff-format", "deflate"], transport=tr) == 2
     assert "--diff-format needs --diff-from" in capsys.readouterr().err
     pytest.importorskip("detools")                              # load_bases checks for it before the directory
@@ -2686,7 +2689,7 @@ def test_main_drop_76_with_diff_from(tmp_path, full_path, capsys):
     base.write_bytes(DELTA_BASE)
     d = delta_server()
     rc = cli.main(["--profile", full_path, "flash", str(img), "--diff-from", str(base), "--drop-76", "2"],
-                  transport=lambda prof, interface: FakeTransport(d, interface))
+                  transport=FakeTransport.on(d))
     assert rc == 2 and d.dfis == []
     assert "--drop-76 is for full and compressed downloads" in capsys.readouterr().err
 
@@ -2766,7 +2769,7 @@ def test_main_diff_from_a_directory(tmp_path, full_path, capsys, monkeypatch):
     (bases / "resigned.img").write_bytes(resigned(DELTA_BASE))
     d = delta_server(boot_silence=0, confirm_refusals=0)
     rc = cli.main(["--profile", full_path, "--master", str(master), "flash", str(img), "--diff-from", str(bases),
-                   "--compress-auto"], transport=lambda prof, interface: FakeTransport(d, interface))
+                   "--compress-auto"], transport=FakeTransport.on(d))
     assert rc == 0 and d.dfis == [0x30] and bytes(d.written) == DELTA_NEW
     assert "delta base: %s" % (bases / "v0.2.0.bin") in capsys.readouterr().out
     assert cli.main(["--profile", full_path, "--master", str(master), "flash", str(img), "--diff-from",
