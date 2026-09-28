@@ -2,15 +2,16 @@
 the keyed reset. Every product-specific step comes from the profile."""
 import contextlib
 import time
+import zlib
 
 from .errors import NoResponse, Nrc, Refused, SendFailed, UpdateFailed
 from .image import parse_image
 from .keys import DeviceKeys, SigningKeys
 from .wire import (DID_COUNTERS, DID_DEVICE_ID, DID_RESULT, DID_RUNNING_SHA, DID_SESSION, DID_STATUS, DID_VERSION,
-                   IMG_PENDING_VERIFY, IMG_STATES, NRC_CONDITIONS, NRC_OUT_OF_RANGE, NRC_PROGRAMMING_FAILURE,
-                   NRC_SEQUENCE, OTHER_VERIFIED, RID_ACTIVATE, RID_CHECK_DEPS, RID_CONFIRM, SESSION_EXTENDED,
-                   SESSION_PROGRAMMING, cstr, decode_counters, decode_result, decode_status, describe_status,
-                   reason_name)
+                   DL_DFI, DL_DFI_DEFLATE, IMG_PENDING_VERIFY, IMG_STATES, NRC_CONDITIONS, NRC_OUT_OF_RANGE,
+                   NRC_PROGRAMMING_FAILURE, NRC_SEQUENCE, OTHER_VERIFIED, RID_ACTIVATE, RID_CHECK_DEPS, RID_CONFIRM,
+                   SESSION_EXTENDED, SESSION_PROGRAMMING, cstr, decode_counters, decode_result, decode_status,
+                   describe_status, reason_name)
 
 REBOOT_WAIT_S = 3.0
 BOOT_TIMEOUT_S = 60.0
@@ -64,22 +65,78 @@ def send_block(uds, bsc, chunk):
         uds.transfer(bsc, chunk)
 
 
-# RequestDownload, every 0x36 block (counter from 1, wrapping 0xFF -> 0x00) and RequestTransferExit.
-# drop_76 = N resends block N once as if its 76 were lost; an N past the last block is refused before any 0x36.
-def download(uds, image, drop_76=None, log=print):
-    max_data = uds.request_download(len(image))
-    total = (len(image) + max_data - 1) // max_data
+# The image as a raw DEFLATE stream (RFC 1951, no zlib header), level 9: what a 34 with DFI 0x10 announces.
+def deflate(image):
+    c = zlib.compressobj(9, zlib.DEFLATED, -15)
+    return c.compress(image) + c.flush()
+
+
+# Why the server refused a compressed RequestDownload with nrc: (reason, the error a "deflate" run raises). 0x31 is a
+# server without compressed downloads, or an image larger than its slot, which the same check refuses; 0x22 with F1F1
+# DL_NO_MEMORY is one without memory for the inflater now. None for any other refusal, which is not about compression.
+def compressed_refusal(uds, nrc):
+    if nrc.code == NRC_OUT_OF_RANGE:
+        why = "the server has no compressed downloads, or the image is larger than its slot"
+        return why, Refused("%s (RequestDownload with DFI 0x10 answered 0x31); flash without --compress, or with "
+                            "--compress-auto" % why)
+    if nrc.code == NRC_CONDITIONS and decode_result(uds.read_did(DID_RESULT))[0] == "DL_NO_MEMORY":
+        why = "the server has no memory for a compressed download now"
+        return why, UpdateFailed("%s (RequestDownload with DFI 0x10 answered 0x22, F1F1 DL_NO_MEMORY); a plain flash, "
+                                 "without --compress, may work" % why)
+    return None
+
+
+# RequestDownload for image, compressed unless compress is "none": returns (payload, max_data), payload being what the
+# 0x36 blocks carry. The 34 announces the image's own size either way. A compressed 34 the server refuses for a reason
+# compressed_refusal names stops a "deflate" run there, and an "auto" run sends the image uncompressed instead.
+def open_download(uds, image, compress, log=print):
+    if compress == "none":
+        return image, uds.request_download(len(image))
+    payload = deflate(image)
+    try:
+        max_data = uds.request_download(len(image), DL_DFI_DEFLATE)
+    except Nrc as e:
+        refusal = compressed_refusal(uds, e)
+        if refusal is None:
+            raise
+        if compress != "auto":
+            raise refusal[1] from e
+        log("%s: sending the image uncompressed" % refusal[0])
+        return image, uds.request_download(len(image), DL_DFI)
+    log("compressed with raw DEFLATE: %d -> %d bytes (%.0f%%)" % (len(image), len(payload),
+                                                                 100.0 * len(payload) / len(image)))
+    return payload, max_data
+
+
+# RequestDownload, every 0x36 block (counter from 1, wrapping 0xFF -> 0x00) and RequestTransferExit, the image
+# compressed per compress (open_download). drop_76 = N resends block N once as if its 76 were lost; an N past the
+# last block is refused before any 0x36. A compressed download ends with the time the compression saved.
+def download(uds, image, drop_76=None, log=print, compress="none", clock=time.monotonic):
+    payload, max_data = open_download(uds, image, compress, log=log)
+    total = (len(payload) + max_data - 1) // max_data
     if drop_76 is not None and drop_76 > total:
-        raise Refused("--drop-76 %d: the image is only %d blocks of %d bytes" % (drop_76, total, max_data))
-    for n in range(1, total + 1):
-        chunk = image[(n - 1) * max_data:n * max_data]
-        send_block(uds, n & 0xFF, chunk)
-        if n == drop_76:
-            log("--drop-76: resending block %d as if its 76 were lost" % n)
+        raise Refused("--drop-76 %d: the download is only %d blocks of %d bytes" % (drop_76, total, max_data))
+    start = clock()
+    try:
+        for n in range(1, total + 1):
+            chunk = payload[(n - 1) * max_data:n * max_data]
             send_block(uds, n & 0xFF, chunk)
-        if n % 32 == 0 or n == total:
-            log("sent %d of %d bytes" % (min(n * max_data, len(image)), len(image)))
-    transfer_exit(uds, len(image), log=log)
+            if n == drop_76:
+                log("--drop-76: resending block %d as if its 76 were lost" % n)
+                send_block(uds, n & 0xFF, chunk)
+            if n % 32 == 0 or n == total:
+                log("sent %d of %d bytes" % (min(n * max_data, len(payload)), len(payload)))
+        transfer_exit(uds, len(payload), log=log)
+    except Nrc as e:
+        if payload is image:
+            raise
+        raise UpdateFailed("%s; the last-result DID F1F1 reads %s" % (e, decode_result(uds.read_did(DID_RESULT))[0])) \
+            from e
+    if payload is not image:
+        took = clock() - start
+        log("sent %d compressed bytes in %.1f s; the %d-byte image would take about %.1f s, so about %.1f s saved"
+            % (len(payload), took, len(image), took * len(image) / len(payload),
+               took * (len(image) - len(payload)) / len(payload)))
 
 
 # RequestTransferExit, resent once after a plain timeout. A resend refused with 0x24 means the first 0x37
@@ -203,9 +260,10 @@ def read_status_precheck(uds):
 # `flash`: precheck, programming session (and unlock), download, FF01, ActivateImage, the restart and
 # ConfirmImage. Returns 0 or raises ToolError. secret is the master or private key (make_keys), unused when the
 # profile has no [security]. quiet() is entered once an update is needed and held until the end (the transport's
-# bus quieting).
+# bus quieting). compress is "none", "deflate" or "auto" (download); None takes the profile's [image] compression.
 def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep=time.sleep,
-          clock=time.monotonic, log=print, quiet=contextlib.nullcontext):
+          clock=time.monotonic, log=print, quiet=contextlib.nullcontext, compress=None):
+    compress = profile.compression if compress is None else compress
     img = parse_image(profile, image)
     board_of = profile.board_names.get(img.hw_id, "hw_id %d" % img.hw_id)
     log("image %s for %s, %d bytes, app_elf_sha256 %s" % (img.version, board_of, img.size, img.elf_sha[:8].hex()))
@@ -232,7 +290,7 @@ def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep
         need_download, recovered, resent = not verified, False, False
         while True:
             if need_download:
-                download(uds, image, drop_76=drop_76, log=log)
+                download(uds, image, drop_76=drop_76, log=log, compress=compress, clock=clock)
                 check_image(uds, log=log)
                 drop_76 = None                    # the fault injection applies to the first download only
             try:

@@ -1,12 +1,13 @@
 # udsota_demo_server: the portable core (udsota_core, isotp) on Linux over SocketCAN or a stdin/stdout frame
 # pipe, with fake_engine's file-backed A/B slots behind the ESP32 port's first-block check and the core's image
-# rules. Built from the root CMakeLists.txt on Linux only. client/tests/test_e2e_*.py drive it with the client.
+# rules, and compressed downloads over udsota_inflate's vendored tinfl. Built from the root CMakeLists.txt on Linux
+# only. client/tests/test_e2e_*.py drive it with the client.
 add_executable(udsota_demo_server
     demo_server.c demo_engine.c demo_can.c hmac_sha256_host.c
     ${CORE_DIR}/test/fake_engine.c ${CORE_DIR}/test/sha256_host.c ${ESP32_DIR}/udsota_esp32_image.c)
 target_include_directories(udsota_demo_server PRIVATE ${CMAKE_CURRENT_LIST_DIR} ${CORE_DIR}/test ${ESP32_DIR}/include)
 target_compile_options(udsota_demo_server PRIVATE -Wall -Wextra -Werror)
-target_link_libraries(udsota_demo_server PRIVATE udsota_core)
+target_link_libraries(udsota_demo_server PRIVATE udsota_core udsota_inflate)
 
 # The host HMAC under udsota_keys.c's known answers (RFC 4231 TC2 and both derivations).
 add_test(NAME udsota_demo_server_self_test COMMAND udsota_demo_server --self-test)

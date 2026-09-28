@@ -128,10 +128,11 @@ class Uds:
         if any(seed):
             self.request(services.SecurityAccess, seed_level + 1, keys.key(seed, seed_level))
 
-    # RequestDownload of size bytes at address 0; returns the data bytes per 0x36 block.
-    def request_download(self, size):
+    # RequestDownload of size bytes at address 0, in data format dfi (DL_DFI_DEFLATE: the blocks carry a raw DEFLATE
+    # stream of those size bytes); returns the data bytes per 0x36 block.
+    def request_download(self, size, dfi=DL_DFI):
         d = self.request(services.RequestDownload,
-                         data=bytes([DL_DFI, DL_ALFID]) + (0).to_bytes(4, "big") + size.to_bytes(4, "big"))
+                         data=bytes([dfi, DL_ALFID]) + (0).to_bytes(4, "big") + size.to_bytes(4, "big"))
         n = d[0] >> 4 if d else 0
         if n == 0 or len(d) < 1 + n:
             raise UpdateFailed("bad RequestDownload response %s" % d.hex())

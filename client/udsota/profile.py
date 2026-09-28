@@ -15,7 +15,7 @@ SLOT_SIZE_DEFAULT = 0x400000   # UDSOTA_SLOT_SIZE_DEFAULT
 KEYS = {"can": {"interface", "req_id", "resp_id", "deny_tx"},
         "security": {"mode", "label", "master_file", "private_key_file", "device_id_did", "level_extended",
                      "level_programming"},
-        "image": {"product", "hw_ids", "layout_id", "slot_size"},
+        "image": {"product", "hw_ids", "layout_id", "slot_size", "compression"},
         "board": {"did", "names"},
         "busy": {"id", "byte", "values"},
         "preroll": {"tester_present_frames"},
@@ -27,6 +27,7 @@ HASH_KEYS = {"did", "first", "last", "schema"}
 
 
 SECURITY_MODES = {"hmac": ("label", "master_file"), "ecdsa": ("private_key_file",)}   # mode: its required keys
+COMPRESSION = ("none", "deflate", "auto")   # [image] compression: --no-compress, --compress and --compress-auto
 
 
 # [security]: the 0x27 keys and the seed levels. Mode "hmac" (the default) derives the keys, K_dev = HMAC(master,
@@ -104,6 +105,7 @@ class Profile:
     func_id: int | None = None      # [functional] id: the only other ID the tool may transmit on
     quiet_bus: bool = False         # [functional] quiet_bus: silence the bus's other nodes while flashing
     config: ConfigSpec | None = None   # [config]: config set's commit routine, status DID and hash check
+    compression: str = "none"       # [image] compression: "none", "deflate" or "auto", as flash's compress
 
 
 # Raise Refused naming the profile and the problem.
@@ -278,6 +280,9 @@ def from_dict(name, d):
     if busy_t is not None:
         busy = BusyDetector(_int(name, busy_t, "id", 0, 0x7FF, required=True),
                             _int(name, busy_t, "byte", 0, 7, required=True), _ints(name, busy_t, "values", 0, 0xFF))
+    compression = _str(name, img_t, "compression") or "none"
+    if compression not in COMPRESSION:
+        _bad(name, "[image] compression must be one of %s" % ", ".join(COMPRESSION))
     dids = tuple(_did_entry(name, key, entry) for key, entry in d.get("dids", {}).items())
     names = [e.name for e in dids if e.writable]
     for n in names:
@@ -291,7 +296,7 @@ def from_dict(name, d):
                    board_did=None if board_t is None else _int(name, board_t, "did", 0, 0xFFFF, required=True),
                    board_names=board_names, busy=busy,
                    preroll_frames=_int(name, d.get("preroll", {}), "tester_present_frames", 0, 64, default=0),
-                   dids=dids, func_id=func_id,
+                   dids=dids, func_id=func_id, compression=compression,
                    quiet_bus=func_t is not None and _bool(name, func_t, "quiet_bus", False),
                    config=_config(name, d.get("config")))
 

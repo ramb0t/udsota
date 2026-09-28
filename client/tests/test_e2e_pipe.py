@@ -1,6 +1,7 @@
 """End-to-end tests: the client (cli.main, update.flash and the Uds layer, over can-isotp's Python ISO-TP stack)
 against the real server core in tools/linux_server's udsota_demo_server, whose frames travel over its stdin and
 stdout. No vcan or kernel ISO-TP needed; skipped when the demo is not built."""
+import random
 import subprocess
 import threading
 import tomllib
@@ -367,3 +368,160 @@ def test_lost_response_pending_on_a_long_job(demo, tmp_path):
     s.drop = lambda m: is_nrc(m, 0x36, 0x78) and not s.dropped
     assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash",
                        image_file(tmp_path, build_image("v0.2.0"))]) == 0
+
+
+# ---- compressed downloads (DFI 0x10) ----
+
+# The demo's arguments and an image that compresses about as a real app does, 48 KB of segment 0.
+def z_image(version="v0.2.0", **kw):
+    return build_image(version, payload=48 * 1024, noise=True, **kw)
+
+
+# True for the first frame of a 34 the client sends with dataFormatIdentifier dfi.
+def is_34(msg, dfi):
+    return msg.data[0] >> 4 == 1 and msg.data[2:4] == bytes([0x34, dfi])
+
+
+# Check `flash --compress` runs the whole sequence with a raw DEFLATE stream: 34 announces DFI 0x10, fewer blocks
+# go out, the new image runs, F1F1 counted the compressed bytes, and the output gives the ratio and the time saved.
+def test_flash_compressed_runs_the_whole_sequence(demo, tmp_path, capsys):
+    s = demo()
+    sent = []
+    s.tap = sent.append
+    image = z_image()
+    zlen = len(update.deflate(image))
+    assert zlen < 0.7 * len(image)
+    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash", image_file(tmp_path, image),
+                       "--compress"]) == 0
+    assert any(is_34(m, wire.DL_DFI_DEFLATE) for m in sent) and not any(is_34(m, wire.DL_DFI) for m in sent)
+    out = capsys.readouterr().out
+    assert "compressed with raw DEFLATE: %d -> %d bytes" % (len(image), zlen) in out and "s saved" in out
+    status, sha, version = read_state(s)
+    assert (status["running_slot"], status["running_state"], version) == (1, VALID, "v0.2.0")
+    assert sha == elf_sha(image)
+
+
+# Check `--compress` against a server built without a decompressor stops with exit 2 and the cause, having written
+# nothing; `--compress-auto` falls back to the uncompressed download and completes.
+def test_compress_on_a_server_without_it(demo, tmp_path, capsys):
+    s = demo("--no-compress")
+    path = image_file(tmp_path, z_image())
+    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash", path, "--compress"]) == 2
+    assert "the server has no compressed downloads" in capsys.readouterr().err
+    assert read_state(s)[0]["other_state"] == 0
+    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash", path, "--compress-auto"]) == 0
+    assert "sending the image uncompressed" in capsys.readouterr().out
+    assert read_state(s)[2] == "v0.2.0"
+
+
+# Check a profile's [image] compression = "deflate" compresses without the flag.
+def test_profile_compression(demo, tmp_path):
+    s = demo()
+    text = (profile.PROFILE_DIR / "example.toml").read_text().replace("[image]\n", '[image]\ncompression = "deflate"\n')
+    _, path = write_profile(tmp_path, text)
+    sent = []
+    s.tap = sent.append
+    assert run_cli(s, ["--profile", path, "--interface", "pipe", "flash", image_file(tmp_path, z_image())]) == 0
+    assert any(is_34(m, wire.DL_DFI_DEFLATE) for m in sent)
+
+
+# Fault injection mid-stream: --drop-76 resends block 3 of the compressed stream, which the server answers again
+# without inflating it twice, and the image still verifies.
+def test_compressed_drop_76_mid_stream(demo, tmp_path):
+    s = demo()
+    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash", image_file(tmp_path, z_image()),
+                       "--compress", "--drop-76", "3"]) == 0
+    assert [bytes(m.data[:3]) for m in s.sent].count(b"\x02\x76\x03") == 2
+    assert read_state(s)[2] == "v0.2.0"
+
+
+# Fault injection mid-stream: one consecutive frame of block 4 never reaches the server, whose ISO-TP receive times
+# out; the client, with no answer, resends the block and the stream carries on intact.
+def test_compressed_lost_frame_mid_stream(demo, tmp_path):
+    s = demo()
+    state = {"in_block_4": False}
+
+    def drop_tx(m):
+        if m.data[0] >> 4 == 1:                   # a first frame: note whether it opens block 4
+            state["in_block_4"] = m.data[2:4] == bytes([0x36, 0x04])
+            return False
+        return state["in_block_4"] and m.data[0] >> 4 == 2 and not s.dropped_tx and m.data[0] & 0x0F == 5
+
+    s.drop_tx = drop_tx
+    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash", image_file(tmp_path, z_image()),
+                       "--compress"]) == 0
+    assert len(s.dropped_tx) == 1
+    assert read_state(s)[2] == "v0.2.0"
+
+
+# Fault injection mid-stream: with slow worker jobs, block 2's 0x78 and 76 are lost; the client's resend meets 0x21
+# while the job runs, then the repeat's 76, and the update completes.
+def test_compressed_lost_answers_on_a_slow_job(demo, tmp_path):
+    s = demo("--job-ms", "1000")
+    s.drop = lambda m: (is_nrc(m, 0x36, 0x78) or is_block_answer(m, 2)) and len(s.dropped) < 2 and \
+        any(is_block_answer(x, 1) for x in s.sent)
+    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash", image_file(tmp_path, z_image()),
+                       "--compress"]) == 0
+    assert len(s.dropped) == 2
+    assert read_state(s)[2] == "v0.2.0"
+
+
+# Opens a compressed download of image on server and sends payload in blocks; returns the transport, the Uds and the
+# Nrc a block raised (None if all were taken).
+def send_stream(server, image, payload):
+    t = PipeTransport(EXAMPLE, server)
+    uds = t.uds()
+    uds.session(wire.SESSION_PROGRAMMING)
+    max_data = uds.request_download(len(image), wire.DL_DFI_DEFLATE)
+    for n, off in enumerate(range(0, len(payload), max_data), 1):
+        try:
+            uds.transfer(n & 0xFF, payload[off:off + max_data])
+        except Nrc as e:
+            return t, uds, e
+    return t, uds, None
+
+
+# Check a stream with 64 random bytes spliced in mid-way is refused at the block that trips the inflater: with this seed
+# the stream inflates past the announced size, so a 36 answers 0x31 with F1F1 DL_BAD_STREAM, and FF01 has nothing to
+# verify.
+def test_corrupt_stream_is_refused(demo):
+    s = demo()
+    image = z_image()
+    z = bytearray(update.deflate(image))
+    z[len(z) // 2:len(z) // 2 + 64] = random.Random(7).randbytes(64)
+    t, uds, nrc = send_stream(s, image, z)
+    with t:
+        assert nrc is not None and nrc.code == wire.NRC_OUT_OF_RANGE
+        assert wire.decode_result(uds.read_did(wire.DID_RESULT))[0] == "DL_BAD_STREAM"
+        with pytest.raises(Nrc) as e:
+            uds.routine(wire.RID_CHECK_DEPS)
+        assert e.value.code == wire.NRC_SEQUENCE
+
+
+# Check a stream cut short passes every block but fails 37 with 0x72 and F1F1 DL_BAD_STREAM, and FF01 then has
+# nothing to verify.
+def test_truncated_stream_fails_transfer_exit(demo):
+    s = demo()
+    image = z_image()
+    t, uds, nrc = send_stream(s, image, update.deflate(image)[:-20])
+    with t:
+        assert nrc is None
+        with pytest.raises(Nrc) as e:
+            uds.transfer_exit()
+        assert e.value.code == wire.NRC_PROGRAMMING_FAILURE
+        assert wire.decode_result(uds.read_did(wire.DID_RESULT))[0] == "DL_BAD_STREAM"
+        with pytest.raises(Nrc) as e:
+            uds.routine(wire.RID_CHECK_DEPS)
+        assert e.value.code == wire.NRC_SEQUENCE
+
+
+# Check the first-block rules run on the inflated bytes: a compressed image for another product is refused with
+# 0x31 and DL_BAD_PROJECT before anything is erased.
+def test_compressed_first_block_rules_refuse(demo):
+    s = demo()
+    image = z_image(product="widget")
+    t, uds, nrc = send_stream(s, image, update.deflate(image))
+    with t:
+        assert nrc is not None and nrc.code == wire.NRC_OUT_OF_RANGE
+        assert wire.decode_result(uds.read_did(wire.DID_RESULT)) == ("DL_BAD_PROJECT", 0)
+        assert wire.decode_status(uds.read_did(wire.DID_STATUS))["other_state"] == 0

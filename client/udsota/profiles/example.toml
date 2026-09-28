@@ -13,6 +13,8 @@ product = "example"                   # esp_app_desc_t project name the image mu
 hw_ids = [1]                          # hw_id values in the udsota descriptor that this profile accepts
 layout_id = 1                         # partition layout ID the image must carry
 slot_size = 0x1E0000                  # largest image in bytes: examples/esp32's OTA slot (default 0x400000)
+# compression = "deflate"             # send the image as raw DEFLATE (DFI 0x10), as --compress does; "auto" as
+#                                     # --compress-auto, which falls back to uncompressed; default "none"
 
 [board]
 did = 0xF191                          # a DID the server answers with its board name (ASCII)

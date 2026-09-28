@@ -6,6 +6,7 @@ import hashlib
 import os
 import pathlib
 import queue
+import random
 import re
 import shutil
 import struct
@@ -57,11 +58,12 @@ def is_release(version):
     return re.fullmatch(r"v?[0-9]+\.[0-9]+\.[0-9]+", version) is not None
 
 
-# An image the demo accepts, byte for byte what `udsota_demo_server --make-image` writes: fake_ota_build_image's
+# An image the demo accepts, byte for byte what `udsota_demo_server --make-image` writes (unless noise: a segment
+# of pseudo-random text that compresses about as well as a real app): fake_ota_build_image's
 # one-segment ESP32-S3 image (esp_app_desc_t at 32, the udsota descriptor at 288, app_elf_sha256 = SHA-256 of the
 # version, checksum byte, appended SHA-256) with this product, layout and IDs.
 def build_image(version="v0.2.0", product="example", hw_id=1, layout=1, ids=(0x710, 0x718), payload=8192,
-                release=None):
+                release=None, noise=False):
     unpadded = 32 + payload
     padded = (unpadded + 1 + 15) & ~15
     img = bytearray(padded + 32)
@@ -76,8 +78,15 @@ def build_image(version="v0.2.0", product="example", hw_id=1, layout=1, ids=(0x7
     img[176:208] = hashlib.sha256(v).digest()                                   # app_elf_sha256
     flags = int(is_release(version) if release is None else release)
     struct.pack_into("<IHBBHHB", img, 288, 0x5544534F, 1, hw_id, layout, ids[0], ids[1], flags)
-    for i in range(320, unpadded):
-        img[i] = (i * 7 + 13) & 0xFF
+    rnd, i = random.Random(len(v) + payload), 320
+    while i < unpadded:   # noise: repeats of earlier runs and fresh bytes, which DEFLATE shrinks about as an app's
+        if not noise:
+            img[i], i = (i * 7 + 13) & 0xFF, i + 1
+        elif rnd.random() < 0.12 and i > 2000:
+            src, n = i - rnd.randrange(8, 2000), min(rnd.randrange(4, 16), unpadded - i)
+            img[i:i + n], i = img[src:src + n], i + n
+        else:
+            img[i], i = rnd.randrange(256), i + 1
     x = 0xEF
     for b in img[32:unpadded]:
         x ^= b
@@ -100,8 +109,8 @@ def parse_line(line):
 
 # udsota_demo_server in pipe mode: frames in on its stdin, out on its stdout, its log in log_path. For fault
 # injection, drop(msg) -> True keeps a response frame from the client (kept in dropped; release() hands one on
-# later), and tap(msg) sees every frame the client sends before the server does. Every frame the server sent is
-# kept in sent.
+# later), tap(msg) sees every frame the client sends before the server does, and drop_tx(msg) -> True keeps one
+# from the server (kept in dropped_tx). Every frame the server sent is kept in sent.
 class DemoServer:
     # Start binary with args; the log goes to log_path.
     def __init__(self, binary, args, log_path):
@@ -111,6 +120,7 @@ class DemoServer:
                                      stderr=self._log, bufsize=0)
         self.rx = queue.Queue()
         self.sent, self.dropped, self.drop, self.tap = [], [], None, None
+        self.dropped_tx, self.drop_tx = [], None
         self._wlock = threading.Lock()
         self._reader = threading.Thread(target=self._read, daemon=True)
         self._reader.start()
@@ -129,6 +139,9 @@ class DemoServer:
     def send(self, msg):
         if self.tap is not None:
             self.tap(msg)
+        if self.drop_tx is not None and self.drop_tx(msg):
+            self.dropped_tx.append(msg)
+            return
         line = "%03X#%s\n" % (msg.arbitration_id, bytes(msg.data).hex().upper())
         with self._wlock:
             self.proc.stdin.write(line.encode())
