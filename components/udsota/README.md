@@ -129,7 +129,7 @@ Every struct carries its own `ctx`, which is passed back to its callbacks. A NUL
 | `stmin_us(ctx)` | when a request's first frame arrives, for that message's flow control | `cfg.stmin_us` (2 ms) |
 | `reset(ctx)` | once the answer to 11 01 or ActivateImage has left (the transport's `tx_pending` reads 0, or after 100 ms); it returns only on failure, and the server then re-opens | in the core, 11 01 answers 0x11 and ActivateImage answers positive without a restart, so the new image boots at the next power cycle. The ESP32 port uses `esp_restart()` |
 | `comm_control(ctx, control, comm_type)` | for a 28 that passed the core's checks; returns 0 once the app has stopped or resumed its own frames as asked, else the NRC. Called again with 00 and 03 (enable everything) when the session returns to default after a change | 28 answers 0x11 |
-| `dtc_setting(ctx, on)` | after an accepted 85 01 or 85 02, and with `true` when the session returns to default after 85 02 | 85 is still answered: udsota records no DTCs, so there is nothing to stop |
+| `dtc_setting(ctx, on)` | after an accepted 85 01 or 85 02, and with `true` when the session returns to default after 85 02 | 85 answers 0x11, as before |
 
 The gate returns 0 to allow, or the NRC to send: 0x22 conditionsNotCorrect in general, a specific code where one fits (0x88 vehicleSpeedTooHigh, 0x90 shifterLeverNotInPark, 0x92/0x93 voltage too high or too low, all ISO 14229-1), or 0x21 busyRepeatRequest for a condition that clears by itself shortly.
 
@@ -178,9 +178,9 @@ Each 16-byte seed is single-use and valid for 30 s. What the tester sends back i
 
 Use ECDSA for a product. In the HMAC mode every device must be able to compute its own keys, so the port builds the fleet's master key into every image, and one leaked image or one flash dump unlocks every device. In the ECDSA mode a device stores nothing that makes a key: a dump yields a public key, and a signature for one seed only unlocks one level of one device, once. So keep the private key in an HSM or a signing service that answers seeds for authorised testers, never in a repository or an image. `udsota keygen` makes a key pair. The HMAC mode still suits a bench, or a fleet whose images and flash are protected (flash encryption) and whose master can be rotated.
 
-The ESP32 port serves `cfg.device_id` as F18C and binds the keys to it when it is set (1 to 16 bytes), otherwise to the 6-byte base MAC. It picks the ECDSA mode when `cfg.key_pubkey` is set (65 bytes, 04 ‖ X ‖ Y), and the HMAC mode when only `cfg.key_label` is. A software P-256 verify takes tens of milliseconds on chips without an ECC accelerator, such as the ESP32 and ESP32-S3, so a sendKey answer may come after P2 (50 ms). The udsota client waits 150 ms. For a tester that holds the server to its announced P2, raise `cfg.p2_ms`. A port for another platform sets `verify` to its own P-256 verify over the same message.
+The ESP32 port serves `cfg.device_id` as F18C and binds the keys to it when it is set (1 to 16 bytes), otherwise to the 6-byte base MAC. It picks the ECDSA mode when `cfg.key_pubkey` is set (65 bytes, 04 ‖ X ‖ Y), and the HMAC mode when only `cfg.key_label` is. A software P-256 verify takes tens of milliseconds on chips without an ECC accelerator, such as the ESP32 and ESP32-S3, so a sendKey answer may come after P2 (50 ms). The udsota client waits 150 ms. For a tester that holds the server to its announced P2, raise `cfg.p2_prog_ms` for `level_programming`, whose 27 03/04 run in the programming session, and `cfg.p2_ms` only for `level_extended`. A port for another platform sets `verify` to its own P-256 verify over the same message.
 
-Three wrong keys answer 0x36, then 0x37 for 10 s, and the same 10 s delay follows every boot. An unlock ends at a session change, an S3 timeout or a reset. When no key can be checked, security stays on and no key matches: sendKey answers 0x22 and counts no attempt. That happens with a label but no master (a CI build, say), with a public key that PSA refuses, or when the port's start-up self-test of its HMAC or ECDSA fails.
+Three wrong keys answer 0x36, then 0x37 for 10 s, and the same 10 s delay follows every boot. An unlock ends at a session change, an S3 timeout or a reset. When no key can be checked, security stays on and no key matches: sendKey answers 0x22 and counts no attempt. That happens with a label but no master (a CI build, say), with a public key that PSA refuses, when the port's start-up self-test of its HMAC or ECDSA fails, or when `udsota_init()` was given a `security` with neither `key` nor `verify`, which it also reports by returning false. A `security` with no `rng16` is refused the same way: requestSeed answers 0x22, so no seed is ever issued.
 
 With `security` NULL, or both `cfg.key_pubkey` and `cfg.key_label` NULL in the port, 27 answers 0x11, and the programming session, the download, activation and reset need no key.
 
@@ -225,7 +225,7 @@ The first 36 block is checked before anything is erased, and FF01 checks the who
 | 37 | RequestTransferExit | once every announced byte has arrived | programming | programming |
 | 3E | TesterPresent | 00; 80 suppresses the answer | any | – |
 | 28 | CommunicationControl (with `comm_control` only) | controlType 00–03 and a communicationType naming normal or network-management messages; answers `68 xx` | extended, programming | – |
-| 85 | ControlDTCSetting | 01 on, 02 off, with any option record; answers `C5 xx` | extended, programming | – |
+| 85 | ControlDTCSetting (with `dtc_setting` only) | 01 on, 02 off, with any option record; answers `C5 xx` | extended, programming | – |
 
 Any other SID answers 0x11. While a flash job runs, every request but 3E answers 0x21. The key column applies only with security on. A return to the default session, by 10 01, S3 or an end of session, undoes 28 and 85 through their hooks.
 
@@ -262,7 +262,7 @@ Every other DID goes to `did_read`, and so does any of these whose source is NUL
 
 | NRC | Name | udsota sends it for |
 |---|---|---|
-| 0x11 | serviceNotSupported | an unknown SID; 27 with security off; 11 01 with no `reset` hook; 28 with no `comm_control` hook |
+| 0x11 | serviceNotSupported | an unknown SID; 27 with security off; 11 01 with no `reset` hook; 28 with no `comm_control` hook; 85 with no `dtc_setting` hook |
 | 0x12 | subFunctionNotSupported | an unknown sub-function |
 | 0x13 | incorrectMessageLengthOrInvalidFormat | a wrong length, or more than one DID in a 22 |
 | 0x21 | busyRepeatRequest | any request but 3E while a flash job runs; or the gate's choice |

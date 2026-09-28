@@ -130,8 +130,8 @@ typedef struct {
  * when cfg->key_label is set, else off; a key_master given with a key_pubkey is ignored, with a warning,
  * and should be left out of the image. hooks may be NULL; a NULL hooks->reset
  * restarts with esp_restart(). Returns ESP_ERR_INVALID_ARG for a NULL cfg, can or can_send, or a set
- * device_id whose device_id_len is not 1 to UDSOTA_KEYS_ID_MAX (16), or a set func_id equal to req_id or
- * resp_id; ESP_ERR_INVALID_STATE on a second
+ * device_id whose device_id_len is not 1 to UDSOTA_KEYS_ID_MAX (16), a set key_pubkey that is not a 65-byte
+ * uncompressed point (04 || X || Y), or a set func_id equal to req_id or resp_id; ESP_ERR_INVALID_STATE on a second
  * call; and ESP_ERR_NO_MEM when an allocation or the task fails. Only a bad-argument failure may be
  * retried: after ESP_ERR_NO_MEM the updater stays off for this boot, and a second call returns
  * ESP_ERR_INVALID_STATE. When the buffers or frame queue cannot be allocated nothing else was started; when

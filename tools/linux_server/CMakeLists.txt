@@ -14,6 +14,12 @@ add_test(NAME udsota_demo_server_self_test COMMAND udsota_demo_server --self-tes
 add_test(NAME udsota_demo_server_pipe
          COMMAND sh -c "printf '710#0322F186\\n' | '$<TARGET_FILE:udsota_demo_server>'")
 set_tests_properties(udsota_demo_server_pipe PROPERTIES PASS_REGULAR_EXPRESSION "718#0462F18601AAAAAA")
+# --socketcan refuses an interface that is not vcan, before it opens any socket: lo, and a name that does not exist.
+add_test(NAME udsota_demo_server_refuses_real_bus
+         COMMAND sh -c "! '$<TARGET_FILE:udsota_demo_server>' --socketcan lo && \
+! '$<TARGET_FILE:udsota_demo_server>' --socketcan udsota_no_such_if")
+set_tests_properties(udsota_demo_server_refuses_real_bus PROPERTIES
+                     PASS_REGULAR_EXPRESSION "lo is not a vcan interface.*udsota_no_such_if is not a vcan interface")
 # An image from --make-image passes the port's first-block check as tools/image_check runs it.
 add_test(NAME udsota_demo_server_make_image
          COMMAND sh -c "'$<TARGET_FILE:udsota_demo_server>' --make-image '${CMAKE_CURRENT_BINARY_DIR}/demo.bin' \

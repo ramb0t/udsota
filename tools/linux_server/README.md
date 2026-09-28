@@ -43,7 +43,8 @@ A pipe carries no timing, so each frame's arrival stamp is the time the server r
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--socketcan IFACE` | the pipe | serve on a SocketCAN interface through a CAN_RAW socket that receives only the request ID |
+| `--socketcan IFACE` | the pipe | serve on a SocketCAN interface through a CAN_RAW socket that receives only the request ID. Only a vcan interface is accepted, by its rtnetlink link kind |
+| `--allow-real-bus` | off | let `--socketcan` open a real CAN interface. The demo then answers every tester on that bus |
 | `--req-id`, `--resp-id` | 0x710, 0x718 | the ID pair (11-bit) |
 | `--product`, `--hw-id`, `--layout-id` | example, 1, 1 | the identity the image rules expect (`cfg.product`, `cfg.hw_id`, `cfg.layout_id`) |
 | `--board NAME` | devkit | the board name F191 answers, which the example profile's precheck reads |

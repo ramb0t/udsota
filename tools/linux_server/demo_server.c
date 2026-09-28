@@ -38,6 +38,7 @@
 /* Everything the command line sets. */
 typedef struct {
     const char *iface;                /* NULL: the pipe */
+    bool        allow_real_bus;       /* --allow-real-bus: iface may be a CAN interface other than vcan */
     const char *state_dir;            /* NULL: a fresh temporary directory, removed at exit */
     bool        fresh;
     uint32_t    slot_size;
@@ -291,7 +292,8 @@ static void usage(FILE *out)
     fputs("usage: udsota_demo_server [--socketcan IFACE] [options]\n"
           "       udsota_demo_server --make-image OUT --version V [identity options] [--payload N]\n"
           "       udsota_demo_server --self-test\n"
-          "bus:      --socketcan IFACE (default: frames on stdin/stdout), --req-id 0x710, --resp-id 0x718\n"
+          "bus:      --socketcan IFACE (default: frames on stdin/stdout; vcan only unless --allow-real-bus),\n"
+          "          --req-id 0x710, --resp-id 0x718\n"
           "identity: --product example, --hw-id 1, --layout-id 1, --board devkit (F191), --chip-id 0x0009\n"
           "slots:    --state-dir DIR, --fresh, --slot-size 0x1E0000, --running-version v0.1.0, --no-rollback\n"
           "security: --label LABEL [--master FILE (32 bytes)], --device-id 02:00:00:00:00:01, --skip-boot-delay\n"
@@ -305,7 +307,7 @@ static bool parse_args(int argc, char **argv)
     enum {
         O_SOCKETCAN = 256, O_REQ, O_RESP, O_PRODUCT, O_HW, O_LAYOUT, O_BOARD, O_CHIP, O_DIR, O_FRESH, O_SLOT, O_RUNNING,
         O_NO_ROLLBACK, O_LABEL, O_MASTER, O_DEVID, O_SKIP_DELAY, O_BOOT_MS, O_JOB_MS, O_SOAK_MS, O_STMIN, O_BS,
-        O_MONITOR, O_MAKE, O_VERSION, O_PAYLOAD, O_SELF_TEST, O_HELP,
+        O_MONITOR, O_MAKE, O_VERSION, O_PAYLOAD, O_SELF_TEST, O_HELP, O_REAL_BUS,
     };
     static const struct option longopts[] = {
         {"socketcan", required_argument, NULL, O_SOCKETCAN}, {"req-id", required_argument, NULL, O_REQ},
@@ -322,6 +324,7 @@ static bool parse_args(int argc, char **argv)
         {"stmin-monitor", no_argument, NULL, O_MONITOR}, {"make-image", required_argument, NULL, O_MAKE},
         {"version", required_argument, NULL, O_VERSION}, {"payload", required_argument, NULL, O_PAYLOAD},
         {"self-test", no_argument, NULL, O_SELF_TEST}, {"help", no_argument, NULL, O_HELP},
+        {"allow-real-bus", no_argument, NULL, O_REAL_BUS},
         {NULL, 0, NULL, 0},
     };
     d.o = (opts_t){
@@ -339,6 +342,7 @@ static bool parse_args(int argc, char **argv)
         bool ok = true;
         switch (c) {
         case O_SOCKETCAN:   d.o.iface = optarg; break;
+        case O_REAL_BUS:    d.o.allow_real_bus = true; break;
         case O_REQ:         ok = num("req-id", optarg, 0, 0x7FF, &v); d.cfg.req_id = (uint16_t)v; break;
         case O_RESP:        ok = num("resp-id", optarg, 0, 0x7FF, &v); d.cfg.resp_id = (uint16_t)v; break;
         case O_PRODUCT:     d.cfg.product = optarg; break;
@@ -378,6 +382,11 @@ static bool parse_args(int argc, char **argv)
     }
     if (optind != argc) {
         usage(stderr);
+        return false;
+    }
+    if (d.o.iface != NULL && !d.o.allow_real_bus && !demo_can_is_vcan(d.o.iface)) {
+        fprintf(stderr, "udsota_demo_server: %s is not a vcan interface; a demo on a real bus would answer real "
+                "testers (--allow-real-bus to serve on it anyway)\n", d.o.iface);
         return false;
     }
     if (d.o.slot_size % FAKE_OTA_SECTOR != 0u) {

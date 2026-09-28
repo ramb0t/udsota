@@ -238,8 +238,8 @@ static void test_s3_timeout_undoes_28_and_85(void)
     TEST_ASSERT_EQUAL_UINT(2, s_dtc_calls);
 }
 
-/* 85: C5 <sub> with or without a hook and with an option record; SPRMIB silences it; a session change undoes 85 02
- * only. */
+/* 85 with the hook: C5 <sub> with an option record; SPRMIB silences it; a session change undoes 85 02 only.
+ * Without the hook 85 answers 0x11 physically, functionally nothing, and the hook-less server owes no restore. */
 static void test_dtc_setting(void)
 {
     TEST_ASSERT_EQUAL_UINT(6, PHYS(0x10, 0x03));
@@ -251,12 +251,67 @@ static void test_dtc_setting(void)
     TEST_ASSERT_EQUAL_UINT(6, PHYS(0x10, 0x01));
     TEST_ASSERT_EQUAL_UINT(2, s_dtc_calls);                   /* 85 01 left nothing to undo */
     g_hooks.dtc_setting = NULL;
-    udsota_init(&s, &g_cfg, &ENGINE, NULL, &g_hooks);
+    TEST_ASSERT_TRUE(udsota_init(&s, &g_cfg, &ENGINE, NULL, &g_hooks));
     TEST_ASSERT_EQUAL_UINT(6, PHYS(0x10, 0x03));
-    TEST_ASSERT_EQUAL_UINT(2, PHYS(0x85, 0x02));
-    EXPECT(0xC5, 0x02);
+    TEST_ASSERT_EQUAL_UINT(3, PHYS(0x85, 0x02));
+    EXPECT(0x7F, 0x85, 0x11);
+    TEST_ASSERT_EQUAL_UINT(0, FUNC(0x85, 0x02));
+    TEST_ASSERT_EQUAL_UINT(0, FUNC(0x85, 0x82));
+    TEST_ASSERT_FALSE(s.dtc_off);
     TEST_ASSERT_EQUAL_UINT(6, PHYS(0x10, 0x01));
     TEST_ASSERT_EQUAL_UINT(2, s_dtc_calls);
+}
+
+/* 85 with the hook, its checks in order: session 0x7F, then length 0x13, then sub-function 0x12; 85 01 is served in
+ * the programming session too. None of the refused ones reaches the hook. */
+static void test_dtc_setting_checks(void)
+{
+    TEST_ASSERT_EQUAL_UINT(3, PHYS(0x85, 0x02));
+    EXPECT(0x7F, 0x85, 0x7F);
+    TEST_ASSERT_EQUAL_UINT(3, PHYS(0x85));
+    EXPECT(0x7F, 0x85, 0x7F);
+    TEST_ASSERT_EQUAL_UINT(6, PHYS(0x10, 0x03));
+    TEST_ASSERT_EQUAL_UINT(3, PHYS(0x85));
+    EXPECT(0x7F, 0x85, 0x13);
+    TEST_ASSERT_EQUAL_UINT(3, PHYS(0x85, 0x03));
+    EXPECT(0x7F, 0x85, 0x12);
+    TEST_ASSERT_EQUAL_UINT(0, s_dtc_calls);
+    TEST_ASSERT_EQUAL_UINT(6, PHYS(0x10, 0x02));
+    TEST_ASSERT_EQUAL_UINT(2, PHYS(0x85, 0x01));
+    EXPECT(0xC5, 0x01);
+    TEST_ASSERT_EQUAL_UINT(1, s_dtc_calls);
+    TEST_ASSERT_TRUE(s_dtc_on);
+}
+
+/* With only comm_control set, a return to default restores 28 and 85 answers 0x11; with only dtc_setting set, it
+ * restores 85 and 28 answers 0x11. */
+static void test_default_session_restores_with_one_hook(void)
+{
+    g_hooks.dtc_setting = NULL;
+    TEST_ASSERT_TRUE(udsota_init(&s, &g_cfg, &ENGINE, NULL, &g_hooks));
+    TEST_ASSERT_EQUAL_UINT(6, PHYS(0x10, 0x03));
+    TEST_ASSERT_EQUAL_UINT(2, PHYS(0x28, 0x03, 0x01));
+    TEST_ASSERT_EQUAL_UINT(3, PHYS(0x85, 0x02));
+    EXPECT(0x7F, 0x85, 0x11);
+    TEST_ASSERT_EQUAL_UINT(6, PHYS(0x10, 0x01));
+    TEST_ASSERT_EQUAL_UINT(2, s_cc_calls);
+    TEST_ASSERT_EQUAL_HEX8(UDSOTA_CC_ENABLE_RX_TX, s_cc_control);
+    TEST_ASSERT_EQUAL_HEX8(UDSOTA_CC_TYPE_ALL, s_cc_type);
+    TEST_ASSERT_EQUAL_UINT(0, s_dtc_calls);
+
+    s_cc_calls = 0u;
+    g_hooks.comm_control = NULL;
+    g_hooks.dtc_setting = hook_dtc;
+    TEST_ASSERT_TRUE(udsota_init(&s, &g_cfg, &ENGINE, NULL, &g_hooks));
+    TEST_ASSERT_EQUAL_UINT(6, PHYS(0x10, 0x03));
+    TEST_ASSERT_EQUAL_UINT(3, PHYS(0x28, 0x03, 0x01));
+    EXPECT(0x7F, 0x28, 0x11);
+    TEST_ASSERT_EQUAL_UINT(2, PHYS(0x85, 0x02));
+    TEST_ASSERT_FALSE(s_dtc_on);
+    TEST_ASSERT_EQUAL_UINT(6, PHYS(0x10, 0x01));
+    TEST_ASSERT_TRUE(s_dtc_on);
+    TEST_ASSERT_EQUAL_UINT(2, s_dtc_calls);
+    TEST_ASSERT_EQUAL_UINT(0, s_cc_calls);
 }
 
 /* cfg.p2_prog_ms and p2star_prog_ms: 10 02 advertises them and the programming session's 0x78 follows them;
@@ -298,6 +353,8 @@ int main(void)
     RUN_TEST(test_default_session_reenables_communication);
     RUN_TEST(test_s3_timeout_undoes_28_and_85);
     RUN_TEST(test_dtc_setting);
+    RUN_TEST(test_dtc_setting_checks);
+    RUN_TEST(test_default_session_restores_with_one_hook);
     RUN_TEST(test_p2_per_session);
     return UNITY_END();
 }

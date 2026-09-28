@@ -31,7 +31,7 @@ Start reads these `udsota_config_t` fields for 0x27; the core README's [Security
 
 | Field | Mode | What |
 |---|---|---|
-| `key_pubkey`, `key_pubkey_len` | ECDSA | the tester's P-256 public key, uncompressed SEC1 (`04 ‖ X ‖ Y`, 65 bytes), as `udsota keygen` writes it in `udsota_pubkey.h`. It is public: the image holds no secret. Set, it turns security on in the ECDSA mode and wins over the fields below |
+| `key_pubkey`, `key_pubkey_len` | ECDSA | the tester's P-256 public key, uncompressed SEC1 (`04 ‖ X ‖ Y`, 65 bytes), as `udsota keygen` writes it in `udsota_pubkey.h`. It is public: the image holds no secret. Set, it turns security on in the ECDSA mode and wins over the fields below; a malformed one makes start return `ESP_ERR_INVALID_ARG` |
 | `key_label` | HMAC | turns security on in the HMAC mode when `key_pubkey` is NULL; K_dev = HMAC-SHA256(master, label ‖ device ID) |
 | `key_master`, `key_master_len` | HMAC | the fleet's master key, which every image then carries. NULL gives security with no key that matches. Given with `key_pubkey`, it is ignored and start logs a warning: leave it out of the image |
 | `device_id`, `device_id_len` | both | the device ID above |

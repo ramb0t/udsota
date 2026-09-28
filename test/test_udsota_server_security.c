@@ -690,6 +690,63 @@ static void test_verifier_needs_a_live_seed(void)
     TEST_ASSERT_EQUAL_INT(0, M.verify_calls);
 }
 
+/* init refuses a security with neither key nor verify (false), yet keeps security on: a sendKey answers 22 and
+ * counts no attempt, so no key ever unlocks, and 34 still needs the programming level (33). */
+static void test_init_refuses_security_without_key_or_verify(void)
+{
+    const udsota_config_t cfg = udsota_mock_cfg();
+    const udsota_hooks_t hooks = udsota_mock_hooks(&g_mock);
+    const udsota_security_t none = {.rng16 = mock_rng16, .ctx = &M};
+    TEST_ASSERT_FALSE(udsota_init(&S, &cfg, &ENGINE, &none, &hooks));
+    TEST_ASSERT_TRUE(S.secured);
+    uint8_t seed[16], key[16];
+    memset(key, 0, sizeof key);
+    enter(UDSOTA_SESSION_PROGRAMMING, T0);
+    for (uint32_t i = 0; i < 4u; i++) {
+        request_seed(0x03, T0 + 10u * i + 1u, seed);
+        send_key(0x04, key, T0 + 10u * i + 2u);
+        assert_nrc(0x22);
+    }
+    TEST_ASSERT_EQUAL_HEX8(0x00, S.security);
+    TEST_ASSERT_EQUAL_UINT8(0, S.sa_failed);
+    static const uint8_t rd[] = {0x34, 0x00, 0x44, 0, 0, 0, 0, 0, 0, 0, 0x40};
+    txreq(rd, sizeof rd, T0 + 50);
+    TEST_ASSERT_EQUAL_UINT(3, RL);
+    TEST_ASSERT_EQUAL_HEX8(0x7F, R[0]);
+    TEST_ASSERT_EQUAL_HEX8(0x34, R[1]);
+    TEST_ASSERT_EQUAL_HEX8(0x33, R[2]);
+    TEST_ASSERT_TRUE(udsota_init(&S, &cfg, &ENGINE, &SECURITY, &hooks));
+    TEST_ASSERT_TRUE(udsota_init(&S, &cfg, &ENGINE, NULL, &hooks));
+}
+
+/* init refuses a security without rng16 (false), with key or verify set or not, yet keeps security on: every
+ * requestSeed answers 22 (no seed can be issued), a sendKey then has no seed (24), and 34 still answers 33. */
+static void test_init_refuses_security_without_rng16(void)
+{
+    const udsota_config_t cfg = udsota_mock_cfg();
+    const udsota_hooks_t hooks = udsota_mock_hooks(&g_mock);
+    const udsota_security_t no_rng = {.key = mock_key, .ctx = &M};
+    const udsota_security_t nothing = {.ctx = &M};
+    TEST_ASSERT_FALSE(udsota_init(&S, &cfg, &ENGINE, &nothing, &hooks));
+    TEST_ASSERT_FALSE(udsota_init(&S, &cfg, &ENGINE, &no_rng, &hooks));
+    TEST_ASSERT_TRUE(S.secured);
+    uint8_t key[16];
+    memset(key, 0, sizeof key);
+    enter(UDSOTA_SESSION_EXTENDED, T0);
+    txreq(SEED01, 2, T0 + 1);                 assert_nrc(0x22);
+    enter(UDSOTA_SESSION_PROGRAMMING, T0 + 2);
+    const uint8_t seed03[2] = {0x27, 0x03};
+    txreq(seed03, sizeof seed03, T0 + 3);     assert_nrc(0x22);
+    send_key(0x04, key, T0 + 4);              assert_nrc(0x24);
+    TEST_ASSERT_EQUAL_HEX8(0x00, S.security);
+    static const uint8_t rd[] = {0x34, 0x00, 0x44, 0, 0, 0, 0, 0, 0, 0, 0x40};
+    txreq(rd, sizeof rd, T0 + 5);
+    TEST_ASSERT_EQUAL_UINT(3, RL);
+    TEST_ASSERT_EQUAL_HEX8(0x7F, R[0]);
+    TEST_ASSERT_EQUAL_HEX8(0x34, R[1]);
+    TEST_ASSERT_EQUAL_HEX8(0x33, R[2]);
+}
+
 /* Runs every SecurityAccess test. */
 int main(void)
 {
@@ -721,5 +778,7 @@ int main(void)
     RUN_TEST(test_verifier_wrong_keys_lock_out);
     RUN_TEST(test_verifier_unavailable_is_not_an_attempt);
     RUN_TEST(test_verifier_needs_a_live_seed);
+    RUN_TEST(test_init_refuses_security_without_key_or_verify);
+    RUN_TEST(test_init_refuses_security_without_rng16);
     return UNITY_END();
 }

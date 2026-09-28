@@ -230,6 +230,7 @@ esp_err_t udsota_esp32_start(const udsota_config_t *cfg, const udsota_hooks_t *h
 {
     if (cfg == NULL || can == NULL || can->can_send == NULL ||
         !udsota_esp32_devid_len_ok(cfg->device_id, cfg->device_id_len) ||
+        (cfg->key_pubkey != NULL && !udsota_esp32_sa_pubkey_ok(cfg->key_pubkey, cfg->key_pubkey_len)) ||
         (cfg->func_id != 0u && (cfg->func_id == cfg->req_id || cfg->func_id == cfg->resp_id))) {
         return ESP_ERR_INVALID_ARG;
     }

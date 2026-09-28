@@ -90,7 +90,8 @@ static size_t sa_request_seed(udsota_server_t *s, uint8_t level, bool suppress,
         memset(&resp[2], 0, UDSOTA_SEED_LEN);                  /* ISO 14229-1: zero seed = already unlocked */
     } else {
         sa_forget_seed(s);                                  /* a new request replaces any outstanding seed */
-        if (!s->sec.rng16(s->sec.ctx, s->sa_seed) || sa_is_zero(s->sa_seed)) {
+        if (s->sec.rng16 == NULL ||                        /* init refused this security: no seed, ever */
+            !s->sec.rng16(s->sec.ctx, s->sa_seed) || sa_is_zero(s->sa_seed)) {
             sa_forget_seed(s);
             return udsota_nrc(resp, resp_max, UDSOTA_SID_SECURITY, UDSOTA_NRC_CONDITIONS_NOT_CORRECT);
         }
@@ -129,7 +130,8 @@ static size_t sa_send_key(udsota_server_t *s, uint8_t level, const uint8_t *key,
         return udsota_nrc(resp, resp_max, UDSOTA_SID_SECURITY, UDSOTA_NRC_REQUEST_SEQUENCE_ERROR);
     }
     const int verdict = (s->sec.verify != NULL) ? s->sec.verify(s->sec.ctx, s->sa_seed, level, key, key_len)
-                                                : sa_key_matches(s, level, key);
+                        : (s->sec.key != NULL)  ? sa_key_matches(s, level, key)
+                                                : -1;       /* init refused this security: never unlocks */
     sa_forget_seed(s);                                      /* single use, whatever the outcome */
     if (verdict < 0) {
         return udsota_nrc(resp, resp_max, UDSOTA_SID_SECURITY, UDSOTA_NRC_CONDITIONS_NOT_CORRECT);
@@ -432,9 +434,7 @@ static void restore_default_comm(udsota_server_t *s)
     }
     if (s->dtc_off) {
         s->dtc_off = false;
-        if (s->hooks.dtc_setting != NULL) {
-            s->hooks.dtc_setting(s->hooks.ctx, true);
-        }
+        s->hooks.dtc_setting(s->hooks.ctx, true);
     }
 }
 
@@ -1027,9 +1027,8 @@ static size_t handle_comm_control(udsota_server_t *s, const uint8_t *req, size_t
     return 2;
 }
 
-/* 0x85 ControlDTCSetting: 01 on, 02 off, in the extended or programming session, with any option record. udsota
- * records no DTCs itself, so it answers C5 <sub> and tells hooks.dtc_setting, when set. Check order: session 7F,
- * length 13, sub-function 12. */
+/* 0x85 ControlDTCSetting (only with hooks.dtc_setting): 01 on, 02 off, in the extended or programming session, with
+ * any option record; answers C5 <sub> and tells the hook. Check order: session 7F, length 13, sub-function 12. */
 static size_t handle_dtc_setting(udsota_server_t *s, const uint8_t *req, size_t len, uint8_t *resp, size_t resp_max)
 {
     const uint8_t sid = UDSOTA_SID_DTC_SETTING;
@@ -1045,9 +1044,7 @@ static size_t handle_dtc_setting(udsota_server_t *s, const uint8_t *req, size_t 
         return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_SUBFUNC_NOT_SUPPORTED);
     }
     s->dtc_off = (sub == UDSOTA_DTC_OFF);
-    if (s->hooks.dtc_setting != NULL) {
-        s->hooks.dtc_setting(s->hooks.ctx, sub == UDSOTA_DTC_ON);
-    }
+    s->hooks.dtc_setting(s->hooks.ctx, sub == UDSOTA_DTC_ON);
     if (spr || resp_max < 2u) {
         return 0;
     }
@@ -1084,8 +1081,9 @@ static size_t dispatch(udsota_server_t *s, const uint8_t *req, size_t len, uint8
     case UDSOTA_SID_COMM_CONTROL:        /* no comm_control hook: 0x11 before anything else */
         return s->hooks.comm_control != NULL ? handle_comm_control(s, req, len, resp, resp_max)
                                              : udsota_nrc(resp, resp_max, req[0], UDSOTA_NRC_SERVICE_NOT_SUPPORTED);
-    case UDSOTA_SID_DTC_SETTING:
-        return handle_dtc_setting(s, req, len, resp, resp_max);
+    case UDSOTA_SID_DTC_SETTING:         /* no dtc_setting hook: 0x11 before anything else */
+        return s->hooks.dtc_setting != NULL ? handle_dtc_setting(s, req, len, resp, resp_max)
+                                            : udsota_nrc(resp, resp_max, req[0], UDSOTA_NRC_SERVICE_NOT_SUPPORTED);
     /* 0x2E is not served. */
     default:
         return udsota_nrc(resp, resp_max, req[0], UDSOTA_NRC_SERVICE_NOT_SUPPORTED);
@@ -1114,8 +1112,9 @@ static udsota_config_t cfg_resolve(const udsota_config_t *in)
     return c;
 }
 
-/* Resets s to the default session, locked and idle, and copies the four structs (see udsota.h). */
-void udsota_init(udsota_server_t *s, const udsota_config_t *cfg, const udsota_engine_t *engine,
+/* Resets s to the default session, locked and idle, and copies the four structs (see udsota.h); false for a
+ * security with no rng16 or with neither key nor verify, which is then kept on and never unlocks. */
+bool udsota_init(udsota_server_t *s, const udsota_config_t *cfg, const udsota_engine_t *engine,
                  const udsota_security_t *security, const udsota_hooks_t *hooks)
 {
     memset(s, 0, sizeof *s);
@@ -1134,6 +1133,7 @@ void udsota_init(udsota_server_t *s, const udsota_config_t *cfg, const udsota_en
     s->phase = UDSOTA_PHASE_IDLE;
     s->next_bsc = 1;
     sa_init(s);
+    return security == NULL || (security->rng16 != NULL && (security->key != NULL || security->verify != NULL));
 }
 
 /* Installs the transport's tx_pending source; call after udsota_init. */

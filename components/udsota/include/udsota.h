@@ -88,8 +88,8 @@ typedef struct {   /* all optional */
                                                       again with 00 and UDSOTA_CC_TYPE_ALL when the session returns to
                                                       default after a change. NULL: 28 answers 0x11 */
     void     (*dtc_setting)(void *ctx, bool on);   /* after an accepted 85 01 / 85 02, and with true when the session
-                                                      returns to default after 85 02. NULL: 85 is still answered
-                                                      (udsota records no DTCs of its own) */
+                                                      returns to default after 85 02. NULL: 85 answers 0x11, as
+                                                      before */
     void     *ctx;
 } udsota_hooks_t;
 
@@ -125,7 +125,8 @@ typedef struct {
     uint8_t     hw_id, layout_id;      /* port: descriptor values the image must carry */
     const uint8_t *key_pubkey;         /* port: security on in the ECDSA mode (udsota_keys.h): the tester's P-256 public
                                           key, an uncompressed SEC1 point (04 || X || Y). It wins over key_label and
-                                          key_master, and a bad one leaves security on with no key that matches */
+                                          key_master. udsota_esp32_start() refuses a malformed one (ESP_ERR_INVALID_ARG);
+                                          one PSA refuses leaves security on with no key that matches */
     size_t      key_pubkey_len;        /* port: UDSOTA_KEYS_PUBKEY_LEN (65) */
 } udsota_config_t;
 
@@ -190,9 +191,11 @@ typedef struct udsota_server {
 
 /* Resets s to the default session, locked and idle, and copies cfg (NULL = every default), engine (required),
  * security (NULL = none: 0x27 answers 0x11 and nothing needs a key) and hooks (NULL = none). Silent: no phase call.
+ * Returns false for a security with no rng16, or with neither key nor verify; s is still initialised, with
+ * security on and every requestSeed (no rng16) or sendKey (no key or verify) answered 0x22, so nothing unlocks.
  * Every now_ms below is milliseconds since boot (wrapping at 2^32): the post-boot 0x27 delay is measured from
  * now_ms 0, so a clock that starts elsewhere shortens or skips it. */
-void   udsota_init(udsota_server_t *s, const udsota_config_t *cfg, const udsota_engine_t *engine,
+bool   udsota_init(udsota_server_t *s, const udsota_config_t *cfg, const udsota_engine_t *engine,
                    const udsota_security_t *security, const udsota_hooks_t *hooks);
 /* The transport installs its tx_pending source after udsota_init (which clears it); NULL = a restart waits the full
  * UDSOTA_RESET_TX_WAIT_MS (100 ms). */

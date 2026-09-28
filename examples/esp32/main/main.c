@@ -27,7 +27,7 @@ static const char *TAG = "example";
  * from this project is accepted only by a unit running it with these values. */
 #define EXAMPLE_REQ_ID      0x710u   /* the tester's request ID */
 #define EXAMPLE_RESP_ID     0x718u   /* this unit's response ID */
-#define EXAMPLE_FUNC_ID     0x7DFu   /* functional requests (OBD's broadcast ID): 3E 80, 10 03, 22, 28 and 85 */
+#define EXAMPLE_FUNC_ID     0x7DFu   /* functional requests (OBD's broadcast ID): 3E, 10 01, 10 03 and 22 */
 #define EXAMPLE_HW_ID       1u       /* the board this image is for: the product's to allocate */
 #define EXAMPLE_LAYOUT_ID   1u       /* the partition layout: bump it whenever partitions.csv moves */
 #define EXAMPLE_BOARD_NAME  "devkit" /* this board's name, served as DID F191 */
@@ -228,7 +228,8 @@ static esp_err_t updater_start(void)
      * UDSOTA_OP_CONFIRM until the app's own self-test has passed. With no reset, a restart over UDS is
      * the port's esp_restart(). A product whose app sends its own frames adds .comm_control, which stops them
      * for 28 01/03 (a tester sends it to the whole bus before programming) until 28 00 or the default
-     * session; without it, 28 answers 0x11. The port copies the struct. */
+     * session, and one that records DTCs adds .dtc_setting for 85; without them, 28 and 85 answer 0x11
+     * (nothing, functionally). The port copies the struct. */
     const udsota_hooks_t hooks = { .did_read = did_read, .ctx = NULL };
     return udsota_esp32_start(&cfg, &hooks, &can);
 }

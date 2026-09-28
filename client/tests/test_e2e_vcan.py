@@ -1,6 +1,7 @@
 """End-to-end over a virtual CAN bus: the real `udsota` command (SocketCAN, the kernel's ISO-TP socket) flashes
 tools/linux_server's udsota_demo_server on vcan0 (or $UDSOTA_VCAN). Skipped unless the demo is built, the
-interface exists and the kernel serves CAN_ISOTP sockets; CI's e2e job sets both up."""
+interface exists and the kernel serves CAN_ISOTP sockets; CI's e2e job sets both up. $UDSOTA_VCAN must name a
+vcan interface (vcan0, vcan1, ...): the test never drives a real bus."""
 import os
 import signal
 import socket
@@ -16,8 +17,10 @@ IFACE = os.environ.get("UDSOTA_VCAN", "vcan0")
 CLI_TIMEOUT_S = 240
 
 
-# The demo binary, or a skip naming what is missing: the interface or the kernel's ISO-TP module.
+# The demo binary, or a skip naming what is missing: a vcan name, the interface or the kernel's ISO-TP module.
 def vcan_or_skip():
+    if not IFACE.startswith("vcan"):
+        pytest.skip("UDSOTA_VCAN=%s is not a vcan interface name; this test only runs on vcan" % IFACE)
     binary = binary_or_skip()
     if not os.path.exists("/sys/class/net/%s" % IFACE):
         pytest.skip("no %s: modprobe vcan && ip link add dev %s type vcan && ip link set up %s" % (IFACE, IFACE, IFACE))

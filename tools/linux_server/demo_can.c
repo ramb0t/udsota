@@ -10,6 +10,9 @@
 #include <unistd.h>
 #include <linux/can.h>
 #include <linux/can/raw.h>
+#include <linux/if_link.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 #include "udsota_isotp.h"   /* UDSOTA_TX_RETRY */
 
 /* Value of one hex digit, or -1. */
@@ -121,6 +124,75 @@ bool demo_can_open_pipe(demo_can_t *c, uint16_t req_id, uint32_t (*now_us)(void)
     c->req_id = req_id;
     c->now_us = now_us;
     return true;
+}
+
+/* The attribute of this type among the rtattrs in [p, p + len), or NULL; a malformed list ends the search. */
+static const struct rtattr *rta_find(const uint8_t *p, size_t len, unsigned short type)
+{
+    while (len >= sizeof(struct rtattr)) {
+        const struct rtattr *a = (const struct rtattr *)(const void *)p;
+        if (a->rta_len < sizeof *a || a->rta_len > len) {
+            return NULL;
+        }
+        if ((a->rta_type & NLA_TYPE_MASK) == type) {
+            return a;
+        }
+        const size_t step = RTA_ALIGN(a->rta_len);
+        if (step >= len) {
+            return NULL;
+        }
+        p += step;
+        len -= step;
+    }
+    return NULL;
+}
+
+/* See demo_can.h. The kernel's rtnetlink link kind (the "vcan" that `ip -details link show` prints) is the only
+ * test that tells vcan apart: ARPHRD_CAN (280) is the type of every CAN interface, real or virtual, and the absence
+ * of /sys/class/net/<if>/device would pass slcan, a real bus behind a serial or USB-serial adapter. Fails closed:
+ * an unknown interface, a netlink error or a reply without IFLA_INFO_KIND is "not vcan". */
+bool demo_can_is_vcan(const char *ifname)
+{
+    const unsigned idx = if_nametoindex(ifname);
+    if (idx == 0u) {
+        return false;
+    }
+    const int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+    if (fd < 0) {
+        return false;
+    }
+    struct {
+        struct nlmsghdr  nh;
+        struct ifinfomsg ifi;
+    } req = {
+        .nh = { .nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg)), .nlmsg_type = RTM_GETLINK,
+                .nlmsg_flags = NLM_F_REQUEST, .nlmsg_seq = 1u },
+        .ifi = { .ifi_family = AF_UNSPEC, .ifi_index = (int)idx },
+    };
+    struct sockaddr_nl kernel = { .nl_family = AF_NETLINK };
+    static union {
+        struct nlmsghdr nh;
+        uint8_t         buf[32768];
+    } rsp;
+    ssize_t n = -1;
+    if (sendto(fd, &req, req.nh.nlmsg_len, 0, (struct sockaddr *)&kernel, sizeof kernel) ==
+        (ssize_t)req.nh.nlmsg_len) {
+        n = recv(fd, rsp.buf, sizeof rsp.buf, 0);
+    }
+    close(fd);
+    const size_t head = NLMSG_LENGTH(sizeof(struct ifinfomsg));
+    if (n < (ssize_t)head || rsp.nh.nlmsg_type != RTM_NEWLINK || rsp.nh.nlmsg_len < head ||
+        rsp.nh.nlmsg_len > (size_t)n) {
+        return false;
+    }
+    const size_t at = NLMSG_ALIGN(head);                     /* the link's attributes follow the ifinfomsg */
+    const size_t at_len = rsp.nh.nlmsg_len > at ? rsp.nh.nlmsg_len - at : 0u;
+    const struct rtattr *info = rta_find(rsp.buf + at, at_len, IFLA_LINKINFO);
+    const struct rtattr *kind = (info != NULL) ? rta_find((const uint8_t *)RTA_DATA(info), RTA_PAYLOAD(info),
+                                                          IFLA_INFO_KIND)
+                                               : NULL;
+    static const char vcan[] = "vcan";
+    return kind != NULL && RTA_PAYLOAD(kind) >= sizeof vcan && memcmp(RTA_DATA(kind), vcan, sizeof vcan) == 0;
 }
 
 /* Opens the SocketCAN backend; see demo_can.h. */

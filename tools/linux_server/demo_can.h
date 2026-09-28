@@ -36,6 +36,9 @@ bool demo_can_open_pipe(demo_can_t *c, uint16_t req_id, uint32_t (*now_us)(void)
 /* Opens a non-blocking CAN_RAW socket on ifname that receives only standard frames on req_id. False (and a
  * message on stderr) when the interface or PF_CAN is missing. */
 bool demo_can_open_socketcan(demo_can_t *c, const char *ifname, uint16_t req_id, uint32_t (*now_us)(void));
+/* True only when ifname is a vcan interface (its rtnetlink link kind is "vcan"); false for a real CAN interface,
+ * an unknown name or any netlink error. */
+bool demo_can_is_vcan(const char *ifname);
 /* The descriptor to poll for input. */
 int  demo_can_fd(const demo_can_t *c);
 /* Reads every frame available now and calls fn for each standard frame on req_id. Returns the frames read, or
