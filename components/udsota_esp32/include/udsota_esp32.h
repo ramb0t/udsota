@@ -131,14 +131,13 @@ typedef struct {
  * and should be left out of the image. hooks may be NULL; the diag task calls every hook the app sets with
  * hooks->ctx, and a NULL hooks->reset restarts with esp_restart(). Returns ESP_ERR_INVALID_ARG for a NULL
  * cfg, can or can_send, or a set device_id whose device_id_len is not 1 to UDSOTA_KEYS_ID_MAX (16), a set
- * key_pubkey that is not a 65-byte
- * uncompressed point (04 || X || Y), or a set func_id equal to req_id or resp_id; ESP_ERR_INVALID_STATE on a second
- * call; and ESP_ERR_NO_MEM when an allocation or the task fails. Only a bad-argument failure may be
- * retried: after ESP_ERR_NO_MEM the updater stays off for this boot, and a second call returns
- * ESP_ERR_INVALID_STATE. When the buffers or frame queue cannot be allocated nothing else was started; when
- * the diag task cannot be created, what start already set up stays behind: the flash worker with its
- * buffer and queue and, with security on, the derived key or the imported public key in RAM and the SAR-ADC
- * entropy source, left on. */
+ * key_pubkey that is not a 65-byte uncompressed point (04 || X || Y), or a set func_id equal to req_id or
+ * resp_id; ESP_ERR_INVALID_STATE on a second call; and ESP_ERR_NO_MEM when an allocation or the task fails.
+ * Only a bad-argument failure may be retried: after ESP_ERR_NO_MEM the updater stays off for this boot, and
+ * a second call returns ESP_ERR_INVALID_STATE. When the buffers or frame queue cannot be allocated nothing
+ * else was started; when the diag task cannot be created, what start already set up stays behind: the flash
+ * worker with its buffer and queue and, with security on, the derived key or the imported public key in RAM
+ * and the SAR-ADC entropy source, left on. */
 esp_err_t udsota_esp32_start(const udsota_config_t *cfg, const udsota_hooks_t *hooks, const udsota_esp32_can_t *can);
 /* Any task: queues one frame on cfg->req_id, or on cfg->func_id when set (a functional request), with its receive
  * time in microseconds; never blocks. Other IDs, frames before start and frames past a full queue are dropped (the

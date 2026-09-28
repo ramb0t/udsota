@@ -80,10 +80,10 @@ typedef struct {
     uint8_t  session;         /* UDSOTA_SESSION_* now in force */
     uint8_t  unlocked_level;  /* the requestSeed level unlocked in this session; 0 = none (always 0 without security) */
     uint32_t epoch;           /* +1 on every session entry, whatever causes it: 10 0x including a repeat, S3,
-                                 udsota_end_session (at once or latched), the 90 s cap, the restart, a refused 36
-                                 and a withheld FC point. A value an app saved in one session never matches in a
-                                 later one. udsota_init restarts it at 0, so an app must not keep staged state
-                                 across a re-init */
+                                 udsota_end_session (at once or latched), the 90 s cap, the restart, a 36 the gate
+                                 or the STmin monitor refuses with anything but 0x21, and a withheld FC point. A
+                                 value an app saved in one session never matches in a later one. udsota_init
+                                 restarts it at 0, so an app must not keep staged state across a re-init */
 } udsota_access_t;
 
 typedef struct {   /* all optional */
