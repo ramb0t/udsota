@@ -321,8 +321,9 @@ class FakeServer:
         self.unlocked = sub - 1
         return [bytes([0x67, sub])]
 
-    # 0x34 RequestDownload: DFI 00 (or 10 with compress), ALFID 44, address 0; answers 74 20 <max_block> and starts
-    # a fresh download, which also ends any earlier FF01 pass.
+    # 0x34 RequestDownload: DFI 00, 10 with compress, or one in delta; ALFID 44, address 0. A DFI in no_memory (or 10
+    # with z_nomem) answers 0x22 with F1F1 DL_NO_MEMORY; otherwise 74 20 <max_block> starts a fresh download, which
+    # also ends any earlier FF01 pass.
     def s34(self, req, _):
         self.dfis.append(req[1])
         if (req[1] not in ((0x00, 0x10) if self.compress else (0x00,)) + self.delta or req[2] != 0x44
@@ -371,31 +372,31 @@ class FakeServer:
     def patch(self):
         return bytes(self.zin) if self.dfi == 0x20 else zlib.decompressobj(-15).decompress(bytes(self.zin))
 
-    # The image the patch rebuilds from base, or b"" when it does not apply.
+    # The image the patch rebuilds from base, or None when it does not apply.
     def apply_patch(self):
         import detools
         out = io.BytesIO()
         try:
             detools.apply_patch(io.BytesIO(self.base), io.BytesIO(self.patch()[delta.HEADER_LEN:]), out)
         except (detools.Error, zlib.error):
-            return b""
+            return None
         return out.getvalue()
 
-    # 0x37 RequestTransferExit: an open transfer holding every announced byte closes (77), else 0x24.
+    # The DFI 0x10 blocks inflated, or None unless they are exactly one complete raw DEFLATE stream.
+    def inflate(self):
+        z = zlib.decompressobj(-15)
+        try:
+            out = z.decompress(bytes(self.zin))
+        except zlib.error:
+            return None
+        return out if z.eof and not z.unused_data else None
+
+    # 0x37 RequestTransferExit: an inflated or patched stream that is not the announced image answers 0x72
+    # (DL_BAD_STREAM); an open transfer holding every announced byte closes (77), else 0x24.
     def s37(self, req, _):
-        if self.dl_open and self.dfi in (0x20, 0x30):
-            out = self.apply_patch()
-            if len(out) != self.announced:
-                self.dl_open, self.last_dl = False, (13, len(self.zin))    # DL_BAD_STREAM
-                return self.nrc(0x37, 0x72)
-            self.written = bytearray(out)
-        if self.dl_open and self.dfi == 0x10:
-            z = zlib.decompressobj(-15)
-            try:
-                out = z.decompress(bytes(self.zin))
-            except zlib.error:
-                out = b""
-            if not z.eof or z.unused_data or len(out) != self.announced:
+        if self.dl_open and self.dfi:
+            out = self.apply_patch() if self.dfi in (0x20, 0x30) else self.inflate()
+            if out is None or len(out) != self.announced:
                 self.dl_open, self.last_dl = False, (13, len(self.zin))    # DL_BAD_STREAM
                 return self.nrc(0x37, 0x72)
             self.written = bytearray(out)
