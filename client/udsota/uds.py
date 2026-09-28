@@ -7,13 +7,12 @@ from udsoncan.exceptions import (InvalidResponseException, NegativeResponseExcep
 
 from .errors import NoResponse, Nrc, SendFailed, UpdateFailed
 from .keys import SEED_LEN
-from .wire import DL_ALFID, DL_DFI, DL_MAX_DATA, NRC_BUSY, NRC_TIME_DELAY
+from .wire import DL_ALFID, DL_DFI, DL_MAX_DATA, NRC_BUSY, NRC_PENDING, NRC_TIME_DELAY
 
 BUSY_BACKOFF_S = (0.05, 0.1, 0.2, 0.4, 0.8, 1.6)   # waits before each retry after NRC 0x21
 SA_DELAY_S = 10.0        # the server's 0x27 delay after boot or after three wrong keys
 KEEPALIVE_S = 2.0        # 3E 00 interval while waiting in a session (at least every 2 s)
-LATE_WAIT_S = 5.5        # how long a late answer, or the next 0x78 of a job still running, is waited for (P2*)
-NRC_PENDING = 0x78
+P2_STAR_S = 5.5          # client P2*: the wait for a late answer, or a running job's next 0x78 (sent every 1.5 s)
 
 
 # One request method per service the update uses.
@@ -47,7 +46,7 @@ class Uds:
         raise AssertionError("unreachable")
 
     # Listen window_s seconds for an answer to service that no send of ours is waiting for: a late one, or one
-    # still being served. A 0x78 extends the wait by LATE_WAIT_S each time, as it would for a request. Returns the
+    # still being served. A 0x78 extends the wait by P2_STAR_S each time, as it would for a request. Returns the
     # positive response after its SID, raises Nrc for a final NRC, and returns None when nothing arrives. 0x21 and
     # frames for other services are passed over. The second-tester monitor counts the wait as a request of ours.
     def await_answer(self, service, window_s):
@@ -62,7 +61,7 @@ class Uds:
                 return None
             if len(frame) >= 3 and frame[0] == 0x7F and frame[1] == sid:
                 if frame[2] == NRC_PENDING:
-                    timeout = LATE_WAIT_S
+                    timeout = P2_STAR_S
                     continue
                 if frame[2] != NRC_BUSY:
                     raise Nrc(sid, frame[2])
@@ -148,7 +147,7 @@ class Uds:
         d = self.request(services.TransferData, data=bytes([bsc]) + bytes(chunk))
         previous = bytes([(bsc - 1) & 0xFF])
         while d[:1] == previous:
-            d = self.await_answer(services.TransferData, LATE_WAIT_S)
+            d = self.await_answer(services.TransferData, P2_STAR_S)
             if d is None:
                 raise NoResponse("no response to service 0x36 block %d after a late answer to block %d"
                                  % (bsc, previous[0]))
