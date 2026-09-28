@@ -42,6 +42,27 @@ typedef enum {
     UDSOTA_PHASE_ACTIVATING,        /* from a positive ActivateImage answer until the restart */
 } udsota_phase_t;
 
+/* The download's stage, finer than the phase, for an app's progress display. The core derives it from its own state. */
+typedef enum {
+    UDSOTA_STAGE_IDLE = 0,          /* everything below does not hold: no download, or it ended (last_reason says how) */
+    UDSOTA_STAGE_ERASING,           /* from an accepted 34 until the first block is written: the first-block check
+                                       and the erase run in the first 36's job */
+    UDSOTA_STAGE_WRITING,           /* from the first written block until FF01 starts; done == total after the 37 */
+    UDSOTA_STAGE_VERIFYING,         /* while the FF01 job runs */
+    UDSOTA_STAGE_ACTIVATING,        /* the phase of the same name: from a positive ActivateImage until the restart */
+} udsota_stage_t;
+
+/* What udsota_progress() reads and hooks.progress gets. done and total are image bytes; both are 0 outside
+ * ERASING and WRITING, where total is 34's memorySize and done only grows, never past total. */
+typedef struct {
+    udsota_stage_t stage;
+    uint32_t       done;
+    uint32_t       total;
+    uint8_t        last_reason;     /* udsota_reason_t of the last download, as F1F1 reports it. It describes a finished
+                                       download, so read it only in IDLE: during FF01 it reads UDSOTA_DL_WORKER_TIMEOUT
+                                       until the verdict replaces it */
+} udsota_progress_t;
+
 typedef struct {   /* required; only unverify, status, running_sha and version may be NULL */
     int    (*check_first)(void *ctx, const uint8_t *first, size_t len, udsota_reason_t *why); /* first 36 block, before any erase; 0 = ok */
     int    (*begin)(void *ctx, uint32_t size);                                  /* erase; may return UDSOTA_PENDING */
@@ -130,6 +151,12 @@ typedef struct {   /* all optional */
                                                       during the call. NULL: a routine that returns UDSOTA_PENDING
                                                       ends in 0x10 at the first poll. It may read udsota_phase() but
                                                       must not call other udsota functions */
+    void     (*progress)(void *ctx, const udsota_progress_t *p);
+                                                   /* at the end of a request, poll or other server call that changed
+                                                      the stage or wrote a block (about once a second at 4 KB blocks),
+                                                      and at most once per call; p is valid only during the call. It
+                                                      must not call udsota functions or block. NULL: nothing changes,
+                                                      and udsota_progress() still reads the same values */
 } udsota_hooks_t;
 
 typedef struct {
@@ -233,6 +260,12 @@ typedef struct udsota_server {
     /* Respond-then-restart. */
     uint8_t           reset_phase;       /* 0 idle, 1 armed (the answer is leaving), 2 fired */
     uint32_t          reset_armed_ms;
+    /* Progress (udsota_progress). */
+    uint32_t          dl_written;        /* image bytes written in this download, udsota_progress_t.done: set by the
+                                            34 and advanced with dl_received after each 76. A download whose 36s carry
+                                            other than image bytes (a compressed one) sets it from the engine's count */
+    uint8_t           progress_stage;    /* udsota_stage_t last reported to hooks.progress */
+    bool              progress_block;    /* a block was written since the last report */
 } udsota_server_t;
 
 /* Resets s to the default session, locked and idle, and copies cfg (NULL = every default), engine (required),
@@ -252,6 +285,13 @@ void   udsota_set_tx_pending(udsota_server_t *s, uint32_t (*tx_pending)(void *ct
 void   udsota_end_session(udsota_server_t *s, uint32_t now_ms);
 /* The phase last reported to hooks.phase (IDLE after init). */
 udsota_phase_t udsota_phase(const udsota_server_t *s);
+/* Server context only: the download's stage, bytes and last reason into *out (udsota_progress_t). A pure read of
+ * the server's state: it calls no engine op or hook, and between server calls it equals what hooks.progress last
+ * got, or would have. */
+void   udsota_progress(const udsota_server_t *s, udsota_progress_t *out);
+/* done / total in permille (0..1000), with 64-bit arithmetic; 0 when total is 0 (the stage is indeterminate). Pure:
+ * any task may call it on a copy, such as the ESP32 port's snapshot. */
+uint16_t udsota_progress_permille(const udsota_progress_t *p);
 /* Handles one reassembled request; returns the response length written to resp (0 = no response). */
 size_t udsota_on_request(udsota_server_t *s, const uint8_t *req, size_t len, uint8_t *resp, size_t max, uint32_t now_ms);
 /* Handles one functionally addressed request (a single frame on cfg.func_id), answered on the response ID like

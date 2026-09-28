@@ -149,3 +149,7 @@ void udsota_esp32_on_frame(uint16_t id, const uint8_t *data, uint8_t dlc, uint32
 void udsota_esp32_end_session(void);
 /* Any task, an app hook included: the phase as of the server's last change; one atomic read, IDLE before start. */
 udsota_phase_t udsota_esp32_phase(void);
+/* Any task, an app hook included: the download's progress as the server last reported it (udsota_progress_t),
+ * copied under a spinlock, so a UI task can draw it without touching the server; IDLE before start. The port
+ * keeps the snapshot by wrapping hooks.progress, and still calls the app's own with its ctx. */
+void udsota_esp32_progress(udsota_progress_t *out);

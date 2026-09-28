@@ -2,7 +2,7 @@
  * and the UDS server. The app hands it request frames from its CAN task and the port sends through the
  * app's can_send, so the port never touches TWAI. The task does ISO-TP and the 0x27 HMAC or ECDSA verify
  * only and never flash (the engine's worker makes every esp_ota_* call), which is why its stack may live in
- * PSRAM. Phase, end-session and the hook wrappers are the pure udsota_esp32_ctl.c. */
+ * PSRAM. Phase, progress, end-session and the hook wrappers are the pure udsota_esp32_ctl.c. */
 #include <inttypes.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -63,8 +63,9 @@ static udsota_can_t       s_tpcan;
 static udsota_server_t    s_srv;
 static udsota_isotp_t     s_tp;
 /* Cross-task. */
-static udsota_esp32_ctl_t     s_ctl;         /* phase and end-session request, atomics inside */
+static udsota_esp32_ctl_t     s_ctl;         /* phase, end-session request and progress snapshot */
 static _Atomic(QueueHandle_t) s_q;           /* published last by start(); NULL = frames are dropped */
+static portMUX_TYPE           s_progress_mux = portMUX_INITIALIZER_UNLOCKED;   /* guards s_ctl's progress copy */
 static atomic_uint            s_rx_q_dropped;   /* written by the app's CAN task */
 static atomic_bool            s_wake_posted;    /* a wake item is queued and not yet taken: at most one at a time */
 
@@ -98,6 +99,18 @@ static uint32_t tp_tx_pending(void *ctx)
 {
     (void)ctx;
     return s_can.tx_pending(s_can.ctx);
+}
+
+/* The progress snapshot's lock: a critical section on s_progress_mux, which any task on either core may take. */
+static void progress_lock(void *ctx)
+{
+    portENTER_CRITICAL((portMUX_TYPE *)ctx);
+}
+
+/* Releases progress_lock's critical section. */
+static void progress_unlock(void *ctx)
+{
+    portEXIT_CRITICAL((portMUX_TYPE *)ctx);
 }
 
 /* The default reset hook: esp_restart() moves SP off a PSRAM stack first (system_internal.c:106-113)
@@ -249,6 +262,7 @@ esp_err_t udsota_esp32_start(const udsota_config_t *cfg, const udsota_hooks_t *h
     }
     s_can = *can;
     udsota_esp32_ctl_init(&s_ctl, hooks, default_reset, &s_hooks);
+    udsota_esp32_ctl_set_lock(&s_ctl, progress_lock, progress_unlock, &s_progress_mux);
     udsota_isotp_bufs_t *bufs = heap_caps_calloc(1, sizeof *bufs, BUF_CAPS);
     QueueHandle_t q = xQueueCreate(CONFIG_UDSOTA_ESP32_RX_QUEUE_LEN, sizeof(rx_item_t));
     if (bufs == NULL || q == NULL) {
@@ -333,4 +347,14 @@ void udsota_esp32_end_session(void)
 udsota_phase_t udsota_esp32_phase(void)
 {
     return udsota_esp32_ctl_phase(&s_ctl);
+}
+
+/* Any task: the control block's progress snapshot once the port runs, else IDLE. */
+void udsota_esp32_progress(udsota_progress_t *out)
+{
+    if (atomic_load_explicit(&s_q, memory_order_acquire) == NULL) {
+        *out = (udsota_progress_t){.stage = UDSOTA_STAGE_IDLE};
+        return;
+    }
+    udsota_esp32_ctl_progress(&s_ctl, out);
 }

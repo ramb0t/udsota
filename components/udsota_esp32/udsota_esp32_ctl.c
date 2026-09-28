@@ -13,6 +13,23 @@ static void w_phase(void *ctx, udsota_phase_t p)
     }
 }
 
+/* progress hook: stores *p for every task under the lock first, so an app hook that reads the snapshot
+ * sees p, then runs the app's hook with no lock held. */
+static void w_progress(void *ctx, const udsota_progress_t *p)
+{
+    udsota_esp32_ctl_t *ctl = ctx;
+    if (ctl->lock != NULL) {
+        ctl->lock(ctl->lock_ctx);
+    }
+    ctl->progress = *p;
+    if (ctl->unlock != NULL) {
+        ctl->unlock(ctl->lock_ctx);
+    }
+    if (ctl->app.progress != NULL) {
+        ctl->app.progress(ctl->app.ctx, p);
+    }
+}
+
 /* gate hook: the app's gate with the app's ctx (installed only when the app has one). */
 static uint8_t w_gate(void *ctx, udsota_op_t op)
 {
@@ -87,6 +104,10 @@ void udsota_esp32_ctl_init(udsota_esp32_ctl_t *ctl, const udsota_hooks_t *app,
     const udsota_hooks_t none = {0};
     ctl->app = (app != NULL) ? *app : none;
     ctl->default_reset = default_reset;
+    ctl->progress = (udsota_progress_t){.stage = UDSOTA_STAGE_IDLE};
+    ctl->lock = NULL;
+    ctl->unlock = NULL;
+    ctl->lock_ctx = NULL;
     atomic_store_explicit(&ctl->phase, (unsigned)UDSOTA_PHASE_IDLE, memory_order_release);
     atomic_store_explicit(&ctl->end_req, false, memory_order_release);
     *out = (udsota_hooks_t){
@@ -101,13 +122,35 @@ void udsota_esp32_ctl_init(udsota_esp32_ctl_t *ctl, const udsota_hooks_t *app,
         .did_write    = (ctl->app.did_write != NULL) ? w_did_write : NULL,
         .routine      = (ctl->app.routine != NULL) ? w_routine : NULL,
         .routine_poll = (ctl->app.routine_poll != NULL) ? w_routine_poll : NULL,
+        .progress     = w_progress,
     };
+}
+
+/* Installs the snapshot's lock; see the header. */
+void udsota_esp32_ctl_set_lock(udsota_esp32_ctl_t *ctl, void (*lock)(void *ctx), void (*unlock)(void *ctx),
+                               void *lock_ctx)
+{
+    ctl->lock = lock;
+    ctl->unlock = unlock;
+    ctl->lock_ctx = lock_ctx;
 }
 
 /* One atomic load. */
 udsota_phase_t udsota_esp32_ctl_phase(udsota_esp32_ctl_t *ctl)
 {
     return (udsota_phase_t)atomic_load_explicit(&ctl->phase, memory_order_acquire);
+}
+
+/* One copy under the lock. */
+void udsota_esp32_ctl_progress(udsota_esp32_ctl_t *ctl, udsota_progress_t *out)
+{
+    if (ctl->lock != NULL) {
+        ctl->lock(ctl->lock_ctx);
+    }
+    *out = ctl->progress;
+    if (ctl->unlock != NULL) {
+        ctl->unlock(ctl->lock_ctx);
+    }
 }
 
 /* One atomic store: the request never runs on the caller. */

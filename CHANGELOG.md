@@ -2,6 +2,12 @@
 
 All notable changes to udsota. Versions follow semantic versioning; the wire protocol is part of the public API.
 
+## [Unreleased]
+
+Apps can show an update's progress. `udsota_progress()` reads the download's stage (IDLE, ERASING, WRITING, VERIFYING or ACTIVATING), the image bytes written of the size the 34 announced, and the last download's F1F1 reason, so a display can show a failure rather than just falling back to idle. The new optional `hooks.progress` gets the same at each change of stage and after each written block, at most once per server call, and `udsota_progress_permille()` turns the bytes into permille. The ESP32 port keeps the last report in a snapshot under a spinlock, which any task reads with the new `udsota_esp32_progress()`, and forwards the hook to the app's with its `ctx`.
+
+Additive, with nothing changed on the wire: `udsota_hooks_t` gains `progress` after `routine_poll`, and `udsota_server_t` gains `dl_written`, `progress_stage` and `progress_block` at its end. With the hook NULL every answer is the same bytes, and a third fuzz build, `fuzz_udsota_progress`, sets the hook and checks that `done` never passes `total` or shrinks within a download.
+
 ## [0.3.0] - 2026-09-28
 
 Apps can serve their own writes and routines. WriteDataByIdentifier (0x2E) goes to a new `did_write` hook, and 31 01 on a RID the core doesn't own goes to a new `routine` hook. A routine may return `UDSOTA_PENDING` and finish in `routine_poll`, and the core treats it as a job meanwhile: 0x78, 0x21 to other requests, and the 90 s cap. Both hooks get a `udsota_access_t` with the session, the unlocked level and a session epoch, so the app decides which session and key each write needs and can drop state an earlier session left. The ESP32 port forwards all three hooks with the app's `ctx`.

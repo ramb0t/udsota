@@ -1,8 +1,9 @@
 /* Host tests for the ESP32 port's control block (components/udsota_esp32/udsota_esp32_ctl.c) with the
  * real udsota server: an app phase hook that calls back into the port neither deadlocks nor recurses,
  * an end-session it requests runs after the current request, one requested during a job runs after
- * that job's answer, and the app's did_write, routine and routine_poll reach the app through the
- * port's wrappers with its ctx, the request's bytes and the session's access state. */
+ * that job's answer, the app's did_write, routine and routine_poll reach the app through the
+ * port's wrappers with its ctx, the request's bytes and the session's access state, and the progress
+ * snapshot copies what the server reported, under the port's lock, before the app's own hook runs. */
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -34,6 +35,13 @@ static size_t             s_write_len, s_routine_in_len;
 static uint8_t            s_routine_in0;     /* the first option byte of the last routine */
 static udsota_access_t    s_write_access, s_routine_access;
 static int                s_routine_poll_ret;   /* what app_routine_poll returns */
+static int                s_progress_calls;  /* app progress hook calls */
+static udsota_progress_t  s_progress_arg;    /* what the app's progress hook last got */
+static udsota_progress_t  s_progress_read;   /* what udsota_esp32_ctl_progress() returned inside it */
+static int                s_lock_depth;      /* the fake lock: held now, and its most, lock and unlock calls */
+static int                s_lock_max, s_locks, s_unlocks;
+static int                s_lock_depth_in_hook;   /* s_lock_depth while the app's progress hook ran */
+static const void        *s_lock_ctx_seen;
 
 /* Mock engine: the first block passes. */
 static int eng_check_first(void *ctx, const uint8_t *first, size_t len, udsota_reason_t *why)
@@ -178,6 +186,36 @@ static int app_routine_poll(void *ctx, uint8_t *out, size_t out_max, size_t *out
     return s_routine_poll_ret;
 }
 
+/* The app's progress hook: records its ctx and argument, whether the port's lock was held, and what the
+ * snapshot reads from inside it (a call back into the port). */
+static void app_progress(void *ctx, const udsota_progress_t *p)
+{
+    s_ctx_seen = ctx;
+    s_progress_calls++;
+    s_progress_arg = *p;
+    s_lock_depth_in_hook = s_lock_depth;
+    udsota_esp32_ctl_progress(&s_ctl, &s_progress_read);
+}
+
+/* The fake snapshot lock: counts, and tracks how deep it is held. */
+static void fake_lock(void *ctx)
+{
+    s_lock_ctx_seen = ctx;
+    s_locks++;
+    s_lock_depth++;
+    if (s_lock_depth > s_lock_max) {
+        s_lock_max = s_lock_depth;
+    }
+}
+
+/* The fake snapshot unlock. */
+static void fake_unlock(void *ctx)
+{
+    s_lock_ctx_seen = ctx;
+    s_unlocks++;
+    s_lock_depth--;
+}
+
 /* Wraps app's hooks and starts a server on them with default config and no security. */
 static void start(const udsota_hooks_t *app)
 {
@@ -222,6 +260,15 @@ void setUp(void)
     s_write_access = (udsota_access_t){0};
     s_routine_access = (udsota_access_t){0};
     s_routine_poll_ret = 0;
+    s_progress_calls = 0;
+    s_progress_arg = (udsota_progress_t){0};
+    s_progress_read = (udsota_progress_t){0};
+    s_lock_depth = 0;
+    s_lock_max = 0;
+    s_locks = 0;
+    s_unlocks = 0;
+    s_lock_depth_in_hook = -1;
+    s_lock_ctx_seen = NULL;
 }
 
 /* Unity hook: nothing to undo. */
@@ -471,6 +518,100 @@ static void test_without_write_and_routine_hooks_the_core_answers_as_before(void
     TEST_ASSERT_EQUAL_HEX8(0x31, resp[2]);
 }
 
+/* Sends req and asserts the answer's first byte. */
+static void exchange(const uint8_t *req, size_t len, uint8_t first, uint32_t now)
+{
+    uint8_t resp[16];
+    TEST_ASSERT_TRUE(udsota_on_request(&s_srv, req, len, resp, sizeof resp, now) >= 1u);
+    TEST_ASSERT_EQUAL_HEX8(first, resp[0]);
+}
+
+/* Asserts the snapshot equals what the server's udsota_progress() reads now. */
+static void expect_snapshot_is_server(void)
+{
+    udsota_progress_t srv, snap;
+    udsota_progress(&s_srv, &srv);
+    udsota_esp32_ctl_progress(&s_ctl, &snap);
+    TEST_ASSERT_EQUAL_INT(srv.stage, snap.stage);
+    TEST_ASSERT_EQUAL_UINT32(srv.done, snap.done);
+    TEST_ASSERT_EQUAL_UINT32(srv.total, snap.total);
+    TEST_ASSERT_EQUAL_UINT8(srv.last_reason, snap.last_reason);
+}
+
+/* Through a download with the real server, the snapshot copies each report under the port's lock (with its
+ * lock_ctx), and the app's progress hook then runs with the app's ctx, the same values and the lock released,
+ * so it can read the snapshot back. */
+static void test_progress_snapshot_copies_the_report_and_forwards_it(void)
+{
+    const udsota_hooks_t app = { .progress = app_progress, .ctx = &s_marker };
+    start(&app);
+    TEST_ASSERT_NOT_NULL(s_hooks.progress);
+    udsota_esp32_ctl_set_lock(&s_ctl, fake_lock, fake_unlock, &s_lock_depth);
+    udsota_progress_t snap;
+    udsota_esp32_ctl_progress(&s_ctl, &snap);
+    TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_IDLE, snap.stage);
+    TEST_ASSERT_EQUAL_UINT32(0u, snap.total);
+
+    const uint8_t prog[] = {0x10, 0x02};
+    const uint8_t rd[] = {0x34, 0x00, 0x44, 0, 0, 0, 0, 0, 0, 0x00, 0x08};   /* 8 bytes */
+    const uint8_t blk1[] = {0x36, 0x01, 1, 2, 3, 4, 5};
+    const uint8_t blk2[] = {0x36, 0x02, 6, 7, 8};
+    exchange(prog, sizeof prog, 0x50, NOW);
+    exchange(rd, sizeof rd, 0x74, NOW + 1u);
+    TEST_ASSERT_EQUAL_INT(1, s_progress_calls);
+    TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_ERASING, s_progress_arg.stage);
+    TEST_ASSERT_EQUAL_UINT32(8u, s_progress_arg.total);
+    expect_snapshot_is_server();
+    exchange(blk1, sizeof blk1, 0x76, NOW + 2u);
+    TEST_ASSERT_EQUAL_INT(2, s_progress_calls);
+    TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_WRITING, s_progress_arg.stage);
+    TEST_ASSERT_EQUAL_UINT32(5u, s_progress_arg.done);
+    expect_snapshot_is_server();
+    exchange(blk2, sizeof blk2, 0x76, NOW + 3u);
+    TEST_ASSERT_EQUAL_INT(3, s_progress_calls);
+    TEST_ASSERT_EQUAL_UINT32(8u, s_progress_arg.done);
+    expect_snapshot_is_server();
+
+    TEST_ASSERT_EQUAL_PTR(&s_marker, s_ctx_seen);
+    TEST_ASSERT_EQUAL_INT(0, s_lock_depth_in_hook);            /* the lock is never held while the app's hook runs */
+    TEST_ASSERT_EQUAL_UINT32(s_progress_arg.done, s_progress_read.done);   /* stored before the app's hook ran */
+    TEST_ASSERT_EQUAL_INT(s_progress_arg.stage, s_progress_read.stage);
+    TEST_ASSERT_EQUAL_PTR(&s_lock_depth, s_lock_ctx_seen);
+    TEST_ASSERT_EQUAL_INT(s_locks, s_unlocks);
+    TEST_ASSERT_EQUAL_INT(1, s_lock_max);
+    TEST_ASSERT_EQUAL_INT(0, s_lock_depth);
+
+    udsota_esp32_ctl_request_end(&s_ctl);                      /* the session ends: IDLE, aborted */
+    TEST_ASSERT_TRUE(udsota_esp32_ctl_run_end(&s_ctl, &s_srv, NOW + 4u));
+    TEST_ASSERT_EQUAL_INT(4, s_progress_calls);
+    udsota_esp32_ctl_progress(&s_ctl, &snap);
+    TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_IDLE, snap.stage);
+    TEST_ASSERT_EQUAL_UINT32(0u, snap.done);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_ABORTED, snap.last_reason);
+}
+
+/* Without an app progress hook the port still keeps the snapshot, and init resets it and the lock. */
+static void test_progress_snapshot_without_an_app_hook(void)
+{
+    start(NULL);
+    TEST_ASSERT_NOT_NULL(s_hooks.progress);
+    const uint8_t prog[] = {0x10, 0x02};
+    const uint8_t rd[] = {0x34, 0x00, 0x44, 0, 0, 0, 0, 0, 0, 0x00, 0x08};
+    exchange(prog, sizeof prog, 0x50, NOW);
+    exchange(rd, sizeof rd, 0x74, NOW + 1u);
+    expect_snapshot_is_server();
+    TEST_ASSERT_EQUAL_INT(0, s_progress_calls);
+
+    udsota_esp32_ctl_set_lock(&s_ctl, fake_lock, fake_unlock, NULL);
+    start(NULL);
+    TEST_ASSERT_NULL(s_ctl.lock);
+    udsota_progress_t snap;
+    udsota_esp32_ctl_progress(&s_ctl, &snap);
+    TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_IDLE, snap.stage);
+    TEST_ASSERT_EQUAL_UINT32(0u, snap.total);
+    TEST_ASSERT_EQUAL_INT(0, s_locks);
+}
+
 /* Waits become ticks rounded down, never 0 for a real wait: 5 ms is 1 tick at 100 Hz (not 0, which spun the
  * diag task) and 5 at 1 kHz; 0 stays 0 and a huge wait saturates. */
 static void test_wait_ticks_never_round_a_wait_to_zero(void)
@@ -496,5 +637,7 @@ int main(void)
     RUN_TEST(test_write_and_routine_wrappers_follow_each_app_hook);
     RUN_TEST(test_without_write_and_routine_hooks_the_core_answers_as_before);
     RUN_TEST(test_wait_ticks_never_round_a_wait_to_zero);
+    RUN_TEST(test_progress_snapshot_copies_the_report_and_forwards_it);
+    RUN_TEST(test_progress_snapshot_without_an_app_hook);
     return UNITY_END();
 }

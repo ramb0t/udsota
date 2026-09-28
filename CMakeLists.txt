@@ -118,6 +118,11 @@ udsota_test(test_udsota_server_functional
     SOURCES  test/test_udsota_server_functional.c ${SERVER_SRCS}
     INCLUDES ${CORE_INC} ${CORE_PRIV})
 
+# udsota_progress() and hooks.progress: the stage and bytes after each step of a download, and when the hook runs.
+udsota_test(test_udsota_server_progress
+    SOURCES  test/test_udsota_server_progress.c ${SERVER_SRCS}
+    INCLUDES ${CORE_INC} ${CORE_PRIV})
+
 # ---- Image descriptor: one UDSOTA_ESP32_IMAGE_DESC instance per variant, as a dev image for two
 # boards and as a release image. On target, udsota_esp32_image_desc() sets UDSOTA_ESP32_IMG_RELEASE
 # from PROJECT_VER.
@@ -226,6 +231,15 @@ if(UDSOTA_FUZZ AND UDSOTA_FUZZ_SAN_OK)
     target_link_options(fuzz_udsota_app_hooks PRIVATE ${FUZZ_SAN})
     target_compile_definitions(fuzz_udsota_app_hooks PRIVATE UDSOTA_FUZZ_UBSAN_TRAP=1 UDSOTA_FUZZ_APP_HOOKS=1)
     set_tests_properties(fuzz_udsota_app_hooks PROPERTIES TIMEOUT 300)
+    # The same harness with the progress hook set: done never passes total nor shrinks within a download, and the
+    # hook runs at most once per call and reports every change of stage. Its PASS line matches fuzz_udsota's.
+    udsota_test(fuzz_udsota_progress
+        SOURCES  ${CORE_DIR}/test/fuzz_udsota.c ${SERVER_SRCS}
+        INCLUDES ${CORE_INC} ${CORE_PRIV})
+    target_compile_options(fuzz_udsota_progress PRIVATE ${FUZZ_SAN})
+    target_link_options(fuzz_udsota_progress PRIVATE ${FUZZ_SAN})
+    target_compile_definitions(fuzz_udsota_progress PRIVATE UDSOTA_FUZZ_UBSAN_TRAP=1 UDSOTA_FUZZ_PROGRESS=1)
+    set_tests_properties(fuzz_udsota_progress PROPERTIES TIMEOUT 300)
     if(UDSOTA_FUZZ_CORPUS)
         add_test(NAME fuzz_udsota_corpus COMMAND fuzz_udsota ${UDSOTA_FUZZ_CORPUS})
         set_tests_properties(fuzz_udsota_corpus PROPERTIES TIMEOUT 1800)

@@ -133,6 +133,7 @@ Every struct carries its own `ctx`, which is passed back to its callbacks. A NUL
 | `reset(ctx)` | once the answer to 11 01 or ActivateImage has left (the transport's `tx_pending` reads 0, or after 100 ms); it returns only on failure, and the server then re-opens | in the core, 11 01 answers 0x11 and ActivateImage answers positive without a restart, so the new image boots at the next power cycle. The ESP32 port uses `esp_restart()` |
 | `comm_control(ctx, control, comm_type)` | for a 28 that passed the core's checks; returns 0 once the app has stopped or resumed its own frames as asked, else the NRC. Called again with 00 and 03 (enable everything) when the session returns to default after a change | 28 answers 0x11 |
 | `dtc_setting(ctx, on)` | after an accepted 85 01 or 85 02, and with `true` when the session returns to default after 85 02 | 85 answers 0x11, as before |
+| `progress(ctx, p)` | at the end of a request, poll or other server call that changed the download's stage or wrote a block, at most once per call ([Progress](#progress)); `p` is valid only during the call | nobody is told; `udsota_progress()` reads the same values |
 
 The gate returns 0 to allow, or the NRC to send: 0x22 conditionsNotCorrect in general, a specific code where one fits (0x88 vehicleSpeedTooHigh, 0x90 shifterLeverNotInPark, 0x92/0x93 voltage too high or too low, all ISO 14229-1), or 0x21 busyRepeatRequest for a condition that clears by itself shortly.
 
@@ -154,7 +155,25 @@ The phase is IDLE in the default session, and EXTENDED or PROGRAMMING in those s
 
 A routine that returns `UDSOTA_PENDING` is a job like FF01: the core answers 0x78 on the flash-job cadence and every other request but 3E with 0x21, and at 90 s answers 0x72 and ends the session. The routine is then orphaned. Until `routine_poll` stops returning `UDSOTA_PENDING`, every "no flash job runs" condition in the op table fails: 10 02 answers 0x22, and so do 11 01 and a 31 01 on an app RID in the extended session, the last without calling `routine`, so the programming session, and with it 34 and ActivateImage, is out of reach until the orphan ends. A routine that can outlast 90 s should leave its outcome where a client can read it, such as a DID.
 
-The hooks run in the server's context, which in the ESP32 port is the diag task. The gate is asked at flow-control points while frames stream in, so it must read a snapshot the app keeps current, return at once and never block. The phase hook must not wait on anything either, and neither may `did_write`, `routine` or `routine_poll`: work that takes time runs elsewhere, and the routine reports it through `UDSOTA_PENDING` and `routine_poll`.
+The hooks run in the server's context, which in the ESP32 port is the diag task. The gate is asked at flow-control points while frames stream in, so it must read a snapshot the app keeps current, return at once and never block. The phase hook must not wait on anything either, and neither may `did_write`, `routine`, `routine_poll` or `progress`: work that takes time runs elsewhere, and the routine reports it through `UDSOTA_PENDING` and `routine_poll`. The progress hook must not call any udsota function.
+
+## Progress
+
+An app that draws an update, with a bar or a percentage, reads the download's stage and bytes from `udsota_progress()` in the server's context, or takes them from the optional `progress` hook as they change; in the ESP32 port any task reads them with `udsota_esp32_progress()`. The phase alone cannot drive a bar: it reads TRANSFERRING from the 34 to the 37 and PROGRAMMING through the erase and the verify. Both give a `udsota_progress_t`: the `stage`, `done` and `total` in image bytes, and `last_reason`, the last download's F1F1 reason, so a display that falls back to IDLE can say that the update failed, and why. `udsota_progress_permille()` turns `done` and `total` into 0 to 1000 with 64-bit arithmetic. `last_reason` describes a finished download, so read it only in IDLE: during FF01 it reads 10 (worker timeout), as F1F1 does, until the verdict replaces it.
+
+| Stage | From | Until | `done` / `total` |
+|---|---|---|---|
+| IDLE | init, and every end below | an accepted 34 | 0 / 0 |
+| ERASING | an accepted 34 | the first block is written; the first-block check and the erase run in that 36's job | 0 / memorySize |
+| WRITING | the first written block | FF01 starts; after the 37, `done` equals `total` | bytes written / memorySize |
+| VERIFYING | FF01's job starts | its verdict, then IDLE | 0 / 0: engines report no hash progress, so it is indeterminate |
+| ACTIVATING | a positive ActivateImage | the restart | 0 / 0 |
+
+A download also returns to IDLE when it ends early: an abort, a session change, S3, the 90 s cap, a refused first block or a failed write. `last_reason` then says which, as F1F1 does (reason 11, 10, 1 to 7 or 12). Within a download `done` only grows and never passes `total`: a resent block, a 36 refused for its counter or with 0x21, and a 0x78 leave it where it was. A new 34 starts it at the download's offset, which is 0 while GetResumePoint answers "not available". Between a passed FF01 and a positive ActivateImage the stage reads IDLE with reason 0, so a display that saw VERIFYING can hold at "verified" there rather than treat it as idle.
+
+The hook runs at the end of the call that changed the stage or wrote a block, and never more than once per call, so during a transfer of 4 KB blocks it runs about once a second. A 0x78 never calls it. Like every hook, it runs in the server's context and must not block; with it NULL, every answer is the same bytes.
+
+How the stages share one bar is the app's policy: erase 0–2 %, write 2–95 %, verify 95–99 % and activate 99–100 %, say. Progress stays off the wire, since a client counts its own; a DID can carry it later if telemetry needs one. After the restart the stage reads IDLE, and whether the client confirmed the new image is F1F0's to say.
 
 ## Integrating safely
 
