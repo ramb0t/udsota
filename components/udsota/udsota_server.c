@@ -730,12 +730,11 @@ static bool dl_z_refused(int result)
 
 /* Final answer for a 0x36 job (udsota_job_done_fn): 76 BSC once the worker wrote the block, else 0x72 and the
  * download ends with UDSOTA_DL_FLASH_ERROR. A coded block the engine refused (dl_z_refused) ends it with 0x31
- * and that reason instead, as a first-block refusal does. job_arg carries the block's data length in bits 8..20 and
- * its BSC in bits 0..7. */
+ * and that reason instead, as a first-block refusal does. job_arg is the block's data length. */
 static size_t dl_block_done(udsota_server_t *s, int result, uint8_t *resp, size_t resp_max, uint32_t now_ms)
 {
     (void)now_ms;
-    const uint8_t bsc = (uint8_t)(s->job_arg & 0xFFu);
+    const uint8_t bsc = s->next_bsc;              /* unchanged since the 36 matched it: no 34 runs during a job */
     if (result != 0 && DL_Z(s) && dl_z_refused(result)) {
         abort_download(s);
         s->last_dl.reason_code = (uint8_t)result;
@@ -745,9 +744,9 @@ static size_t dl_block_done(udsota_server_t *s, int result, uint8_t *resp, size_
         dl_flash_failed(s);
         return udsota_nrc(resp, resp_max, UDSOTA_SID_TRANSFER_DATA, UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE);
     }
-    s->dl_received += s->job_arg >> 8;
+    s->dl_received += s->job_arg;
     if (!DL_Z(s)) {
-        s->dl_written += s->job_arg >> 8;         /* the block's bytes are image bytes */
+        s->dl_written += s->job_arg;              /* the block's bytes are image bytes */
     } else if (s->engine.zwritten != NULL) {
         const uint32_t written = s->engine.zwritten(s->engine.ctx);   /* coded: what the stream wrote */
         if (written > s->dl_written) {
@@ -813,11 +812,7 @@ static size_t handle_transfer_data(udsota_server_t *s, const uint8_t *req, size_
         abort_download(s);                        /* iso14229 server.c:1060-1062: 0x71 ends the transfer */
         return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_TRANSFER_DATA_SUSPENDED);
     }
-    if (DL_Z(s)) {
-        return udsota_job_start(s, sid, false, s->engine.zwrite(s->engine.ctx, data, len), dl_block_done,
-                                ((uint32_t)len << 8) | bsc, resp, resp_max, now_ms);
-    }
-    if (!s->ota_open) {
+    if (!DL_Z(s) && !s->ota_open) {
         /* First block: check the image before anything is erased. */
         udsota_reason_t why = UDSOTA_DL_OK;
         if (s->engine.check_first(s->engine.ctx, data, len, &why) != 0) {
@@ -832,9 +827,10 @@ static size_t handle_transfer_data(udsota_server_t *s, const uint8_t *req, size_
         }
         s->ota_open = true;
     }
-    /* Queued behind the erase on the first block; engine.write copies data before it returns. */
-    return udsota_job_start(s, sid, false, s->engine.write(s->engine.ctx, s->dl_received, data, len), dl_block_done,
-                            ((uint32_t)len << 8) | bsc, resp, resp_max, now_ms);
+    /* Queued behind the erase on the first block; write and zwrite copy data before they return. */
+    const int rc = DL_Z(s) ? s->engine.zwrite(s->engine.ctx, data, len)
+                           : s->engine.write(s->engine.ctx, s->dl_received, data, len);
+    return udsota_job_start(s, sid, false, rc, dl_block_done, (uint32_t)len, resp, resp_max, now_ms);
 }
 
 /* The 37's positive tail: the transfer closes, FF01 may verify the open image, F1F1 reads OK; 77. */

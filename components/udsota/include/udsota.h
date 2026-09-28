@@ -261,7 +261,7 @@ typedef struct udsota_server {
     uint8_t           job_sid;           /* SID being answered with 0x78 */
     uint32_t          job_start_ms;      /* for the first 0x78 and the 90 s cap */
     uint32_t          last_pending_ms;   /* last 0x78 sent */
-    uint32_t          job_arg;           /* handler data for job_done, e.g. the BSC to echo */
+    uint32_t          job_arg;           /* handler data for job_done, e.g. a 36's block length or a routine's RID */
     udsota_job_done_fn job_done;         /* builds the final answer when the job's poll (engine.poll, or
                                             hooks.routine_poll for an app routine) reports a result */
     bool              worker_orphan;     /* a job the server stopped waiting on at the 90 s cap still runs */
