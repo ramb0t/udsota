@@ -282,7 +282,6 @@ int fake_ota_write(fake_ota_t *f, const uint8_t *data, size_t len)
         return -1;
     }
     f->written += (uint32_t)len;
-    f->writes++;
     return 0;
 }
 
@@ -397,26 +396,6 @@ void fake_ota_fill_status(const fake_ota_t *f, udsota_status_t *out)
         (void)udsota_parse_version(v, sizeof v, out->other_version, NULL);   /* zeroes it when unparseable */
         memcpy(out->other_elf_sha_prefix, sha, sizeof out->other_elf_sha_prefix);
     }
-}
-
-/* Stateless resume point of the inactive slot: the sector before the first blank one (it may hold a torn page). */
-uint32_t fake_ota_resume_point(const fake_ota_t *f)
-{
-    static uint8_t sec[FAKE_OTA_SECTOR];
-    int fd = f->fd[fake_ota_other(f)];
-    for (uint32_t off = 0; off < f->slot_size; off += FAKE_OTA_SECTOR) {
-        if (pread_all(fd, sec, sizeof sec, (off_t)off) != 0) {
-            return 0;
-        }
-        size_t i = 0;
-        while (i < sizeof sec && sec[i] == 0xFF) {
-            i++;
-        }
-        if (i == sizeof sec) {
-            return off >= FAKE_OTA_SECTOR ? off - FAKE_OTA_SECTOR : 0;
-        }
-    }
-    return f->slot_size - FAKE_OTA_SECTOR;
 }
 
 /* Where an image's appended SHA-256 starts: past the header, the segment walk and the checksum byte, which must

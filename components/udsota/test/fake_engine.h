@@ -33,7 +33,6 @@ typedef struct {
     bool     no_rollback;      /* CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE off: activate writes UNDEFINED, confirm
                                 * does nothing. A build setting, not otadata: set it after fake_ota_open */
     uint32_t written;          /* bytes written since fake_ota_begin */
-    unsigned writes;           /* fake_ota_write calls since open (tests count rewrites with it) */
 } fake_ota_t;
 
 /* Opens (or with fresh, recreates) the slot files and otadata under dir, then simulates a boot.
@@ -77,9 +76,6 @@ int  fake_ota_slot_read(const fake_ota_t *f, uint8_t slot, uint32_t off, uint8_t
 bool fake_ota_slot_hash(const fake_ota_t *f, uint8_t slot, uint8_t out[32]);
 /* F1F0 from the fake's state. flags carries nothing. */
 void fake_ota_fill_status(const fake_ota_t *f, udsota_status_t *out);
-/* Stateless resume point of the inactive slot (for a future resume): C = S - 4096 for the first all-0xFF
- * sector S, clamped at 0; slot_size - 4096 when no sector is blank. */
-uint32_t fake_ota_resume_point(const fake_ota_t *f);
 
 /* The fake's esp_ota_end check over a whole image: header, segment walk, checksum byte and the
  * appended SHA-256 (hash_appended must be 1). UDSOTA_DL_OK or UDSOTA_DL_VERIFY_FAILED. */
