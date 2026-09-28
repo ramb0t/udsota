@@ -406,7 +406,8 @@ static uint8_t          s_base_hash[UDSOTA_PATCH_HASH_LEN];   /* worker only: th
 static bool             s_base_hash_ok; /* worker only: s_base_hash is computed; the running image never changes */
 #endif
 
-/* The inflater's state and dictionary: PSRAM first with UDSOTA_ESP32_INFLATE_PSRAM, else internal RAM. */
+/* The inflater's state and dictionary: PSRAM first with UDSOTA_ESP32_INFLATE_PSRAM, else internal RAM. The
+ * decoders free through free(), which on IDF is heap_caps_free (esp_libc/src/heap.c), so no free hook. */
 static void *z_alloc(void *ctx, size_t n)
 {
     (void)ctx;
@@ -415,13 +416,6 @@ static void *z_alloc(void *ctx, size_t n)
 #else
     return heap_caps_malloc(n, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 #endif
-}
-
-/* Frees what z_alloc or internal_alloc gave. */
-static void z_free(void *ctx, void *p)
-{
-    (void)ctx;
-    heap_caps_free(p);
 }
 
 /* Closes the download and frees its decoders and buffers; the caller has cleared s_z_live. */
@@ -905,7 +899,7 @@ static int eng_zbegin(void *ctx, uint32_t size, uint8_t dfi)
         z_release();
     }
     s_zout = heap_caps_malloc(BLOCK_BUF, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    s_tinfl = (udsota_tinfl_t){.alloc = z_alloc, .free = z_free};
+    s_tinfl = (udsota_tinfl_t){.alloc = z_alloc};
     const udsota_inflate_t inf = udsota_tinfl_inflate(&s_tinfl);
     udsota_coded_cfg_t cfg = {
         .sink = {.check_first = z_check, .begin = z_begin, .write = z_write},
@@ -913,7 +907,7 @@ static int eng_zbegin(void *ctx, uint32_t size, uint8_t dfi)
     };
     bool bufs = (s_zout != NULL);
 #if CONFIG_UDSOTA_ESP32_DELTA
-    s_detools = (udsota_detools_t){.alloc = internal_alloc, .free = z_free};
+    s_detools = (udsota_detools_t){.alloc = internal_alloc};
     const udsota_patch_t patch = udsota_detools_patch(&s_detools);
     static const udsota_pbase_t base = {.read = base_read, .hash = base_hash};
     cfg.patch = &patch;
