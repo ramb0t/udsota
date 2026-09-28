@@ -1,7 +1,7 @@
-/* Host tests for the image descriptor: its layout, and the 32 bytes image_check reads at offset 288 from an
- * instance made with the ESP32 port's UDSOTA_ESP32_IMAGE_DESC for the example device (IDs 0x710/0x718). The
- * top-level CMakeLists.txt builds it three times: board 1 and board 3 as dev images, and board 1 as a release. */
-#include <stddef.h>
+/* Host tests for the image descriptor: the 32 bytes image_check reads at offset 288 from an instance made with
+ * the ESP32 port's UDSOTA_ESP32_IMAGE_DESC for the example device (IDs 0x710/0x718). The layout itself is
+ * _Static_asserted in udsota_image_desc.h. The top-level CMakeLists.txt builds it three times: board 1 and board 3
+ * as dev images, and board 1 as a release. */
 #include <stdint.h>
 #include <string.h>
 #include "unity.h"
@@ -23,36 +23,6 @@ UDSOTA_ESP32_IMAGE_DESC(UDSOTA_TEST_HW_ID, 1, REQ_ID, RESP_ID);   /* hw_id, layo
 void setUp(void) {}
 /* Unity hook: no per-test teardown. */
 void tearDown(void) {}
-
-/* The struct is 32 bytes with every field at its pinned offset, and sits at image offset 288. */
-static void test_layout(void)
-{
-    TEST_ASSERT_EQUAL_UINT(32u, (unsigned)sizeof(udsota_image_desc_t));
-    TEST_ASSERT_EQUAL_UINT(0u,  (unsigned)offsetof(udsota_image_desc_t, magic));
-    TEST_ASSERT_EQUAL_UINT(4u,  (unsigned)offsetof(udsota_image_desc_t, desc_version));
-    TEST_ASSERT_EQUAL_UINT(6u,  (unsigned)offsetof(udsota_image_desc_t, hw_id));
-    TEST_ASSERT_EQUAL_UINT(7u,  (unsigned)offsetof(udsota_image_desc_t, partition_layout_id));
-    TEST_ASSERT_EQUAL_UINT(8u,  (unsigned)offsetof(udsota_image_desc_t, diag_request_id));
-    TEST_ASSERT_EQUAL_UINT(10u, (unsigned)offsetof(udsota_image_desc_t, diag_response_id));
-    TEST_ASSERT_EQUAL_UINT(12u, (unsigned)offsetof(udsota_image_desc_t, flags));
-    TEST_ASSERT_EQUAL_UINT(13u, (unsigned)offsetof(udsota_image_desc_t, reserved));
-    TEST_ASSERT_EQUAL_UINT(19u, (unsigned)sizeof(((udsota_image_desc_t *)0)->reserved));
-    TEST_ASSERT_EQUAL_UINT(24u + 8u + 256u, UDSOTA_IMG_DESC_OFFSET);
-}
-
-/* The magic is ASCII "UDSO" read as a big-endian word. */
-static void test_magic_is_udso(void)
-{
-    const uint8_t s[4] = {'U', 'D', 'S', 'O'};
-    uint32_t be = ((uint32_t)s[0] << 24) | ((uint32_t)s[1] << 16) | ((uint32_t)s[2] << 8) | s[3];
-    TEST_ASSERT_EQUAL_HEX32(be, UDSOTA_IMG_DESC_MAGIC);
-}
-
-/* The release flag is bit0 of flags. */
-static void test_release_flag_is_bit0(void)
-{
-    TEST_ASSERT_EQUAL_HEX8(0x01u, UDSOTA_IMG_FLAG_RELEASE);
-}
 
 /* The instance carries the magic, version 1, this build's board, layout 1, the diag IDs
  * and flags 00 (01 only in the _release target). */
@@ -82,9 +52,6 @@ static void test_flash_bytes(void)
 int main(void)
 {
     UNITY_BEGIN();
-    RUN_TEST(test_layout);
-    RUN_TEST(test_magic_is_udso);
-    RUN_TEST(test_release_flag_is_bit0);
     RUN_TEST(test_values);
     RUN_TEST(test_flash_bytes);
     return UNITY_END();
