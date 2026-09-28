@@ -8,7 +8,7 @@ Apps can serve their own writes and routines. WriteDataByIdentifier (0x2E) goes 
 
 Additive: `udsota_hooks_t` gains `did_write`, `routine` and `routine_poll` after `ctx`. With them NULL every answer is byte for byte as in 0.2.0, so 2E answers 0x11 and an unknown RID 0x31.
 
-The client gains `config show` and `config set NAME=VALUE ... [--commit] [--reset]`. A `[dids]` entry can be a typed, writable key (`type`, `writable`, `min`, `max`), and `u8` and `u16` decode as decimal. A `[config]` table names the commit routine, a status DID and an optional config-hash check. A 0.1.0 client refuses a profile that uses them.
+The client gains `config show` and `config set NAME=VALUE ... [--commit] [--reset]`. A `[dids]` entry can be a typed, writable key (`type`, `writable`, `min`, `max`), and `u8` and `u16` decode as decimal. A `[config]` table names the commit routine, a status DID and an optional config-hash check. A client before 0.3.0 refuses a profile that uses them.
 
 ## [0.2.0] - unreleased
 

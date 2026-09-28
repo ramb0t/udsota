@@ -8,7 +8,7 @@ import time
 from .errors import Nrc, Refused, ToolError, UpdateFailed
 from .profile import TYPES
 from .update import DECODE, device_keys, wait_for_boot
-from .wire import NRC_CONDITIONS, NRC_NOT_SUPPORTED, NRC_OUT_OF_RANGE, SESSION_EXTENDED
+from .wire import NRC_CONDITIONS, NRC_NOT_SUPPORTED, NRC_OUT_OF_RANGE, NRC_SEQUENCE, SESSION_EXTENDED
 
 NO_CONFIG_WRITES = "this firmware has no config writes"
 
@@ -68,14 +68,20 @@ def parse_writes(profile, assignments, commit, reset):
     return writes
 
 
-# One DID's record decoded with decode, or "not supported" when the server answers 0x31.
-def read_value(uds, did, decode):
+# One DID's record, or None when the server answers 0x31 (it does not serve that DID).
+def read_record(uds, did):
     try:
-        return DECODE[decode](uds.read_did(did))
+        return uds.read_did(did)
     except Nrc as e:
         if e.code != NRC_OUT_OF_RANGE:
             raise
-        return "not supported"
+        return None
+
+
+# One DID's record decoded with decode, or "not supported" when the server answers 0x31.
+def read_value(uds, did, decode):
+    d = read_record(uds, did)
+    return "not supported" if d is None else DECODE[decode](d)
 
 
 # SHA-256 of schema || (did BE16, len, value)* over every DID in first..last the server answers (0x31: absent,
@@ -83,11 +89,8 @@ def read_value(uds, did, decode):
 def compute_hash(uds, spec):
     enc = bytearray([spec.schema])
     for did in range(spec.first, spec.last + 1):
-        try:
-            v = uds.read_did(did)
-        except Nrc as e:
-            if e.code != NRC_OUT_OF_RANGE:
-                raise
+        v = read_record(uds, did)
+        if v is None:
             continue
         if len(v) > 0xFF:
             raise UpdateFailed("DID 0x%04X is %d bytes; the hash encoding holds at most 255" % (did, len(v)))
@@ -106,11 +109,16 @@ def check_hash(uds, spec, log=print):
 
 
 # `config show`: each writable key's DID, name, value and write range, then the status DID and the hash check when
-# the profile has them. Reads only, in the default session.
+# the profile has them. Reads only, in the default session. A server that serves none of the keys (0x31 to each)
+# has no config writes: Refused (exit 2), as config set.
 def config_show(uds, profile, log=print):
-    for e in writable_keys(profile):
+    keys = writable_keys(profile)
+    records = [read_record(uds, e.first) for e in keys]
+    if all(r is None for r in records):
+        raise Refused("%s (every writable DID answered NRC 0x31)" % NO_CONFIG_WRITES)
+    for e, r in zip(keys, records):
         limits = "" if e.type == "blob" else " (%d..%d)" % write_range(e)
-        log("%04X %s: %s%s" % (e.first, e.name, read_value(uds, e.first, e.decode), limits))
+        log("%04X %s: %s%s" % (e.first, e.name, "not supported" if r is None else DECODE[e.decode](r), limits))
     cfg = profile.config
     if cfg is not None and cfg.status_did is not None:
         log("%04X config status: %s" % (cfg.status_did, read_value(uds, cfg.status_did, "hex")))
@@ -144,7 +152,7 @@ def report_status(uds, cfg, log=print):
 
 
 # The commit routine; status 00 is success. NRC 0x31 means the firmware has no config writes (Refused, exit 2). Any
-# other NRC or status fails (exit 1) after report_status.
+# other NRC or status fails (exit 1) after report_status; 0x24 means a session change dropped the staged values.
 def commit_config(uds, cfg, log=print):
     try:
         status = uds.routine(cfg.commit_rid)
@@ -152,7 +160,9 @@ def commit_config(uds, cfg, log=print):
         if e.code == NRC_OUT_OF_RANGE:
             raise Refused("%s (routine 0x%04X answered NRC 0x31)" % (NO_CONFIG_WRITES, cfg.commit_rid)) from e
         report_status(uds, cfg, log)
-        raise UpdateFailed("the commit (routine 0x%04X) answered NRC 0x%02X" % (cfg.commit_rid, e.code)) from e
+        why = ": the staged values were dropped (the session changed); run config set again" \
+            if e.code == NRC_SEQUENCE else ""
+        raise UpdateFailed("the commit (routine 0x%04X) answered NRC 0x%02X%s" % (cfg.commit_rid, e.code, why)) from e
     if not status or status[0] != 0:
         report_status(uds, cfg, log)
         raise UpdateFailed("the commit (routine 0x%04X) reported status %s"

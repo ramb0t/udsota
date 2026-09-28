@@ -204,7 +204,8 @@ def _did_entry(name, key, entry):
 
 
 # [config] as a ConfigSpec (None when absent): commit_rid, the optional status_did and hash = { did, first, last,
-# schema }, all four required in the hash.
+# schema }, all four required in the hash. The hash DID and the status DID lie outside first..last: inside, their
+# own records would feed the hash and the check could never pass.
 def _config(name, t):
     if t is None:
         return None
@@ -218,8 +219,13 @@ def _config(name, t):
                         _int(name, h, "schema", 0, 0xFF, required=True))
         if spec.first > spec.last:
             _bad(name, "[config] hash first 0x%04X is above last 0x%04X" % (spec.first, spec.last))
-    return ConfigSpec(_int(name, t, "commit_rid", 0, 0xFFFF, required=True), _int(name, t, "status_did", 0, 0xFFFF),
-                      spec)
+        if spec.first <= spec.did <= spec.last:
+            _bad(name, "[config] hash did 0x%04X is inside first..last, so it would hash itself" % spec.did)
+    status_did = _int(name, t, "status_did", 0, 0xFFFF)
+    if spec is not None and status_did is not None and spec.first <= status_did <= spec.last:
+        _bad(name, "[config] status_did 0x%04X is inside the hash range 0x%04X..0x%04X"
+             % (status_did, spec.first, spec.last))
+    return ConfigSpec(_int(name, t, "commit_rid", 0, 0xFFFF, required=True), status_did, spec)
 
 
 # Build a Profile from parsed TOML; every problem raises Refused (exit 2, nothing sent).

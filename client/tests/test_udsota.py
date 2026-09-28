@@ -1886,6 +1886,15 @@ def test_config_profile_values():
      "letters, digits and _"),
     (CAN + KEY + 'type = "u8", writable = true }\n"0x0201" = { name = "mode", decode = "u8", type = "u8", '
                  "writable = true }\n", "two writable keys are named mode"),
+    (CAN + "[config]\ncommit_rid = 0x10000\n", "commit_rid must be an integer from 0x0 to 0xFFFF"),
+    (CAN + "[config]\ncommit_rid = 0x1234\nstatus_did = 0x10000\n", "status_did must be an integer from 0x0 to 0xFFFF"),
+    (CAN + KEY.replace('"u8", ', '"u16", ') + 'type = "u16", writable = true, max = 0x10000 }\n',
+     "max must be an integer from 0x0 to 0xFFFF"),
+    (CAN + "[config]\ncommit_rid = 0x1234\nhash = { did = 0x0205, first = 0x0200, last = 0x020F, schema = 1 }\n",
+     "hash did 0x0205 is inside first..last"),
+    (CAN + "[config]\ncommit_rid = 0x1234\nstatus_did = 0x020F\n"
+           "hash = { did = 0xF1B0, first = 0x0200, last = 0x020F, schema = 1 }\n",
+     r"status_did 0x020F is inside the hash range 0x0200\.\.0x020F"),
 ])
 def test_bad_config_profiles_are_refused(text, why):
     with pytest.raises(errors.Refused, match=why):
@@ -2137,3 +2146,103 @@ def test_main_config_show_end_to_end(conf_path, capsys):
     d = FakeServer(cfg_keys=CFG_VALUES)
     assert cli.main(["--profile", conf_path, "config", "show"], transport=lambda p, i: FakeTransport(d, i)) == 0
     assert "0201 timeout_ms: 2000 (1000..5000)" in capsys.readouterr().out
+
+
+
+# ---- config writes: review follow-ups ----
+
+# CONF with [security] in the ecdsa mode.
+CONF_ECDSA = CONF.replace(CONF_SECURITY, '[security]\nmode = "ecdsa"\nprivate_key_file = "udsota_private.pem"\n')
+
+
+# Check main runs config set --commit with an ecdsa profile and --private-key (the value is stored), and that
+# --master on that profile is refused (exit 2) before the bus opens.
+def test_main_ecdsa_config_set(tmp_path, capsys):
+    p = tmp_path / "conf-ecdsa.toml"
+    p.write_text(CONF_ECDSA)
+    private, _ = keys.keygen(tmp_path / "keys")
+    d = FakeServer(pubkey=keys.public_point(keys.load_private_key(private)), cfg_keys=CFG_VALUES)
+    assert cli.main(["--profile", str(p), "--private-key", str(private), "config", "set", "mode=2", "--commit"],
+                    transport=lambda prof, i: FakeTransport(d, i)) == 0
+    assert d.nvs[0x0200] == b"\x02" and d.log[:4] == UNLOCK_EXT
+    master = tmp_path / "master.bin"
+    master.write_bytes(MASTER)
+    assert cli.main(["--profile", str(p), "--master", str(master), "config", "set", "mode=2", "--commit"],
+                    transport=no_transport) == 2
+    assert "--master is for mode hmac" in capsys.readouterr().err
+
+
+# Check config show on firmware without config writes (every key answers 0x31) exits 2 as set does, after reading
+# the keys only. The fake still serves F1B0 (CONF's hash DID) from its base records, so the refusal must come from
+# the keys, not from a failed hash or status read.
+def test_main_config_show_without_config_writes(conf_path, capsys):
+    d = FakeServer()
+    assert cli.main(["--profile", conf_path, "config", "show"], transport=lambda p, i: FakeTransport(d, i)) == 2
+    assert "this firmware has no config writes" in capsys.readouterr().err
+    assert d.log == [(0x22, did) for did in (0x0200, 0x0201, 0x0202, 0x0203)]
+
+
+# Check the boot wait's timeout names what restarted the server: ActivateImage for flash, the reset for config set.
+def test_boot_wait_timeouts_name_their_cause():
+    ft = FakeTime()
+
+    # A server that never answers again.
+    class Gone:
+        # Every read times out.
+        def read_did(self, did):
+            raise errors.NoResponse("no answer")
+
+    with pytest.raises(errors.UpdateFailed, match="did not answer within 60 s of ActivateImage$"):
+        update.wait_for_image(Gone(), NEW_SHA, lambda: None, sleep=ft.sleep, clock=ft.clock)
+    d = FakeServer(cfg_keys=CFG_VALUES, boot_silence=10 ** 6)
+    with pytest.raises(errors.UpdateFailed, match="did not answer within 60 s of the reset$"):
+        run_config_set(d, ["mode=2"])
+    assert d.nvs[0x0200] == b"\x02"
+
+
+# Check main hands the transport's pre-roll to config set --reset: once per poll of the restarting server. main
+# waits in real time, so the boot waits are zeroed.
+def test_main_config_set_prerolls_the_restart(conf_path, monkeypatch):
+    monkeypatch.setattr(update, "REBOOT_WAIT_S", 0)
+    monkeypatch.setattr(update, "BOOT_POLL_S", 0)
+    d, prerolls = FakeServer(cfg_keys=CFG_VALUES), []
+
+    # FakeTransport that counts its pre-rolls.
+    class Counting(FakeTransport):
+        # Record one pre-roll.
+        def preroll(self):
+            prerolls.append(1)
+
+    master = str(pathlib.Path(conf_path).parent / "master.bin")
+    assert cli.main(["--profile", conf_path, "--master", master, "config", "set", "mode=2", "--commit", "--reset"],
+                    transport=lambda p, i: Counting(d, i)) == 0
+    assert len(prerolls) == 3 and d.cfg_keys[0x0200] == b"\x02"
+
+
+# Check the write range's ends: min and max themselves are accepted, and a u16 without max takes 0..0xFFFF.
+def test_parse_writes_accepts_the_range_ends():
+    writes = config.parse_writes(C, ["timeout_ms=1000", "mode=0"], commit=False, reset=False)
+    assert [v for _, v in writes] == [b"\x03\xe8", b"\x00"]
+    assert config.parse_writes(C, ["timeout_ms=5000"], commit=False, reset=False)[0][1] == b"\x13\x88"
+    wide = profile.from_dict("wide", tomllib.loads(
+        CAN + '[dids]\n"0x0200" = { name = "w", decode = "u16", type = "u16", writable = true }\n'))
+    assert config.parse_writes(wide, ["w=0xFFFF"], commit=False, reset=False)[0][1] == b"\xff\xff"
+    with pytest.raises(errors.Refused, match=r"w = 65536 is outside 0\.\.65535"):
+        config.parse_writes(wide, ["w=0x10000"], commit=False, reset=False)
+
+
+# Check a 6E answer echoing another DID fails the write (exit 1).
+def test_write_echo_for_another_did_fails():
+    d = FakeServer(cfg_keys=CFG_VALUES)
+    d.s2e = lambda req, did: [b"\x6E\x02\x01"]
+    with pytest.raises(errors.UpdateFailed, match="write echo 0201 does not match 0x0200"):
+        run_config_set(d, ["mode=2"])
+
+
+# Check a commit refused with 0x24 (a session change dropped the staged set) exits 1 and says to run set again.
+def test_config_set_commit_sequence_error():
+    d = FakeServer(cfg_keys=CFG_VALUES, nrc_once={(0x31, CFG_COMMIT_RID): 0x24})
+    with pytest.raises(errors.UpdateFailed, match=r"answered NRC 0x24: the staged values were dropped \(the session "
+                                                  r"changed\); run config set again") as e:
+        run_config_set(d, ["mode=2"])
+    assert e.value.exit_code == 1 and d.nvs == CFG_VALUES
