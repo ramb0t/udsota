@@ -13,7 +13,7 @@ from udsota import cli, profile, transport, update, wire
 from udsota.errors import NoResponse, Nrc
 
 from .demo_server import (LABEL, MASTER, PIPE_P2_S, DemoServer, PipeTransport, binary_or_skip, build_image,
-                          elf_sha)
+                          delta_pair, elf_sha, reseal)
 
 EXAMPLE = profile.load("example")
 OLD = "v0.1.0"                     # the demo's seeded running image
@@ -554,3 +554,66 @@ def test_compressed_first_block_rules_refuse(demo):
         assert nrc is not None and nrc.code == wire.NRC_OUT_OF_RANGE
         assert wire.decode_result(uds.read_did(wire.DID_RESULT)) == ("DL_BAD_PROJECT", 0)
         assert wire.decode_status(uds.read_did(wire.DID_STATUS))["other_state"] == 0
+
+
+# ---- delta downloads (DFI 0x20, 0x30) ----
+
+# Flashes base with a full download, so the server runs it; then returns the base and new of delta_pair's 48 KB pair
+# with their files under tmp_path.
+def running_base(server, tmp_path):
+    pytest.importorskip("detools")
+    base, new = delta_pair(payload=48 * 1024)
+    assert run_cli(server, ["--profile", "example", "--interface", "pipe", "flash", image_file(tmp_path, base, "base.bin"),
+                            "--compress"]) == 0
+    return base, new, str(tmp_path / "base.bin"), image_file(tmp_path, new, "new.bin")
+
+
+# Check `flash --diff-from` against the real server: it rebuilds the new image from the one it runs, from a patch of
+# a few hundred bytes. By default 0x30 goes (the smaller mode), and --diff-format heatshrink sends 0x20; either way
+# the new image runs and confirms.
+@pytest.mark.parametrize("args, dfi", [([], wire.DL_DFI_DELTA_DEFLATE),
+                                       (["--diff-format", "heatshrink"], wire.DL_DFI_DELTA)])
+def test_flash_delta_runs_the_whole_sequence(demo, tmp_path, capsys, args, dfi):
+    s = demo()
+    base, new, base_path, new_path = running_base(s, tmp_path)
+    capsys.readouterr()
+    sent = []
+    s.tap = sent.append
+    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash", new_path, "--diff-from", base_path,
+                       *args]) == 0
+    assert any(is_34(m, dfi) for m in sent)
+    assert not any(is_34(m, d) for m in sent for d in (wire.DL_DFI, wire.DL_DFI_DEFLATE))
+    out = capsys.readouterr().out
+    assert "delta, DFI 0x%02X" % dfi in out and "confirmed" in out
+    status, sha, version = read_state(s)
+    assert (status["running_state"], version, sha) == (VALID, "v0.3.0", elf_sha(new))
+
+
+# Check a base with the running app_elf_sha256 but other bytes (a re-signed build of the same source) is refused by
+# the server before anything is erased, with F1F1 DL_BAD_BASE, and the client then sends the full download.
+def test_flash_delta_from_a_wrong_base_falls_back(demo, tmp_path, capsys):
+    s = demo()
+    base, new, _, new_path = running_base(s, tmp_path)
+    other = bytearray(base)
+    other[1000] ^= 0xFF
+    wrong = image_file(tmp_path, reseal(other), "resigned.bin")
+    capsys.readouterr()
+    sent = []
+    s.tap = sent.append
+    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash", new_path, "--diff-from", wrong]) == 0
+    assert any(is_34(m, wire.DL_DFI_DELTA_DEFLATE) for m in sent) and any(is_34(m, wire.DL_DFI) for m in sent)
+    assert not any(is_34(m, wire.DL_DFI_DELTA) for m in sent)          # the base is wrong for every delta mode
+    assert "not running the base this patch was made from" in capsys.readouterr().out
+    assert read_state(s)[2] == "v0.3.0"
+
+
+# Check a server without delta downloads answers each delta mode's 34 with 0x31, and the client tries the next, then
+# the full download.
+def test_flash_delta_on_a_server_without_it(demo, tmp_path, capsys):
+    s = demo("--no-delta")
+    base, new, base_path, new_path = running_base(s, tmp_path)
+    capsys.readouterr()
+    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash", new_path, "--diff-from", base_path]) == 0
+    out = capsys.readouterr().out
+    assert "no delta downloads for DFI 0x30" in out and "no delta downloads for DFI 0x20" in out
+    assert read_state(s)[2] == "v0.3.0"

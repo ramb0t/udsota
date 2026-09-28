@@ -14,6 +14,10 @@ requires-python = ">=3.11"
 # ecdsa mode's seeds through its stable EC API only, so it takes a lower bound and its security fixes install.
 dependencies = ["python-can==4.6.1", "can-isotp==2.0.7", "udsoncan==1.26.1", "cryptography>=42"]
 
+# flash --diff-from builds its patches with detools; PyPI has only its sdist, so installing it needs a C and C++ compiler.
+[project.optional-dependencies]
+diff = ["detools==0.53.0"]
+
 [project.scripts]
 udsota = "udsota.cli:main"
 

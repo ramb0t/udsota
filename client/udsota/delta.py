@@ -6,6 +6,8 @@ import io
 import struct
 import zlib
 
+from .wire import DL_DFI_DELTA, DL_DFI_DELTA_DEFLATE
+
 MAGIC = 0xFCCDDE10                   # the header's first 4 bytes, little-endian (esp_delta_ota's magic)
 HEADER_LEN, HASH_LEN = 64, 32        # magic, the base's validation hash, 28 reserved bytes
 IMG_MAGIC, SEG_MAX = 0xE9, 16        # esp_image_header_t magic; ESP_IMAGE_MAX_SEGMENTS
@@ -53,7 +55,17 @@ def deflate(data):
     return c.compress(data) + c.flush()
 
 
+# What a delta download with dfi carries for base -> new: 0x20 the header and a heatshrink patch, 0x30 the header
+# and an uncompressed patch, all of it raw DEFLATE.
+def build(base, new, dfi):
+    if dfi == DL_DFI_DELTA:
+        return make_patch(base, new, "heatshrink")
+    if dfi == DL_DFI_DELTA_DEFLATE:
+        return deflate(make_patch(base, new, "none"))
+    raise ValueError("DFI 0x%02X is no delta download" % dfi)
+
+
 # The two delta payloads for base -> new: {0x20: header + heatshrink patch, 0x30: DEFLATE of header + uncompressed
 # patch}.
 def payloads(base, new):
-    return {0x20: make_patch(base, new, "heatshrink"), 0x30: deflate(make_patch(base, new, "none"))}
+    return {dfi: build(base, new, dfi) for dfi in (DL_DFI_DELTA, DL_DFI_DELTA_DEFLATE)}

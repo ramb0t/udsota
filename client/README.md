@@ -10,6 +10,7 @@ It runs on Linux with SocketCAN and the kernel's ISO-TP module, on Python 3.11 o
 udsota --profile example info                    # identity, update state, the profile's DIDs
 udsota --profile example flash build/example.bin # precheck, download, verify, activate, confirm
 udsota --profile example flash --compress build/example.bin   # the same, sending the image as raw DEFLATE
+udsota --profile example flash --diff-from releases/ build/example.bin   # a patch from the running image, if one fits
 udsota --profile example confirm                 # ConfirmImage for an image left unconfirmed
 udsota --profile example reset                   # 11 01; an unconfirmed image rolls back
 udsota --profile example config show             # the writable DIDs, the config status and hash
@@ -27,6 +28,10 @@ udsota keygen --out keys                         # a new ecdsa-mode key pair; no
 
 `flash --compress` sends the image as a raw DEFLATE stream (Python's `zlib`, level 9, no header), which usually takes an update to 50–65 % of its time on the bus. The RequestDownload still announces the image's own size, and the device writes the same bytes. Once the device takes the compressed download, the tool prints the ratio, and after it the time saved. A device answers 0x31 when it has no compressed downloads, or when the image is larger than its slot, and 0x22 with F1F1 reading `DL_NO_MEMORY` when it has no memory for the inflater now. `--compress` then stops before anything is written: exit code 2 for the first, 1 for the second, whose message says a plain flash may work. `--compress-auto` sends the image uncompressed in both cases instead. `[image] compression` in the profile sets the default, `"deflate"`, `"auto"` or `"none"`, which `--compress`, `--compress-auto` and `--no-compress` override. No download resumes, compressed or not: a new run starts from the first byte.
 
+`flash --diff-from PATH` sends only a patch from the image the device runs, so a small code change costs kilobytes on the bus instead of the whole image. It needs a device that serves delta downloads (the ESP32 port with `UDSOTA_ESP32_DELTA`) and detools, the optional extra `pip install udsota[diff]`; PyPI has only detools' source distribution, so installing it needs a C and C++ compiler. `PATH` is one base `.bin` or a directory of them, such as past release images, and the tool uses the one file carrying the device's running app_elf_sha256 (F1F3). The base must be the very `.bin` that was flashed: a rebuild of the same source generally differs, and the device checks the patch against its image's appended SHA-256. With no matching file, several different ones, or one without an appended SHA-256, the tool says why and sends the full download.
+
+A delta goes as DFI 0x20, an Espressif `esp_delta_ota` patch compressed with heatshrink, or DFI 0x30, the same patch uncompressed and then raw DEFLATE, which is usually much smaller. The tool tries each mode whose patch is smaller than the full download, smallest first; `--no-compress` rules out 0x30, and `--diff-format heatshrink` or `deflate` allows only 0x20 or only 0x30 (default `auto`). A device that answers 0x31 to one mode gets the next. A device running another build with the same app_elf_sha256, a re-signed one for example, refuses the patch before it erases anything (F1F1 `DL_BAD_BASE`), and the tool then sends the full download.
+
 The tool transmits only on the profile's request ID and never on a `deny_tx` ID. Before its first frame it listens for 2 s and stops if it hears the response ID or the profile's busy value. During a run it stops if a response arrives that it did not ask for.
 
 The exit code says why it stopped:
@@ -35,7 +40,7 @@ The exit code says why it stopped:
 |---|---|
 | 0 | done |
 | 1 | the device refused or failed a step |
-| 2 | refused with nothing written: a bad profile, image, key file or `config set` value, a precheck stop (an image for another board, a running image still unconfirmed, a device that does not serve the udsota status DID F1F0), firmware without config writes, or `flash --compress` on a server without compressed downloads |
+| 2 | refused with nothing written: a bad profile, image, key file or `config set` value, a precheck stop (an image for another board, a running image still unconfirmed, a device that does not serve the udsota status DID F1F0), firmware without config writes, `flash --compress` on a server without compressed downloads, or `--diff-from` without detools installed |
 | 3 | another tester holds a session |
 | 4 | a second tester is on the bus |
 

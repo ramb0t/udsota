@@ -4,12 +4,14 @@ and no vcan: the UDS layer runs over a stub udsoncan connection, the pre-flight 
 Most tests run with FULL (P), a profile that turns every optional feature on."""
 import errno
 import hashlib
+import io
 import os
 import pathlib
 import re
 import socket
 import stat
 import struct
+import sys
 import threading
 import time
 import tomllib
@@ -26,9 +28,11 @@ from udsoncan.client import Client
 from udsoncan.connections import BaseConnection, IsoTPSocketConnection
 from udsoncan.exceptions import TimeoutException
 
-from udsota import cli, config, errors, keys, profile, transport, update, wire
+from udsota import cli, config, delta, errors, keys, profile, transport, update, wire
 from udsota.image import parse_image
 from udsota.uds import BUSY_BACKOFF_S, KEEPALIVE_S, SA_DELAY_S, Uds
+
+from .demo_server import build_image, delta_pair, elf_sha, reseal
 
 # Every optional table on, with the example IDs, label, product and board; a deny list and three boards so
 # the deny-list and board checks have something to refuse.
@@ -162,13 +166,16 @@ class FakeTime:
 # With cfg_keys it serves config writes: 0x2E stages a value, the commit routine CFG_COMMIT_RID stores the staged
 # set (answering 0x78 first), a restart serves the stored values, a session change drops the staged set, and
 # CFG_HASH_DID and CFG_STATUS_DID answer the config hash and status. Without cfg_keys, 0x2E answers 0x11.
+# With delta (DFIs 0x20 and/or 0x30) it serves delta downloads from base, its running image: the 36 that completes
+# the patch header answers 0x31 with F1F1 DL_BAD_BASE when the header names another base, and the 37 applies the
+# patch with detools.
 class FakeServer:
     # Knobs select the faults and states each test needs.
     def __init__(self, max_block=18, boot_silence=2, confirm_refusals=2, running_state=3, sha=OLD_SHA,
                  board=b"devkit", other_state=0, other_sha=bytes(32), lose_76_once=None, mute_block=None,
                  nrc_once=None, activate_refusals=0, ff01_status=0, config=None, lose_77_once=False,
                  lose_ff01_once=False, activate_nrcs=None, activate_fail=None, no_fc=None, security=True,
-                 pubkey=None, cfg_keys=None, commit_status=0, compress=False, z_nomem=False):
+                 pubkey=None, cfg_keys=None, commit_status=0, compress=False, z_nomem=False, delta=(), base=None):
         self.max_block, self.boot_silence, self.confirm_refusals = max_block, boot_silence, confirm_refusals
         self.running_state, self.sha, self.board = running_state, sha, board
         self.other_state, self.other_sha = other_state, other_sha
@@ -188,6 +195,8 @@ class FakeServer:
         self.compress = compress                # serves DFI 0x10: the blocks carry raw DEFLATE, inflated at 37
         self.z_nomem = z_nomem                  # a DFI 0x10 34 finds no memory: 0x22, F1F1 DL_NO_MEMORY
         self.dfi, self.zin = 0x00, bytearray()  # the open download's format, and its compressed bytes
+        self.delta, self.base = tuple(delta), base   # the delta DFIs served, and the image their patches apply to
+        self.dfis = []                          # every 34's DFI, in order
         self.log, self.written, self.writes = [], bytearray(), 0
         self.silence, self.announced, self.next_bsc, self.last_bsc = 0, None, 1, None
         self.session, self.unlocked, self.last_t, self.clock = 1, 0, 0.0, lambda: 0.0
@@ -312,12 +321,14 @@ class FakeServer:
     # 0x34 RequestDownload: DFI 00 (or 10 with compress), ALFID 44, address 0; answers 74 20 <max_block> and starts
     # a fresh download, which also ends any earlier FF01 pass.
     def s34(self, req, _):
-        if req[1] not in ((0x00, 0x10) if self.compress else (0x00,)) or req[2] != 0x44 or req[3:7] != bytes(4):
+        self.dfis.append(req[1])
+        if (req[1] not in ((0x00, 0x10) if self.compress else (0x00,)) + self.delta or req[2] != 0x44
+                or req[3:7] != bytes(4)):
             return self.nrc(0x34, 0x31)
         if req[1] == 0x10 and self.z_nomem:
             self.last_dl = (14, 0)                      # DL_NO_MEMORY
             return self.nrc(0x34, 0x22)
-        self.dfi, self.zin = req[1], bytearray()
+        self.dfi, self.zin, self.header_ok = req[1], bytearray(), False
         self.announced = int.from_bytes(req[7:11], "big")
         self.written, self.next_bsc, self.last_bsc = bytearray(), 1, None
         self.dl_open, self.dl_complete, self.verified, self.last_dl = True, False, False, (0, 0)
@@ -333,12 +344,19 @@ class FakeServer:
             return [bytes([0x76, bsc])]
         if bsc != self.next_bsc:
             return self.nrc(0x36, 0x73)
-        if self.dfi == 0x10:
+        if self.dfi:
             self.zin += req[2:]
         else:
             self.written += req[2:]
         self.writes += 1
-        self.last_dl = (0, len(self.zin) if self.dfi == 0x10 else len(self.written))
+        self.last_dl = (0, len(self.zin) if self.dfi else len(self.written))
+        if self.dfi in (0x20, 0x30) and not self.header_ok:
+            head = self.patch()[:delta.HEADER_LEN]
+            if len(head) == delta.HEADER_LEN:
+                if head != delta.header(delta.validation_hash(self.base)):
+                    self.dl_open, self.last_dl = False, (15, len(self.zin))    # DL_BAD_BASE
+                    return self.nrc(0x36, 0x31)
+                self.header_ok = True
         self.last_bsc, self.next_bsc = bsc, (bsc + 1) & 0xFF
         if self.writes == self.lose_76_once:
             self.lose_76_once = None
@@ -346,8 +364,28 @@ class FakeServer:
         first = [bytes([0x7F, 0x36, 0x78])] if self.writes == 1 else []   # the erase runs under 0x78
         return first + [bytes([0x76, bsc])]
 
+    # The delta download's patch bytes so far: the blocks as they are (0x20) or inflated (0x30).
+    def patch(self):
+        return bytes(self.zin) if self.dfi == 0x20 else zlib.decompressobj(-15).decompress(bytes(self.zin))
+
+    # The image the patch rebuilds from base, or b"" when it does not apply.
+    def apply_patch(self):
+        import detools
+        out = io.BytesIO()
+        try:
+            detools.apply_patch(io.BytesIO(self.base), io.BytesIO(self.patch()[delta.HEADER_LEN:]), out)
+        except (detools.Error, zlib.error):
+            return b""
+        return out.getvalue()
+
     # 0x37 RequestTransferExit: an open transfer holding every announced byte closes (77), else 0x24.
     def s37(self, req, _):
+        if self.dl_open and self.dfi in (0x20, 0x30):
+            out = self.apply_patch()
+            if len(out) != self.announced:
+                self.dl_open, self.last_dl = False, (13, len(self.zin))    # DL_BAD_STREAM
+                return self.nrc(0x37, 0x72)
+            self.written = bytearray(out)
         if self.dl_open and self.dfi == 0x10:
             z = zlib.decompressobj(-15)
             try:
@@ -1074,6 +1112,7 @@ WIRE_DEFINES = {"UDSOTA_DID_ACTIVE_SESSION": "DID_SESSION", "UDSOTA_DID_SW_VERSI
                 "UDSOTA_DID_RUNNING_SHA": "DID_RUNNING_SHA", "UDSOTA_RID_CHECK_PROG_DEPS": "RID_CHECK_DEPS",
                 "UDSOTA_RID_ACTIVATE_IMAGE": "RID_ACTIVATE", "UDSOTA_RID_CONFIRM_IMAGE": "RID_CONFIRM",
                 "UDSOTA_DL_DFI": "DL_DFI", "UDSOTA_DL_DFI_DEFLATE": "DL_DFI_DEFLATE",
+                "UDSOTA_DL_DFI_DELTA": "DL_DFI_DELTA", "UDSOTA_DL_DFI_DELTA_DEFLATE": "DL_DFI_DELTA_DEFLATE",
                 "UDSOTA_DL_ALFID": "DL_ALFID", "UDSOTA_NRC_BUSY_REPEAT": "NRC_BUSY",
                 "UDSOTA_NRC_SERVICE_NOT_SUPPORTED": "NRC_NOT_SUPPORTED",
                 "UDSOTA_NRC_CONDITIONS_NOT_CORRECT": "NRC_CONDITIONS",
@@ -2478,3 +2517,205 @@ def test_main_compress_on_a_server_without_it_exits_2(tmp_path, full_path, capsy
     rc = cli.main(["--profile", full_path, "--master", str(master), "flash", "--compress", str(img)],
                   transport=lambda prof, interface: FakeTransport(d, interface))
     assert rc == 2 and "the server has no compressed downloads" in capsys.readouterr().err
+
+
+# ---- delta downloads (DFI 0x20 and 0x30) ----
+
+ESPRESSIF_PATCH = pathlib.Path(__file__).resolve().parents[2] / "test" / "fixtures" / "delta_espressif.patch"
+DELTA_BASE, DELTA_NEW = delta_pair()
+
+
+# A re-signed build of base: the same app_elf_sha256, other bytes after it, so another appended SHA-256.
+def resigned(base):
+    img = bytearray(base)
+    img[400] ^= 0xFF
+    return reseal(img)
+
+
+# Run flash from DELTA_BASE (what server runs) to DELTA_NEW with bases; returns (rc, the log lines). Needs detools.
+def run_delta(server, bases, **kw):
+    pytest.importorskip("detools")
+    ft, lines = FakeTime(), []
+    rc = update.flash(uds_for(server, ft), P, DELTA_NEW, MASTER, sleep=ft.sleep, clock=ft.clock, log=lines.append,
+                      bases=bases, **kw)
+    return rc, lines
+
+
+# A server running DELTA_BASE that serves the delta DFIs in delta, and compressed downloads.
+def delta_server(delta=(0x20, 0x30), base=DELTA_BASE, **kw):
+    return FakeServer(sha=elf_sha(DELTA_BASE), delta=delta, base=base, compress=True, **kw)
+
+
+# Check the 0x20 patch is byte for byte what Espressif's esp_delta_ota_patch_gen.py wrote for the same pair.
+def test_heatshrink_patch_matches_espressif():
+    pytest.importorskip("detools")
+    if not ESPRESSIF_PATCH.is_file():
+        pytest.skip("no %s (not a repo checkout)" % ESPRESSIF_PATCH)
+    assert delta.make_patch(DELTA_BASE, DELTA_NEW, "heatshrink") == ESPRESSIF_PATCH.read_bytes()
+    assert delta.build(DELTA_BASE, DELTA_NEW, 0x20) == ESPRESSIF_PATCH.read_bytes()
+
+
+# Check a delta download end to end: the one base whose app_elf_sha256 matches F1F3 is used (a copy of it under
+# another name is the same base; another image is ignored), the smaller 0x30 goes first, the server's slot ends up
+# holding the new image, and the mode, size and time saved are logged.
+def test_flash_delta_uses_the_matching_base():
+    d = delta_server()
+    bases = [("other.bin", build_image(version="v0.1.0")), ("a.bin", DELTA_BASE), ("copy.bin", DELTA_BASE)]
+    rc, lines = run_delta(d, bases, compress="auto")
+    p30 = delta.build(DELTA_BASE, DELTA_NEW, 0x30)
+    assert rc == 0 and d.dfis == [0x30] and bytes(d.written) == DELTA_NEW and d.writes == (len(p30) + 15) // 16
+    assert "delta base: a.bin" in lines
+    assert "delta, DFI 0x30 (patch as raw DEFLATE): %d -> %d bytes (%.0f%%)" % (
+        len(DELTA_NEW), len(p30), 100.0 * len(p30) / len(DELTA_NEW)) in lines
+    assert any(ln.startswith("sent %d delta bytes in" % len(p30)) and ln.endswith("s saved") for ln in lines)
+
+
+# Check no delta is sent, and why is logged, when no base matches F1F3, when different files match, and when the
+# matching base has no valid appended SHA-256: each run is the full download.
+@pytest.mark.parametrize("bases, why", [
+    ([("other.bin", build_image(version="v0.1.0"))], "no delta: none of the 1 base files has the running"),
+    ([("a.bin", DELTA_BASE), ("b.bin", resigned(DELTA_BASE))], "no delta: 2 different base files have the running"),
+    ([("a.bin", DELTA_BASE[:-1] + bytes([DELTA_BASE[-1] ^ 1]))], "no delta: the base a.bin has no valid appended"),
+])
+def test_flash_delta_without_a_usable_base(bases, why):
+    d = delta_server()
+    rc, lines = run_delta(d, bases, compress="auto")
+    assert rc == 0 and d.dfis == [0x10] and bytes(d.written) == DELTA_NEW
+    assert any(ln.startswith(why) for ln in lines)
+
+
+# Check choose_base passes over the new image itself as a base.
+def test_choose_base_skips_the_new_image():
+    lines = []
+    assert update.choose_base([("n.bin", DELTA_NEW)], DELTA_NEW, elf_sha(DELTA_NEW), log=lines.append) is None
+    assert lines == ["no delta: the base n.bin is the new image itself"]
+
+
+# Check plan_deltas: a delta payload no smaller than the full path's is dropped (the full path being the DEFLATE
+# stream, or the image under "none"), the rest come smallest first, and "none" rules out 0x30 only.
+@pytest.mark.parametrize("compress, sizes, planned", [
+    ("auto", {0x20: 100, 0x30: 50}, [0x30, 0x20]),
+    ("deflate", {0x20: 50, 0x30: 100}, [0x20, 0x30]),
+    ("auto", {0x20: "full", 0x30: 50}, [0x30]),
+    ("deflate", {0x20: 100, 0x30: "full"}, [0x20]),
+    ("none", {0x20: 100, 0x30: 50}, [0x20]),
+    ("none", {0x20: "image", 0x30: 50}, []),
+    ("none", {0x20: "full", 0x30: 50}, [0x20]),     # bigger than the DEFLATE stream, smaller than the image
+])
+def test_plan_deltas_compares_sizes(monkeypatch, compress, sizes, planned):
+    full = len(update.deflate(DELTA_NEW))
+    n = {"full": full, "image": len(DELTA_NEW)}
+    monkeypatch.setattr(update, "build_delta", lambda base, new, dfi: bytes(n.get(sizes[dfi], sizes[dfi])))
+    plan = update.plan_deltas([("a.bin", DELTA_BASE)], DELTA_NEW, elf_sha(DELTA_BASE), compress, "auto",
+                              log=lambda *a: None)
+    assert [dfi for dfi, _ in plan] == planned
+
+
+# Check --no-compress ("none") tries 0x20 but never 0x30 or 0x10.
+def test_flash_delta_no_compress_sends_heatshrink_only():
+    d = delta_server()
+    rc, _ = run_delta(d, [("a.bin", DELTA_BASE)], compress="none")
+    assert rc == 0 and d.dfis == [0x20] and bytes(d.written) == DELTA_NEW
+
+
+# Check --diff-format limits the delta modes tried, and "deflate" under compression none tries none, saying why.
+@pytest.mark.parametrize("fmt, compress, dfis", [("heatshrink", "auto", [0x20]), ("deflate", "auto", [0x30]),
+                                                 ("auto", "auto", [0x30]), ("deflate", "none", [0x00])])
+def test_flash_delta_diff_format(fmt, compress, dfis):
+    d = delta_server()
+    rc, lines = run_delta(d, [("a.bin", DELTA_BASE)], compress=compress, diff_format=fmt)
+    assert rc == 0 and d.dfis == dfis and bytes(d.written) == DELTA_NEW
+    assert ("no delta: DFI 0x30 is raw DEFLATE" in " ".join(lines)) == (dfis == [0x00])
+
+
+# Check the profile's default compression "none" still tries 0x30 (only --no-compress rules it out), and a full
+# download after it is uncompressed, as the profile says.
+def test_flash_delta_profile_none_still_tries_0x30():
+    assert P.compression == "none"
+    d = delta_server()
+    rc, _ = run_delta(d, [("a.bin", DELTA_BASE)])
+    assert rc == 0 and d.dfis == [0x30] and bytes(d.written) == DELTA_NEW
+    d = delta_server(delta=())
+    rc, _ = run_delta(d, [("a.bin", DELTA_BASE)])
+    assert rc == 0 and d.dfis == [0x30, 0x20, 0x00] and bytes(d.written) == DELTA_NEW
+
+
+# Check a 34 answering 0x31 to a delta DFI moves on to the next mode, smallest first, then to the full path.
+@pytest.mark.parametrize("served, dfis", [((0x20,), [0x30, 0x20]), ((), [0x30, 0x20, 0x10])])
+def test_flash_delta_falls_back_on_0x31_at_the_34(served, dfis):
+    d = delta_server(delta=served)
+    rc, lines = run_delta(d, [("a.bin", DELTA_BASE)], compress="auto")
+    assert rc == 0 and d.dfis == dfis and bytes(d.written) == DELTA_NEW
+    assert ("the device has no delta downloads for DFI 0x30 (RequestDownload answered 0x31): trying the next mode"
+            in lines)
+
+
+# Check a 36 refused with 0x31 and F1F1 DL_BAD_BASE (the server runs a re-signed build: same app_elf_sha256, other
+# image) skips every other delta mode and sends the full download with a new 34.
+def test_flash_delta_wrong_base_falls_back_to_a_full_download():
+    d = delta_server(base=resigned(DELTA_BASE))
+    rc, lines = run_delta(d, [("a.bin", DELTA_BASE)], compress="auto")
+    assert rc == 0 and d.dfis == [0x30, 0x10] and bytes(d.written) == DELTA_NEW
+    assert any(ln.startswith("the device is not running the base this patch was made from") for ln in lines)
+    d = delta_server(base=resigned(DELTA_BASE))
+    assert run_delta(d, [("a.bin", DELTA_BASE)], compress="none")[0] == 0 and d.dfis == [0x20, 0x00]
+
+
+# Check any other refusal stops the run: a 0x22 at the delta 34, and a patch the server cannot apply (0x72 at 37,
+# named with F1F1's reason).
+def test_flash_delta_other_refusals_stop(monkeypatch):
+    d = delta_server(nrc_once={(0x34, None): 0x22})
+    with pytest.raises(errors.Nrc) as e:
+        run_delta(d, [("a.bin", DELTA_BASE)], compress="auto")
+    assert (e.value.sid, e.value.code) == (0x34, 0x22)
+    assert [x for x in d.log if x[0] == 0x34] == [(0x34, None)]
+    good = delta.build
+    monkeypatch.setattr(update, "build_delta", lambda base, new, dfi: good(base, new, 0x20)[:-8])
+    d = delta_server()
+    with pytest.raises(errors.UpdateFailed, match="0x72.*DL_BAD_STREAM"):
+        run_delta(d, [("a.bin", DELTA_BASE)], compress="none")
+
+
+# Check --diff-from and --diff-format parse, with auto the default, and a format outside the three is refused.
+def test_diff_flags(capsys):
+    args = cli.parse_args(["--profile", "example", "flash", "x.bin", "--diff-from", "bases"])
+    assert (str(args.diff_from), args.diff_format) == ("bases", "auto")
+    args = cli.parse_args(["--profile", "example", "flash", "x.bin", "--diff-from", "b.bin",
+                           "--diff-format", "deflate"])
+    assert (str(args.diff_from), args.diff_format) == ("b.bin", "deflate")
+    with pytest.raises(SystemExit):
+        cli.parse_args(["--profile", "example", "flash", "x.bin", "--diff-format", "lzma"])
+    assert "invalid choice" in capsys.readouterr().err
+
+
+# Check --diff-from without detools installed exits 2 before any bus opens, naming the extra to install.
+def test_main_diff_from_without_detools(tmp_path, full_path, capsys, monkeypatch):
+    img, master = tmp_path / "i.bin", tmp_path / "m.bin"
+    img.write_bytes(DELTA_NEW)
+    master.write_bytes(MASTER)
+    monkeypatch.setitem(sys.modules, "detools", None)       # import detools raises ImportError
+    rc = cli.main(["--profile", full_path, "--master", str(master), "flash", str(img), "--diff-from", str(img)],
+                  transport=no_transport)
+    assert rc == 2 and "pip install udsota[diff]" in capsys.readouterr().err
+
+
+# Check main with --diff-from DIR takes the *.bin files directly in DIR (not a subdirectory's, and not other
+# names), and a missing path exits 2 before any bus opens.
+def test_main_diff_from_a_directory(tmp_path, full_path, capsys, monkeypatch):
+    pytest.importorskip("detools")
+    monkeypatch.setattr(update, "REBOOT_WAIT_S", 0.0)
+    img, master, bases = tmp_path / "i.bin", tmp_path / "m.bin", tmp_path / "bases"
+    img.write_bytes(DELTA_NEW)
+    master.write_bytes(MASTER)
+    (bases / "old").mkdir(parents=True)
+    (bases / "v0.2.0.bin").write_bytes(DELTA_BASE)
+    (bases / "old" / "resigned.bin").write_bytes(resigned(DELTA_BASE))
+    (bases / "resigned.img").write_bytes(resigned(DELTA_BASE))
+    d = delta_server(boot_silence=0, confirm_refusals=0)
+    rc = cli.main(["--profile", full_path, "--master", str(master), "flash", str(img), "--diff-from", str(bases),
+                   "--compress-auto"], transport=lambda prof, interface: FakeTransport(d, interface))
+    assert rc == 0 and d.dfis == [0x30] and bytes(d.written) == DELTA_NEW
+    assert "delta base: %s" % (bases / "v0.2.0.bin") in capsys.readouterr().out
+    assert cli.main(["--profile", full_path, "--master", str(master), "flash", str(img), "--diff-from",
+                     str(tmp_path / "absent.bin")], transport=no_transport) == 2
+    assert "cannot read" in capsys.readouterr().err

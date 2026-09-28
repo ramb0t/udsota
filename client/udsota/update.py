@@ -4,20 +4,25 @@ import contextlib
 import time
 import zlib
 
+from .delta import build as build_delta, validation_hash
 from .errors import NoResponse, Nrc, Refused, SendFailed, UpdateFailed
 from .image import parse_image
 from .keys import DeviceKeys, SigningKeys
 from .wire import (DID_COUNTERS, DID_DEVICE_ID, DID_RESULT, DID_RUNNING_SHA, DID_SESSION, DID_STATUS, DID_VERSION,
-                   DL_DFI, DL_DFI_DEFLATE, IMG_PENDING_VERIFY, IMG_STATES, NRC_CONDITIONS, NRC_OUT_OF_RANGE,
-                   NRC_PROGRAMMING_FAILURE, NRC_SEQUENCE, OTHER_VERIFIED, RID_ACTIVATE, RID_CHECK_DEPS, RID_CONFIRM,
-                   SESSION_EXTENDED, SESSION_PROGRAMMING, cstr, decode_counters, decode_result, decode_status,
-                   describe_status, reason_name)
+                   DL_DFI, DL_DFI_DEFLATE, DL_DFI_DELTA, DL_DFI_DELTA_DEFLATE, IMG_PENDING_VERIFY, IMG_STATES,
+                   NRC_CONDITIONS, NRC_OUT_OF_RANGE, NRC_PROGRAMMING_FAILURE, NRC_SEQUENCE, OTHER_VERIFIED,
+                   RID_ACTIVATE, RID_CHECK_DEPS, RID_CONFIRM, SESSION_EXTENDED, SESSION_PROGRAMMING, cstr,
+                   decode_counters, decode_result, decode_status, describe_status, reason_name)
 
 REBOOT_WAIT_S = 3.0
 BOOT_TIMEOUT_S = 60.0
 BOOT_POLL_S = 1.0
 CONFIRM_RETRY_S = 2.0    # under S3 (5 s), so the retries keep the extended session open
 CONFIRM_TIMEOUT_S = 120.0   # a product's soak plus its health check, with margin
+# flash's diff_format (--diff-format): the delta DFIs it may try; and each delta DFI's name in the log.
+DIFF_DFIS = {"auto": (DL_DFI_DELTA, DL_DFI_DELTA_DEFLATE), "heatshrink": (DL_DFI_DELTA,),
+             "deflate": (DL_DFI_DELTA_DEFLATE,)}
+DELTA_NAMES = {DL_DFI_DELTA: "heatshrink patch", DL_DFI_DELTA_DEFLATE: "patch as raw DEFLATE"}
 
 # The server-owned DIDs `info` reads first, with their labels and renderers.
 CORE_DIDS = ((DID_SESSION, "active session", lambda d: d.hex(" ")),
@@ -78,6 +83,14 @@ def last_result(uds):
         return "the last-result DID F1F1 could not be read"
 
 
+# F1F1's reason name, or None when it cannot be read.
+def last_reason(uds):
+    try:
+        return decode_result(uds.read_did(DID_RESULT))[0]
+    except UpdateFailed:
+        return None
+
+
 # Block n's failure e as the same error naming the block. After a send the server stopped (SendFailed), with F1F1:
 # a server that withheld flow control has ended the download (DL_ABORTED). After no answer the download may still
 # be open, so F1F1 would describe the previous one; it is not read.
@@ -130,11 +143,37 @@ def open_download(uds, image, compress, log=print):
     return payload, max_data
 
 
-# RequestDownload, every 0x36 block (counter from 1, wrapping 0xFF -> 0x00) and RequestTransferExit, the image
-# compressed per compress (open_download). drop_76 = N resends block N once as if its 76 were lost; an N past the
-# last block is refused before any 0x36. A compressed download ends with the time the compression saved.
-def download(uds, image, drop_76=None, log=print, compress="none", clock=time.monotonic):
+# RequestDownload, every 0x36 block (counter from 1, wrapping 0xFF -> 0x00) and RequestTransferExit: first each
+# delta in deltas ((dfi, payload) pairs, plan_deltas) in turn, then the image compressed per compress
+# (open_download). A delta DFI the server answers 0x31 moves on to the next; a delta refused for its base
+# (send_payload) skips the rest and sends the image. drop_76 = N resends block N once as if its 76 were lost; an N
+# past the last block is refused before any 0x36.
+def download(uds, image, drop_76=None, log=print, compress="none", clock=time.monotonic, deltas=()):
+    for dfi, patch in deltas:
+        try:
+            max_data = uds.request_download(len(image), dfi)
+        except Nrc as e:
+            if e.code != NRC_OUT_OF_RANGE:
+                raise
+            log("the device has no delta downloads for DFI 0x%02X (RequestDownload answered 0x31): trying the next "
+                "mode" % dfi)
+            continue
+        log("delta, DFI 0x%02X (%s): %d -> %d bytes (%.0f%%)" % (dfi, DELTA_NAMES[dfi], len(image), len(patch),
+                                                                100.0 * len(patch) / len(image)))
+        if send_payload(uds, image, patch, max_data, "delta", drop_76=drop_76, log=log, clock=clock):
+            return
+        log("the device is not running the base this patch was made from (0x36 answered 0x31, F1F1 DL_BAD_BASE; "
+            "for example a re-signed build of the same source): sending a full download")
+        break
     payload, max_data = open_download(uds, image, compress, log=log)
+    send_payload(uds, image, payload, max_data, None if payload is image else "compressed", drop_76=drop_76,
+                 log=log, clock=clock)
+
+
+# The 0x36 blocks and the 0x37 of an open download of image carrying payload: the image itself (kind None), or it
+# coded as kind ("compressed" or "delta"), which ends with the time the coding saved. True when done; False when
+# a delta's 36 was refused (0x31) with F1F1 DL_BAD_BASE, which ends the download on the server.
+def send_payload(uds, image, payload, max_data, kind, drop_76=None, log=print, clock=time.monotonic):
     total = (len(payload) + max_data - 1) // max_data
     if drop_76 is not None and drop_76 > total:
         raise Refused("--drop-76 %d: the download is only %d blocks of %d bytes" % (drop_76, total, max_data))
@@ -153,14 +192,68 @@ def download(uds, image, drop_76=None, log=print, compress="none", clock=time.mo
                 log("sent %d of %d bytes" % (min(n * max_data, len(payload)), len(payload)))
         transfer_exit(uds, len(payload), log=log)
     except Nrc as e:
-        if payload is image:
+        if kind is None:
             raise
+        if kind == "delta" and (e.sid, e.code) == (0x36, NRC_OUT_OF_RANGE) and last_reason(uds) == "DL_BAD_BASE":
+            return False
         raise UpdateFailed("%s; %s" % (e, last_result(uds))) from e
-    if payload is not image:
+    if kind is not None:
         took = clock() - start
-        log("sent %d compressed bytes in %.1f s; the %d-byte image would take about %.1f s, so about %.1f s saved"
-            % (len(payload), took, len(image), took * len(image) / len(payload),
+        log("sent %d %s bytes in %.1f s; the %d-byte image would take about %.1f s, so about %.1f s saved"
+            % (len(payload), kind, took, len(image), took * len(image) / len(payload),
                took * (len(image) - len(payload)) / len(payload)))
+    return True
+
+
+# The one base in bases ((name, bytes) pairs) whose app_elf_sha256 is running_sha, the running image's; None, saying
+# why, when no file or several different ones match, when it is image itself, or when it has no appended SHA-256.
+def choose_base(bases, image, running_sha, log=print):
+    found = {}
+    for name, data in bases:
+        if bytes(data[176:208]) == running_sha:
+            found.setdefault(bytes(data), name)
+    if not found:
+        log("no delta: none of the %d base files has the running app_elf_sha256 %s"
+            % (len(bases), running_sha[:8].hex()))
+        return None
+    if len(found) > 1:
+        log("no delta: %d different base files have the running app_elf_sha256 %s: %s"
+            % (len(found), running_sha[:8].hex(), ", ".join(found.values())))
+        return None
+    (base, name), = found.items()
+    if base == bytes(image):
+        log("no delta: the base %s is the new image itself" % name)
+        return None
+    if validation_hash(base) is None:
+        log("no delta: the base %s has no valid appended SHA-256, which the device checks it against" % name)
+        return None
+    log("delta base: %s" % name)
+    return base
+
+
+# The delta downloads worth trying for image, as (dfi, payload) pairs smallest first: the modes diff_format allows
+# (DIFF_DFIS) but 0x30 without deflate_ok (default: compress is not "none"), each only when its payload is smaller
+# than what the full path would send (the image, raw DEFLATE unless compress is "none"). Empty when bases hold no
+# usable base (choose_base).
+def plan_deltas(bases, image, running_sha, compress, diff_format, log=print, deflate_ok=None):
+    base = choose_base(bases, image, running_sha, log=log)
+    if base is None:
+        return []
+    deflate_ok = compress != "none" if deflate_ok is None else deflate_ok
+    dfis = [d for d in DIFF_DFIS[diff_format] if deflate_ok or d != DL_DFI_DELTA_DEFLATE]
+    if not dfis:
+        log("no delta: DFI 0x30 is raw DEFLATE, which --no-compress rules out")
+        return []
+    full = len(image) if compress == "none" else len(deflate(image))
+    out = []
+    for dfi in dfis:
+        payload = build_delta(base, image, dfi)
+        if len(payload) < full:
+            out.append((dfi, payload))
+        else:
+            log("no delta over DFI 0x%02X: its %d bytes are no fewer than the full download's %d"
+                % (dfi, len(payload), full))
+    return sorted(out, key=lambda d: len(d[1]))
 
 
 # RequestTransferExit, resent once after a plain timeout. A resend refused with 0x24 means the first 0x37
@@ -285,8 +378,14 @@ def read_status_precheck(uds):
 # ConfirmImage. Returns 0 or raises ToolError. secret is the master or private key (make_keys), unused when the
 # profile has no [security]. quiet() is entered once an update is needed and held until the end (the transport's
 # bus quieting). compress is "none", "deflate" or "auto" (download); None takes the profile's [image] compression.
+# bases, (name, bytes) pairs, offers a delta download from the one the server runs, in the modes diff_format
+# allows (plan_deltas); its patches are built before the programming session opens. Only an explicit "none"
+# (--no-compress) rules out the DEFLATE delta, 0x30: a server with delta downloads has compressed ones too, and one
+# without answers 0x31.
 def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep=time.sleep,
-          clock=time.monotonic, log=print, quiet=contextlib.nullcontext, compress=None):
+          clock=time.monotonic, log=print, quiet=contextlib.nullcontext, compress=None, bases=None,
+          diff_format="auto"):
+    deflate_ok = compress != "none"             # before the profile's default: see the comment above
     compress = profile.compression if compress is None else compress
     img = parse_image(profile, image)
     board_of = profile.board_names.get(img.hw_id, "hw_id %d" % img.hw_id)
@@ -307,6 +406,9 @@ def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep
         raise Refused("image is for %s but the server is %s" % (board_of, board))
     verified = state["other_state"] == OTHER_VERIFIED and state["other_sha_prefix"] == img.elf_sha[:8]
     keys = make_keys(profile, secret, device_id)
+    deltas = []
+    if bases is not None and not verified:
+        deltas = plan_deltas(bases, image, running_sha, compress, diff_format, log=log, deflate_ok=deflate_ok)
     with quiet():                             # [functional] quiet_bus: the other nodes stay quiet until the end
         enter_programming(uds, profile, keys)
         if verified:
@@ -314,7 +416,7 @@ def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep
         need_download, recovered, resent = not verified, False, False
         while True:
             if need_download:
-                download(uds, image, drop_76=drop_76, log=log, compress=compress, clock=clock)
+                download(uds, image, drop_76=drop_76, log=log, compress=compress, clock=clock, deltas=deltas)
                 check_image(uds, log=log)
                 drop_76 = None                    # the fault injection applies to the first download only
             try:
