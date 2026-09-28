@@ -2,6 +2,7 @@
 guard and pre-roll, the TX-ID hard limit, profiles, and a run with a minimal profile. No kernel ISO-TP socket
 and no vcan: the UDS layer runs over a stub udsoncan connection, the pre-flight over python-can virtual buses.
 Most tests run with FULL (P), a profile that turns every optional feature on."""
+import argparse
 import errno
 import hashlib
 import io
@@ -19,6 +20,7 @@ import zlib
 from collections import deque
 
 import can
+import isotp
 import pytest
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
@@ -30,9 +32,9 @@ from udsoncan.exceptions import TimeoutException
 
 from udsota import cli, config, delta, errors, keys, profile, transport, update, wire
 from udsota.image import parse_image
-from udsota.uds import BUSY_BACKOFF_S, KEEPALIVE_S, SA_DELAY_S, Uds
+from udsota.uds import KEEPALIVE_S, SA_DELAY_S, Uds
 
-from .demo_server import build_image, delta_pair, elf_sha, reseal
+from .demo_server import MASTER, build_image, delta_pair, elf_sha, reseal
 
 # Every optional table on, with the example IDs, label, product and board; a deny list and three boards so
 # the deny-list and board checks have something to refuse.
@@ -90,7 +92,6 @@ def chatter(channel, msg, stop):
     tx.shutdown()
 
 
-MASTER = bytes(range(32))                      # master 0..31: the udsota-example vectors below and udsota_keys.c's KAT
 MAC = bytes.fromhex("020000000001")
 SEED = bytes(range(0x10, 0x20))
 KEYS = {0x01: bytes.fromhex("5de67156ccb30a17846a4cac31c9db8f"),
@@ -795,7 +796,6 @@ def test_quiet_bus_cleans_up_on_send_errors():
 
 # Check a key flag for the other 0x27 mode is refused, not silently ignored.
 def test_key_flag_for_the_other_mode_is_refused():
-    import argparse
     hmac_args = argparse.Namespace(master=None, private_key="k.pem")
     with pytest.raises(errors.Refused, match="--private-key is for mode ecdsa"):
         cli.load_secret(P, hmac_args)
@@ -832,7 +832,6 @@ def test_isotp_address_refuses_deny_tx_ids():
 
 # Check the kernel socket is blocking, WAIT_TX_DONE, padded 0xAA and never forces STmin (no real socket).
 def test_isotp_connection_socket_options(monkeypatch):
-    import isotp
     made = []
 
     # Records the constructor timeout and the options; never opens an AF_CAN socket.
@@ -892,7 +891,6 @@ class EcommSocket:
 
 # Open cls (a udsoncan ISO-TP socket connection) over an EcommSocket and send payload from the peer.
 def open_over_ecomm(cls, payload, errors=1, stolen=False):
-    import isotp
     sock = EcommSocket(errors=errors, stolen=stolen)
     conn = cls("vcan0", isotp.Address(isotp.AddressingMode.Normal_11bits, txid=0x710, rxid=0x718), tpsock=sock)
     conn.open()

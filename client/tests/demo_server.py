@@ -25,7 +25,7 @@ from udsota.uds import Uds
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 BINARY_NAME = "udsota_demo_server"
-MASTER = bytes(range(32))                # the master the key tests use (udsota_keys.c's KAT master)
+MASTER = bytes(range(32))                # the key tests' master: the udsota-example vectors and udsota_keys.c's KAT
 LABEL = "udsota-example"
 EXAMPLE = profile.load("example")
 
