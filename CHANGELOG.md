@@ -2,17 +2,13 @@
 
 All notable changes to udsota. Versions follow semantic versioning; the wire protocol is part of the public API.
 
-## [0.3.0] - unreleased
+## [0.3.0] - 2026-09-28
 
 Apps can serve their own writes and routines. WriteDataByIdentifier (0x2E) goes to a new `did_write` hook, and 31 01 on a RID the core doesn't own goes to a new `routine` hook. A routine may return `UDSOTA_PENDING` and finish in `routine_poll`, and the core treats it as a job meanwhile: 0x78, 0x21 to other requests, and the 90 s cap. Both hooks get a `udsota_access_t` with the session, the unlocked level and a session epoch, so the app decides which session and key each write needs and can drop state an earlier session left. The ESP32 port forwards all three hooks with the app's `ctx`.
 
-Additive: `udsota_hooks_t` gains `did_write`, `routine` and `routine_poll` after `ctx`. With them NULL every answer is byte for byte as in 0.2.0, so 2E answers 0x11 and an unknown RID 0x31.
+Additive: `udsota_hooks_t` gains `did_write`, `routine` and `routine_poll` after `ctx`. With them NULL, 2E answers 0x11 and an unknown RID 0x31, as before.
 
 The client gains `config show` and `config set NAME=VALUE ... [--commit] [--reset]`. A `[dids]` entry can be a typed, writable key (`type`, `writable`, `min`, `max`), and `u8` and `u16` decode as decimal. A `[config]` table names the commit routine, a status DID and an optional config-hash check. A client before 0.3.0 refuses a profile that uses them.
-
-## [0.2.0] - unreleased
-
-The ESP32 port now derives the 0x27 keys from `cfg.device_id` when it is set (1 to 16 bytes), otherwise from the base MAC, so an app with its own device ID can unlock. Before, it always hashed the base MAC while F18C served the app's ID, and every key was refused (0x35, then 0x36 and 0x37). With `cfg.device_id` NULL, F18C and the keys are unchanged.
 
 An ECDSA mode for SecurityAccess, after SAE paper 2022-01-0132, recommended for production. The device holds only the tester's P-256 public key, and the key in 27 02 or 27 04 is a 64-byte signature (r ‖ s) over SHA-256("udsota-27-ecdsa-v1" ‖ seed ‖ level ‖ id_len ‖ device ID). No image or flash dump then unlocks any device, where the HMAC mode's fleet master key, built into every image, unlocks all of them. The HMAC mode stays the default, and its keys and wire are unchanged.
 - Core: `udsota_security_t` gains `verify` and `key_len`, appended after `ctx`. With `verify` set, the server asks it instead of computing the key, and a sendKey must be exactly 2 + `key_len` bytes. Counting, lockout, single use, expiry and NRC order are as before. `udsota_keys_sig_msg()` builds the signed message, and `udsota_keys_sig_self_test()` checks a verify against a published test key.
@@ -39,12 +35,18 @@ Fixed:
 
 Breaking, for code that fills `udsota_hooks_t` or `udsota_config_t` positionally: both gained fields (`comm_control`, `dtc_setting`; `func_id`, `p2_prog_ms`, `p2star_prog_ms`). Designated initializers are unaffected.
 
+Breaking, in the ESP32 port only: `udsota_esp32_start()` also returns `ESP_ERR_INVALID_ARG` for a set `cfg.key_pubkey` that is not a 65-byte uncompressed point.
+
+`tools/linux_server` is a Linux demo server for testing the client end to end. It runs the core's UDS server and ISO-TP adapter over SocketCAN or a stdin/stdout frame pipe. Its engine keeps two file-backed A/B slots, runs the real first-block rules and checks a real SHA-256 in FF01. It emulates rollback with an in-process restart after ActivateImage or 11 01, and security with `udsota_keys.c` over a host HMAC-SHA256. New client tests drive it: `client/tests/test_e2e_pipe.py` runs `cli.main` and `update` over the pipe with can-isotp's Python ISO-TP stack, and `client/tests/test_e2e_vcan.py` runs the `udsota` command on vcan0. A new CI job, `e2e`, builds the demo and runs the pipe tests, then the vcan tests where the runner can load vcan and can-isotp (they skip where it cannot). The three client bugs the pipe tests found are listed under Fixed. `--socketcan` accepts only a vcan interface unless `--allow-real-bus` is given, and the vcan tests skip unless `UDSOTA_VCAN` names one.
+
+## [0.2.0] - 2026-09-28
+
+The ESP32 port now derives the 0x27 keys from `cfg.device_id` when it is set (1 to 16 bytes), otherwise from the base MAC, so an app with its own device ID can unlock. Before, it always hashed the base MAC while F18C served the app's ID, and every key was refused (0x35, then 0x36 and 0x37). With `cfg.device_id` NULL, F18C and the keys are unchanged.
+
 Breaking, in the ESP32 port only:
 - `udsota_esp32_security()` takes the device ID: `(label, master, master_len, id, id_len)`, where `id` NULL means the base MAC.
 - `udsota_esp32_device_id()` takes a `size_t *len` and returns the ID in use, not always the base MAC.
-- `udsota_esp32_start()` returns `ESP_ERR_INVALID_ARG` for a set `cfg.device_id` whose length is not 1 to 16 or a set `cfg.key_pubkey` that is not a 65-byte uncompressed point, and serves a copy of the ID as F18C rather than the app's buffer.
-
-`tools/linux_server` is a Linux demo server for testing the client end to end. It runs the core's UDS server and ISO-TP adapter over SocketCAN or a stdin/stdout frame pipe. Its engine keeps two file-backed A/B slots, runs the real first-block rules and checks a real SHA-256 in FF01. It emulates rollback with an in-process restart after ActivateImage or 11 01, and security with `udsota_keys.c` over a host HMAC-SHA256. New client tests drive it: `client/tests/test_e2e_pipe.py` runs `cli.main` and `update` over the pipe with can-isotp's Python ISO-TP stack, and `client/tests/test_e2e_vcan.py` runs the `udsota` command on vcan0. A new CI job, `e2e`, builds the demo and runs the pipe tests, then the vcan tests where the runner can load vcan and can-isotp (they skip where it cannot). The three client bugs the pipe tests found are listed under Fixed. `--socketcan` accepts only a vcan interface unless `--allow-real-bus` is given, and the vcan tests skip unless `UDSOTA_VCAN` names one.
+- `udsota_esp32_start()` returns `ESP_ERR_INVALID_ARG` for a set `cfg.device_id` whose length is not 1 to 16, and serves a copy of the ID as F18C rather than the app's buffer.
 
 ## [0.1.0] - unreleased
 
