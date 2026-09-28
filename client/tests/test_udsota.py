@@ -813,23 +813,30 @@ def test_isotp_connection_socket_options(monkeypatch):
 
 
 # A kernel ISO-TP socket stand-in over a local datagram pair: recv() raises ECOMM (a TX timeout's error) errors
-# times first, then returns what the peer sent. select() sees a real descriptor.
+# times first, then returns what the peer sent. select() sees a real descriptor. With stolen, the first read
+# finds the datagram that woke select() already gone, as when sendmsg() takes a TX timeout's error first: it
+# raises EAGAIN for a non-blocking read, and a blocking one waits for the next datagram.
 class EcommSocket:
     # A bound socket whose first `errors` reads fail.
-    def __init__(self, errors=1):
+    def __init__(self, errors=1, stolen=False):
         self._socket, self.peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
-        self.errors, self.bound, self.closed = errors, True, False
+        self.errors, self.stolen, self.bound, self.closed = errors, stolen, True, False
+        self.woken = threading.Event()
 
     # Nothing to bind: the pair is already connected.
     def bind(self, interface, address):
         pass
 
-    # Fail with ECOMM while errors remain (leaving the datagram queued), then read one datagram.
-    def recv(self):
+    # Fail with ECOMM while errors remain (leaving the datagram queued), then read one datagram with flags.
+    def recv(self, bufsize=4095, flags=0):
+        if self.stolen:
+            self.stolen = False
+            self._socket.recv(bufsize)            # the wakeup, gone before this read
+            self.woken.set()
         if self.errors:
             self.errors -= 1
             raise OSError(errno.ECOMM, os.strerror(errno.ECOMM))
-        return self._socket.recv(4095)
+        return self._socket.recv(bufsize, flags)
 
     # Close both ends.
     def close(self):
@@ -839,9 +846,9 @@ class EcommSocket:
 
 
 # Open cls (a udsoncan ISO-TP socket connection) over an EcommSocket and send payload from the peer.
-def open_over_ecomm(cls, payload):
+def open_over_ecomm(cls, payload, errors=1, stolen=False):
     import isotp
-    sock = EcommSocket()
+    sock = EcommSocket(errors=errors, stolen=stolen)
     conn = cls("vcan0", isotp.Address(isotp.AddressingMode.Normal_11bits, txid=0x710, rxid=0x718), tpsock=sock)
     conn.open()
     sock.peer.send(payload)
@@ -864,6 +871,27 @@ def test_rx_thread_survives_a_socket_error():
         assert not stock.rxthread.is_alive() and stock.rxqueue.empty() and sock.errors == 0
     finally:
         stock.close()
+
+
+# Check a receive-thread wakeup whose error sendmsg() took first (the refused-download hang): the thread reads
+# nothing and selects again, so close() returns promptly with no frame after it, and on a second connection a
+# later answer still reaches the queue. Before, its blocking recv() waited for the next frame, and close(), which
+# joins the thread, never returned when none came.
+def test_rx_thread_wakeup_without_data_does_not_block_close():
+    for answer in (None, b"\x76\x2f"):
+        conn, sock = open_over_ecomm(transport.RxResilientIsoTPConnection, b"wakeup", errors=0, stolen=True)
+        closer = threading.Thread(target=conn.close, daemon=True)
+        try:
+            assert sock.woken.wait(timeout=1.0)
+            if answer is not None:
+                time.sleep(0.3)                   # the thread is back in select(), not stuck in recv()
+                sock.peer.send(answer)
+                assert conn.rxqueue.get(timeout=1.0) == answer
+        finally:
+            t0 = time.monotonic()
+            closer.start()
+            closer.join(timeout=2.0)
+            assert not closer.is_alive() and time.monotonic() - t0 < 1.0 and not conn.rxthread.is_alive()
 
 
 # ---- pre-flight: listen, busy guard, pre-roll ----

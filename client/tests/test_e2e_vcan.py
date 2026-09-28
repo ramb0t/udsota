@@ -135,11 +135,12 @@ def vcan_demo(tmp_path):
             p.kill()
 
 
-# Runs `python -m udsota args...` on this checkout's client; returns the completed process.
-def udsota(*args):
+# Runs `python -m udsota args...` on this checkout's client; returns the completed process. A run past timeout_s
+# fails the test (subprocess.TimeoutExpired).
+def udsota(*args, timeout_s=CLI_TIMEOUT_S):
     env = dict(os.environ, PYTHONPATH=str(ROOT / "client"))
     return subprocess.run([sys.executable, "-m", "udsota", *args], env=env, capture_output=True, text=True,
-                          timeout=CLI_TIMEOUT_S)
+                          timeout=timeout_s)
 
 
 # Check the client's whole update over vcan with the Python ISO-TP stack: the demo's SocketCAN backend, CAN_RAW
@@ -200,3 +201,32 @@ def test_cli_flash_with_security_over_vcan(vcan_demo, tmp_path):
     image.write_bytes(build_image("v0.2.0"))
     r = udsota("--profile", str(prof), "--interface", IFACE, "flash", str(image))
     assert r.returncode == 0, r.stdout + r.stderr + demo.log.read_text()
+
+
+# Check a server that withholds the FC after the first block of CFs of block 1, then ignores the resent FF (the
+# refused-download hang): the `udsota` command exits 1 within seconds, naming the block and F1F1's DL_ABORTED.
+# Before, the kernel socket's N_Bs error could wake the receive thread's select() and be taken by sendmsg(), leaving
+# that thread in a blocking recv() that close() joined for ever. The race goes either way, so it runs five times.
+def test_cli_flash_exits_1_when_the_server_withholds_flow_control(vcan_demo, tmp_path):
+    kernel_isotp_or_skip()
+    image = tmp_path / "v0.2.0.bin"
+    image.write_bytes(build_image("v0.2.0"))
+    for _ in range(5):
+        demo = vcan_demo("--withhold-fc-after", "64")
+        t0 = time.monotonic()
+        r = udsota("--profile", "example", "--interface", IFACE, "flash", str(image), timeout_s=30)
+        assert r.returncode == 1 and time.monotonic() - t0 < 15.0, r.stdout + r.stderr + demo.log.read_text()
+        assert "block 1:" in r.stderr and "F1F1 reads DL_ABORTED" in r.stderr, r.stderr
+        demo.send_signal(signal.SIGTERM)
+        demo.wait(timeout=5)
+
+
+# Check one FC lost on the bus is resent by the kernel stack's N_Bs error and the update completes over the socket.
+def test_cli_flash_resends_after_a_lost_flow_control(vcan_demo, tmp_path):
+    kernel_isotp_or_skip()
+    demo = vcan_demo("--drop-fc-after", "64")
+    image = tmp_path / "v0.2.0.bin"
+    image.write_bytes(build_image("v0.2.0"))
+    r = udsota("--profile", "example", "--interface", IFACE, "flash", str(image), timeout_s=60)
+    assert r.returncode == 0, r.stdout + r.stderr + demo.log.read_text()
+    assert "--drop-fc-after: losing the FC" in demo.log.read_text()

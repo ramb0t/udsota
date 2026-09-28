@@ -65,6 +65,16 @@ def send_block(uds, bsc, chunk):
         uds.transfer(bsc, chunk)
 
 
+# Block n's failure e (no answer, or a send the server stopped) as the same error, with the server's own account
+# from F1F1 when it can still answer: a server that withheld flow control has ended the download (DL_ABORTED).
+def block_failed(uds, n, e):
+    try:
+        reason, received = decode_result(uds.read_did(DID_RESULT))
+    except UpdateFailed:
+        return type(e)("block %d: %s; the last-result DID F1F1 could not be read" % (n, e))
+    return type(e)("block %d: %s; the last-result DID F1F1 reads %s, %d bytes received" % (n, e, reason, received))
+
+
 # The image as a raw DEFLATE stream (RFC 1951, no zlib header), level 9: what a 34 with DFI 0x10 announces.
 def deflate(image):
     c = zlib.compressobj(9, zlib.DEFLATED, -15)
@@ -120,7 +130,10 @@ def download(uds, image, drop_76=None, log=print, compress="none", clock=time.mo
     try:
         for n in range(1, total + 1):
             chunk = payload[(n - 1) * max_data:n * max_data]
-            send_block(uds, n & 0xFF, chunk)
+            try:
+                send_block(uds, n & 0xFF, chunk)
+            except (NoResponse, SendFailed) as e:
+                raise block_failed(uds, n, e) from e
             if n == drop_76:
                 log("--drop-76: resending block %d as if its 76 were lost" % n)
                 send_block(uds, n & 0xFF, chunk)
