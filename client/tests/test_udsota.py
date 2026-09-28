@@ -1962,14 +1962,14 @@ C = profile.from_dict("conf", tomllib.loads(CONF))
 KEY = '[dids]\n"0x0200" = { name = "mode", decode = "u8", '
 
 
-# Check CONF's typed entries (an absent min or max stays None), the overlapping range, and its [config]; FULL has
+# Check CONF's typed entries (an absent min or max is the type's bound), the overlapping range, and its [config]; FULL has
 # no config and no typed DID.
 def test_config_profile_values():
     assert [(e.first, e.last, e.name, e.decode, e.type, e.writable, e.min, e.max) for e in C.dids] == [
-        (0x0200, 0x0200, "mode", "u8", "u8", True, None, 2),
+        (0x0200, 0x0200, "mode", "u8", "u8", True, 0, 2),
         (0x0201, 0x0201, "timeout_ms", "u16", "u16", True, 1000, 5000),
         (0x0202, 0x0202, "tag", "hex", "blob", True, None, None),
-        (0x0203, 0x0203, "spare", "u8", "u8", True, None, None),
+        (0x0203, 0x0203, "spare", "u8", "u8", True, 0, 255),
         (0x0205, 0x0205, "limit", "u8", None, False, None, None),
         (0x0200, 0x020F, "settings", "hex", None, False, None, None)]
     assert C.config == profile.ConfigSpec(0x1234, 0xF1B2, profile.HashSpec(0xF1B0, 0x0200, 0x020F, 1))
@@ -2019,7 +2019,7 @@ def test_example_config_comments_load():
     text = (profile.PROFILE_DIR / "example.toml").read_text()
     live = re.sub(r'(?m)^# (?=(?:"0x020[01]" |\[config\]$|commit_rid |status_did |hash ))', "", text)
     e = profile.from_dict("example", tomllib.loads(live))
-    assert [(d.name, d.type, d.min, d.max) for d in e.dids if d.writable] == [("mode", "u8", None, 2),
+    assert [(d.name, d.type, d.min, d.max) for d in e.dids if d.writable] == [("mode", "u8", 0, 2),
                                                                             ("timeout_ms", "u16", 1000, 5000)]
     assert e.config == profile.ConfigSpec(0x1234, 0xF1B2, profile.HashSpec(0xF1B0, 0x0200, 0x02FF, 1))
 

@@ -6,17 +6,10 @@ import hashlib
 import time
 
 from .errors import Nrc, Refused, ToolError, UpdateFailed
-from .profile import TYPES
 from .update import device_keys, read_record, wait_for_boot
 from .wire import DECODE, NRC_CONDITIONS, NRC_NOT_SUPPORTED, NRC_OUT_OF_RANGE, NRC_SEQUENCE, SESSION_EXTENDED
 
 NO_CONFIG_WRITES = "this firmware has no config writes"
-
-
-# A u8 or u16 entry's write range (lo, hi): the profile's min and max, each defaulting to the type's bounds.
-def write_range(entry):
-    top = TYPES[entry.type]
-    return (0 if entry.min is None else entry.min), (top if entry.max is None else entry.max)
 
 
 # The profile's writable [dids] entries in file order; Refused (exit 2) when it has none.
@@ -41,9 +34,8 @@ def encode_value(entry, text):
         v = int(text, 0)
     except ValueError:
         raise Refused("%s takes an integer; got %r" % (entry.name, text)) from None
-    lo, hi = write_range(entry)
-    if not lo <= v <= hi:
-        raise Refused("%s = %d is outside %d..%d" % (entry.name, v, lo, hi))
+    if not entry.min <= v <= entry.max:
+        raise Refused("%s = %d is outside %d..%d" % (entry.name, v, entry.min, entry.max))
     return v.to_bytes(1 if entry.type == "u8" else 2, "big")
 
 
@@ -107,7 +99,7 @@ def config_show(uds, profile, log=print):
     if all(r is None for r in records):
         raise Refused("%s (every writable DID answered NRC 0x31)" % NO_CONFIG_WRITES)
     for e, r in zip(keys, records):
-        limits = "" if e.type == "blob" else " (%d..%d)" % write_range(e)
+        limits = "" if e.type == "blob" else " (%d..%d)" % (e.min, e.max)
         log("%04X %s: %s%s" % (e.first, e.name, "not supported" if r is None else DECODE[e.decode](r), limits))
     cfg = profile.config
     if cfg is not None and cfg.status_did is not None:
