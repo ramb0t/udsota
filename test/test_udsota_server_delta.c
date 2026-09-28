@@ -195,18 +195,6 @@ static int eng_verify(void *ctx)
     return memcmp(e.flash, DELTA_NEW, IMG_LEN) == 0 ? 0 : (int)UDSOTA_DL_VERIFY_FAILED;
 }
 
-/* engine.check_first of the raw path: the core image rules, as the sink's. */
-static int eng_raw_check(void *ctx, const uint8_t *first, size_t len, udsota_reason_t *why)
-{
-    return s_check(ctx, first, len, why);
-}
-
-/* engine.begin of the raw path: the sink's erase. */
-static int eng_raw_begin(void *ctx, uint32_t size) { return s_begin(ctx, size); }
-
-/* engine.write of the raw path: the sink's write. */
-static int eng_raw_write(void *ctx, uint32_t off, const uint8_t *d, size_t n) { return s_write(ctx, off, d, n); }
-
 /* engine.activate and engine.confirm: done at once. */
 static int eng_ok(void *ctx) { return 0; }
 
@@ -221,8 +209,9 @@ static int eng_poll(void *ctx)
 #define ALL_FORMATS (UDSOTA_DL_FMT(UDSOTA_DL_DFI_DEFLATE) | UDSOTA_DL_FMT(UDSOTA_DL_DFI_DELTA) | \
                      UDSOTA_DL_FMT(UDSOTA_DL_DFI_DELTA_DEFLATE))
 
+/* The raw path's check_first, begin and write are the sink's: udsota_zsink_t has the engine ops' signatures. */
 static const udsota_engine_t ENGINE = {
-    .check_first = eng_raw_check, .begin = eng_raw_begin, .write = eng_raw_write, .verify = eng_verify,
+    .check_first = s_check, .begin = s_begin, .write = s_write, .verify = eng_verify,
     .activate = eng_ok, .confirm = eng_ok, .abort = eng_abort, .poll = eng_poll, .status = udsota_mock_status,
     .ctx = &g_mock, .zbegin = eng_zbegin, .zwrite = eng_zwrite, .zend = eng_zend, .zwritten = eng_zwritten,
     .zformats = ALL_FORMATS,
