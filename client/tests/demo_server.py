@@ -92,12 +92,7 @@ def build_image(version="v0.2.0", product="example", hw_id=1, layout=1, ids=(0x7
             img[i:i + n], i = img[src:src + n], i + n
         else:
             img[i], i = rnd.randrange(256), i + 1
-    x = 0xEF
-    for b in img[32:unpadded]:
-        x ^= b
-    img[padded - 1] = x
-    img[padded:] = hashlib.sha256(img[:padded]).digest()
-    return bytes(img)
+    return reseal(img)
 
 
 # The app_elf_sha256 an image carries (what F1F3 answers once it runs).
