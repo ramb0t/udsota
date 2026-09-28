@@ -19,8 +19,8 @@
 /* The engine for udsota_init() or another front end. Its jobs run on the worker: the ops queue them and
  * return UDSOTA_PENDING, and poll() reports the result. One task (the server's) calls its ops. Before the
  * port has started the engine (or when it has no worker or inactive slot), check_first answers
- * UDSOTA_DL_FLASH_ERROR and begin, write, verify, activate and abort refuse with a negative error, as does
- * confirm with rollback on; without rollback confirm returns 0 as always. poll reads 0 (nothing queued),
+ * UDSOTA_DL_FLASH_ERROR, begin, write, verify and activate refuse with a negative error, as does confirm with
+ * rollback on (without rollback confirm returns 0 as always), and abort does nothing. poll reads 0 (nothing queued),
  * status reads UDSOTA_SLOT_NONE and slot_size 0 (UDSOTA_SLOT_SIZE_DEFAULT). The core never calls confirm
  * then: it refuses ConfirmImage while the running slot reads UDSOTA_SLOT_NONE. */
 const udsota_engine_t *udsota_esp32_engine(void);
@@ -66,8 +66,9 @@ const uint8_t *udsota_esp32_device_id(size_t *len);
 
 /* ---- PSA lock (udsota_esp32_psa.c) ---- */
 
-/* Takes the mutex that serialises PSA crypto between the port (0x27 HMAC, the worker's esp_ota_end and
- * set_boot) and the app's own PSA users. IDF v6.1's PSA is thread-safe for key management only, not for
+/* Takes the mutex that serialises PSA crypto between the port (its key setup and self-tests, the 0x27 HMAC or
+ * ECDSA check, the worker's esp_ota_end and set_boot, and the slot-state refresh's invalid-image lookup) and the
+ * app's own PSA users. IDF v6.1's PSA is thread-safe for key management only, not for
  * one-shot or multi-part operations. Waits up to wait_ms (UDSOTA_ESP32_PSA_WAIT_FOREVER: no limit);
  * true when held. Before the port has created the lock, returns true without locking. */
 bool udsota_esp32_psa_lock(uint32_t wait_ms);
