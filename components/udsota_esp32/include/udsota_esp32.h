@@ -153,3 +153,11 @@ udsota_phase_t udsota_esp32_phase(void);
  * copied under a spinlock, so a UI task can draw it without touching the server; IDLE before start. The port
  * keeps the snapshot by wrapping hooks.progress, and still calls the app's own with its ctx. */
 void udsota_esp32_progress(udsota_progress_t *out);
+
+#define UDSOTA_ESP32_VERSION_MAX 32u   /* esp_app_desc_t.version's size: up to 31 characters and a NUL */
+
+/* Any task, an app hook included: the version of the image being downloaded, copied into out with a NUL, from
+ * a snapshot under the progress snapshot's spinlock; returns its length. "" before any download, and from an
+ * accepted 34 until that download's first block passes the first-block check. Read udsota_esp32_progress()
+ * first and this second: the 34's ERASING report clears the version in the same locked copy. */
+size_t udsota_esp32_incoming_version(char out[UDSOTA_ESP32_VERSION_MAX]);

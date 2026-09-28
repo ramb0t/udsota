@@ -48,6 +48,7 @@ _Static_assert(offsetof(esp_image_header_t, segment_count) == 1u && offsetof(esp
 _Static_assert(offsetof(esp_image_segment_header_t, data_len) == 4u, "segment 0 data_len at image offset 28");
 _Static_assert(offsetof(esp_app_desc_t, version) == 16u && offsetof(esp_app_desc_t, project_name) == 48u,
                "esp_app_desc_t version and project_name");
+_Static_assert(sizeof(((esp_app_desc_t *)0)->version) == UDSOTA_ESP32_VERSION_MAX, "the incoming version's size");
 _Static_assert(ESP_IMAGE_HEADER_MAGIC == 0xE9 && ESP_IMAGE_MAX_SEGMENTS == 16 &&
                ESP_IMAGE_SPI_MODE_SLOW_READ == 5 && ESP_APP_DESC_MAGIC_WORD == 0xABCD5432u,
                "the constants udsota_esp32_image.c copies");
@@ -239,8 +240,9 @@ static void refresh_all(void)
 }
 
 /* Chip revision and flash mode against the running app (IDF, :1131), then the header and core rules with
- * the size rule left to BEGIN. Copies into aligned locals because first may sit at any alignment. */
-static udsota_reason_t check_first_block(const uint8_t *first, size_t len)
+ * the size rule left to BEGIN. Copies into aligned locals because first may sit at any alignment. With store,
+ * an accepted image's version becomes the incoming version; a refused one leaves it as the 34 cleared it. */
+static udsota_reason_t check_first_block(const uint8_t *first, size_t len, bool store)
 {
     if (first == NULL || len < UDSOTA_IMAGE_MIN_LEN) {
         return UDSOTA_DL_BAD_HEADER;
@@ -261,20 +263,23 @@ static udsota_reason_t check_first_block(const uint8_t *first, size_t len)
         ESP_LOGW(TAG, "image refused: reason %d", (int)r);
     } else {
         ESP_LOGD(TAG, "image accepted: %.32s (%s build)", app.version, release ? "release" : "dev");
+        if (store) {
+            udsota_esp32_set_incoming_version(app.version, sizeof app.version);
+        }
     }
     return r;
 }
 
 /* Worker: reads the slot's first UDSOTA_IMAGE_MIN_LEN bytes back from flash and re-runs the
  * first-block checks on the bytes esp_ota_end verified (FF01 after the verify, ActivateImage before
- * set_boot). */
+ * set_boot). The first block already stored the version, so this leaves it alone. */
 static udsota_reason_t recheck_slot(void)
 {
     uint8_t first[UDSOTA_IMAGE_MIN_LEN];
     if (esp_partition_read(s_target, 0, first, sizeof first) != ESP_OK) {
         return UDSOTA_DL_VERIFY_FAILED;
     }
-    return check_first_block(first, sizeof first);
+    return check_first_block(first, sizeof first, false);
 }
 
 /* Worker: closes an open download handle with esp_ota_abort; the partial image stays in the slot. */
@@ -415,11 +420,12 @@ static void z_release(void)
     s_zout = NULL;
 }
 
-/* Worker, the stream's sink: the first-block check on the first inflated bytes, before any erase. */
+/* Worker, the stream's sink: the first-block check on the first inflated bytes, before any erase; a pass
+ * stores the version. */
 static int z_check(void *ctx, const uint8_t *first, size_t len, udsota_reason_t *why)
 {
     (void)ctx;
-    *why = check_first_block(first, len);
+    *why = check_first_block(first, len, true);
     return (*why == UDSOTA_DL_OK) ? 0 : 1;
 }
 
@@ -741,12 +747,14 @@ bool udsota_esp32_engine_busy(void)
     return busy;
 }
 
-/* engine.check_first: the first-block check on the caller's task, no flash access. UDSOTA_DL_FLASH_ERROR
- * when the worker never started or there is no inactive slot. 0 = pass, else 1 with *why set. */
+/* engine.check_first: the first-block check on the caller's task, no flash access; a pass stores the version.
+ * UDSOTA_DL_FLASH_ERROR when the worker never started or there is no inactive slot. 0 = pass, else 1 with *why
+ * set. */
 static int eng_check_first(void *ctx, const uint8_t *first, size_t len, udsota_reason_t *why)
 {
     (void)ctx;
-    const udsota_reason_t r = (s_q == NULL || s_target == NULL) ? UDSOTA_DL_FLASH_ERROR : check_first_block(first, len);
+    const udsota_reason_t r = (s_q == NULL || s_target == NULL) ? UDSOTA_DL_FLASH_ERROR
+                              : check_first_block(first, len, true);
     if (why != NULL) {
         *why = r;
     }

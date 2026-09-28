@@ -29,6 +29,8 @@
 
 static const char *TAG = "udsota";
 
+_Static_assert(UDSOTA_ESP32_VERSION_MAX == UDSOTA_ESP32_CTL_VERSION_MAX, "the control block holds the public size");
+
 #define MAX_WAIT_MS   100u      /* longest sleep, so a queued end-session never waits longer */
 #define LOG_EVERY_MS  5000u
 
@@ -63,9 +65,9 @@ static udsota_can_t       s_tpcan;
 static udsota_server_t    s_srv;
 static udsota_isotp_t     s_tp;
 /* Cross-task. */
-static udsota_esp32_ctl_t     s_ctl;         /* phase, end-session request and progress snapshot */
+static udsota_esp32_ctl_t     s_ctl;         /* phase, end-session request, progress snapshot and incoming version */
 static _Atomic(QueueHandle_t) s_q;           /* published last by start(); NULL = frames are dropped */
-static portMUX_TYPE           s_progress_mux = portMUX_INITIALIZER_UNLOCKED;   /* guards s_ctl's progress copy */
+static portMUX_TYPE           s_progress_mux = portMUX_INITIALIZER_UNLOCKED;   /* guards s_ctl's progress and version */
 static atomic_uint            s_rx_q_dropped;   /* written by the app's CAN task */
 static atomic_bool            s_wake_posted;    /* a wake item is queued and not yet taken: at most one at a time */
 
@@ -347,6 +349,23 @@ void udsota_esp32_end_session(void)
 udsota_phase_t udsota_esp32_phase(void)
 {
     return udsota_esp32_ctl_phase(&s_ctl);
+}
+
+/* See udsota_esp32_priv.h. The engine checks a first block only once the server runs, after start() has set
+ * the control block's lock. */
+void udsota_esp32_set_incoming_version(const char *v, size_t max)
+{
+    udsota_esp32_ctl_set_version(&s_ctl, v, max);
+}
+
+/* Any task: the control block's version once the port runs, else "". */
+size_t udsota_esp32_incoming_version(char out[UDSOTA_ESP32_VERSION_MAX])
+{
+    if (atomic_load_explicit(&s_q, memory_order_acquire) == NULL) {
+        out[0] = '\0';
+        return 0u;
+    }
+    return udsota_esp32_ctl_version(&s_ctl, out);
 }
 
 /* Any task: the control block's progress snapshot once the port runs, else IDLE. */
