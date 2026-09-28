@@ -138,9 +138,9 @@ class DemoServer:
     # Start binary with args; the log goes to log_path.
     def __init__(self, binary, args, log_path):
         self.log_path = pathlib.Path(log_path)
-        self._log = open(self.log_path, "wb")
-        self.proc = subprocess.Popen([binary, *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=self._log, bufsize=0)
+        with open(self.log_path, "wb") as err:            # the child keeps its own descriptor
+            self.proc = subprocess.Popen([binary, *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                         stderr=err, bufsize=0)
         self.rx = queue.Queue()
         self.sent, self.dropped, self.drop, self.tap = [], [], None, None
         self.dropped_tx, self.drop_tx = [], None
@@ -188,7 +188,6 @@ class DemoServer:
 
     # The server's log so far.
     def log(self):
-        self._log.flush()
         return self.log_path.read_text(errors="replace")
 
     # Close stdin (the server stops at EOF) and wait; kill it if it lingers. Returns its exit code.
@@ -201,7 +200,7 @@ class DemoServer:
                 self.proc.kill()
                 self.proc.wait()
         self._reader.join(timeout=2)
-        self._log.close()
+        self.proc.stdout.close()
         return self.proc.returncode
 
 

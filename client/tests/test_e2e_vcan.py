@@ -116,8 +116,9 @@ def vcan_demo(tmp_path):
 
     def start(*args):
         log = tmp_path / ("demo%d.log" % len(procs))
-        p = subprocess.Popen([binary, "--socketcan", IFACE, *args], stdin=subprocess.DEVNULL,
-                             stdout=subprocess.DEVNULL, stderr=open(log, "wb"))
+        with open(log, "wb") as err:                      # the child keeps its own descriptor
+            p = subprocess.Popen([binary, "--socketcan", IFACE, *args], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=err)
         procs.append(p)
         deadline = time.monotonic() + 5
         while "boot 1:" not in log.read_text() and time.monotonic() < deadline:

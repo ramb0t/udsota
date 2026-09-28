@@ -304,7 +304,7 @@ def test_lost_flow_control_is_resent_and_the_update_completes(demo, tmp_path):
     s = demo("--drop-fc-after", "64")
     assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash",
                        image_file(tmp_path, build_image("v0.2.0"))]) == 0
-    assert "--drop-fc-after: losing the FC" in s.log_path.read_text()
+    assert "--drop-fc-after: losing the FC" in s.log()
     assert read_state(s)[2] == "v0.2.0"
 
 
