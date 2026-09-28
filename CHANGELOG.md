@@ -4,6 +4,8 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ## [Unreleased]
 
+Releases have a written process, [RELEASING.md](RELEASING.md): semantic versioning where, while udsota is 0.x, anything new or breaking is a minor bump and a patch is for fixes only; one version shared by the tag, the dated CHANGELOG heading and the client's `__version__`; and a release workflow that checks those agree, then publishes the client's wheel and the example's images as a GitHub Release. `tools/release.py` does the check and extracts the notes. 0.1.0 is dated and tagged: it is the initial import, `da16abf`.
+
 Apps can show an update's progress. `udsota_progress()` reads the download's stage (IDLE, ERASING, WRITING, VERIFYING or ACTIVATING), the image bytes written of the size the 34 announced, and the last download's F1F1 reason, so a display can show a failure rather than just falling back to idle. The new optional `hooks.progress` gets the same at each change of stage and after each written block, at most once per server call, and `udsota_progress_permille()` turns the bytes into permille. The ESP32 port keeps the last report in a snapshot under a spinlock, which any task reads with the new `udsota_esp32_progress()`, and forwards the hook to the app's with its `ctx`.
 
 Additive, with nothing changed on the wire: `udsota_hooks_t` gains `progress` after `routine_poll`, and `udsota_server_t` gains `dl_written`, `progress_stage` and `progress_block` at its end. With the hook NULL every answer is the same bytes, and a third fuzz build, `fuzz_udsota_progress`, sets the hook and checks that `done` never passes `total` or shrinks within a download.
@@ -61,7 +63,7 @@ Breaking, in the ESP32 port only:
 - `udsota_esp32_device_id()` takes a `size_t *len` and returns the ID in use, not always the base MAC.
 - `udsota_esp32_start()` returns `ESP_ERR_INVALID_ARG` for a set `cfg.device_id` whose length is not 1 to 16, and serves a copy of the ID as F18C rather than the app's buffer.
 
-## [0.1.0] - unreleased
+## [0.1.0] - 2026-09-27
 
 First standalone release. udsota was developed and bench-tested inside a CAN-connected product before it was extracted here.
 
