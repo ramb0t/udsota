@@ -103,7 +103,9 @@ typedef struct {   /* required; only unverify, status, running_sha, version and 
                                                      udsota_reason_t or UDSOTA_PENDING */
     int    (*zend)(void *ctx);                    /* 37: 0 when the stream or patch ended at exactly size bytes, all
                                                      written, with nothing after it, else a udsota_reason_t; frees the
-                                                     decoder either way. Never UDSOTA_PENDING */
+                                                     decoder either way. May return UDSOTA_PENDING, as zwrite does:
+                                                     a delta patch's decoder may still hold the image's last bytes,
+                                                     so its end can read and write flash */
     uint32_t (*zwritten)(void *ctx);              /* nullable, with or without the others: the image bytes the open
                                                      download has written so far (udsota_isink_t.written), read after
                                                      each coded 76 for progress. NULL: done stays 0 until the 37 sets

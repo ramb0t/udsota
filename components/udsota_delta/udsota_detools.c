@@ -3,6 +3,7 @@
  * by detools' own state (done once the target size is out) rather than by detools_apply_patch_finalize, which needs
  * the patch's length up front for an uncompressed patch. */
 #include "udsota_detools.h"
+#include <limits.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include "detools.h"
@@ -32,11 +33,11 @@ static void dt_free(udsota_detools_t *t, void *p)
 }
 
 /* detools' base read: n bytes at the running offset, refused when the offset is negative or the read would pass
- * 4 GB. */
+ * INT_MAX, where detools' own int offset ends. */
 static int dt_read(void *arg, uint8_t *buf, size_t n)
 {
     dt_state_t *st = arg;
-    if (st->from_off < 0 || (uint64_t)st->from_off + n > UINT32_MAX) {
+    if (st->from_off < 0 || (uint64_t)st->from_off + n > (uint64_t)INT_MAX) {
         return -DETOOLS_IO_FAILED;
     }
     if (st->io.read(st->io.ctx, (uint32_t)st->from_off, buf, n) != 0) {
@@ -46,11 +47,16 @@ static int dt_read(void *arg, uint8_t *buf, size_t n)
     return 0;
 }
 
-/* detools' base seek: moves the running offset; the next read checks it. */
+/* detools' base seek: moves the running offset, which the next read checks. detools adds the same offset to its own
+ * int offset, so a seek that would take it out of int's range is refused before it can overflow there. */
 static int dt_seek(void *arg, int offset)
 {
     dt_state_t *st = arg;
-    st->from_off += offset;
+    const int64_t next = st->from_off + offset;
+    if (next < INT_MIN || next > INT_MAX) {
+        return -DETOOLS_IO_FAILED;
+    }
+    st->from_off = next;
     return 0;
 }
 

@@ -836,10 +836,43 @@ static size_t handle_transfer_data(udsota_server_t *s, const uint8_t *req, size_
                             ((uint32_t)len << 8) | bsc, resp, resp_max, now_ms);
 }
 
+/* The 37's positive tail: the transfer closes, FF01 may verify the open image, F1F1 reads OK; 77. */
+static size_t dl_exit_ok(udsota_server_t *s, uint8_t *resp)
+{
+    s->download_active = false;
+    s->dl_complete = true;                        /* FF01 may now verify the open handle */
+    s->last_dl.reason_code = UDSOTA_DL_OK;
+    s->last_dl.bytes_received = s->dl_received;
+    resp[0] = UDSOTA_POS(UDSOTA_SID_TRANSFER_EXIT);
+    return 1;
+}
+
+/* Final answer for a coded 0x37 (udsota_job_done_fn): 77 once engine.zend found the stream or patch ended at
+ * exactly memorySize, all written, with nothing after it; else 0x72, the download ends and F1F1 records zend's
+ * reason (UDSOTA_DL_BAD_STREAM when it names none). */
+static size_t dl_exit_done(udsota_server_t *s, int result, uint8_t *resp, size_t resp_max, uint32_t now_ms)
+{
+    (void)now_ms;
+    if (result != 0) {
+        abort_download(s);
+        s->last_dl.reason_code = dl_reason(result, UDSOTA_DL_BAD_STREAM);
+        return udsota_nrc(resp, resp_max, UDSOTA_SID_TRANSFER_EXIT, UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE);
+    }
+    if (resp_max < 1u) {
+        return 0;
+    }
+    if (s->dl_written != s->dl_announced) {       /* the stream ended at memorySize: every byte is written */
+        s->dl_written = s->dl_announced;
+        s->progress_block = true;
+    }
+    return dl_exit_ok(s, resp);
+}
+
 /* 0x37: closes the transfer once every announced byte has arrived (else 0x24, still open); 77. The OTA
- * handle stays open for FF01. A coded transfer closes once engine.zend finds the stream ended at exactly
- * memorySize with nothing after it; else 0x72, the download ends and F1F1 records UDSOTA_DL_BAD_STREAM. */
-static size_t handle_transfer_exit(udsota_server_t *s, size_t req_len, uint8_t *resp, size_t resp_max)
+ * handle stays open for FF01. A coded transfer asks engine.zend, which may run as a worker job (0x78 meanwhile),
+ * whether the stream or patch ended at exactly memorySize with nothing after it; dl_exit_done answers. */
+static size_t handle_transfer_exit(udsota_server_t *s, size_t req_len, uint8_t *resp, size_t resp_max,
+                                   uint32_t now_ms)
 {
     const uint8_t sid = UDSOTA_SID_TRANSFER_EXIT;
     const uint8_t access = dl_access_nrc(s);
@@ -856,23 +889,9 @@ static size_t handle_transfer_exit(udsota_server_t *s, size_t req_len, uint8_t *
         return 0;
     }
     if (DL_Z(s)) {
-        const int rc = s->engine.zend(s->engine.ctx);
-        if (rc != 0) {
-            abort_download(s);
-            s->last_dl.reason_code = dl_reason(rc, UDSOTA_DL_BAD_STREAM);
-            return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE);
-        }
-        if (s->dl_written != s->dl_announced) {   /* the stream ended at memorySize: every byte is written */
-            s->dl_written = s->dl_announced;
-            s->progress_block = true;
-        }
+        return udsota_job_start(s, sid, false, s->engine.zend(s->engine.ctx), dl_exit_done, 0, resp, resp_max, now_ms);
     }
-    s->download_active = false;
-    s->dl_complete = true;                        /* FF01 may now verify the open handle */
-    s->last_dl.reason_code = UDSOTA_DL_OK;
-    s->last_dl.bytes_received = s->dl_received;
-    resp[0] = UDSOTA_POS(sid);
-    return 1;
+    return dl_exit_ok(s, resp);
 }
 
 /* FC-point check (see udsota.h). Not judged while a job runs (the client waits); a latched end_session or any
@@ -1320,7 +1339,7 @@ static size_t dispatch(udsota_server_t *s, const uint8_t *req, size_t len, uint8
     case UDSOTA_SID_TRANSFER_DATA:
         return handle_transfer_data(s, req, len, resp, resp_max, now_ms);
     case UDSOTA_SID_TRANSFER_EXIT:
-        return handle_transfer_exit(s, len, resp, resp_max);
+        return handle_transfer_exit(s, len, resp, resp_max, now_ms);
     case UDSOTA_SID_ROUTINE:
         return handle_routine(s, req, len, resp, resp_max, now_ms);
     case UDSOTA_SID_RESET:               /* no reset hook: 0x11 before anything else */

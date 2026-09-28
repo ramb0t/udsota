@@ -175,7 +175,8 @@ class FakeServer:
                  board=b"devkit", other_state=0, other_sha=bytes(32), lose_76_once=None, mute_block=None,
                  nrc_once=None, activate_refusals=0, ff01_status=0, config=None, lose_77_once=False,
                  lose_ff01_once=False, activate_nrcs=None, activate_fail=None, no_fc=None, security=True,
-                 pubkey=None, cfg_keys=None, commit_status=0, compress=False, z_nomem=False, delta=(), base=None):
+                 pubkey=None, cfg_keys=None, commit_status=0, compress=False, z_nomem=False, delta=(), base=None,
+                 no_memory=()):
         self.max_block, self.boot_silence, self.confirm_refusals = max_block, boot_silence, confirm_refusals
         self.running_state, self.sha, self.board = running_state, sha, board
         self.other_state, self.other_sha = other_state, other_sha
@@ -196,6 +197,7 @@ class FakeServer:
         self.z_nomem = z_nomem                  # a DFI 0x10 34 finds no memory: 0x22, F1F1 DL_NO_MEMORY
         self.dfi, self.zin = 0x00, bytearray()  # the open download's format, and its compressed bytes
         self.delta, self.base = tuple(delta), base   # the delta DFIs served, and the image their patches apply to
+        self.no_memory = tuple(no_memory)       # delta DFIs whose 34 finds no memory: 0x22, F1F1 DL_NO_MEMORY
         self.dfis = []                          # every 34's DFI, in order
         self.log, self.written, self.writes = [], bytearray(), 0
         self.silence, self.announced, self.next_bsc, self.last_bsc = 0, None, 1, None
@@ -325,7 +327,7 @@ class FakeServer:
         if (req[1] not in ((0x00, 0x10) if self.compress else (0x00,)) + self.delta or req[2] != 0x44
                 or req[3:7] != bytes(4)):
             return self.nrc(0x34, 0x31)
-        if req[1] == 0x10 and self.z_nomem:
+        if (req[1] == 0x10 and self.z_nomem) or req[1] in self.no_memory:
             self.last_dl = (14, 0)                      # DL_NO_MEMORY
             return self.nrc(0x34, 0x22)
         self.dfi, self.zin, self.header_ok = req[1], bytearray(), False
@@ -2638,6 +2640,27 @@ def test_flash_delta_profile_none_still_tries_0x30():
     d = delta_server(delta=())
     rc, _ = run_delta(d, [("a.bin", DELTA_BASE)])
     assert rc == 0 and d.dfis == [0x30, 0x20, 0x00] and bytes(d.written) == DELTA_NEW
+
+
+# Check a 34 answering 0x22 with F1F1 DL_NO_MEMORY to a delta DFI moves on to the next mode too, as --compress-auto
+# does for 0x10.
+def test_flash_delta_falls_back_on_no_memory_at_the_34():
+    d = delta_server(no_memory=(0x30,))
+    rc, lines = run_delta(d, [("a.bin", DELTA_BASE)], compress="auto")
+    assert rc == 0 and d.dfis == [0x30, 0x20] and bytes(d.written) == DELTA_NEW
+    assert any("no memory for DFI 0x30" in ln for ln in lines)
+
+
+# Check --drop-76 with --diff-from is refused before the bus is touched: a delta's block count is unknown until its 34.
+def test_main_drop_76_with_diff_from(tmp_path, full_path, capsys):
+    img, base = tmp_path / "i.bin", tmp_path / "base.bin"
+    img.write_bytes(DELTA_NEW)
+    base.write_bytes(DELTA_BASE)
+    d = delta_server()
+    rc = cli.main(["--profile", full_path, "flash", str(img), "--diff-from", str(base), "--drop-76", "2"],
+                  transport=lambda prof, interface: FakeTransport(d, interface))
+    assert rc == 2 and d.dfis == []
+    assert "--drop-76 is for full and compressed downloads" in capsys.readouterr().err
 
 
 # Check a 34 answering 0x31 to a delta DFI moves on to the next mode, smallest first, then to the full path.

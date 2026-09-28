@@ -44,6 +44,9 @@ def main():
     p20 = delta.make_patch(base, new, "heatshrink")
     pnone = delta.make_patch(base, new, "none")
     p30 = delta.deflate(pnone)
+    tail = bytearray(base)                  # a new image ending in 2,000 zero bytes: its heatshrink patch leaves the
+    tail[-2000:] = bytes(2000)              # last image bytes in the decoder, for the 37 to write
+    ptail = delta.make_patch(base, bytes(tail), "heatshrink")
     if args.espressif_tool is not None:
         esp = espressif_patch(args.espressif_tool, base, new)
         if esp != p20:
@@ -54,10 +57,13 @@ def main():
         " * and a new demo image (fake_ota_build_image's layout: one segment, checksum, appended SHA-256) and the\n"
         " * patches between them in esp_delta_ota's format: DELTA_P20 (heatshrink, what DFI 0x20 carries, byte for byte\n"
         " * what Espressif's esp_delta_ota_patch_gen.py writes), DELTA_PNONE (uncompressed) and DELTA_P30 (DELTA_PNONE\n"
-        " * as raw DEFLATE, what DFI 0x30 carries). DELTA_BASE_HASH is the base's appended SHA-256. */\n",
+        " * as raw DEFLATE, what DFI 0x30 carries). DELTA_BASE_HASH is the base's appended SHA-256. DELTA_TAIL is the base\n"
+        " * with its last 2,000 bytes zeroed (no valid image) and DELTA_PTAIL its heatshrink patch, whose last image bytes\n"
+        " * the decoder still holds when the input ends, so the 37 writes them. */\n",
         "#pragma once\n#include <stdint.h>\n\n",
         c_array("DELTA_BASE", base), c_array("DELTA_NEW", new), c_array("DELTA_BASE_HASH", delta.validation_hash(base)),
         c_array("DELTA_P20", p20), c_array("DELTA_PNONE", pnone), c_array("DELTA_P30", p30),
+        c_array("DELTA_TAIL", bytes(tail)), c_array("DELTA_PTAIL", ptail),
     ]
     (ROOT / "test" / "fixtures" / "delta_fixtures.h").write_text("".join(body[:2]) + "\n".join(body[2:]))
     print("base %d, new %d; 0x20 patch %d, uncompressed %d, 0x30 %d bytes" % (len(base), len(new), len(p20),

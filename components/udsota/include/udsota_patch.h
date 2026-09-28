@@ -56,7 +56,6 @@ typedef struct {
     size_t           header_len;   /* header bytes gathered so far */
     uint32_t         taken;        /* patch bytes taken so far, header included */
     bool             open;         /* patch.init succeeded and patch.finish has not run */
-    bool             base_failed;  /* a base read was refused: the patch reads outside the running image */
     bool             ended;        /* the decoder reported the end of the patch */
     bool             trailing;     /* bytes arrived after the end */
     udsota_reason_t  failed;       /* the first failure (UDSOTA_DL_OK while none); every later push returns it */

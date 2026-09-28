@@ -77,7 +77,9 @@ _Static_assert(BLOCK_BUF >= UDSOTA_DL_MAX_DATA, "a whole 0x36 payload fits the w
 _Static_assert(sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t) + sizeof(esp_app_desc_t) ==
                UDSOTA_IMG_DESC_OFFSET, "udsota_image_desc_t sits right after esp_app_desc_t");
 
-typedef enum { JOB_REFRESH, JOB_BEGIN, JOB_WRITE, JOB_END, JOB_ABORT, JOB_ACTIVATE, JOB_CONFIRM, JOB_ZWRITE } job_kind_t;
+typedef enum {
+    JOB_REFRESH, JOB_BEGIN, JOB_WRITE, JOB_END, JOB_ABORT, JOB_ACTIVATE, JOB_CONFIRM, JOB_ZWRITE, JOB_ZEND
+} job_kind_t;
 
 typedef struct {
     uint8_t  kind;              /* job_kind_t */
@@ -511,6 +513,16 @@ static int base_hash(void *ctx, uint8_t out[UDSOTA_PATCH_HASH_LEN])
 }
 #endif
 
+/* Worker: the coded download's 37 check, then its memory freed. A delta patch's decoder may still hold the image's
+ * last bytes, whose base reads and writes are flash work, so this runs here and not on the diag task. eng_zend has
+ * already cleared s_z_live, so no abort frees the download meanwhile. */
+static int job_zend(void)
+{
+    const int r = (int)udsota_coded_end(&s_cd);
+    z_release();
+    return r;
+}
+
 /* Worker: decodes the len coded bytes waiting in s_buf into the check, the erase and the writes, then frees s_buf.
  * Returns the download's reason. */
 static int job_zwrite(uint32_t len)
@@ -722,6 +734,7 @@ static void worker_task(void *arg)
         case JOB_ABORT:    r = job_abort(j.arg); break;
 #if CONFIG_UDSOTA_ESP32_COMPRESSION
         case JOB_ZWRITE:   r = job_zwrite(j.arg); break;
+        case JOB_ZEND:     r = job_zend(); break;
 #endif
         case JOB_ACTIVATE: r = job_activate(); break;
         case JOB_CONFIRM:  r = job_confirm(); break;
@@ -964,8 +977,8 @@ static uint32_t eng_zwritten(void *ctx)
     return udsota_coded_written(&s_cd);
 }
 
-/* engine.zend, on the diag task with the worker idle: the download's 37 check, then its memory freed. A delta
- * download's decoder may still hold the image's last bytes, which this writes. */
+/* engine.zend, on the diag task with the worker idle: queues JOB_ZEND, the download's 37 check and its free, on the
+ * worker. A queue that refuses it frees the download here, which touches no flash, and fails the 37. */
 static int eng_zend(void *ctx)
 {
     (void)ctx;
@@ -973,8 +986,15 @@ static int eng_zend(void *ctx)
     const bool live = s_z_live;
     s_z_live = false;
     taskEXIT_CRITICAL(&s_mux);
-    const int r = live ? (int)udsota_coded_end(&s_cd) : (int)UDSOTA_DL_BAD_STREAM;
-    z_release();
+    if (!live) {
+        z_release();
+        return UDSOTA_DL_BAD_STREAM;
+    }
+    const int r = submit(JOB_ZEND, 0);
+    if (r != UDSOTA_PENDING) {
+        z_release();
+        return UDSOTA_DL_FLASH_ERROR;
+    }
     return r;
 }
 #endif

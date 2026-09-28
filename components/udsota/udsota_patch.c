@@ -12,15 +12,11 @@ static udsota_reason_t fail(udsota_pstream_t *p, udsota_reason_t r)
     return p->failed;
 }
 
-/* The decoder's base read: the caller's, with a refusal remembered as a read outside the running image. */
+/* The decoder's base read: the caller's, which refuses a read outside the running image. */
 static int io_read(void *ctx, uint32_t off, uint8_t *buf, size_t n)
 {
-    udsota_pstream_t *p = ctx;
-    if (p->base.read(p->base.ctx, off, buf, n) != 0) {
-        p->base_failed = true;
-        return -1;
-    }
-    return 0;
+    const udsota_pstream_t *p = ctx;
+    return p->base.read(p->base.ctx, off, buf, n) == 0 ? 0 : -1;
 }
 
 /* The decoder's write: the rebuilt image's next bytes into the sink. */

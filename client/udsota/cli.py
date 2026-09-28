@@ -136,6 +136,8 @@ def main(argv=None, transport=Transport):
             if args.drop_76 is not None and args.drop_76 < 1:
                 raise Refused("--drop-76 takes a block number from 1")
             if args.diff_from is not None:
+                if args.drop_76 is not None:
+                    raise Refused("--drop-76 is for full and compressed downloads, not with --diff-from")
                 bases = load_bases(args.diff_from)
         if args.cmd == "config" and args.config_cmd == "set":
             writes = parse_writes(prof, args.assignments, args.commit, args.reset)

@@ -145,19 +145,24 @@ def open_download(uds, image, compress, log=print):
 
 # RequestDownload, every 0x36 block (counter from 1, wrapping 0xFF -> 0x00) and RequestTransferExit: first each
 # delta in deltas ((dfi, payload) pairs, plan_deltas) in turn, then the image compressed per compress
-# (open_download). A delta DFI the server answers 0x31 moves on to the next; a delta refused for its base
-# (send_payload) skips the rest and sends the image. drop_76 = N resends block N once as if its 76 were lost; an N
-# past the last block is refused before any 0x36.
+# (open_download). A delta DFI the server answers 0x31, or 0x22 for memory, moves on to the next; a delta refused
+# for its base (send_payload) skips the rest and sends the image. drop_76 = N resends block N once as if its 76 were
+# lost; an N past the last block is refused before any 0x36 (the CLI refuses it with deltas, whose size it can't
+# know before the 34).
 def download(uds, image, drop_76=None, log=print, compress="none", clock=time.monotonic, deltas=()):
     for dfi, patch in deltas:
         try:
             max_data = uds.request_download(len(image), dfi)
         except Nrc as e:
-            if e.code != NRC_OUT_OF_RANGE:
-                raise
-            log("the device has no delta downloads for DFI 0x%02X (RequestDownload answered 0x31): trying the next "
-                "mode" % dfi)
-            continue
+            if e.code == NRC_OUT_OF_RANGE:
+                log("the device has no delta downloads for DFI 0x%02X (RequestDownload answered 0x31): trying the "
+                    "next mode" % dfi)
+                continue
+            if e.code == NRC_CONDITIONS and last_reason(uds) == "DL_NO_MEMORY":
+                log("the device has no memory for DFI 0x%02X now (RequestDownload answered 0x22, F1F1 "
+                    "DL_NO_MEMORY): trying the next mode" % dfi)
+                continue
+            raise
         log("delta, DFI 0x%02X (%s): %d -> %d bytes (%.0f%%)" % (dfi, DELTA_NAMES[dfi], len(image), len(patch),
                                                                 100.0 * len(patch) / len(image)))
         if send_payload(uds, image, patch, max_data, "delta", drop_76=drop_76, log=log, clock=clock):

@@ -3,7 +3,7 @@
  * insertions, deletions and header edits) in random splits, under DFI 0x20 and 0x30. Deterministic (a fixed LCG
  * seed), and built with the sanitizers. Every mutant must end without a crash, with every base read inside the
  * running image, every write at the next image offset and never past memorySize, and only a download that
- * rebuilt all memorySize bytes may pass its 37. Prints one PASS line; exits 1 at the first broken invariant. */
+ * rebuilt all memorySize bytes may pass its 37. DELTA_PTAIL's mutants also exercise image bytes the 37 writes. Prints one PASS line; exits 1 at the first broken invariant. */
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -26,7 +26,7 @@ static uint8_t  g_zbuf[256];
 static uint32_t g_next;           /* where the next image write must land */
 static bool     g_begun;
 static unsigned g_failures;
-static unsigned g_passes, g_reasons[UDSOTA_DL_REASON_COUNT];
+static unsigned g_passes, g_drained, g_reasons[UDSOTA_DL_REASON_COUNT];
 
 /* The next pseudo-random number. */
 static uint32_t rnd(void)
@@ -157,10 +157,12 @@ static void run(uint8_t dfi, const uint8_t *payload, size_t n)
         off += m;
     }
     if (r == UDSOTA_DL_OK) {
+        const uint32_t before_end = g_next;
         r = udsota_coded_end(&cd);
         if (r == UDSOTA_DL_OK && g_next != IMG_LEN) {
             broken("a 37 passed without the whole image", g_it);
         }
+        g_drained += (r == UDSOTA_DL_OK && before_end != IMG_LEN);   /* image bytes the 37's drain wrote */
     } else {
         udsota_coded_close(&cd);
     }
@@ -179,7 +181,7 @@ int main(void)
 {
     static uint8_t p[PATCH_CAP], raw[PATCH_CAP];
     for (g_it = 0; g_it < ITERATIONS; g_it++) {
-        const unsigned form = g_it % 3u;
+        const unsigned form = g_it % 4u;
         size_t n;
         if (form == 0u) {                               /* 0x20: the heatshrink patch, mutated */
             memcpy(p, DELTA_P20, sizeof DELTA_P20);
@@ -189,6 +191,10 @@ int main(void)
             memcpy(p, DELTA_PNONE, sizeof DELTA_PNONE);
             n = mutate(p, sizeof DELTA_PNONE, sizeof p);
             run(UDSOTA_DL_DFI_DELTA, p, n);
+        } else if (form == 2u) {                        /* 0x20: the patch whose last image bytes wait for the 37 */
+            memcpy(p, DELTA_PTAIL, sizeof DELTA_PTAIL);
+            n = mutate(p, sizeof DELTA_PTAIL, sizeof p);
+            run(UDSOTA_DL_DFI_DELTA, p, n);
         } else {                                        /* 0x30: the uncompressed patch mutated, then deflated */
             memcpy(raw, DELTA_PNONE, sizeof DELTA_PNONE);
             const size_t rn = mutate(raw, sizeof DELTA_PNONE, sizeof raw);
@@ -197,8 +203,8 @@ int main(void)
             run(UDSOTA_DL_DFI_DELTA_DEFLATE, p, n);
         }
     }
-    printf("%s fuzz_udsota_patch: %u mutants, %u passed their 37 (rebuilding whole images); reasons:",
-           g_failures == 0u ? "PASS" : "FAIL", ITERATIONS, g_passes);
+    printf("%s fuzz_udsota_patch: %u mutants, %u passed their 37 (rebuilding whole images, %u of them writing at the "
+           "37); reasons:", g_failures == 0u ? "PASS" : "FAIL", ITERATIONS, g_passes, g_drained);
     for (unsigned i = 0; i < UDSOTA_DL_REASON_COUNT; i++) {
         if (g_reasons[i] != 0u) printf(" %u=%u", i, g_reasons[i]);
     }

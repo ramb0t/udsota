@@ -45,6 +45,10 @@ typedef struct {
     uint8_t          base_hash[UDSOTA_PATCH_HASH_LEN];
     bool             hash_fails;          /* base.hash cannot identify the running image */
     const char      *product;             /* the product the first-block check wants */
+    bool             zend_job;            /* zend answers UDSOTA_PENDING, as the ESP32 port's worker job does */
+    int              job_result;          /* the pending zend's result */
+    uint32_t         job_done_at;         /* when it is done */
+    bool             job_queued;
 } eng_t;
 
 static eng_t e;
@@ -157,11 +161,16 @@ static int eng_zwrite(void *ctx, const uint8_t *d, size_t n)
     return (int)udsota_coded_feed(&e.cd, d, n);
 }
 
-/* engine.zend: the 37 check. */
+/* engine.zend: the 37 check; with zend_job, a job that finishes 100 ms later. */
 static int eng_zend(void *ctx)
 {
     e.zends++;
-    return (int)udsota_coded_end(&e.cd);
+    const int r = (int)udsota_coded_end(&e.cd);
+    if (!e.zend_job) return r;
+    e.job_result = r;
+    e.job_done_at = g_now + 100u;
+    e.job_queued = true;
+    return UDSOTA_PENDING;
 }
 
 /* engine.zwritten: the image bytes written, for progress. */
@@ -199,8 +208,13 @@ static int eng_raw_write(void *ctx, uint32_t off, const uint8_t *d, size_t n) { 
 /* engine.activate and engine.confirm: done at once. */
 static int eng_ok(void *ctx) { return 0; }
 
-/* Never a job: every op answers at once. */
-static int eng_poll(void *ctx) { return 0; }
+/* UDSOTA_PENDING while a zend job runs, then its result; every other op answers at once. */
+static int eng_poll(void *ctx)
+{
+    if (e.job_queued && g_now < e.job_done_at) return UDSOTA_PENDING;
+    e.job_queued = false;
+    return e.job_result;
+}
 
 #define ALL_FORMATS (UDSOTA_DL_FMT(UDSOTA_DL_DFI_DEFLATE) | UDSOTA_DL_FMT(UDSOTA_DL_DFI_DELTA) | \
                      UDSOTA_DL_FMT(UDSOTA_DL_DFI_DELTA_DEFLATE))
@@ -328,6 +342,25 @@ static uint8_t send_payload(size_t chunk)
         EXPECT(0x76, bsc);
     }
     return bsc;
+}
+
+/* Polls every 10 ms until a final response, counting 0x78s; fails after 100 s. */
+static size_t finish_job(unsigned *pending)
+{
+    for (uint32_t waited = 0; waited < 100000u; waited += 10u) {
+        g_now += 10u;
+        const size_t n = udsota_poll(&srv, g_resp, sizeof g_resp, g_now);
+        if (n == 3u && g_resp[0] == UDSOTA_NEG_RESPONSE && g_resp[2] == UDSOTA_NRC_RESPONSE_PENDING) {
+            (*pending)++;
+            continue;
+        }
+        if (n > 0u) {
+            g_resp_len = n;
+            return n;
+        }
+    }
+    TEST_FAIL_MESSAGE("the job never finished");
+    return 0;
 }
 
 /* Sends 37. */
@@ -668,6 +701,57 @@ static void test_progress_counts_image_bytes(void)
     TEST_ASSERT_EQUAL_UINT32(IMG_LEN, pr.done);
 }
 
+/* A 37 whose check runs as a worker job (the ESP32 port runs a patch's end on its flash worker): nothing at once, 0x78
+ * while it runs, then 77, and FF01 passes; a failing one answers 0x72 with its reason after the 0x78. */
+static void test_37_as_a_worker_job(void)
+{
+    e.zend_job = true;
+    enter_programming();
+    send_34(UDSOTA_DL_DFI_DELTA, IMG_LEN);
+    send_payload(BLOCK);
+    TEST_ASSERT_EQUAL_UINT(0u, send_37());
+    unsigned pending = 0;
+    finish_job(&pending);
+    EXPECT(0x77);
+    TEST_ASSERT_TRUE(pending >= 1u);
+    expect_reason(UDSOTA_DL_OK);
+    send_routine(UDSOTA_RID_CHECK_PROG_DEPS);
+    EXPECT(0x71, 0x01, 0xFF, 0x01, UDSOTA_DL_OK);
+
+    setUp();
+    e.zend_job = true;
+    g_p_len -= 40u;
+    enter_programming();
+    send_34(UDSOTA_DL_DFI_DELTA, IMG_LEN);
+    send_payload(BLOCK);
+    TEST_ASSERT_EQUAL_UINT(0u, send_37());
+    pending = 0;
+    finish_job(&pending);
+    EXPECT(0x7F, 0x37, 0x72);
+    expect_reason(UDSOTA_DL_BAD_STREAM);
+    TEST_ASSERT_EQUAL_UINT(e.allocs, e.frees);
+}
+
+/* A heatshrink patch whose decoder still holds the image's last bytes when the input ends (DELTA_PTAIL, rebuilding
+ * an image ending in 2,000 zeros): the 36s leave part of the image unwritten, and the 37 writes the rest, in order,
+ * to exactly memorySize. That is flash work at the 37, which the ESP32 port therefore runs on its worker. */
+static void test_37_writes_the_last_image_bytes(void)
+{
+    set_payload(DELTA_PTAIL, sizeof DELTA_PTAIL);
+    enter_programming();
+    send_34(UDSOTA_DL_DFI_DELTA, IMG_LEN);
+    send_payload(BLOCK);
+    TEST_ASSERT_TRUE(e.next_off < IMG_LEN);
+    const unsigned writes = e.writes;
+    send_37();
+    EXPECT(0x77);
+    TEST_ASSERT_TRUE(e.writes > writes);
+    TEST_ASSERT_TRUE(e.offsets_ok);
+    TEST_ASSERT_EQUAL_UINT32(IMG_LEN, e.next_off);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(DELTA_TAIL, e.flash, IMG_LEN);
+    TEST_ASSERT_EQUAL_UINT(e.allocs, e.frees);
+}
+
 /* The detools decoder's whole state is one small allocation. */
 static void test_decoder_heap_cost(void)
 {
@@ -767,6 +851,8 @@ int main(void)
     RUN_TEST(test_no_memory_for_the_decoder);
     RUN_TEST(test_abort_mid_patch_frees_the_decoders);
     RUN_TEST(test_progress_counts_image_bytes);
+    RUN_TEST(test_37_as_a_worker_job);
+    RUN_TEST(test_37_writes_the_last_image_bytes);
     RUN_TEST(test_decoder_heap_cost);
     RUN_TEST(test_isink_holds_checks_batches_and_bounds);
     return UNITY_END();
