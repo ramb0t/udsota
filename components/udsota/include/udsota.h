@@ -74,6 +74,15 @@ typedef struct {   /* udsota_init() with security == NULL: 27 answers 0x11, and 
                            whose key is 16 bytes */
 } udsota_security_t;
 
+/* The session state the server passes to an app hook that serves a service on its behalf. */
+typedef struct {
+    uint8_t  session;         /* UDSOTA_SESSION_* now in force */
+    uint8_t  unlocked_level;  /* the requestSeed level unlocked in this session; 0 = none (always 0 without security) */
+    uint32_t epoch;           /* 0 after init, +1 on every session entry: 10 0x including a repeat, S3, udsota_end_session
+                                 (at once or latched), the 90 s cap and the restart. A value an app saved in one
+                                 session never matches in a later one */
+} udsota_access_t;
+
 typedef struct {   /* all optional */
     uint8_t  (*gate)(void *ctx, udsota_op_t op);   /* 0 = allow, else the NRC to send (0x22, 0x88, 0x21, ...) */
     void     (*phase)(void *ctx, udsota_phase_t p);/* on every change, from the server's context; it may read
@@ -91,6 +100,13 @@ typedef struct {   /* all optional */
                                                       returns to default after 85 02. NULL: 85 answers 0x11, as
                                                       before */
     void     *ctx;
+    /* Callbacks added after ctx, so every earlier field keeps its offset. */
+    uint8_t  (*did_write)(void *ctx, uint16_t did, const uint8_t *data, size_t len, udsota_access_t access);
+                                                   /* 0x2E. NULL: 2E answers 0x11 in every session. Core: 0x7F in the
+                                                      default session, then 0x13 when the request is under 4 bytes;
+                                                      else data/len are the bytes after the DID (len >= 1, valid only
+                                                      during the call) and the hook returns 0 to answer 6E <did>, or
+                                                      the NRC to send. It answers at once: never 0x78 */
 } udsota_hooks_t;
 
 typedef struct {
@@ -153,6 +169,7 @@ typedef struct udsota_server {
     bool              comm_changed;      /* hooks.comm_control accepted a 28 other than 00 03 in this session */
     bool              dtc_off;           /* an 85 02 was accepted in this session */
     uint32_t          s3_start_ms;       /* S3 restarts when a request is answered */
+    uint32_t          session_epoch;     /* udsota_access_t.epoch: 0 after init, +1 in every session entry */
     /* The worker-job wait. */
     bool              job_running;       /* a worker job owns the pending response */
     bool              job_pending_sent;  /* at least one 0x78 has gone out for this job */

@@ -109,6 +109,11 @@ udsota_test(test_udsota_server_hooks
     SOURCES  test/test_udsota_server_hooks.c ${SERVER_SRCS}
     INCLUDES ${CORE_INC} ${CORE_PRIV})
 
+# 0x2E through hooks.did_write, and the access state and session epoch every app hook gets.
+udsota_test(test_udsota_server_write
+    SOURCES  test/test_udsota_server_write.c ${SERVER_SRCS}
+    INCLUDES ${CORE_INC} ${CORE_PRIV})
+
 udsota_test(test_udsota_server_functional
     SOURCES  test/test_udsota_server_functional.c ${SERVER_SRCS}
     INCLUDES ${CORE_INC} ${CORE_PRIV})

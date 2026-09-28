@@ -1,4 +1,4 @@
-/* Pure UDS server core: sessions, S3, SecurityAccess, download, routines, reset,
+/* Pure UDS server core: sessions, S3, SecurityAccess, download, routines, reset, 0x2E through the app's hook,
  * and the worker-job wait, behind the engine, security and hooks the integrator passes to udsota_init. No
  * ESP-IDF: the transport feeds it reassembled requests, reception events and now_ms, and sends whatever it
  * returns. */
@@ -220,6 +220,14 @@ static uint8_t gate(const udsota_server_t *s, udsota_op_t op)
     return s->hooks.gate != NULL ? s->hooks.gate(s->hooks.ctx, op) : 0u;
 }
 
+/* The access state an app hook gets: the session, the unlocked level (0 when locked, and always without
+ * security) and the session epoch. */
+static udsota_access_t access_of(const udsota_server_t *s)
+{
+    const udsota_access_t a = {.session = s->session, .unlocked_level = s->security, .epoch = s->session_epoch};
+    return a;
+}
+
 /* True while the worker owns a job: one the server waits on, an orphan, or anything engine.poll() still reports
  * queued (a fire-and-forget abort included). */
 static bool worker_busy(const udsota_server_t *s)
@@ -438,13 +446,14 @@ static void restore_default_comm(udsota_server_t *s)
     }
 }
 
-/* Enters `session` (an accepted 10 xx, S3, the 90 s cap or an app's end_session request): any open download is
- * aborted and security relocks, the same session included (ISO 14229-1 re-initialises it).
- * slot_verified survives, so ActivateImage can follow in a later session. */
+/* Enters `session` (an accepted 10 xx, S3, the 90 s cap, the restart or an app's end_session request): any open
+ * download is aborted, security relocks and the session epoch advances, the same session included (ISO 14229-1
+ * re-initialises it). slot_verified survives, so ActivateImage can follow in a later session. */
 static void enter_session(udsota_server_t *s, uint8_t session)
 {
     abort_download(s);
     sa_relock(s);              /* level and pending seed cleared; attempt count and delay kept */
+    s->session_epoch++;        /* app state tied to the old epoch is stale from here on */
     s->end_pending = false;   /* any session change fulfils a latched end_session */
     s->session = session;
     s->s3_running = false;     /* answered() restarts it in a non-default session */
@@ -549,6 +558,31 @@ static size_t handle_read_did(udsota_server_t *s, const uint8_t *req, size_t len
     resp[0] = UDSOTA_POS(UDSOTA_SID_READ_DID);
     udsota_put_u16be(&resp[1], did);
     return 3 + n;
+}
+
+/* 0x2E WriteDataByIdentifier, only with hooks.did_write (dispatch answers 0x11 without it). Check order: session
+ * 7F, length 13 (the DID and at least one data byte), then the hook decides: 0 answers 6E <did>, anything else is
+ * sent as the NRC. The hook is not asked when resp has no room for its answer. */
+static size_t handle_write_did(udsota_server_t *s, const uint8_t *req, size_t len, uint8_t *resp, size_t resp_max)
+{
+    const uint8_t sid = UDSOTA_SID_WRITE_DID;
+    if (s->session == UDSOTA_SESSION_DEFAULT) {
+        return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_SERVICE_NOT_SUPPORTED_IN_SESSION);
+    }
+    if (len < UDSOTA_WRITE_DID_MIN_LEN) {
+        return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_INCORRECT_LENGTH);
+    }
+    if (resp_max < 3u) {
+        return 0;
+    }
+    const uint16_t did = udsota_get_u16be(&req[1]);
+    const uint8_t nrc = s->hooks.did_write(s->hooks.ctx, did, &req[3], len - 3u, access_of(s));
+    if (nrc != 0u) {
+        return udsota_nrc(resp, resp_max, sid, nrc);
+    }
+    resp[0] = UDSOTA_POS(sid);
+    udsota_put_u16be(&resp[1], did);
+    return 3;
 }
 
 /* ==== Download: 0x34 RequestDownload, 0x36 TransferData, 0x37 RequestTransferExit ==== */
@@ -1084,7 +1118,10 @@ static size_t dispatch(udsota_server_t *s, const uint8_t *req, size_t len, uint8
     case UDSOTA_SID_DTC_SETTING:         /* no dtc_setting hook: 0x11 before anything else */
         return s->hooks.dtc_setting != NULL ? handle_dtc_setting(s, req, len, resp, resp_max)
                                             : udsota_nrc(resp, resp_max, req[0], UDSOTA_NRC_SERVICE_NOT_SUPPORTED);
-    /* 0x2E is not served. */
+    case UDSOTA_SID_WRITE_DID:           /* no did_write hook: 0x11 before anything else */
+        return s->hooks.did_write != NULL ? handle_write_did(s, req, len, resp, resp_max)
+                                          : udsota_nrc(resp, resp_max, UDSOTA_SID_WRITE_DID,
+                                                       UDSOTA_NRC_SERVICE_NOT_SUPPORTED);
     default:
         return udsota_nrc(resp, resp_max, req[0], UDSOTA_NRC_SERVICE_NOT_SUPPORTED);
     }
