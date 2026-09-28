@@ -53,12 +53,20 @@ jobs:
         run: |
           test -x build/tools/linux_server/udsota_demo_server
           UDSOTA_DEMO_SERVER="$PWD/build/tools/linux_server/udsota_demo_server" python -m pytest -q -rsx client/tests/test_e2e_pipe.py
-      - name: Set up vcan0 and the kernel ISO-TP module
-        continue-on-error: true
+      - name: Set up vcan0
         run: |
           sudo apt-get update
-          sudo apt-get install -y linux-modules-extra-$(uname -r) && sudo modprobe vcan && sudo modprobe can-isotp && sudo ip link add dev vcan0 type vcan && sudo ip link set up vcan0
-      - name: Run the udsota command against the demo on vcan0 (skips if the setup failed)
+          sudo apt-get install -y linux-modules-extra-$(uname -r)
+          sudo modprobe vcan
+          sudo ip link add dev vcan0 type vcan
+          sudo ip link set up vcan0
+      - name: Load the kernel ISO-TP module, where the kernel has one (the udsota command's tests need it)
+        continue-on-error: true
+        run: sudo modprobe can-isotp
+      - name: Run the end-to-end tests on vcan0 (UDSOTA_VCAN makes a missing vcan fail, not skip)
+        env:
+          UDSOTA_VCAN: vcan0
+          UDSOTA_DEMO_SERVER: ${{ github.workspace }}/build/tools/linux_server/udsota_demo_server
         run: python -m pytest -q -rsx client/tests/test_e2e_vcan.py
 
   esp32:

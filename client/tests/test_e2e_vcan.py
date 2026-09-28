@@ -3,8 +3,9 @@ through its SocketCAN backend, and the client flashes it two ways:
 - over can-isotp's Python ISO-TP stack on a python-can SocketCAN bus, which needs only the vcan module (CI's e2e
   job runs these on GitHub's hosted runners, whose kernel has no ISO-TP module);
 - as the real `udsota` command over the kernel's ISO-TP socket, which also needs can-isotp (a local Linux box).
-Each skips when what it needs is missing. $UDSOTA_VCAN must name a vcan interface (vcan0, vcan1, ...): the tests
-never drive a real bus."""
+Each skips when what it needs is missing, except that the Python-stack tests fail instead when $UDSOTA_VCAN is set,
+as CI sets it, so a broken setup cannot pass as skips. $UDSOTA_VCAN must name a vcan interface (vcan0, vcan1,
+...): the tests never drive a real bus."""
 import os
 import signal
 import socket
@@ -23,13 +24,31 @@ IFACE = os.environ.get("UDSOTA_VCAN", "vcan0")
 CLI_TIMEOUT_S = 240
 
 
-# The demo binary, or a skip naming what is missing: a vcan name, the demo or the interface.
+IFACE_REQUIRED = "UDSOTA_VCAN" in os.environ   # set (as in CI): a missing vcan, demo or python-can fails
+
+
+# A skip naming what is missing, or a failure when IFACE_REQUIRED.
+def missing(reason):
+    if IFACE_REQUIRED:
+        pytest.fail("UDSOTA_VCAN is set but " + reason, pytrace=False)
+    pytest.skip(reason)
+
+
+# The demo binary, or a skip (a failure when IFACE_REQUIRED) naming what is missing: a vcan name, the demo or the
+# interface.
 def vcan_or_skip():
     if not IFACE.startswith("vcan"):
-        pytest.skip("UDSOTA_VCAN=%s is not a vcan interface name; this test only runs on vcan" % IFACE)
-    binary = binary_or_skip()
+        missing("UDSOTA_VCAN=%s is not a vcan interface name; this test only runs on vcan" % IFACE)
+    try:
+        binary = binary_or_skip()
+    except pytest.skip.Exception as e:
+        reason = str(e)
+    else:
+        reason = None
+    if reason is not None:
+        missing(reason)
     if not os.path.exists("/sys/class/net/%s" % IFACE):
-        pytest.skip("no %s: modprobe vcan && ip link add dev %s type vcan && ip link set up %s" % (IFACE, IFACE, IFACE))
+        missing("no %s: modprobe vcan && ip link add dev %s type vcan && ip link set up %s" % (IFACE, IFACE, IFACE))
     return binary
 
 
