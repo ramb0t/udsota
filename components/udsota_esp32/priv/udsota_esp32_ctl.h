@@ -1,6 +1,7 @@
-/* The ESP32 port's control block: the phase copy any task reads, the end-session request any task
- * raises, and the hook wrappers the server and the ISO-TP adapter call. No lock anywhere, so an app
- * hook may call any udsota_esp32_* function. Pure C11 (stdatomic, no ESP-IDF, no FreeRTOS):
+/* The ESP32 port's control block: the phase copy and progress snapshot any task reads, the end-session
+ * request any task raises, and the hook wrappers the server and the ISO-TP adapter call. The only lock is
+ * the snapshot's, which the port supplies (a portMUX) and which is never held while an app hook runs, so
+ * an app hook may call any udsota_esp32_* function. Pure C11 (stdatomic, no ESP-IDF, no FreeRTOS):
  * host-tested by test_udsota_esp32_ctl. */
 #pragma once
 #include <stdatomic.h>
@@ -13,16 +14,28 @@ typedef struct {
     atomic_bool    end_req;                  /* raised by udsota_esp32_end_session(), taken by the diag task */
     udsota_hooks_t app;                      /* the app's hooks, its ctx included */
     bool         (*default_reset)(void *ctx);   /* runs when app.reset is NULL; gets app.ctx */
+    udsota_progress_t progress;              /* the last progress the server reported, under lock */
+    void         (*lock)(void *ctx);         /* guard progress; NULL = no lock (one task, as on the host) */
+    void         (*unlock)(void *ctx);
+    void          *lock_ctx;
 } udsota_esp32_ctl_t;
 
-/* Before the server exists: copies *app (NULL = no hooks), stores IDLE, clears any request, and fills
- * *out with the hooks to give the server and the adapter. out->ctx is ctl. out's gate, did_read, stmin_us,
- * comm_control, dtc_setting, did_write, routine and routine_poll stay NULL where the app's are, so the core's
- * defaults hold; out's phase is always set, and out's reset is set when the app or default_reset gives one. */
+/* Before the server exists: copies *app (NULL = no hooks), stores IDLE and an IDLE progress, clears any
+ * request and the lock, and fills *out with the hooks to give the server and the adapter. out->ctx is ctl.
+ * out's gate, did_read, stmin_us, comm_control, dtc_setting, did_write, routine and routine_poll stay NULL
+ * where the app's are, so the core's defaults hold; out's phase and progress are always set, and out's reset
+ * is set when the app or default_reset gives one. */
 void udsota_esp32_ctl_init(udsota_esp32_ctl_t *ctl, const udsota_hooks_t *app,
                            bool (*default_reset)(void *ctx), udsota_hooks_t *out);
+/* After udsota_esp32_ctl_init and before the server runs: the lock that guards the progress snapshot, taken
+ * with lock_ctx around each copy in or out of it and held for nothing else. The port passes a portMUX critical
+ * section, since the reader may be any task on either core. */
+void udsota_esp32_ctl_set_lock(udsota_esp32_ctl_t *ctl, void (*lock)(void *ctx), void (*unlock)(void *ctx),
+                               void *lock_ctx);
 /* Any task: the phase as of the server's last change. */
 udsota_phase_t udsota_esp32_ctl_phase(udsota_esp32_ctl_t *ctl);
+/* Any task: a copy of the progress the server last reported (IDLE, 0 of 0, after init), under the lock. */
+void udsota_esp32_ctl_progress(udsota_esp32_ctl_t *ctl, udsota_progress_t *out);
 /* Any task, an app hook included: asks the diag task to end the session; requests count once until it runs. */
 void udsota_esp32_ctl_request_end(udsota_esp32_ctl_t *ctl);
 /* Diag task, outside every server call: runs udsota_end_session() once if a request is pending (the core

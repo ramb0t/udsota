@@ -10,6 +10,7 @@ udsota_esp32 is the ESP-IDF port of [udsota](../udsota/README.md). It runs the U
 | `udsota_esp32_on_frame(id, data, dlc, rx_us)` | the app's CAN receive task | queues one request frame on `cfg.req_id`, or on `cfg.func_id` when it is set (functional addressing); never blocks. Drops other IDs, frames before start, and frames past a full queue (counted) |
 | `udsota_esp32_end_session()` | any task | ends an open session, after a running flash job has answered; the diag task runs `udsota_end_session()` |
 | `udsota_esp32_phase()` | any task | the current `udsota_phase_t` |
+| `udsota_esp32_progress(out)` | any task | the download's `udsota_progress_t` ([Progress](../udsota/README.md#progress)) as the server last reported it, copied out of a snapshot under a spinlock, so a UI task draws it without touching the server; IDLE before start |
 | `udsota_esp32_image_unconfirmed()` | any task | true while the running image is pending verify and is the boot slot |
 | `udsota_esp32_status(out)` | any task | the cached F1F0 snapshot |
 | `udsota_esp32_engine()` | any task | the engine, for a front end other than UDS |
@@ -25,7 +26,7 @@ udsota_esp32 is the ESP-IDF port of [udsota](../udsota/README.md). It runs the U
 
 The device ID is `cfg.device_id` (1 to 16 bytes) when set, else the 6-byte base MAC. Start copies it once, serves the copy as F18C and derives or checks the 0x27 keys over the same bytes, so the key a client makes from F18C always matches. A set `device_id` of any other length makes start return `ESP_ERR_INVALID_ARG`. A custom ID must be unique per device, or devices share K_dev (HMAC) or accept each other's signatures (ECDSA).
 
-Start passes every hook in `udsota_hooks_t` to the core with the app's own `ctx`, `did_write`, `routine` and `routine_poll` included, and a hook the app leaves NULL stays NULL, so the core's default holds. The port adds only its phase copy and the `esp_restart()` default for `reset`.
+Start passes every hook in `udsota_hooks_t` to the core with the app's own `ctx`, `did_write`, `routine`, `routine_poll` and `progress` included, and a hook the app leaves NULL stays NULL, so the core's default holds. The port adds only its phase copy, its progress snapshot and the `esp_restart()` default for `reset`. It wraps `phase` and `progress` to keep those copies, storing each before the app's own hook runs and holding no lock while it does, so that hook may read them back.
 
 ### Security config
 
