@@ -486,10 +486,11 @@ static int base_read(void *ctx, uint32_t off, uint8_t *buf, size_t n)
     return esp_partition_read(s_running, off, buf, n) == ESP_OK ? 0 : -1;
 }
 
-/* Worker, the delta base's identity: the SHA-256 the running image appends, as esp_image_get_metadata reads it. The
- * bootloader checked that hash when it booted the image, so it is not recomputed here (esp_partition_get_sha256
- * would hash the whole image); a running image changed since would only rebuild an image FF01 then refuses. The
- * first delta download reads it and later ones reuse it: the running image never changes. */
+/* Worker, the delta base's identity: the SHA-256 the running image appends, as esp_image_get_metadata reads it, not
+ * recomputed (esp_partition_get_sha256 would hash the whole image). The bootloader usually checked it at boot, but
+ * need not have (CONFIG_BOOTLOADER_SKIP_VALIDATE_ON_POWER_ON without secure boot): FF01 is the backstop, since a base
+ * that differs from its stored hash only rebuilds an image FF01 refuses. The first delta download reads it and later
+ * ones reuse it: the running image never changes. */
 static int base_hash(void *ctx, uint8_t out[UDSOTA_PATCH_HASH_LEN])
 {
     (void)ctx;

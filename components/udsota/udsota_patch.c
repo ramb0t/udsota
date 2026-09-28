@@ -73,8 +73,7 @@ udsota_reason_t udsota_pstream_push(udsota_pstream_t *p, const uint8_t *d, size_
         return fail(p, UDSOTA_DL_BAD_STREAM);
     }
     if (p->ended) {
-        p->trailing = p->trailing || n > 0u;
-        return UDSOTA_DL_OK;
+        return n > 0u ? fail(p, UDSOTA_DL_BAD_STREAM) : UDSOTA_DL_OK;   /* bytes after the patch's end */
     }
     if (p->header_len < UDSOTA_PATCH_HEADER_LEN) {
         const size_t want = UDSOTA_PATCH_HEADER_LEN - p->header_len;
@@ -103,7 +102,9 @@ udsota_reason_t udsota_pstream_push(udsota_pstream_t *p, const uint8_t *d, size_
         n -= used;
         if (rc == UDSOTA_PATCH_END) {
             p->ended = true;
-            p->trailing = n > 0u;
+            if (n > 0u) {
+                return fail(p, UDSOTA_DL_BAD_STREAM);           /* bytes after the patch's end */
+            }
             const udsota_reason_t r = udsota_isink_finish(p->image);
             return r != UDSOTA_DL_OK ? fail(p, r) : UDSOTA_DL_OK;
         }
@@ -133,7 +134,7 @@ udsota_reason_t udsota_pstream_end(udsota_pstream_t *p)
         }
     }
     udsota_reason_t r = p->failed;
-    if (r == UDSOTA_DL_OK && (!p->ended || p->trailing || !udsota_isink_complete(p->image))) {
+    if (r == UDSOTA_DL_OK && (!p->ended || !udsota_isink_complete(p->image))) {
         r = fail(p, UDSOTA_DL_BAD_STREAM);
     }
     udsota_pstream_close(p);

@@ -308,6 +308,8 @@ if(UDSOTA_FUZZ AND UDSOTA_FUZZ_SAN_OK)
     unset(CMAKE_REQUIRED_FLAGS)
     if(UDSOTA_FUZZ_ASAN_OK)
         list(APPEND FUZZ_PATCH_SAN -fsanitize=address)
+    else()
+        message(WARNING "no AddressSanitizer runtime: fuzz_udsota_patch runs with UBSan only")
     endif()
     add_executable(fuzz_udsota_patch test/fuzz_udsota_patch.c ${CORE_DIR}/udsota_coded.c ${CORE_DIR}/udsota_patch.c
                    ${ZSTREAM_SRCS} ${DELTA_DIR}/udsota_detools.c ${DELTA_DIR}/detools/detools.c
@@ -318,8 +320,8 @@ if(UDSOTA_FUZZ AND UDSOTA_FUZZ_SAN_OK)
                                                          MINIZ_NO_ZLIB_APIS ${UDSOTA_DETOOLS_DEFS})
     target_compile_options(fuzz_udsota_patch PRIVATE -Wall -Wextra -Werror ${FUZZ_PATCH_SAN})
     target_link_options(fuzz_udsota_patch PRIVATE ${FUZZ_PATCH_SAN})
-    add_test(NAME fuzz_udsota_patch COMMAND fuzz_udsota_patch)
-    set_tests_properties(fuzz_udsota_patch PROPERTIES TIMEOUT 600 PASS_REGULAR_EXPRESSION "^PASS fuzz_udsota_patch")
+    add_test(NAME fuzz_udsota_patch COMMAND fuzz_udsota_patch)   # its exit code: 1 for a broken invariant, and a
+    set_tests_properties(fuzz_udsota_patch PROPERTIES TIMEOUT 600)   # sanitizer's (a leak report too) fails it
 endif()
 
 # ---- tools/image_check: the ESP32 port's first-block check as a host program, for checking a real

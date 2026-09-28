@@ -155,8 +155,8 @@ static int base_read(void *ctx, uint32_t off, uint8_t *buf, size_t n)
     return fake_ota_slot_read(&e->ota, e->ota.running_slot, off, buf, n);
 }
 
-/* A delta download's base identity: the running image's appended SHA-256, as esp_partition_get_sha256 gives it;
- * computed once per boot. */
+/* A delta download's base identity: the SHA-256 the running image stores, as the ESP32 port reads it; read once
+ * per boot. */
 static int base_hash(void *ctx, uint8_t out[UDSOTA_PATCH_HASH_LEN])
 {
     demo_engine_t *e = ctx;
@@ -200,11 +200,12 @@ static uint32_t eng_zwritten(void *ctx)
     return udsota_coded_written(&((const demo_engine_t *)ctx)->cd);
 }
 
-/* engine.zend: the 37 check; frees the decoders. */
+/* engine.zend: the 37 check; frees the decoders. A job like any other when job_ms is set, as the ESP32 port runs it
+ * on its worker. */
 static int eng_zend(void *ctx)
 {
     demo_engine_t *e = ctx;
-    return (int)udsota_coded_end(&e->cd);
+    return job(e, (int)udsota_coded_end(&e->cd));
 }
 
 /* engine.unverify: an accepted 34 means the inactive slot no longer counts as verified. */

@@ -1,6 +1,6 @@
 """Delta downloads (DFI 0x20 and 0x30): the patch the device rebuilds the new image from, in Espressif's
 esp_delta_ota format, and the base image's identity. The patch is built with detools, the optional extra
-`pip install udsota[diff]`; everything else here is plain Python."""
+`diff` (pip install "./client[diff]" from the repository); everything else here is plain Python."""
 import hashlib
 import io
 import struct
@@ -45,7 +45,9 @@ def make_patch(base, new, compression):
     if base_hash is None:
         raise ValueError("the base image has no valid appended SHA-256, so a device cannot be matched to it")
     out = io.BytesIO()
-    detools.create_patch(io.BytesIO(bytes(base)), io.BytesIO(bytes(new)), out, compression=compression)
+    # The window and lookahead esp_delta_ota's decoder is built for, named so a detools bump cannot move them.
+    detools.create_patch(io.BytesIO(bytes(base)), io.BytesIO(bytes(new)), out, compression=compression,
+                         heatshrink_window_sz2=8, heatshrink_lookahead_sz2=7)
     return header(base_hash) + out.getvalue()
 
 

@@ -74,7 +74,8 @@ static const udsota_engine_t ENGINE = {
     .check_first = eng_check, .begin = eng_begin, .write = eng_write, .verify = eng_ok, .activate = eng_ok,
     .confirm = eng_ok, .abort = eng_abort, .poll = eng_ok, .status = udsota_mock_status, .ctx = &g_mock,
     .zbegin = eng_zbegin, .zwrite = eng_zwrite, .zend = eng_zend, .zwritten = eng_zwritten,
-    .zformats = UDSOTA_DL_FMT(UDSOTA_DL_DFI_DEFLATE),
+    .zformats = UDSOTA_DL_FMT(UDSOTA_DL_DFI_DEFLATE) | UDSOTA_DL_FMT(UDSOTA_DL_DFI_DELTA) |
+                UDSOTA_DL_FMT(UDSOTA_DL_DFI_DELTA_DEFLATE),
 };
 
 /* A server without security, on ENGINE, in the programming session at T0. */
@@ -107,14 +108,17 @@ static void send(const uint8_t *req, size_t len)
     g_resp_len = udsota_on_request(&srv, req, len, g_resp, sizeof g_resp, T0);
 }
 
-/* A 34 with DFI 0x10 answers 0x31 though the engine offers compression, and leaves F1F1, the download and the engine
- * untouched. */
+/* A 34 with DFI 0x10, 0x20 or 0x30 answers 0x31 though the engine sets the ops and names all three in zformats, and
+ * leaves F1F1, the download and the engine untouched. */
 static void test_dfi_10_answers_0x31_with_the_ops_set(void)
 {
     srv.last_dl.reason_code = UDSOTA_DL_VERIFY_FAILED;
-    const uint8_t r34[] = {UDSOTA_SID_REQUEST_DOWNLOAD, UDSOTA_DL_DFI_DEFLATE, UDSOTA_DL_ALFID, 0, 0, 0, 0, 0, 0, 4, 0};
-    send(r34, sizeof r34);
-    EXPECT(0x7F, 0x34, 0x31);
+    const uint8_t dfis[] = {UDSOTA_DL_DFI_DEFLATE, UDSOTA_DL_DFI_DELTA, UDSOTA_DL_DFI_DELTA_DEFLATE};
+    for (size_t i = 0; i < sizeof dfis; i++) {
+        const uint8_t r34[] = {UDSOTA_SID_REQUEST_DOWNLOAD, dfis[i], UDSOTA_DL_ALFID, 0, 0, 0, 0, 0, 0, 4, 0};
+        send(r34, sizeof r34);
+        EXPECT(0x7F, 0x34, 0x31);
+    }
     TEST_ASSERT_FALSE(srv.download_active);
     TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_VERIFY_FAILED, srv.last_dl.reason_code);
     TEST_ASSERT_EQUAL_UINT(0u, g_z_calls);

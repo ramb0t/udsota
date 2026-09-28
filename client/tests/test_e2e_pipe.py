@@ -617,3 +617,14 @@ def test_flash_delta_on_a_server_without_it(demo, tmp_path, capsys):
     out = capsys.readouterr().out
     assert "no delta downloads for DFI 0x30" in out and "no delta downloads for DFI 0x20" in out
     assert read_state(s)[2] == "v0.3.0"
+
+
+# Check a delta download on a server whose flash jobs are slow, as the ESP32 port's worker is: the 37 runs as a job
+# too and answers 0x78 before its 77, and the update completes.
+def test_flash_delta_on_slow_jobs(demo, tmp_path):
+    s = demo("--job-ms", "300")
+    base, new, base_path, new_path = running_base(s, tmp_path)
+    s.sent.clear()
+    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash", new_path, "--diff-from", base_path]) == 0
+    assert 0x37 in {m.data[2] for m in s.sent if m.data[1] == 0x7F and m.data[3] == 0x78}
+    assert read_state(s)[2] == "v0.3.0"

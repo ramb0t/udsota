@@ -1,9 +1,10 @@
 /* Mutation fuzzing of the delta patch path a device runs on untrusted input: udsota_coded over the real detools and
  * tinfl, fed mutants of test/fixtures/delta_fixtures.h's patches (bit flips, byte overwrites, truncations,
- * insertions, deletions and header edits) in random splits, under DFI 0x20 and 0x30. Deterministic (a fixed LCG
+ * insertions, deletions, bytes appended after the end and header edits) in random splits, under DFI 0x20 and 0x30,
+ * with 0x30's DEFLATE layer mutated as well as the patch inside it. Deterministic (a fixed LCG
  * seed), and built with the sanitizers. Every mutant must end without a crash, with every base read inside the
- * running image, every write at the next image offset and never past memorySize, and only a download that
- * rebuilt all memorySize bytes may pass its 37. DELTA_PTAIL's mutants also exercise image bytes the 37 writes. Prints one PASS line; exits 1 at the first broken invariant. */
+ * running image, the first-block check before the erase, every write at the next image offset and never past
+ * memorySize, and only a download that rebuilt all memorySize bytes, with no base read refused, may pass its 37. DELTA_PTAIL's mutants also exercise image bytes the 37 writes. Prints one PASS line; exits 1 at the first broken invariant. */
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -24,7 +25,9 @@ static uint32_t g_seed = 0x2545F491u;
 static uint8_t  g_out[1024];
 static uint8_t  g_zbuf[256];
 static uint32_t g_next;           /* where the next image write must land */
+static bool     g_checked;        /* the first-block check ran in this download */
 static bool     g_begun;
+static bool     g_refused;        /* a base read was refused in this download */
 static unsigned g_failures;
 static unsigned g_passes, g_drained, g_reasons[UDSOTA_DL_REASON_COUNT];
 
@@ -50,6 +53,7 @@ static int b_read(void *ctx, uint32_t off, uint8_t *buf, size_t n)
 {
     (void)ctx;
     if ((uint64_t)off + n > sizeof DELTA_BASE) {
+        g_refused = true;
         return -1;
     }
     memcpy(buf, &DELTA_BASE[off], n);
@@ -69,7 +73,10 @@ static int s_check(void *ctx, const uint8_t *first, size_t len, udsota_reason_t 
 {
     (void)ctx;
     (void)first;
-    (void)len;
+    if (g_checked || g_begun || len < (IMG_LEN < UDSOTA_IMAGE_MIN_LEN ? IMG_LEN : UDSOTA_IMAGE_MIN_LEN)) {
+        broken("a second check, one after the erase, or one with short bytes", g_it);
+    }
+    g_checked = true;
     *why = UDSOTA_DL_OK;
     return 0;
 }
@@ -78,8 +85,8 @@ static int s_check(void *ctx, const uint8_t *first, size_t len, udsota_reason_t 
 static int s_begin(void *ctx, uint32_t size)
 {
     (void)ctx;
-    if (g_begun || size != IMG_LEN) {
-        broken("a second erase, or one for another size", g_it);
+    if (!g_checked || g_begun || size != IMG_LEN) {
+        broken("an erase before the check, a second one, or one for another size", g_it);
     }
     g_begun = true;
     return 0;
@@ -103,7 +110,12 @@ static size_t mutate(uint8_t *p, size_t n, size_t cap)
     const unsigned edits = 1u + rnd() % 4u;
     for (unsigned e = 0; e < edits && n > 0u; e++) {
         const size_t at = rnd() % n;
-        switch (rnd() % 7u) {
+        switch (rnd() % 8u) {
+        case 7: {                                                             /* bytes after the end */
+            const size_t k = 1u + rnd() % 64u;
+            for (size_t i = 0; i < k && n < cap; i++) p[n++] = (uint8_t)rnd();
+            break;
+        }
         case 0: p[at] ^= (uint8_t)(1u << (rnd() % 8u)); break;               /* a bit flip */
         case 1: p[at] = (uint8_t)rnd(); break;                                /* a byte */
         case 2: n = at; break;                                                /* truncation */
@@ -144,7 +156,7 @@ static void run(uint8_t dfi, const uint8_t *payload, size_t n)
     };
     udsota_coded_t cd;
     g_next = 0;
-    g_begun = false;
+    g_checked = g_begun = g_refused = false;
     if (udsota_coded_open(&cd, dfi, IMG_LEN, &cfg) != UDSOTA_DL_OK) {
         broken("open failed", g_it);
         return;
@@ -163,6 +175,9 @@ static void run(uint8_t dfi, const uint8_t *payload, size_t n)
             broken("a 37 passed without the whole image", g_it);
         }
         g_drained += (r == UDSOTA_DL_OK && before_end != IMG_LEN);   /* image bytes the 37's drain wrote */
+        if (r == UDSOTA_DL_OK && g_refused) {
+            broken("a 37 passed after a refused base read", g_it);
+        }
     } else {
         udsota_coded_close(&cd);
     }
@@ -181,7 +196,7 @@ int main(void)
 {
     static uint8_t p[PATCH_CAP], raw[PATCH_CAP];
     for (g_it = 0; g_it < ITERATIONS; g_it++) {
-        const unsigned form = g_it % 4u;
+        const unsigned form = g_it % 5u;
         size_t n;
         if (form == 0u) {                               /* 0x20: the heatshrink patch, mutated */
             memcpy(p, DELTA_P20, sizeof DELTA_P20);
@@ -195,6 +210,10 @@ int main(void)
             memcpy(p, DELTA_PTAIL, sizeof DELTA_PTAIL);
             n = mutate(p, sizeof DELTA_PTAIL, sizeof p);
             run(UDSOTA_DL_DFI_DELTA, p, n);
+        } else if (form == 3u) {                        /* 0x30: the DEFLATE stream itself mutated */
+            memcpy(p, DELTA_P30, sizeof DELTA_P30);
+            n = mutate(p, sizeof DELTA_P30, sizeof p);
+            run(UDSOTA_DL_DFI_DELTA_DEFLATE, p, n);
         } else {                                        /* 0x30: the uncompressed patch mutated, then deflated */
             memcpy(raw, DELTA_PNONE, sizeof DELTA_PNONE);
             const size_t rn = mutate(raw, sizeof DELTA_PNONE, sizeof raw);

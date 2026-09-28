@@ -176,7 +176,7 @@ class FakeServer:
                  nrc_once=None, activate_refusals=0, ff01_status=0, config=None, lose_77_once=False,
                  lose_ff01_once=False, activate_nrcs=None, activate_fail=None, no_fc=None, security=True,
                  pubkey=None, cfg_keys=None, commit_status=0, compress=False, z_nomem=False, delta=(), base=None,
-                 no_memory=()):
+                 no_memory=(), lose_bad_base=False):
         self.max_block, self.boot_silence, self.confirm_refusals = max_block, boot_silence, confirm_refusals
         self.running_state, self.sha, self.board = running_state, sha, board
         self.other_state, self.other_sha = other_state, other_sha
@@ -198,6 +198,7 @@ class FakeServer:
         self.dfi, self.zin = 0x00, bytearray()  # the open download's format, and its compressed bytes
         self.delta, self.base = tuple(delta), base   # the delta DFIs served, and the image their patches apply to
         self.no_memory = tuple(no_memory)       # delta DFIs whose 34 finds no memory: 0x22, F1F1 DL_NO_MEMORY
+        self.lose_bad_base = lose_bad_base      # the 7F 36 31 of a patch for another base is lost
         self.dfis = []                          # every 34's DFI, in order
         self.log, self.written, self.writes = [], bytearray(), 0
         self.silence, self.announced, self.next_bsc, self.last_bsc = 0, None, 1, None
@@ -357,7 +358,7 @@ class FakeServer:
             if len(head) == delta.HEADER_LEN:
                 if head != delta.header(delta.validation_hash(self.base)):
                     self.dl_open, self.last_dl = False, (15, len(self.zin))    # DL_BAD_BASE
-                    return self.nrc(0x36, 0x31)
+                    return [] if self.lose_bad_base else self.nrc(0x36, 0x31)
                 self.header_ok = True
         self.last_bsc, self.next_bsc = bsc, (bsc + 1) & 0xFF
         if self.writes == self.lose_76_once:
@@ -2642,6 +2643,53 @@ def test_flash_delta_profile_none_still_tries_0x30():
     assert rc == 0 and d.dfis == [0x30, 0x20, 0x00] and bytes(d.written) == DELTA_NEW
 
 
+# Check a lost 7F 36 31 for a patch from another base still falls back: the resent block finds the download ended
+# (0x24), F1F1 reads DL_BAD_BASE, and the full download goes.
+def test_flash_delta_wrong_base_with_the_answer_lost():
+    d = delta_server(base=resigned(DELTA_BASE), lose_bad_base=True)
+    rc, lines = run_delta(d, [("a.bin", DELTA_BASE)], compress="auto")
+    assert rc == 0 and d.dfis == [0x30, 0x10] and bytes(d.written) == DELTA_NEW
+    assert any(ln.startswith("the device is not running the base this patch was made from") for ln in lines)
+
+
+# Check flash() itself refuses --drop-76 with bases, before any request, for a library caller as for the CLI.
+def test_flash_drop_76_with_bases_is_refused():
+    d = delta_server()
+    with pytest.raises(errors.Refused, match="--drop-76 is for full and compressed downloads"):
+        update.flash(uds_for(d, FakeTime()), P, DELTA_NEW, MASTER, bases=[("a.bin", DELTA_BASE)], drop_76=2)
+    assert d.dfis == []
+
+
+# Check a patch that cannot be built stops as a tool error: detools missing is Refused with the install hint, and
+# any other failure while building is UpdateFailed naming the DFI.
+@pytest.mark.parametrize("raised, error, text", [(ImportError("no detools"), errors.Refused, "./client[diff]"),
+                                                 (RuntimeError("bad"), errors.UpdateFailed,
+                                                  "DFI 0x20 patch failed")])
+def test_flash_delta_patch_build_failures(monkeypatch, raised, error, text):
+    def boom(base, new, dfi):
+        raise raised
+    monkeypatch.setattr(update, "build_delta", boom)
+    d = delta_server()
+    with pytest.raises(error, match=re.escape(text)):
+        update.flash(uds_for(d, FakeTime()), P, DELTA_NEW, MASTER, bases=[("a.bin", DELTA_BASE)])
+
+
+# Check --diff-format without --diff-from, and a --diff-from directory with no .bin files, are refused (exit 2).
+def test_main_diff_flag_misuse(tmp_path, full_path, capsys):
+    img = tmp_path / "i.bin"
+    img.write_bytes(DELTA_NEW)
+    (tmp_path / "empty").mkdir()
+    d = delta_server()
+    tr = lambda prof, interface: FakeTransport(d, interface)   # noqa: E731
+    assert cli.main(["--profile", full_path, "flash", str(img), "--diff-format", "deflate"], transport=tr) == 2
+    assert "--diff-format needs --diff-from" in capsys.readouterr().err
+    pytest.importorskip("detools")                              # load_bases checks for it before the directory
+    assert cli.main(["--profile", full_path, "flash", str(img), "--diff-from", str(tmp_path / "empty")],
+                    transport=tr) == 2
+    assert "holds no .bin files" in capsys.readouterr().err
+    assert d.dfis == []
+
+
 # Check a 34 answering 0x22 with F1F1 DL_NO_MEMORY to a delta DFI moves on to the next mode too, as --compress-auto
 # does for 0x10.
 def test_flash_delta_falls_back_on_no_memory_at_the_34():
@@ -2702,7 +2750,7 @@ def test_flash_delta_other_refusals_stop(monkeypatch):
 # Check --diff-from and --diff-format parse, with auto the default, and a format outside the three is refused.
 def test_diff_flags(capsys):
     args = cli.parse_args(["--profile", "example", "flash", "x.bin", "--diff-from", "bases"])
-    assert (str(args.diff_from), args.diff_format) == ("bases", "auto")
+    assert (str(args.diff_from), args.diff_format) == ("bases", None)   # flash takes None as auto
     args = cli.parse_args(["--profile", "example", "flash", "x.bin", "--diff-from", "b.bin",
                            "--diff-format", "deflate"])
     assert (str(args.diff_from), args.diff_format) == ("b.bin", "deflate")
@@ -2719,7 +2767,7 @@ def test_main_diff_from_without_detools(tmp_path, full_path, capsys, monkeypatch
     monkeypatch.setitem(sys.modules, "detools", None)       # import detools raises ImportError
     rc = cli.main(["--profile", full_path, "--master", str(master), "flash", str(img), "--diff-from", str(img)],
                   transport=no_transport)
-    assert rc == 2 and "pip install udsota[diff]" in capsys.readouterr().err
+    assert rc == 2 and 'pip install "./client[diff]"' in capsys.readouterr().err
 
 
 # Check main with --diff-from DIR takes the *.bin files directly in DIR (not a subdirectory's, and not other
