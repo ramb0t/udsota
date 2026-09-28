@@ -17,6 +17,7 @@
 #define CF_GAP_US 2000u                   /* the client honours STmin 2 ms */
 
 static const uint8_t k_dev_id[6] = {0x02, 0x11, 0x22, 0x33, 0x44, 0x55};
+static const uint8_t FF20[8] = {0x10, 0x14, 0x22, 0xF1, 0x86, 0x00, 0x00, 0x00};   /* FF of a 20-byte 22 F1 86 ... */
 
 /* Fake clock, bus and client state. */
 static uint32_t s_now_us;
@@ -360,8 +361,7 @@ static void test_functional_single_frame_only(void)
     TEST_ASSERT_TRUE(s_resp_done);
     TEST_ASSERT_EQUAL_HEX8(0x7E, s_resp[0]);
     const unsigned frames = s_log_n;
-    static const uint8_t ff[8] = {0x10, 0x14, 0x22, 0xF1, 0x86, 0x00, 0x00, 0x00};
-    feed_func(ff, sizeof ff);
+    feed_func(FF20, sizeof FF20);
     static const uint8_t cf[] = {0x21, 0x00};
     feed_func(cf, sizeof cf);
     static const uint8_t fc[] = {0x30, 0x00, 0x00};
@@ -536,14 +536,13 @@ static void test_stmin_hook_sets_each_first_fc(void)
 {
     s_hooks.stmin_us = hook_stmin;
     init_all();
-    static const uint8_t ff[8] = {0x10, 0x14, 0x22, 0xF1, 0x86, 0x00, 0x00, 0x00};   /* FF of 20 bytes */
     s_hook_stmin = 5000u;
-    feed(ff, sizeof ff);
+    feed(FF20, sizeof FF20);
     TEST_ASSERT_EQUAL_HEX8(0x30, s_fc_last[0]);
     TEST_ASSERT_EQUAL_HEX8(0x40, s_fc_last[1]);
     TEST_ASSERT_EQUAL_HEX8(0x05, s_fc_last[2]);
     s_hook_stmin = 2000u;
-    feed(ff, sizeof ff);                                 /* a new FF replaces the message */
+    feed(FF20, sizeof FF20);                             /* a new FF replaces the message */
     TEST_ASSERT_EQUAL_HEX8(0x02, s_fc_last[2]);
     TEST_ASSERT_EQUAL_UINT(2, s_hook_calls);
 }
@@ -557,10 +556,9 @@ static void test_stmin_rounded_up_to_an_encodable_value(void)
     };
     s_hooks.stmin_us = hook_stmin;
     init_all();
-    static const uint8_t ff[8] = {0x10, 0x14, 0x22, 0xF1, 0x86, 0x00, 0x00, 0x00};   /* FF of 20 bytes */
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
         s_hook_stmin = cases[i].us;
-        feed(ff, sizeof ff);
+        feed(FF20, sizeof FF20);
         TEST_ASSERT_EQUAL_HEX8(0x30, s_fc_last[0]);
         TEST_ASSERT_EQUAL_HEX8(cases[i].fc, s_fc_last[2]);
     }
@@ -673,8 +671,7 @@ static void test_withheld_fc_during_send_orphan_ncr_not_counted(void)
     udsota_counters_t c = read_counters();
     TEST_ASSERT_EQUAL_UINT16(1, c.withheld_fcs);
     TEST_ASSERT_EQUAL_UINT16(0, c.ncr_timeouts);
-    static const uint8_t ff20[8] = {0x10, 0x14, 0x22, 0xF1, 0x86, 0x00, 0x00, 0x00};
-    feed(ff20, sizeof ff20);
+    feed(FF20, sizeof FF20);
     run_ms(1100);
     c = read_counters();
     TEST_ASSERT_EQUAL_UINT16(1, c.ncr_timeouts);
@@ -703,9 +700,8 @@ static void test_request_waits_for_parked_answer(void)
  * UDSOTA_ISOTP_FC_RETRY_MS after it was parked, or refused outright, is counted lost. */
 static void test_refused_fc_parked_and_retried(void)
 {
-    static const uint8_t ff[8] = {0x10, 0x14, 0x22, 0xF1, 0x86, 0x00, 0x00, 0x00};   /* FF of 20 bytes */
     s_refuse = 3u;
-    feed(ff, sizeof ff);                                 /* refused once */
+    feed(FF20, sizeof FF20);                             /* refused once */
     TEST_ASSERT_EQUAL_UINT32(UDSOTA_ISOTP_WAIT_SEND_MS, service());   /* twice, still parked */
     run_ms(1);                                           /* three times */
     TEST_ASSERT_EQUAL_UINT(0, s_fc_n);
@@ -716,7 +712,7 @@ static void test_refused_fc_parked_and_retried(void)
 
     init_all();
     s_refuse = 100000u;
-    feed(ff, sizeof ff);
+    feed(FF20, sizeof FF20);
     service();
     run_ms(UDSOTA_ISOTP_FC_RETRY_MS - 1u);
     TEST_ASSERT_EQUAL_UINT32(0, udsota_isotp_fc_lost(&s_tp));
@@ -727,7 +723,7 @@ static void test_refused_fc_parked_and_retried(void)
     init_all();
     s_refuse = 0u;
     s_hard_fail = 1u;
-    feed(ff, sizeof ff);
+    feed(FF20, sizeof FF20);
     TEST_ASSERT_EQUAL_UINT32(1, udsota_isotp_fc_lost(&s_tp));
     TEST_ASSERT_EQUAL_UINT32(UDSOTA_ISOTP_WAIT_OPEN_MS, service());   /* nothing parked: mid-message wait */
 }
@@ -737,11 +733,10 @@ static void test_refused_fc_parked_and_retried(void)
  * the FC counted lost at +40 ms, not at the default 10. */
 static void test_fc_retry_window_follows_cfg(void)
 {
-    static const uint8_t ff[8] = {0x10, 0x14, 0x22, 0xF1, 0x86, 0x00, 0x00, 0x00};   /* FF of 20 bytes */
     s_fc_retry_ms = 40u;
     init_all();
     s_refuse = 2u + 39u;                                 /* the feed, the service at +0, then +1 .. +39 ms */
-    feed(ff, sizeof ff);
+    feed(FF20, sizeof FF20);
     service();
     run_ms(39);
     TEST_ASSERT_EQUAL_UINT(0, s_fc_n);
@@ -754,7 +749,7 @@ static void test_fc_retry_window_follows_cfg(void)
     init_all();
     s_fc_n = 0u;
     s_refuse = 100000u;
-    feed(ff, sizeof ff);
+    feed(FF20, sizeof FF20);
     service();
     run_ms(39);
     TEST_ASSERT_EQUAL_UINT32(0, udsota_isotp_fc_lost(&s_tp));   /* past the default 10 ms, still parked */
@@ -773,13 +768,12 @@ static void test_parked_fc_never_sent_after_newer_fc(void)
 {
     s_hooks.stmin_us = hook_stmin;
     init_all();
-    static const uint8_t ff[8] = {0x10, 0x14, 0x22, 0xF1, 0x86, 0x00, 0x00, 0x00};   /* FF of 20 bytes */
     s_hook_stmin = 5000u;
     s_refuse = 1u;
-    feed(ff, sizeof ff);                                 /* FC 30 40 05 refused: parked */
+    feed(FF20, sizeof FF20);                             /* FC 30 40 05 refused: parked */
     TEST_ASSERT_EQUAL_UINT(0, s_fc_n);
     s_hook_stmin = 2000u;
-    feed(ff, sizeof ff);                                 /* a new FF: FC 30 40 02 goes out at once */
+    feed(FF20, sizeof FF20);                             /* a new FF: FC 30 40 02 goes out at once */
     TEST_ASSERT_EQUAL_UINT(1, s_fc_n);
     run_ms(UDSOTA_ISOTP_FC_RETRY_MS + 5u);
     TEST_ASSERT_EQUAL_UINT(1, s_fc_n);                   /* the stale 30 40 05 never follows it */
