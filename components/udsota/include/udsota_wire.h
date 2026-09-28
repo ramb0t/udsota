@@ -102,15 +102,23 @@ typedef enum {
 #define UDSOTA_DL_DFI            0x00       /* dataFormatIdentifier: no compression or encryption */
 #define UDSOTA_DL_DFI_DEFLATE    0x10       /* dataFormatIdentifier: raw DEFLATE (RFC 1951, no zlib or gzip header), no
                                                encryption; served only when the engine has zbegin */
+#define UDSOTA_DL_DFI_DELTA      0x20       /* dataFormatIdentifier: a delta patch (udsota_patch.h) from the running
+                                               image; served only when the engine's zformats has it */
+#define UDSOTA_DL_DFI_DELTA_DEFLATE 0x30    /* dataFormatIdentifier: a delta patch, all of it raw DEFLATE; served only
+                                               when the engine's zformats has it */
+/* The engine.zformats bit for a coded dataFormatIdentifier: one bit per high nibble (0x10 bit 1, 0x20 bit 2, 0x30
+ * bit 3). */
+#define UDSOTA_DL_FMT(dfi)       ((uint16_t)(1u << (((unsigned)(dfi) >> 4) & 0xFu)))
 #define UDSOTA_DL_ALFID          0x44       /* addressAndLengthFormatIdentifier: 4-byte address, 4-byte size */
 #define UDSOTA_DL_LFID           0x20       /* positive-response lengthFormatIdentifier: 2-byte block length */
 #define UDSOTA_DL_MAX_BLOCK_LEN  4095u      /* maxNumberOfBlockLength (SID + BSC + data): 74 20 0F FF */
 #define UDSOTA_DL_MAX_DATA       (UDSOTA_DL_MAX_BLOCK_LEN - 2u)   /* 4093 data bytes per 0x36 */
 #define UDSOTA_DL_REQ_LEN        11u        /* 34 DFI ALFID address[4] size[4] */
 #define UDSOTA_TD_MIN_LEN        3u         /* 36 BSC and at least one data byte */
-/* The most compressed bytes a DFI 0x10 download of `size` bytes may carry: size + size/8 + 1024. zlib and miniz's
- * tdefl never exceed it (their worst case is stored blocks, 5 bytes per 64 KB); a legal stream padded with empty
- * blocks can, and a 36 that would carry it past the bound is refused as an overrun (0x71). */
+/* The most bytes a coded download (DFI 0x10, 0x20 or 0x30) of a `size`-byte image may carry: size + size/8 + 1024.
+ * zlib and miniz's tdefl never exceed it (their worst case is stored blocks, 5 bytes per 64 KB), and a delta patch
+ * worth sending is far smaller than its image; a legal stream padded with empty blocks can, and a 36 that would carry
+ * it past the bound is refused as an overrun (0x71). */
 #define UDSOTA_DL_Z_BOUND(size)  ((uint64_t)(size) + ((uint64_t)(size) >> 3) + 1024u)
 
 /* ---- Download result: F1F1 reason and FF01 status byte. Wire values; append only. ---- */
@@ -135,10 +143,13 @@ typedef enum {
                            *     or at the first-block check there is no worker or no inactive slot (0x31); for a
                            *     compressed download, no worker or slot at the 34 (0x22), and an erase or write
                            *     failure at a 36 (0x72) */
-    UDSOTA_DL_BAD_STREAM,        /* 13: a compressed download (DFI 0x10) did not inflate to exactly memorySize bytes: a
-                           *     corrupt stream or one inflating past memorySize (36: 0x31), or at 37 a stream that
-                           *     had not ended, ended short or carried data after its end (0x72) */
-    UDSOTA_DL_NO_MEMORY,         /* 14: a 34 with DFI 0x10 found no memory for the inflater (0x22) */
+    UDSOTA_DL_BAD_STREAM,        /* 13: a coded download did not decode to exactly memorySize bytes: a corrupt stream
+                           *     or patch, a delta header with the wrong magic, a patch for another size, a read of the
+                           *     base outside it, or output past memorySize (36: 0x31); or at 37 a stream or patch
+                           *     that had not ended, ended short or carried data after its end (0x72) */
+    UDSOTA_DL_NO_MEMORY,         /* 14: a coded 34 found no memory for its decoder (0x22) */
+    UDSOTA_DL_BAD_BASE,          /* 15: a delta patch made from an image other than the running one, or the running
+                           *     image could not be identified (36: 0x31); a full download still works */
     UDSOTA_DL_REASON_COUNT       /* not a reason and never on the wire: the bound for range checks; append new reasons above it */
 } udsota_reason_t;
 

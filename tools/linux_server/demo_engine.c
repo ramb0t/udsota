@@ -149,8 +149,9 @@ static int z_write(void *ctx, uint32_t off, const uint8_t *d, size_t n)
 }
 
 /* engine.zbegin: opens a stream for size bytes over the vendored tinfl; UDSOTA_DL_NO_MEMORY when malloc fails. */
-static int eng_zbegin(void *ctx, uint32_t size)
+static int eng_zbegin(void *ctx, uint32_t size, uint8_t dfi)
 {
+    (void)dfi;
     demo_engine_t *e = ctx;
     udsota_zstream_close(&e->zs);
     const udsota_inflate_t inf = udsota_tinfl_inflate(&e->tinfl);
@@ -168,7 +169,7 @@ static int eng_zwrite(void *ctx, const uint8_t *d, size_t n)
 /* engine.zwritten: the image bytes the stream has written, for progress. */
 static uint32_t eng_zwritten(void *ctx)
 {
-    return ((const demo_engine_t *)ctx)->zs.written;
+    return ((const demo_engine_t *)ctx)->zs.image.written;
 }
 
 /* engine.zend: the 37 check; frees the inflater. */
@@ -299,6 +300,7 @@ udsota_engine_t demo_engine_ops(demo_engine_t *e)
         .slot_size = e->rules.slot_size, .ctx = e,
         .zbegin = e->compress ? eng_zbegin : NULL, .zwrite = e->compress ? eng_zwrite : NULL,
         .zend = e->compress ? eng_zend : NULL, .zwritten = e->compress ? eng_zwritten : NULL,
+        .zformats = e->compress ? UDSOTA_DL_FMT(UDSOTA_DL_DFI_DEFLATE) : 0u,
     };
 }
 

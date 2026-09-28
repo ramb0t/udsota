@@ -109,7 +109,7 @@ static int s_write(void *ctx, uint32_t off, const uint8_t *d, size_t n)
 /* ---- the engine ---- */
 
 /* engine.zbegin: opens the stream over tinfl and the sink. */
-static int eng_zbegin(void *ctx, uint32_t size)
+static int eng_zbegin(void *ctx, uint32_t size, uint8_t dfi)
 {
     const udsota_inflate_t inf = udsota_tinfl_inflate(&e.tinfl);
     const udsota_zsink_t sink = {.check_first = s_check, .begin = s_begin, .write = s_write};
@@ -138,7 +138,7 @@ static int eng_zend(void *ctx)
 /* engine.zwritten: the image bytes the stream has written, for progress. */
 static uint32_t eng_zwritten(void *ctx)
 {
-    return e.zs.written;
+    return e.zs.image.written;
 }
 
 /* engine.abort: closes any open stream. */
@@ -184,6 +184,7 @@ static const udsota_engine_t ENGINE = {
     .check_first = eng_raw_check, .begin = eng_raw_begin, .write = eng_raw_write, .verify = eng_verify,
     .activate = eng_ok, .confirm = eng_ok, .abort = eng_abort, .poll = eng_poll, .status = udsota_mock_status,
     .ctx = &g_mock, .zbegin = eng_zbegin, .zwrite = eng_zwrite, .zend = eng_zend, .zwritten = eng_zwritten,
+    .zformats = UDSOTA_DL_FMT(UDSOTA_DL_DFI_DEFLATE),
 };
 
 /* ---- images and streams ---- */
@@ -421,7 +422,7 @@ static void test_first_block_buffered_across_blocks(void)
         TEST_ASSERT_EQUAL_UINT(0u, e.begins);
         TEST_ASSERT_EQUAL_UINT(0u, e.writes);
     }
-    TEST_ASSERT_EQUAL_UINT32(285u, e.zs.held);
+    TEST_ASSERT_EQUAL_UINT32(285u, e.zs.image.held);
     send_36(4, 300u, 100u);
     EXPECT(0x76, 0x04);
     TEST_ASSERT_EQUAL_UINT(1u, e.checks);
@@ -958,7 +959,7 @@ static void test_zstream_refuses_over_reported_output(void)
     const uint8_t in[8] = {0};
     TEST_ASSERT_EQUAL_INT(UDSOTA_DL_BAD_STREAM, udsota_zstream_feed(&z, in, sizeof in));
     TEST_ASSERT_EQUAL_UINT32(0u, z.produced);
-    TEST_ASSERT_EQUAL_size_t(0u, z.held);
+    TEST_ASSERT_EQUAL_size_t(0u, z.image.held);
     TEST_ASSERT_EQUAL_UINT(0u, e.checks + e.begins + e.writes);
     TEST_ASSERT_EQUAL_INT(UDSOTA_DL_BAD_STREAM, udsota_zstream_end(&z));
     TEST_ASSERT_EQUAL_UINT(1u, g_fake_finishes);
