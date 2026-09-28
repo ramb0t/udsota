@@ -512,10 +512,10 @@ def uds_for(server, ft, monitor=None):
 
 
 # Run flash against server with fake time; returns (rc, fake time, pre-roll count).
-def run_flash(server, image=None, prof=P, master=MASTER, **kw):
+def run_flash(server, image=None, prof=P, master=MASTER, log=lambda *a: None, **kw):
     ft, prerolls = FakeTime(), []
     rc = update.flash(uds_for(server, ft), prof, make_image() if image is None else image, master,
-                  preroll=lambda: prerolls.append(1), sleep=ft.sleep, clock=ft.clock, log=lambda *a: None, **kw)
+                      preroll=lambda: prerolls.append(1), sleep=ft.sleep, clock=ft.clock, log=log, **kw)
     return rc, ft, len(prerolls)
 
 
@@ -2369,9 +2369,7 @@ def deflate9(image):
 # stream in fewer blocks, counting progress in compressed bytes, and the server's slot ends up holding the image.
 def test_flash_compressed_sends_a_deflate_stream():
     d, lines = FakeServer(compress=True), []
-    ft = FakeTime()
-    rc = update.flash(uds_for(d, ft), P, make_image(), MASTER, sleep=ft.sleep, clock=ft.clock, log=lines.append,
-                      compress="deflate")
+    rc = run_flash(d, compress="deflate", log=lines.append)[0]
     z = deflate9(make_image())
     assert rc == 0 and d.dfi == 0x10 and d.announced == 4800
     assert bytes(d.zin) == z
@@ -2416,9 +2414,7 @@ def test_compress_on_a_server_without_it_is_refused():
 # prints no ratio for a stream it never sent.
 def test_compress_auto_falls_back_to_uncompressed():
     d, lines = FakeServer(), []
-    ft = FakeTime()
-    assert update.flash(uds_for(d, ft), P, make_image(), MASTER, sleep=ft.sleep, clock=ft.clock, log=lines.append,
-                        compress="auto") == 0
+    assert run_flash(d, compress="auto", log=lines.append)[0] == 0
     assert [e for e in d.log if e[0] == 0x34] == [(0x34, None)] * 2
     assert bytes(d.written) == make_image() and d.writes == 300
     assert ("the server has no compressed downloads, or the image is larger than its slot: sending the image "
@@ -2434,9 +2430,7 @@ def test_compressed_34_without_memory():
         run_flash(d, compress="deflate")
     assert not any(e[0] == 0x36 for e in d.log)
     d, lines = FakeServer(compress=True, z_nomem=True), []
-    ft = FakeTime()
-    assert update.flash(uds_for(d, ft), P, make_image(), MASTER, sleep=ft.sleep, clock=ft.clock, log=lines.append,
-                        compress="auto") == 0
+    assert run_flash(d, compress="auto", log=lines.append)[0] == 0
     assert d.dfi == 0x00 and bytes(d.written) == make_image()
     assert "the server has no memory for a compressed download now: sending the image uncompressed" in lines
 
@@ -2535,10 +2529,8 @@ def resigned(base):
 # Run flash from DELTA_BASE (what server runs) to DELTA_NEW with bases; returns (rc, the log lines). Needs detools.
 def run_delta(server, bases, **kw):
     pytest.importorskip("detools")
-    ft, lines = FakeTime(), []
-    rc = update.flash(uds_for(server, ft), P, DELTA_NEW, MASTER, sleep=ft.sleep, clock=ft.clock, log=lines.append,
-                      bases=bases, **kw)
-    return rc, lines
+    lines = []
+    return run_flash(server, DELTA_NEW, bases=bases, log=lines.append, **kw)[0], lines
 
 
 # A server running DELTA_BASE that serves the delta DFIs in delta, and compressed downloads.
@@ -2653,7 +2645,7 @@ def test_flash_delta_wrong_base_with_the_answer_lost():
 def test_flash_drop_76_with_bases_is_refused():
     d = delta_server()
     with pytest.raises(errors.Refused, match="--drop-76 is for full and compressed downloads"):
-        update.flash(uds_for(d, FakeTime()), P, DELTA_NEW, MASTER, bases=[("a.bin", DELTA_BASE)], drop_76=2)
+        run_flash(d, DELTA_NEW, bases=[("a.bin", DELTA_BASE)], drop_76=2)
     assert d.dfis == []
 
 
@@ -2668,7 +2660,7 @@ def test_flash_delta_patch_build_failures(monkeypatch, raised, error, text):
     monkeypatch.setattr(update, "build_delta", boom)
     d = delta_server()
     with pytest.raises(error, match=re.escape(text)):
-        update.flash(uds_for(d, FakeTime()), P, DELTA_NEW, MASTER, bases=[("a.bin", DELTA_BASE)])
+        run_flash(d, DELTA_NEW, bases=[("a.bin", DELTA_BASE)])
 
 
 # Check --diff-format without --diff-from, and a --diff-from directory with no .bin files, are refused (exit 2).
