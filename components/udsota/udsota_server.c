@@ -299,11 +299,12 @@ static uint8_t restart_nrc(const udsota_server_t *s, udsota_op_t op)
 }
 
 /* CONTINUE_TRANSFER at a 36 or an FC point: the STmin monitor (when on), then the gate, which is asked either way
- * so that an STmin violation is counted only when timing alone failed. 0 or the NRC. */
-static uint8_t transfer_nrc(udsota_server_t *s, uint32_t median_cf_us, uint32_t stmin_us)
+ * so that an STmin violation is counted only when timing alone failed. Judges s->cf_median_us and cf_stmin_us, the
+ * last FC point's timing. 0 or the NRC. */
+static uint8_t transfer_nrc(udsota_server_t *s)
 {
     const bool slow_enough = !s->cfg.stmin_monitor ||
-                             (uint64_t)median_cf_us * 5u >= (uint64_t)stmin_us * 4u;   /* NONE always passes */
+                             (uint64_t)s->cf_median_us * 5u >= (uint64_t)s->cf_stmin_us * 4u;   /* NONE always passes */
     const uint8_t g = gate(s, UDSOTA_OP_CONTINUE_TRANSFER);
     if (!slow_enough) {
         if (g == 0u) {
@@ -786,7 +787,7 @@ static size_t handle_transfer_data(udsota_server_t *s, const uint8_t *req, size_
     if (resp_max < 3u) {
         return 0;
     }
-    const uint8_t cond = transfer_nrc(s, s->cf_median_us, s->cf_stmin_us);
+    const uint8_t cond = transfer_nrc(s);
     if (cond != 0u) {
         if (cond != UDSOTA_NRC_BUSY_REPEAT) {
             enter_session(s, UDSOTA_SESSION_DEFAULT);   /* aborts, records UDSOTA_DL_ABORTED, relocks */
@@ -902,20 +903,15 @@ bool udsota_fc_check(udsota_server_t *s, uint32_t median_cf_us, uint32_t stmin_u
     if (!s->download_active || s->job_running) {
         return true;
     }
-    if (s->end_pending) {                         /* the job has answered but no poll has applied the end yet */
-        udsota_sat_inc16(&s->counters.withheld_fcs);
-        apply_end_pending(s);
-        phase_sync(s);
-        progress_sync(s);
-        return false;
-    }
-    s->cf_median_us = median_cf_us;
-    s->cf_stmin_us = stmin_us;
-    if (transfer_nrc(s, median_cf_us, stmin_us) == 0u) {
-        return true;
+    if (!s->end_pending) {                        /* latched: the job answered but no poll has applied the end yet */
+        s->cf_median_us = median_cf_us;
+        s->cf_stmin_us = stmin_us;
+        if (transfer_nrc(s) == 0u) {
+            return true;
+        }
     }
     udsota_sat_inc16(&s->counters.withheld_fcs);
-    enter_session(s, UDSOTA_SESSION_DEFAULT);
+    enter_session(s, UDSOTA_SESSION_DEFAULT);     /* also fulfils the latch */
     phase_sync(s);
     progress_sync(s);
     return false;
