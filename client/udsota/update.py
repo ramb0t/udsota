@@ -103,13 +103,14 @@ def block_failed(uds, n, e):
 
 # Why the server refused a compressed RequestDownload with nrc: (reason, the error a "deflate" run raises). 0x31 is a
 # server without compressed downloads, or an image larger than its slot, which the same check refuses; 0x22 with F1F1
-# DL_NO_MEMORY is one without memory for the inflater now. None for any other refusal, which is not about compression.
+# DL_NO_MEMORY is one without memory for the inflater now. None for any other refusal, which is not about compression,
+# or when F1F1 cannot be read: the caller then raises the 34's own NRC, not the F1F1 read's.
 def compressed_refusal(uds, nrc):
     if nrc.code == NRC_OUT_OF_RANGE:
         why = "the server has no compressed downloads, or the image is larger than its slot"
         return why, Refused("%s (RequestDownload with DFI 0x10 answered 0x31); flash without --compress, or with "
                             "--compress-auto" % why)
-    if nrc.code == NRC_CONDITIONS and decode_result(uds.read_did(DID_RESULT))[0] == "DL_NO_MEMORY":
+    if nrc.code == NRC_CONDITIONS and last_reason(uds) == "DL_NO_MEMORY":
         why = "the server has no memory for a compressed download now"
         return why, UpdateFailed("%s (RequestDownload with DFI 0x10 answered 0x22, F1F1 DL_NO_MEMORY); a plain flash, "
                                  "without --compress, may work" % why)
