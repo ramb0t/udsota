@@ -415,7 +415,7 @@ def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep
             if need_download:
                 download(uds, image, drop_76=drop_76, log=log, compress=compress, clock=clock, deltas=deltas)
                 check_image(uds, log=log)
-                drop_76 = None                    # the fault injection applies to the first download only
+                need_download, drop_76 = False, None   # the fault injection applies to the first download only
             try:
                 uds.routine(RID_ACTIVATE)
                 break
@@ -424,8 +424,7 @@ def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep
                     break
                 if resent:
                     raise
-                resent, need_download = True, False   # the request itself was lost: send it once more
-                continue
+                resent = True                     # the request itself was lost: send it once more
             except Nrc as e:
                 if e.code == NRC_CONDITIONS:
                     raise UpdateFailed("ActivateImage refused (0x22): the server's conditions are not met. The image "
@@ -435,9 +434,8 @@ def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep
                     break
                 if recovered or e.code != NRC_SEQUENCE:
                     raise
-                recovered = True                  # one re-download per run
-            log("ActivateImage answered 0x24 (the slot is not verified): downloading again")
-            need_download = True
+                log("ActivateImage answered 0x24 (the slot is not verified): downloading again")
+                recovered = need_download = True   # one re-download per run
         log("activated; waiting for the server to restart")
         wait_for_image(uds, img.elf_sha, preroll, sleep=sleep, clock=clock)
         log("the server runs %s; confirming" % img.version)
