@@ -1106,7 +1106,6 @@ void udsota_esp32_engine_start(const udsota_config_t *cfg)
     if (s_q != NULL || cfg == NULL) {
         return;
     }
-    udsota_esp32_psa_lock_init();
     const esp_partition_t *run = esp_ota_get_running_partition();
     s_running = run;
     s_target = esp_ota_get_next_update_partition(NULL);
@@ -1134,21 +1133,16 @@ void udsota_esp32_engine_start(const udsota_config_t *cfg)
 
     s_buf = heap_caps_malloc(BLOCK_BUF, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     QueueHandle_t q = xQueueCreate(QUEUE_LEN, sizeof(job_t));
-    if (s_buf == NULL || q == NULL) {
-        ESP_LOGE(TAG, "no internal RAM for the flash worker: downloads refused");
-        heap_caps_free(s_buf);
-        s_buf = NULL;
+    s_q = q;                                    /* before the task: worker_task reads it */
+    /* The task is created only when both allocations succeeded. */
+    if (s_buf == NULL || q == NULL ||
+        xTaskCreatePinnedToCoreWithCaps(worker_task, "udsota_worker", WORKER_STACK, NULL, WORKER_PRIO, NULL,
+                                        WORKER_CORE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) != pdPASS) {
+        ESP_LOGE(TAG, "no internal RAM for the flash worker or its task: downloads refused");
+        s_q = NULL;
         if (q != NULL) {
             vQueueDelete(q);
         }
-        return;
-    }
-    s_q = q;                                    /* before the task: worker_task reads it */
-    if (xTaskCreatePinnedToCoreWithCaps(worker_task, "udsota_worker", WORKER_STACK, NULL, WORKER_PRIO, NULL,
-                                        WORKER_CORE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) != pdPASS) {
-        ESP_LOGE(TAG, "flash worker task not created: downloads refused");
-        s_q = NULL;
-        vQueueDelete(q);
         heap_caps_free(s_buf);
         s_buf = NULL;
         return;

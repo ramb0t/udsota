@@ -8,7 +8,7 @@
 #include "udsota_esp32_devid.h"
 
 /* Creates the PSA mutex in static storage (cannot fail); idempotent. The start code calls it first, with
- * security on or off; udsota_esp32_security() and udsota_esp32_engine_start() call it too. */
+ * security on or off; udsota_esp32_security() calls it too. */
 void udsota_esp32_psa_lock_init(void);
 /* Fixes the port's device ID once (udsota_esp32_devid_fix() over the base MAC): a copy of id when non-NULL
  * (1 to UDSOTA_KEYS_ID_MAX bytes), else of the base MAC. *dev (dev may be NULL) gets the stored ID, which
