@@ -1,6 +1,7 @@
 /* The ESP32 port's control block (priv/udsota_esp32_ctl.h). Pure C11: host-tested. */
 #include "udsota_esp32_ctl.h"
 #include <stddef.h>
+#include <string.h>
 
 /* phase hook: stores p for every task first, so an app hook that reads the phase sees p, then runs
  * the app's hook with no lock held. */
@@ -13,13 +14,17 @@ static void w_phase(void *ctx, udsota_phase_t p)
     }
 }
 
-/* progress hook: stores *p for every task under the lock first, so an app hook that reads the snapshot
- * sees p, then runs the app's hook with no lock held. */
+/* progress hook: stores *p for every task under the lock first, clearing the version in the same copy when
+ * the stage moves into ERASING (an accepted 34), so an app hook that reads the snapshot sees p, then runs the
+ * app's hook with no lock held. */
 static void w_progress(void *ctx, const udsota_progress_t *p)
 {
     udsota_esp32_ctl_t *ctl = ctx;
     if (ctl->lock != NULL) {
         ctl->lock(ctl->lock_ctx);
+    }
+    if (p->stage == UDSOTA_STAGE_ERASING && ctl->progress.stage != UDSOTA_STAGE_ERASING) {
+        ctl->version[0] = '\0';
     }
     ctl->progress = *p;
     if (ctl->unlock != NULL) {
@@ -105,6 +110,7 @@ void udsota_esp32_ctl_init(udsota_esp32_ctl_t *ctl, const udsota_hooks_t *app,
     ctl->app = (app != NULL) ? *app : none;
     ctl->default_reset = default_reset;
     ctl->progress = (udsota_progress_t){.stage = UDSOTA_STAGE_IDLE};
+    ctl->version[0] = '\0';
     ctl->lock = NULL;
     ctl->unlock = NULL;
     ctl->lock_ctx = NULL;
@@ -151,6 +157,39 @@ void udsota_esp32_ctl_progress(udsota_esp32_ctl_t *ctl, udsota_progress_t *out)
     if (ctl->unlock != NULL) {
         ctl->unlock(ctl->lock_ctx);
     }
+}
+
+/* Truncates and sanitises v into a local first, then one copy under the lock. */
+void udsota_esp32_ctl_set_version(udsota_esp32_ctl_t *ctl, const char *v, size_t max)
+{
+    char tmp[UDSOTA_ESP32_CTL_VERSION_MAX];
+    size_t n = 0u;
+    while (n < max && n < sizeof tmp - 1u && v[n] != '\0') {
+        const unsigned char c = (unsigned char)v[n];
+        tmp[n] = (c >= 0x20u && c <= 0x7Eu) ? (char)c : '?';
+        n++;
+    }
+    tmp[n] = '\0';
+    if (ctl->lock != NULL) {
+        ctl->lock(ctl->lock_ctx);
+    }
+    memcpy(ctl->version, tmp, n + 1u);
+    if (ctl->unlock != NULL) {
+        ctl->unlock(ctl->lock_ctx);
+    }
+}
+
+/* One copy under the lock; the length is counted after the lock is released. */
+size_t udsota_esp32_ctl_version(udsota_esp32_ctl_t *ctl, char out[UDSOTA_ESP32_CTL_VERSION_MAX])
+{
+    if (ctl->lock != NULL) {
+        ctl->lock(ctl->lock_ctx);
+    }
+    memcpy(out, ctl->version, UDSOTA_ESP32_CTL_VERSION_MAX);
+    if (ctl->unlock != NULL) {
+        ctl->unlock(ctl->lock_ctx);
+    }
+    return strlen(out);
 }
 
 /* One atomic store: the request never runs on the caller. */

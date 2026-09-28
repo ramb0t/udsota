@@ -4,6 +4,8 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ## [Unreleased]
 
+The ESP32 port says which image is arriving: the new `udsota_esp32_incoming_version()` copies out the version from the image's `esp_app_desc_t`, so an update screen can say "Installing v0.3.1" and, after a failure, name the version next to `last_reason`. It is set when the first-block check accepts the image, compressed downloads included, kept after the download ends, and cleared by the next accepted 34 in the same locked copy as that 34's ERASING report, so a task that reads the progress first and the version second never pairs a new download's ERASING with the previous version. It holds at most 31 characters, with non-printable bytes shown as `?`, and lives in RAM only. Additive and not breaking: the port gains one function and `UDSOTA_ESP32_VERSION_MAX`, and the core, its structs and the wire are unchanged.
+
 ## [0.4.0] - 2026-09-28
 
 Releases have a written process, [RELEASING.md](RELEASING.md): semantic versioning where, while udsota is 0.x, anything new or breaking is a minor bump and a patch is for fixes only; one version shared by the tag, the dated CHANGELOG heading and the client's `__version__`; and a release workflow that checks those agree, then publishes the client's wheel and the example's images as a GitHub Release. `tools/release.py` does the check and extracts the notes. 0.1.0 is dated and tagged: it is the initial import, `da16abf`.

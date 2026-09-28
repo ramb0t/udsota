@@ -2,8 +2,10 @@
  * real udsota server: an app phase hook that calls back into the port neither deadlocks nor recurses,
  * an end-session it requests runs after the current request, one requested during a job runs after
  * that job's answer, the app's did_write, routine and routine_poll reach the app through the
- * port's wrappers with its ctx, the request's bytes and the session's access state, and the progress
- * snapshot copies what the server reported, under the port's lock, before the app's own hook runs. */
+ * port's wrappers with its ctx, the request's bytes and the session's access state, the progress
+ * snapshot copies what the server reported, under the port's lock, before the app's own hook runs, and the
+ * incoming version is set by an accepted first block, kept after the download ends and cleared by the next
+ * accepted 34 in the same locked copy as its report. */
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -42,10 +44,24 @@ static int                s_lock_depth;      /* the fake lock: held now, and its
 static int                s_lock_max, s_locks, s_unlocks;
 static int                s_lock_depth_in_hook;   /* s_lock_depth while the app's progress hook ran */
 static const void        *s_lock_ctx_seen;
+static char               s_version_at_lock[UDSOTA_ESP32_CTL_VERSION_MAX];     /* s_ctl's, as the last lock began */
+static char               s_version_at_unlock[UDSOTA_ESP32_CTL_VERSION_MAX];   /* and as it ended */
+static udsota_stage_t     s_stage_at_lock, s_stage_at_unlock;
+static const char        *s_first_version;   /* the mock first-block check: what an accepted block stores */
+static bool               s_refuse_first;    /* the mock first-block check refuses the block */
+static char               s_version_in_hook[UDSOTA_ESP32_CTL_VERSION_MAX];     /* what the app's progress hook read */
 
-/* Mock engine: the first block passes. */
+/* Mock engine, as the port's check_first_block(): the first block passes unless s_refuse_first, and a pass
+ * stores s_first_version (when set) as the incoming version. */
 static int eng_check_first(void *ctx, const uint8_t *first, size_t len, udsota_reason_t *why)
 {
+    if (s_refuse_first) {
+        *why = UDSOTA_DL_BAD_HEADER;
+        return 1;
+    }
+    if (s_first_version != NULL) {
+        udsota_esp32_ctl_set_version(&s_ctl, s_first_version, UDSOTA_ESP32_CTL_VERSION_MAX);
+    }
     *why = UDSOTA_DL_OK;
     return 0;
 }
@@ -195,6 +211,7 @@ static void app_progress(void *ctx, const udsota_progress_t *p)
     s_progress_arg = *p;
     s_lock_depth_in_hook = s_lock_depth;
     udsota_esp32_ctl_progress(&s_ctl, &s_progress_read);
+    (void)udsota_esp32_ctl_version(&s_ctl, s_version_in_hook);
 }
 
 /* The fake snapshot lock: counts, and tracks how deep it is held. */
@@ -203,6 +220,8 @@ static void fake_lock(void *ctx)
     s_lock_ctx_seen = ctx;
     s_locks++;
     s_lock_depth++;
+    memcpy(s_version_at_lock, s_ctl.version, sizeof s_version_at_lock);
+    s_stage_at_lock = s_ctl.progress.stage;
     if (s_lock_depth > s_lock_max) {
         s_lock_max = s_lock_depth;
     }
@@ -214,6 +233,8 @@ static void fake_unlock(void *ctx)
     s_lock_ctx_seen = ctx;
     s_unlocks++;
     s_lock_depth--;
+    memcpy(s_version_at_unlock, s_ctl.version, sizeof s_version_at_unlock);
+    s_stage_at_unlock = s_ctl.progress.stage;
 }
 
 /* Wraps app's hooks and starts a server on them with default config and no security. */
@@ -269,6 +290,13 @@ void setUp(void)
     s_unlocks = 0;
     s_lock_depth_in_hook = -1;
     s_lock_ctx_seen = NULL;
+    memset(s_version_at_lock, 0, sizeof s_version_at_lock);
+    memset(s_version_at_unlock, 0, sizeof s_version_at_unlock);
+    s_stage_at_lock = UDSOTA_STAGE_IDLE;
+    s_stage_at_unlock = UDSOTA_STAGE_IDLE;
+    s_first_version = NULL;
+    s_refuse_first = false;
+    memset(s_version_in_hook, 0x55, sizeof s_version_in_hook);
 }
 
 /* Unity hook: nothing to undo. */
@@ -612,6 +640,165 @@ static void test_progress_snapshot_without_an_app_hook(void)
     TEST_ASSERT_EQUAL_INT(0, s_locks);
 }
 
+/* Asserts the incoming version reads want, with its length. */
+static void expect_version(const char *want)
+{
+    char v[UDSOTA_ESP32_CTL_VERSION_MAX];
+    memset(v, 0x55, sizeof v);
+    TEST_ASSERT_EQUAL_UINT(strlen(want), udsota_esp32_ctl_version(&s_ctl, v));
+    TEST_ASSERT_EQUAL_STRING(want, v);
+}
+
+/* The version is empty in a zeroed control block before init (the port's static one, before start), after
+ * init, and init empties one a previous start left. */
+static void test_version_is_empty_after_init(void)
+{
+    static udsota_esp32_ctl_t zeroed;
+    char v[UDSOTA_ESP32_CTL_VERSION_MAX];
+    memset(v, 0x55, sizeof v);
+    TEST_ASSERT_EQUAL_UINT(0u, udsota_esp32_ctl_version(&zeroed, v));
+    TEST_ASSERT_EQUAL_STRING("", v);
+    start(NULL);
+    expect_version("");
+    udsota_esp32_ctl_set_version(&s_ctl, "v0.3.1", UDSOTA_ESP32_CTL_VERSION_MAX);
+    expect_version("v0.3.1");
+    start(NULL);
+    expect_version("");
+}
+
+/* Through downloads with the real server: the 34 reports ERASING with the version empty, an accepted first
+ * block sets it, and it stays through WRITING and through IDLE after the session ends. The next accepted 34
+ * clears it in the same locked copy that stores its ERASING report, before the app's hook runs, and a refused
+ * first block leaves it empty. */
+static void test_version_set_by_the_first_block_kept_after_the_end_and_cleared_by_the_next_34(void)
+{
+    const udsota_hooks_t app = { .progress = app_progress, .ctx = &s_marker };
+    start(&app);
+    udsota_esp32_ctl_set_lock(&s_ctl, fake_lock, fake_unlock, &s_lock_depth);
+    s_first_version = "v0.3.1";
+    const uint8_t prog[] = {0x10, 0x02};
+    const uint8_t rd[] = {0x34, 0x00, 0x44, 0, 0, 0, 0, 0, 0, 0x00, 0x08};   /* 8 bytes */
+    const uint8_t blk1[] = {0x36, 0x01, 1, 2, 3, 4, 5};
+    const uint8_t blk2[] = {0x36, 0x02, 6, 7, 8};
+    exchange(prog, sizeof prog, 0x50, NOW);
+    exchange(rd, sizeof rd, 0x74, NOW + 1u);
+    TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_ERASING, s_progress_arg.stage);
+    TEST_ASSERT_EQUAL_STRING("", s_version_in_hook);
+    exchange(blk1, sizeof blk1, 0x76, NOW + 2u);                   /* the first block passes: stored */
+    TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_WRITING, s_progress_arg.stage);
+    TEST_ASSERT_EQUAL_STRING("v0.3.1", s_version_in_hook);
+    exchange(blk2, sizeof blk2, 0x76, NOW + 3u);
+    expect_version("v0.3.1");
+    udsota_esp32_ctl_request_end(&s_ctl);                          /* the session ends: IDLE, aborted */
+    TEST_ASSERT_TRUE(udsota_esp32_ctl_run_end(&s_ctl, &s_srv, NOW + 4u));
+    TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_IDLE, s_progress_arg.stage);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_ABORTED, s_progress_arg.last_reason);
+    TEST_ASSERT_EQUAL_STRING("v0.3.1", s_version_in_hook);          /* kept, so "v0.3.1 failed" can be drawn */
+    expect_version("v0.3.1");
+
+    s_first_version = "v0.3.2";
+    exchange(prog, sizeof prog, 0x50, NOW + 5u);
+    const int locks = s_locks;
+    exchange(rd, sizeof rd, 0x74, NOW + 6u);
+    TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_ERASING, s_progress_arg.stage);
+    TEST_ASSERT_EQUAL_INT(locks + 3, s_locks);         /* the report's copy in, then the hook's two copies out */
+    TEST_ASSERT_EQUAL_STRING("", s_version_in_hook);
+    TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_ERASING, s_progress_read.stage);
+    exchange(blk1, sizeof blk1, 0x76, NOW + 7u);
+    expect_version("v0.3.2");
+
+    s_refuse_first = true;                                         /* a refused first block stores nothing */
+    udsota_esp32_ctl_request_end(&s_ctl);
+    TEST_ASSERT_TRUE(udsota_esp32_ctl_run_end(&s_ctl, &s_srv, NOW + 8u));
+    exchange(prog, sizeof prog, 0x50, NOW + 9u);
+    exchange(rd, sizeof rd, 0x74, NOW + 10u);
+    expect_version("");
+    exchange(blk1, sizeof blk1, 0x7F, NOW + 11u);
+    expect_version("");
+    TEST_ASSERT_EQUAL_INT(s_locks, s_unlocks);
+    TEST_ASSERT_EQUAL_INT(1, s_lock_max);
+    TEST_ASSERT_EQUAL_INT(0, s_lock_depth_in_hook);
+}
+
+/* Reports straight to the wrapper: the move into ERASING from IDLE clears the version inside the one lock span
+ * that stores the report (before it: IDLE and the old version; at its end: ERASING and ""), while a report
+ * that stays in ERASING, one that stays in WRITING and the moves on to VERIFYING and IDLE keep it. */
+static void test_version_cleared_only_by_the_move_into_erasing(void)
+{
+    start(NULL);
+    udsota_esp32_ctl_set_lock(&s_ctl, fake_lock, fake_unlock, &s_lock_depth);
+    const udsota_progress_t erasing = { .stage = UDSOTA_STAGE_ERASING, .done = 0u, .total = 8u };
+    const udsota_progress_t writing1 = { .stage = UDSOTA_STAGE_WRITING, .done = 4u, .total = 8u };
+    const udsota_progress_t writing2 = { .stage = UDSOTA_STAGE_WRITING, .done = 8u, .total = 8u };
+    const udsota_progress_t verifying = { .stage = UDSOTA_STAGE_VERIFYING };
+    const udsota_progress_t idle = { .stage = UDSOTA_STAGE_IDLE, .last_reason = UDSOTA_DL_VERIFY_FAILED };
+
+    udsota_esp32_ctl_set_version(&s_ctl, "v0.3.1", UDSOTA_ESP32_CTL_VERSION_MAX);
+    const int locks = s_locks;
+    s_hooks.progress(s_hooks.ctx, &erasing);
+    TEST_ASSERT_EQUAL_INT(locks + 1, s_locks);
+    TEST_ASSERT_EQUAL_STRING("v0.3.1", s_version_at_lock);
+    TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_IDLE, s_stage_at_lock);
+    TEST_ASSERT_EQUAL_STRING("", s_version_at_unlock);
+    TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_ERASING, s_stage_at_unlock);
+
+    udsota_esp32_ctl_set_version(&s_ctl, "v0.3.2", UDSOTA_ESP32_CTL_VERSION_MAX);
+    s_hooks.progress(s_hooks.ctx, &erasing);                  /* stays in ERASING */
+    expect_version("v0.3.2");
+    s_hooks.progress(s_hooks.ctx, &writing1);
+    s_hooks.progress(s_hooks.ctx, &writing2);                 /* stays in WRITING */
+    expect_version("v0.3.2");
+    s_hooks.progress(s_hooks.ctx, &verifying);
+    s_hooks.progress(s_hooks.ctx, &idle);                     /* failed verify: kept */
+    expect_version("v0.3.2");
+
+    s_hooks.progress(s_hooks.ctx, &writing1);                 /* WRITING after a 37 with the handle open */
+    s_hooks.progress(s_hooks.ctx, &erasing);                  /* a 34 from WRITING clears too */
+    expect_version("");
+    TEST_ASSERT_EQUAL_INT(s_locks, s_unlocks);
+    TEST_ASSERT_EQUAL_INT(1, s_lock_max);
+}
+
+/* A 32-byte version with no NUL keeps its first 31 bytes; a NUL ends it early; max bounds the read; each byte
+ * outside 0x20-0x7E is stored as '?'. */
+static void test_version_truncated_and_sanitised(void)
+{
+    start(NULL);
+    char field[32];
+    memset(field, 'a', sizeof field);                         /* esp_app_desc_t.version with no terminator */
+    field[0] = 'v';
+    udsota_esp32_ctl_set_version(&s_ctl, field, sizeof field);
+    expect_version("vaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");            /* 31 bytes */
+
+    udsota_esp32_ctl_set_version(&s_ctl, "v1.2\0garbage", 13u);
+    expect_version("v1.2");
+    udsota_esp32_ctl_set_version(&s_ctl, "v1.2.3", 3u);
+    expect_version("v1.");
+
+    const char raw[] = {0x01, 'v', '1', 0x7F, (char)0x80, (char)0xFF, 0x1F, ' ', '~', 0x09, 0x00};
+    udsota_esp32_ctl_set_version(&s_ctl, raw, sizeof raw);
+    expect_version("?v1???? ~?");
+}
+
+/* Every copy into and out of the version takes the lock once, with its lock_ctx, and never nests. */
+static void test_version_copies_take_the_lock(void)
+{
+    start(NULL);
+    udsota_esp32_ctl_set_lock(&s_ctl, fake_lock, fake_unlock, &s_lock_depth);
+    char v[UDSOTA_ESP32_CTL_VERSION_MAX];
+    udsota_esp32_ctl_set_version(&s_ctl, "v0.3.1", UDSOTA_ESP32_CTL_VERSION_MAX);
+    TEST_ASSERT_EQUAL_INT(1, s_locks);
+    TEST_ASSERT_EQUAL_INT(1, s_unlocks);
+    TEST_ASSERT_EQUAL_STRING("", s_version_at_lock);          /* stored inside the span */
+    TEST_ASSERT_EQUAL_STRING("v0.3.1", s_version_at_unlock);
+    TEST_ASSERT_EQUAL_UINT(6u, udsota_esp32_ctl_version(&s_ctl, v));
+    TEST_ASSERT_EQUAL_INT(2, s_locks);
+    TEST_ASSERT_EQUAL_INT(2, s_unlocks);
+    TEST_ASSERT_EQUAL_PTR(&s_lock_depth, s_lock_ctx_seen);
+    TEST_ASSERT_EQUAL_INT(1, s_lock_max);
+    TEST_ASSERT_EQUAL_INT(0, s_lock_depth);
+}
+
 /* Waits become ticks rounded down, never 0 for a real wait: 5 ms is 1 tick at 100 Hz (not 0, which spun the
  * diag task) and 5 at 1 kHz; 0 stays 0 and a huge wait saturates. */
 static void test_wait_ticks_never_round_a_wait_to_zero(void)
@@ -639,5 +826,10 @@ int main(void)
     RUN_TEST(test_wait_ticks_never_round_a_wait_to_zero);
     RUN_TEST(test_progress_snapshot_copies_the_report_and_forwards_it);
     RUN_TEST(test_progress_snapshot_without_an_app_hook);
+    RUN_TEST(test_version_is_empty_after_init);
+    RUN_TEST(test_version_set_by_the_first_block_kept_after_the_end_and_cleared_by_the_next_34);
+    RUN_TEST(test_version_cleared_only_by_the_move_into_erasing);
+    RUN_TEST(test_version_truncated_and_sanitised);
+    RUN_TEST(test_version_copies_take_the_lock);
     return UNITY_END();
 }
