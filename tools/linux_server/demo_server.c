@@ -74,8 +74,7 @@ typedef struct {
     bool                booting;      /* restarting: frames are dropped until boot_until */
     uint64_t            boot_until;
     unsigned            boots;
-    bool                temp_dir;     /* the state directory is ours to remove */
-    char                dir[240];
+    char                dir[240];     /* the mkdtemp state directory, when --state-dir is not given */
     uint32_t            cfs;          /* CFs of the request message now arriving (fault injection counts them) */
     bool                ignore_ff;    /* the FF after a withheld FC is dropped unanswered */
 } demo_t;
@@ -515,7 +514,7 @@ static int make_image(void)
     return 0;
 }
 
-/* Removes the temporary state directory this run created. */
+/* Removes the temporary state directory this run created; an atexit handler, so every exit after mkdtemp runs it. */
 static void remove_temp_dir(void)
 {
     static const char *const names[] = {"ota_0.bin", "ota_1.bin", "otadata.txt", "otadata.tmp"};
@@ -552,29 +551,26 @@ int main(int argc, char **argv)
     if (d.secured && d.o.master_file != NULL && !load_master()) {
         return 2;
     }
-    if (d.o.state_dir != NULL) {
-        snprintf(d.dir, sizeof d.dir, "%s", d.o.state_dir);
-    } else {
+    const char *dir = d.o.state_dir;   /* passed as given: fake_ota_open refuses one too long, never truncates it */
+    if (dir == NULL) {
         const char *tmp = getenv("TMPDIR");
         snprintf(d.dir, sizeof d.dir, "%s/udsota_demo.XXXXXX", (tmp != NULL && *tmp != '\0') ? tmp : "/tmp");
         if (mkdtemp(d.dir) == NULL) {
             fprintf(stderr, "udsota_demo_server: cannot create a state directory: %s\n", strerror(errno));
             return 1;
         }
-        d.temp_dir = true;
+        atexit(remove_temp_dir);
+        dir = d.dir;
     }
     const bool bus = d.o.iface != NULL ? demo_can_open_socketcan(&d.can, d.o.iface, d.cfg.req_id, now_us)
                                        : demo_can_open_pipe(&d.can, d.cfg.req_id, now_us);
     if (!bus) {
-        if (d.temp_dir) {
-            remove_temp_dir();
-        }
         return 1;
     }
     d.can.verbose = d.o.verbose;
-    if (!demo_engine_open(&d.eng, d.dir, d.o.slot_size, d.o.fresh, &d.cfg, d.o.running_version, d.o.chip_id,
+    if (!demo_engine_open(&d.eng, dir, d.o.slot_size, d.o.fresh, &d.cfg, d.o.running_version, d.o.chip_id,
                           d.o.job_ms)) {
-        fprintf(stderr, "udsota_demo_server: cannot open the slots in %s (or seed %s)\n", d.dir, d.o.running_version);
+        fprintf(stderr, "udsota_demo_server: cannot open the slots in %s (or seed %s)\n", dir, d.o.running_version);
         demo_can_close(&d.can);
         return 1;
     }
@@ -588,14 +584,11 @@ int main(int argc, char **argv)
     fprintf(stderr, "udsota_demo_server: %s%s, IDs 0x%03X/0x%03X, %s hw_id %u layout %u, slots of 0x%X in %s, "
             "security %s, compressed downloads %s, delta downloads %s\n", d.o.iface != NULL ? "SocketCAN " : "pipe on stdin/stdout",
             d.o.iface != NULL ? d.o.iface : "", d.cfg.req_id, d.cfg.resp_id, d.cfg.product, d.cfg.hw_id,
-            d.cfg.layout_id, d.o.slot_size, d.dir,
+            d.cfg.layout_id, d.o.slot_size, dir,
             !d.secured ? "off" : d.have_kdev ? "on" : "on, no master (every key refused)",
             d.o.no_compress ? "off" : "on", d.eng.delta ? "on" : "off");
     const int rc = serve();
     demo_can_close(&d.can);
     demo_engine_close(&d.eng);
-    if (d.temp_dir) {
-        remove_temp_dir();
-    }
     return rc;
 }
