@@ -28,7 +28,6 @@ static const char *TAG = "udsota_keys";
 #define KEY_LOCK_MS  40u   /* key()'s and verify()'s wait for the PSA lock, inside P2: only an orphaned worker verify
                               holds it longer */
 
-static bool                 s_inited;
 static bool                 s_rng_on;
 static atomic_bool          s_mac_read;   /* stored last (release): s_mac and s_mac_ok are filled in */
 static bool                 s_mac_ok;
@@ -37,7 +36,7 @@ static udsota_esp32_devid_t s_dev;        /* the ID in use, fixed once, and its 
 static uint8_t              s_last_seed[UDSOTA_KEYS_SEED_LEN];
 static psa_key_id_t         s_pub;        /* ECDSA mode: the tester's public key, imported once */
 static bool                 s_pub_ok;     /* s_pub imported and the ECDSA self-test passed */
-static const udsota_security_t *s_sec;    /* the mode the first call fixed: s_security or s_security_ecdsa */
+static const udsota_security_t *s_sec;    /* set once by the first call: s_security or s_security_ecdsa */
 
 /* HMAC-SHA256 through PSA with a volatile key imported for this call and destroyed (PSA wipes its copy)
  * after it. On any failure, including a failed destroy, out is zeroed and false returned. */
@@ -250,7 +249,6 @@ static const udsota_security_t s_security_ecdsa = {
  * when the ID can be hashed; false (logged) leaves security on with no key that can match. */
 static bool security_begin(const udsota_security_t *sec, const uint8_t *id, size_t id_len)
 {
-    s_inited = true;
     s_sec = sec;
     udsota_esp32_psa_lock_init();
     bootloader_random_enable();              /* never disabled; the README gives the ADC/Wi-Fi/BT caveat */
@@ -276,7 +274,7 @@ const udsota_security_t *udsota_esp32_security_ecdsa(const uint8_t *pubkey, size
     if (pubkey == NULL) {
         return NULL;
     }
-    if (s_inited) {
+    if (s_sec != NULL) {
         return s_sec;
     }
     if (!security_begin(&s_security_ecdsa, id, id_len)) {
@@ -311,7 +309,7 @@ const udsota_security_t *udsota_esp32_security(const char *label, const uint8_t 
     if (label == NULL) {
         return NULL;
     }
-    if (s_inited) {
+    if (s_sec != NULL) {
         return s_sec;
     }
     if (!security_begin(&s_security, id, id_len)) {
