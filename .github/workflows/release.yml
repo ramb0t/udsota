@@ -55,6 +55,9 @@ jobs:
           # Only an annotated tag has a peeled ^{} entry; ask origin, since checkout may rewrite a local tag.
           sha=$(git ls-remote origin "refs/tags/$TAG^{}" | cut -f1)
           [ -n "$sha" ] || { echo "::error::$TAG is not an annotated tag on origin"; exit 1; }
+          # checkout sets origin/main to the commit this run started on, which predates the release commit when
+          # cut-release calls this workflow; fetch main as it is now.
+          git fetch -q origin +refs/heads/main:refs/remotes/origin/main
           git merge-base --is-ancestor "$sha" origin/main || { echo "::error::$sha is not on main"; exit 1; }
           { echo "tag=$TAG"; echo "version=$version"; echo "sha=$sha"; } >> "$GITHUB_OUTPUT"
       - name: Check the tag, the CHANGELOG and the client's __version__ agree at the tagged commit
