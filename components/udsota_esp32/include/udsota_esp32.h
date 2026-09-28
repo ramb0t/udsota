@@ -156,8 +156,10 @@ void udsota_esp32_progress(udsota_progress_t *out);
 
 #define UDSOTA_ESP32_VERSION_MAX 32u   /* esp_app_desc_t.version's size: up to 31 characters and a NUL */
 
-/* Any task, an app hook included: the version of the image being downloaded, copied into out with a NUL, from
- * a snapshot under the progress snapshot's spinlock; returns its length. "" before any download, and from an
- * accepted 34 until that download's first block passes the first-block check. Read udsota_esp32_progress()
- * first and this second: the 34's ERASING report clears the version in the same locked copy. */
+/* Any task, an app hook included: the version of the image being downloaded, copied into out (not NULL, with room
+ * for UDSOTA_ESP32_VERSION_MAX bytes) with a NUL, from a snapshot under the progress snapshot's spinlock; returns
+ * its length. "" before any download, from an accepted 34 until that download's first block passes the first-block
+ * check, and after a compressed 34 refused for memory. This and udsota_esp32_progress() take the lock separately:
+ * to pair the version with a progress (its last_reason, say), read the progress, then this, then the progress
+ * again, and read all three again if the stage or last_reason changed. */
 size_t udsota_esp32_incoming_version(char out[UDSOTA_ESP32_VERSION_MAX]);

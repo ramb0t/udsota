@@ -4,16 +4,22 @@
  * that job's answer, the app's did_write, routine and routine_poll reach the app through the
  * port's wrappers with its ctx, the request's bytes and the session's access state, the progress
  * snapshot copies what the server reported, under the port's lock, before the app's own hook runs, and the
- * incoming version is set by an accepted first block, kept after the download ends and cleared by the next
- * accepted 34 in the same locked copy as its report. */
+ * incoming version is read from an accepted first block, plain or inflated from a compressed download, kept
+ * after the download ends, and cleared by the next accepted 34 in the same locked copy as its report or by a
+ * compressed 34 the engine refuses. */
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include "unity.h"
 #include "udsota.h"
 #include "udsota_wire.h"
 #include "udsota_esp32_ctl.h"
+#include "udsota_tinfl.h"
+#include "udsota_zstream.h"
+#include "fixtures/example_first_block.h"
+#include "miniz/miniz.h"   /* tdefl, to make the compressed stream */
 
 #define NOW 1000u
 
@@ -47,23 +53,20 @@ static const void        *s_lock_ctx_seen;
 static char               s_version_at_lock[UDSOTA_ESP32_CTL_VERSION_MAX];     /* s_ctl's, as the last lock began */
 static char               s_version_at_unlock[UDSOTA_ESP32_CTL_VERSION_MAX];   /* and as it ended */
 static udsota_stage_t     s_stage_at_lock, s_stage_at_unlock;
-static const char        *s_first_version;   /* the mock first-block check: what an accepted block stores */
 static bool               s_refuse_first;    /* the mock first-block check refuses the block */
+static bool               s_zbegin_fail;     /* the compressed engine's zbegin fails for memory */
+static udsota_zstream_t   s_zs;              /* the compressed engine's stream over the real tinfl */
+static udsota_tinfl_t     s_tinfl;
+static uint8_t            s_zout[1024];
 static char               s_version_in_hook[UDSOTA_ESP32_CTL_VERSION_MAX];     /* what the app's progress hook read */
 
-/* Mock engine, as the port's check_first_block(): the first block passes unless s_refuse_first, and a pass
- * stores s_first_version (when set) as the incoming version. */
+/* Mock engine, as the port's check_first_block(): the block passes unless s_refuse_first, then goes to the
+ * control block's rule with its reason, as the port hands it every judged first block. */
 static int eng_check_first(void *ctx, const uint8_t *first, size_t len, udsota_reason_t *why)
 {
-    if (s_refuse_first) {
-        *why = UDSOTA_DL_BAD_HEADER;
-        return 1;
-    }
-    if (s_first_version != NULL) {
-        udsota_esp32_ctl_set_version(&s_ctl, s_first_version, UDSOTA_ESP32_CTL_VERSION_MAX);
-    }
-    *why = UDSOTA_DL_OK;
-    return 0;
+    *why = s_refuse_first ? UDSOTA_DL_BAD_HEADER : UDSOTA_DL_OK;
+    udsota_esp32_ctl_first_block(&s_ctl, *why, first, len);
+    return (*why == UDSOTA_DL_OK) ? 0 : 1;
 }
 
 /* Mock engine: begin succeeds at once. */
@@ -109,6 +112,73 @@ static void eng_status(void *ctx, udsota_status_t *out)
     out->boot_slot = UDSOTA_SLOT_OTA0;
     out->running_state = s_running_state;
 }
+
+/* ---- A compressed engine: udsota_zstream over the real tinfl, as the port's worker runs it ---- */
+
+#define Z_IMG_LEN 1024u     /* the compressed test image: the example first block, then text */
+
+/* The stream's sink, as the port's z_check: the mock check and the control block's rule on the inflated block. */
+static int z_check(void *ctx, const uint8_t *first, size_t len, udsota_reason_t *why)
+{
+    return eng_check_first(ctx, first, len, why);
+}
+
+/* The stream's sink: the erase succeeds at once. */
+static int z_begin(void *ctx, uint32_t size)
+{
+    return 0;
+}
+
+/* The stream's sink: each write succeeds at once. */
+static int z_write(void *ctx, uint32_t off, const uint8_t *d, size_t n)
+{
+    return 0;
+}
+
+/* engine.zbegin, as the port's: with s_zbegin_fail, empties the version and refuses for memory; else opens the
+ * stream. */
+static int eng_zbegin(void *ctx, uint32_t size)
+{
+    if (s_zbegin_fail) {
+        udsota_esp32_ctl_clear_version(&s_ctl);
+        return UDSOTA_DL_NO_MEMORY;
+    }
+    s_tinfl = (udsota_tinfl_t){0};
+    const udsota_inflate_t inf = udsota_tinfl_inflate(&s_tinfl);
+    const udsota_zsink_t sink = {.check_first = z_check, .begin = z_begin, .write = z_write};
+    return (int)udsota_zstream_open(&s_zs, &inf, &sink, s_zout, sizeof s_zout, size);
+}
+
+/* engine.zwrite: feeds the stream at once. */
+static int eng_zwrite(void *ctx, const uint8_t *d, size_t n)
+{
+    return (int)udsota_zstream_feed(&s_zs, d, n);
+}
+
+/* engine.zend: the stream's 37 check. */
+static int eng_zend(void *ctx)
+{
+    return (int)udsota_zstream_end(&s_zs);
+}
+
+/* engine.zwritten: the image bytes written. */
+static uint32_t eng_zwritten(void *ctx)
+{
+    return s_zs.written;
+}
+
+/* engine.abort: closes the stream. */
+static void eng_zabort(void *ctx)
+{
+    udsota_zstream_close(&s_zs);
+}
+
+static const udsota_engine_t k_zengine = {
+    .check_first = eng_check_first, .begin = eng_begin, .write = eng_write, .verify = eng_ok,
+    .activate = eng_ok, .confirm = eng_confirm, .abort = eng_zabort, .unverify = NULL, .poll = eng_poll,
+    .status = eng_status, .running_sha = NULL, .version = NULL, .slot_size = 0u, .ctx = NULL,
+    .zbegin = eng_zbegin, .zwrite = eng_zwrite, .zend = eng_zend, .zwritten = eng_zwritten,
+};
 
 static const udsota_engine_t k_engine = {
     .check_first = eng_check_first, .begin = eng_begin, .write = eng_write, .verify = eng_ok,
@@ -294,8 +364,9 @@ void setUp(void)
     memset(s_version_at_unlock, 0, sizeof s_version_at_unlock);
     s_stage_at_lock = UDSOTA_STAGE_IDLE;
     s_stage_at_unlock = UDSOTA_STAGE_IDLE;
-    s_first_version = NULL;
     s_refuse_first = false;
+    s_zbegin_fail = false;
+    udsota_zstream_close(&s_zs);
     memset(s_version_in_hook, 0x55, sizeof s_version_in_hook);
 }
 
@@ -640,6 +711,16 @@ static void test_progress_snapshot_without_an_app_hook(void)
     TEST_ASSERT_EQUAL_INT(0, s_locks);
 }
 
+/* A 36 01 carrying the example image's first block with version v (up to 32 bytes) in its esp_app_desc_t. */
+static void block_with_version(uint8_t out[2u + UDSOTA_IMAGE_MIN_LEN], const char *v)
+{
+    out[0] = 0x36;
+    out[1] = 0x01;
+    example_first_block(&out[2]);
+    memset(&out[2u + UDSOTA_ESP32_CTL_VERSION_OFF], 0, UDSOTA_ESP32_CTL_VERSION_MAX);
+    memcpy(&out[2u + UDSOTA_ESP32_CTL_VERSION_OFF], v, strlen(v));
+}
+
 /* Asserts the incoming version reads want, with its length. */
 static void expect_version(const char *want)
 {
@@ -675,15 +756,15 @@ static void test_version_set_by_the_first_block_kept_after_the_end_and_cleared_b
     const udsota_hooks_t app = { .progress = app_progress, .ctx = &s_marker };
     start(&app);
     udsota_esp32_ctl_set_lock(&s_ctl, fake_lock, fake_unlock, &s_lock_depth);
-    s_first_version = "v0.3.1";
+    uint8_t blk1[2u + UDSOTA_IMAGE_MIN_LEN];
     const uint8_t prog[] = {0x10, 0x02};
-    const uint8_t rd[] = {0x34, 0x00, 0x44, 0, 0, 0, 0, 0, 0, 0x00, 0x08};   /* 8 bytes */
-    const uint8_t blk1[] = {0x36, 0x01, 1, 2, 3, 4, 5};
-    const uint8_t blk2[] = {0x36, 0x02, 6, 7, 8};
+    const uint8_t rd[] = {0x34, 0x00, 0x44, 0, 0, 0, 0, 0, 0, 0x01, 0x48};   /* 328 bytes */
+    const uint8_t blk2[] = {0x36, 0x02, 1, 2, 3, 4, 5, 6, 7, 8};
     exchange(prog, sizeof prog, 0x50, NOW);
     exchange(rd, sizeof rd, 0x74, NOW + 1u);
     TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_ERASING, s_progress_arg.stage);
     TEST_ASSERT_EQUAL_STRING("", s_version_in_hook);
+    block_with_version(blk1, "v0.3.1");
     exchange(blk1, sizeof blk1, 0x76, NOW + 2u);                   /* the first block passes: stored */
     TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_WRITING, s_progress_arg.stage);
     TEST_ASSERT_EQUAL_STRING("v0.3.1", s_version_in_hook);
@@ -696,7 +777,6 @@ static void test_version_set_by_the_first_block_kept_after_the_end_and_cleared_b
     TEST_ASSERT_EQUAL_STRING("v0.3.1", s_version_in_hook);          /* kept, so "v0.3.1 failed" can be drawn */
     expect_version("v0.3.1");
 
-    s_first_version = "v0.3.2";
     exchange(prog, sizeof prog, 0x50, NOW + 5u);
     const int locks = s_locks;
     exchange(rd, sizeof rd, 0x74, NOW + 6u);
@@ -704,6 +784,7 @@ static void test_version_set_by_the_first_block_kept_after_the_end_and_cleared_b
     TEST_ASSERT_EQUAL_INT(locks + 3, s_locks);         /* the report's copy in, then the hook's two copies out */
     TEST_ASSERT_EQUAL_STRING("", s_version_in_hook);
     TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_ERASING, s_progress_read.stage);
+    block_with_version(blk1, "v0.3.2");
     exchange(blk1, sizeof blk1, 0x76, NOW + 7u);
     expect_version("v0.3.2");
 
@@ -713,11 +794,94 @@ static void test_version_set_by_the_first_block_kept_after_the_end_and_cleared_b
     exchange(prog, sizeof prog, 0x50, NOW + 9u);
     exchange(rd, sizeof rd, 0x74, NOW + 10u);
     expect_version("");
+    block_with_version(blk1, "v0.3.3");
     exchange(blk1, sizeof blk1, 0x7F, NOW + 11u);
     expect_version("");
     TEST_ASSERT_EQUAL_INT(s_locks, s_unlocks);
     TEST_ASSERT_EQUAL_INT(1, s_lock_max);
     TEST_ASSERT_EQUAL_INT(0, s_lock_depth_in_hook);
+}
+
+/* The rule the port runs on each judged first block: only an accepted one that holds the whole field stores,
+ * and it stores the field's bytes as set_version does (a 32-byte field with no NUL keeps 31). */
+static void test_first_block_rule_stores_only_an_accepted_whole_field(void)
+{
+    start(NULL);
+    uint8_t blk[2u + UDSOTA_IMAGE_MIN_LEN];
+    block_with_version(blk, "v1.2.3");
+    const uint8_t *first = &blk[2];
+    udsota_esp32_ctl_first_block(&s_ctl, UDSOTA_DL_BAD_HEADER, first, UDSOTA_IMAGE_MIN_LEN);
+    expect_version("");
+    udsota_esp32_ctl_first_block(&s_ctl, UDSOTA_DL_OK, first, UDSOTA_ESP32_CTL_VERSION_OFF + 31u);   /* short */
+    expect_version("");
+    udsota_esp32_ctl_first_block(&s_ctl, UDSOTA_DL_OK, NULL, UDSOTA_IMAGE_MIN_LEN);
+    expect_version("");
+    udsota_esp32_ctl_first_block(&s_ctl, UDSOTA_DL_OK, first, UDSOTA_ESP32_CTL_VERSION_OFF + 32u);
+    expect_version("v1.2.3");
+    memset(&blk[2u + UDSOTA_ESP32_CTL_VERSION_OFF], 'x', UDSOTA_ESP32_CTL_VERSION_MAX);
+    udsota_esp32_ctl_first_block(&s_ctl, UDSOTA_DL_OK, first, UDSOTA_IMAGE_MIN_LEN);
+    expect_version("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+    udsota_esp32_ctl_clear_version(&s_ctl);
+    expect_version("");
+}
+
+/* A compressed download through the real server, udsota_zstream and tinfl: the version comes from the inflated
+ * first block, as the port's worker checks it. A compressed 34 the engine then refuses for memory answers 0x22 and
+ * reports IDLE with last_reason 14, and by then the version is empty: the refusal is never paired with the
+ * previous download's version, in the app's hook or after it. */
+static void test_version_from_a_compressed_download_and_cleared_by_a_refused_zbegin(void)
+{
+    const udsota_hooks_t app = { .progress = app_progress, .ctx = &s_marker };
+    udsota_esp32_ctl_init(&s_ctl, &app, default_reset, &s_hooks);
+    const udsota_config_t cfg = {0};
+    udsota_init(&s_srv, &cfg, &k_zengine, NULL, &s_hooks);
+    udsota_esp32_ctl_set_lock(&s_ctl, fake_lock, fake_unlock, &s_lock_depth);
+
+    static uint8_t img[Z_IMG_LEN];
+    static uint8_t z[Z_IMG_LEN];
+    uint8_t blk[2u + UDSOTA_IMAGE_MIN_LEN];
+    block_with_version(blk, "v0.4.0");
+    memcpy(img, &blk[2], UDSOTA_IMAGE_MIN_LEN);
+    for (size_t i = UDSOTA_IMAGE_MIN_LEN; i < sizeof img; i++) {
+        img[i] = (uint8_t)("udsota "[i % 7u]);
+    }
+    const int flags = (int)tdefl_create_comp_flags_from_zip_params(9, -15, MZ_DEFAULT_STRATEGY);
+    const size_t z_len = tdefl_compress_mem_to_mem(z, sizeof z, img, sizeof img, flags);
+    TEST_ASSERT_TRUE(z_len > 0u && z_len + 2u <= UDSOTA_DL_MAX_BLOCK_LEN);
+    static uint8_t td[2u + Z_IMG_LEN];
+    td[0] = 0x36;
+    td[1] = 0x01;
+    memcpy(&td[2], z, z_len);
+
+    const uint8_t prog[] = {0x10, 0x02};
+    const uint8_t rdz[] = {0x34, UDSOTA_DL_DFI_DEFLATE, 0x44, 0, 0, 0, 0,
+                           0, 0, (uint8_t)(Z_IMG_LEN >> 8), (uint8_t)Z_IMG_LEN};
+    const uint8_t exit_req[] = {0x37};
+    exchange(prog, sizeof prog, 0x50, NOW);
+    exchange(rdz, sizeof rdz, 0x74, NOW + 1u);
+    TEST_ASSERT_EQUAL_STRING("", s_version_in_hook);
+    exchange(td, 2u + z_len, 0x76, NOW + 2u);                      /* inflated past 320 bytes: checked, stored */
+    expect_version("v0.4.0");
+    exchange(exit_req, sizeof exit_req, 0x77, NOW + 3u);
+    expect_version("v0.4.0");
+    udsota_esp32_ctl_request_end(&s_ctl);
+    TEST_ASSERT_TRUE(udsota_esp32_ctl_run_end(&s_ctl, &s_srv, NOW + 4u));
+    expect_version("v0.4.0");                                     /* kept after the end */
+
+    s_zbegin_fail = true;
+    exchange(prog, sizeof prog, 0x50, NOW + 5u);
+    const int calls = s_progress_calls;
+    uint8_t resp[16];
+    TEST_ASSERT_EQUAL_UINT(3u, udsota_on_request(&s_srv, rdz, sizeof rdz, resp, sizeof resp, NOW + 6u));
+    TEST_ASSERT_EQUAL_HEX8(0x7F, resp[0]);
+    TEST_ASSERT_EQUAL_HEX8(0x22, resp[2]);
+    TEST_ASSERT_EQUAL_INT(calls + 1, s_progress_calls);
+    TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_IDLE, s_progress_arg.stage);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_NO_MEMORY, s_progress_arg.last_reason);
+    TEST_ASSERT_EQUAL_STRING("", s_version_in_hook);               /* cleared before the report ran */
+    expect_version("");
+    TEST_ASSERT_EQUAL_INT(s_locks, s_unlocks);
+    TEST_ASSERT_EQUAL_INT(1, s_lock_max);
 }
 
 /* Reports straight to the wrapper: the move into ERASING from IDLE clears the version inside the one lock span
@@ -829,6 +993,8 @@ int main(void)
     RUN_TEST(test_version_is_empty_after_init);
     RUN_TEST(test_version_set_by_the_first_block_kept_after_the_end_and_cleared_by_the_next_34);
     RUN_TEST(test_version_cleared_only_by_the_move_into_erasing);
+    RUN_TEST(test_first_block_rule_stores_only_an_accepted_whole_field);
+    RUN_TEST(test_version_from_a_compressed_download_and_cleared_by_a_refused_zbegin);
     RUN_TEST(test_version_truncated_and_sanitised);
     RUN_TEST(test_version_copies_take_the_lock);
     return UNITY_END();

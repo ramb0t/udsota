@@ -29,6 +29,7 @@
 #include "esp_private/flash_mmap.h"   /* flash_mmap_remain(): the cache-off check, logged only */
 #endif
 
+#include "udsota_esp32_ctl.h"
 #include "udsota_esp32_image.h"
 #include "udsota_esp32_priv.h"
 #if CONFIG_UDSOTA_ESP32_COMPRESSION
@@ -49,6 +50,8 @@ _Static_assert(offsetof(esp_image_segment_header_t, data_len) == 4u, "segment 0 
 _Static_assert(offsetof(esp_app_desc_t, version) == 16u && offsetof(esp_app_desc_t, project_name) == 48u,
                "esp_app_desc_t version and project_name");
 _Static_assert(sizeof(((esp_app_desc_t *)0)->version) == UDSOTA_ESP32_VERSION_MAX, "the incoming version's size");
+_Static_assert(sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t) + offsetof(esp_app_desc_t, version) ==
+               UDSOTA_ESP32_CTL_VERSION_OFF, "where the control block reads the incoming version");
 _Static_assert(ESP_IMAGE_HEADER_MAGIC == 0xE9 && ESP_IMAGE_MAX_SEGMENTS == 16 &&
                ESP_IMAGE_SPI_MODE_SLOW_READ == 5 && ESP_APP_DESC_MAGIC_WORD == 0xABCD5432u,
                "the constants udsota_esp32_image.c copies");
@@ -263,9 +266,9 @@ static udsota_reason_t check_first_block(const uint8_t *first, size_t len, bool 
         ESP_LOGW(TAG, "image refused: reason %d", (int)r);
     } else {
         ESP_LOGD(TAG, "image accepted: %.32s (%s build)", app.version, release ? "release" : "dev");
-        if (store) {
-            udsota_esp32_set_incoming_version(app.version, sizeof app.version);
-        }
+    }
+    if (store) {
+        udsota_esp32_first_block_checked(r, first, len);   /* keeps the version only when r is UDSOTA_DL_OK */
     }
     return r;
 }
@@ -812,6 +815,7 @@ static int eng_zbegin(void *ctx, uint32_t size)
 {
     (void)ctx;
     if (s_q == NULL || s_target == NULL) {
+        udsota_esp32_zbegin_refused();
         return UDSOTA_DL_FLASH_ERROR;
     }
     taskENTER_CRITICAL(&s_mux);
@@ -832,6 +836,7 @@ static int eng_zbegin(void *ctx, uint32_t size)
                  "%u B", (unsigned)BLOCK_BUF, (unsigned)(udsota_tinfl_state_len() + UDSOTA_TINFL_DICT_LEN),
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         z_release();
+        udsota_esp32_zbegin_refused();
         return UDSOTA_DL_NO_MEMORY;
     }
     taskENTER_CRITICAL(&s_mux);

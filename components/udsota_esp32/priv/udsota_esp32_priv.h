@@ -25,9 +25,12 @@ void udsota_esp32_engine_start(const udsota_config_t *cfg);
 /* Installs the function the flash worker calls after each finished job, from the worker's task, so the diag
  * task answers at once instead of at its next poll. Call before udsota_esp32_engine_start(); NULL = none. */
 void udsota_esp32_engine_set_wake(void (*wake)(void));
-/* The engine's first-block check, on whichever task runs it, when it accepts an image: stores the first max
- * bytes of its esp_app_desc_t.version as the incoming version (udsota_esp32_ctl_set_version). */
-void udsota_esp32_set_incoming_version(const char *v, size_t max);
+/* The engine's first-block check, on whichever task runs it, once it has judged a first block with reason r: the
+ * control block keeps an accepted block's version as the incoming version (udsota_esp32_ctl_first_block). */
+void udsota_esp32_first_block_checked(udsota_reason_t r, const uint8_t *first, size_t len);
+/* The engine, on the diag task, when zbegin refuses a compressed 34: empties the incoming version
+ * (udsota_esp32_ctl_clear_version). */
+void udsota_esp32_zbegin_refused(void);
 /* True when the app ran udsota_esp32_bootloop_init() this boot and the boot step chose to ignore config
  * (status flag 0x02). Never runs the boot step itself, so an app without the counter never sees the flag. */
 bool udsota_esp32_bootloop_reported(void);

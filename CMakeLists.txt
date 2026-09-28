@@ -169,10 +169,13 @@ udsota_test(test_udsota_esp32_image
     SOURCES  test/test_udsota_esp32_image.c ${ESP32_DIR}/udsota_esp32_image.c ${CORE_DIR}/udsota_image.c
     INCLUDES ${CORE_INC} ${ESP32_DIR}/include ${TEST_DIR})
 
-# The port's control block (phase, end-session, hook wrappers) with the real server.
+# The port's control block (phase, end-session, hook wrappers, incoming version) with the real server, and the
+# real stream and tinfl for a compressed download.
 udsota_test(test_udsota_esp32_ctl
-    SOURCES  test/test_udsota_esp32_ctl.c ${ESP32_DIR}/udsota_esp32_ctl.c ${SERVER_SRCS}
-    INCLUDES ${CORE_INC} ${CORE_PRIV} ${ESP32_DIR}/priv)
+    SOURCES  test/test_udsota_esp32_ctl.c ${ESP32_DIR}/udsota_esp32_ctl.c ${SERVER_SRCS} ${ZSTREAM_SRCS}
+    INCLUDES ${CORE_INC} ${CORE_PRIV} ${ESP32_DIR}/priv ${TEST_DIR} ${INFLATE_DIR}/include ${INFLATE_DIR})
+target_compile_definitions(test_udsota_esp32_ctl PRIVATE MINIZ_NO_STDIO MINIZ_NO_TIME MINIZ_NO_ARCHIVE_APIS
+                                                         MINIZ_NO_ZLIB_APIS)
 
 # The device ID the port serves as F18C and the K_dev and keys over it, with the real server and key derivation.
 udsota_test(test_udsota_esp32_devid

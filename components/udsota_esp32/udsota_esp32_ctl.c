@@ -179,6 +179,22 @@ void udsota_esp32_ctl_set_version(udsota_esp32_ctl_t *ctl, const char *v, size_t
     }
 }
 
+/* The version field of an accepted block, else nothing; see the header. */
+void udsota_esp32_ctl_first_block(udsota_esp32_ctl_t *ctl, udsota_reason_t r, const uint8_t *first, size_t len)
+{
+    if (r != UDSOTA_DL_OK || first == NULL || len < UDSOTA_ESP32_CTL_VERSION_OFF + UDSOTA_ESP32_CTL_VERSION_MAX) {
+        return;
+    }
+    udsota_esp32_ctl_set_version(ctl, (const char *)&first[UDSOTA_ESP32_CTL_VERSION_OFF],
+                                 UDSOTA_ESP32_CTL_VERSION_MAX);
+}
+
+/* An empty version, stored as set_version stores one. */
+void udsota_esp32_ctl_clear_version(udsota_esp32_ctl_t *ctl)
+{
+    udsota_esp32_ctl_set_version(ctl, "", 0u);
+}
+
 /* One copy under the lock; the length is counted after the lock is released. */
 size_t udsota_esp32_ctl_version(udsota_esp32_ctl_t *ctl, char out[UDSOTA_ESP32_CTL_VERSION_MAX])
 {

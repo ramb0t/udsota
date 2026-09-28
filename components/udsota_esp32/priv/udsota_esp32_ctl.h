@@ -11,6 +11,7 @@
 #include "udsota.h"
 
 #define UDSOTA_ESP32_CTL_VERSION_MAX 32u   /* UDSOTA_ESP32_VERSION_MAX: up to 31 characters and a NUL */
+#define UDSOTA_ESP32_CTL_VERSION_OFF 48u   /* esp_app_desc_t.version in a first block: 24 + 8 header bytes, then 16 */
 
 typedef struct {
     atomic_uint    phase;                    /* udsota_phase_t, stored before the app's phase hook runs */
@@ -45,6 +46,13 @@ void udsota_esp32_ctl_progress(udsota_esp32_ctl_t *ctl, udsota_progress_t *out);
  * clears it, in the same locked copy as the report, when the stage moves into ERASING from any other stage (an
  * accepted 34), so a reader that sees the new download's ERASING never sees the previous download's version. */
 void udsota_esp32_ctl_set_version(udsota_esp32_ctl_t *ctl, const char *v, size_t max);
+/* The first-block check's task, once it has judged a first block of len bytes: when r is UDSOTA_DL_OK, stores the
+ * esp_app_desc_t.version the block holds at UDSOTA_ESP32_CTL_VERSION_OFF (udsota_esp32_ctl_set_version); a
+ * refused block, or one too short to hold the field, stores nothing. */
+void udsota_esp32_ctl_first_block(udsota_esp32_ctl_t *ctl, udsota_reason_t r, const uint8_t *first, size_t len);
+/* The diag task, when the engine refuses a compressed 34 (zbegin fails, and the server records the refusal as
+ * last_reason): empties the version under the lock, so the refusal never reads as the previous download's. */
+void udsota_esp32_ctl_clear_version(udsota_esp32_ctl_t *ctl);
 /* Any task: a copy of the version with its NUL, under the lock; returns its length ("" after init and from an
  * accepted 34 until that download's first block passes the check). */
 size_t udsota_esp32_ctl_version(udsota_esp32_ctl_t *ctl, char out[UDSOTA_ESP32_CTL_VERSION_MAX]);
