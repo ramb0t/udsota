@@ -3,22 +3,6 @@
 #include <stddef.h>
 #include "udsota_bootloop.h"
 
-typedef enum { RR_CLEAR, RR_KEEP, RR_CRASH } rr_class_t;
-
-/* Sorts a reset reason: power-on clears, deliberate resets keep, crashes and unknown values count. */
-static rr_class_t classify(udsota_reset_reason_t reason)
-{
-    switch (reason) {
-    case UDSOTA_RST_POWERON:
-        return RR_CLEAR;
-    case UDSOTA_RST_SW:
-    case UDSOTA_RST_EXT:
-        return RR_KEEP;
-    default:   /* OTHER, PANIC, WDT, BROWNOUT, and any value outside the enum */
-        return RR_CRASH;
-    }
-}
-
 /* Applies this boot's reset reason to *s and writes the magic; returns whether to ignore config. */
 udsota_bootloop_action_t udsota_bootloop_on_boot(udsota_bootloop_state_t *s, udsota_reset_reason_t reason, bool magic_valid)
 {
@@ -28,17 +12,18 @@ udsota_bootloop_action_t udsota_bootloop_on_boot(udsota_bootloop_state_t *s, uds
         a.cleared = true;
     }
     s->magic = UDSOTA_BOOTLOOP_MAGIC;
-    switch (classify(reason)) {
-    case RR_CLEAR:
+    switch (reason) {
+    case UDSOTA_RST_POWERON:
         s->count = 0;
         a.cleared = true;
         break;
-    case RR_CRASH:
+    case UDSOTA_RST_SW:
+    case UDSOTA_RST_EXT:
+        break;                          /* deliberate: keep the count */
+    default:                            /* OTHER, PANIC, WDT, BROWNOUT, and any value outside the enum */
         if (s->count < UINT32_MAX) {
             s->count++;
         }
-        break;
-    case RR_KEEP:
         break;
     }
     a.ignore_config = s->count >= UDSOTA_BOOTLOOP_THRESHOLD;
