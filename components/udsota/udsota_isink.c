@@ -100,14 +100,11 @@ udsota_reason_t udsota_isink_push(udsota_isink_t *k, const uint8_t *d, size_t n)
         uint8_t *at = NULL;
         size_t room = udsota_isink_space(k, &at);
         if (room == 0u) {
-            return k->failed != UDSOTA_DL_OK ? k->failed : fail(k, UDSOTA_DL_BAD_STREAM);
+            return fail(k, UDSOTA_DL_BAD_STREAM);              /* keeps an earlier failure */
         }
         const size_t take = n < room ? n : room;
-        if (take > (size_t)(k->size - k->produced)) {
-            return fail(k, UDSOTA_DL_BAD_STREAM);              /* past memorySize */
-        }
         memcpy(at, d, take);
-        const udsota_reason_t r = udsota_isink_commit(k, take);
+        const udsota_reason_t r = udsota_isink_commit(k, take);   /* refuses bytes past memorySize */
         if (r != UDSOTA_DL_OK) {
             return r;
         }
