@@ -52,9 +52,9 @@ struct udsota_isotp {
     udsota_can_t         can;                /* copied at init */
     uint32_t           (*stmin_us)(void *ctx);   /* hooks.stmin_us, copied at init; NULL = stmin_default_us */
     void                *stmin_ctx;          /* hooks.ctx */
-    uint32_t             stmin_default_us;   /* cfg.stmin_us (0 = UDSOTA_STMIN_DEFAULT_US), rounded up to what an FC carries */
+    uint32_t             stmin_default_us;   /* s->cfg.stmin_us, rounded up to what an FC carries */
     uint16_t             resp_id;
-    uint32_t             rx_limit_dl;        /* receive limit while a download is open: cfg.max_block_len */
+    uint32_t             rx_limit_dl;        /* receive limit while a download is open: s->cfg.max_block_len */
     uint32_t             rx_limit_idle;      /* receive limit otherwise */
     uint32_t             rx_limit;           /* the link's current receive buffer size */
     udsota_rxwatch_t     rxw;                /* isotp-c's receive state, mirrored from the raw frames */
@@ -74,10 +74,10 @@ struct udsota_isotp {
 };
 typedef struct udsota_isotp udsota_isotp_t;
 
-/* Starts the adapter on s (call after udsota_init): link at the idle limit, BS cfg->block_size, default STmin
- * cfg->stmin_us, download limit cfg->max_block_len (0 = 4095, capped there), FC retry window cfg->fc_retry_ms
- * (0 = UDSOTA_ISOTP_FC_RETRY_MS). Copies *can and hooks->stmin_us (hooks may be NULL), and installs its own
- * tx_pending on s. */
+/* Starts the adapter on s (call after udsota_init): link at the idle limit; BS, default STmin and download limit
+ * are s->cfg's block_size, stmin_us and max_block_len as udsota_init resolved them. From cfg it takes resp_id and
+ * the FC retry window fc_retry_ms (0 = UDSOTA_ISOTP_FC_RETRY_MS). Copies *can and hooks->stmin_us (hooks may be
+ * NULL), and installs its own tx_pending on s. */
 void     udsota_isotp_init(udsota_isotp_t *t, udsota_server_t *s, const udsota_config_t *cfg,
                            const udsota_hooks_t *hooks, const udsota_can_t *can, udsota_isotp_bufs_t *bufs);
 /* One request frame already filtered to cfg.req_id; rx_us is its arrival (for the STmin median). May send an

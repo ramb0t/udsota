@@ -217,15 +217,16 @@ void udsota_isotp_init(udsota_isotp_t *t, udsota_server_t *s, const udsota_confi
         t->stmin_us = hooks->stmin_us;
         t->stmin_ctx = hooks->ctx;
     }
-    t->stmin_default_us = stmin_sendable((cfg->stmin_us != 0u) ? cfg->stmin_us : UDSOTA_STMIN_DEFAULT_US);
-    t->link_cfg.bs = (cfg->block_size != 0u) ? cfg->block_size : (uint8_t)UDSOTA_BLOCK_SIZE_DEFAULT;
+    /* BS, STmin and the download limit come from s->cfg, as udsota_init resolved them, so the ISO-TP receive
+     * limit is the very maxNumberOfBlockLength that 0x74 announces. The server does not resolve fc_retry_ms. */
+    const udsota_config_t *rc = &s->cfg;
+    t->stmin_default_us = stmin_sendable(rc->stmin_us);
+    t->link_cfg.bs = rc->block_size;
     t->link_cfg.st_min_us = t->stmin_default_us;
     t->fc_retry_ms = (cfg->fc_retry_ms != 0u) ? cfg->fc_retry_ms : UDSOTA_ISOTP_FC_RETRY_MS;
-    const uint32_t dl = (cfg->max_block_len != 0u) ? cfg->max_block_len : UDSOTA_ISOTP_RX_MAX;
-    t->rx_limit_dl = (dl < UDSOTA_ISOTP_RX_MAX) ? dl : UDSOTA_ISOTP_RX_MAX;
+    t->rx_limit_dl = rc->max_block_len;
     t->rx_limit_idle = (t->rx_limit_dl < UDSOTA_ISOTP_RX_LIMIT_IDLE) ? t->rx_limit_dl : UDSOTA_ISOTP_RX_LIMIT_IDLE;
-    link_init(t, t->rx_limit_idle);
-    udsota_rxwatch_reset(&t->rxw);
+    link_init(t, t->rx_limit_idle);       /* the memset above has already reset rxw */
     s_clock = &t->can;
     udsota_set_tx_pending(s, tp_tx_pending, t);
 }
