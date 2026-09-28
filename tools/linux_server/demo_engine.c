@@ -126,57 +126,85 @@ static int eng_confirm(void *ctx)
     return job(e, fake_ota_confirm(&e->ota));
 }
 
-/* engine.abort: drops the open write, and any compressed stream; the partial image stays in the slot. */
+/* engine.abort: drops the open write, and any coded download; the partial image stays in the slot. */
 static void eng_abort(void *ctx)
 {
     demo_engine_t *e = ctx;
-    udsota_zstream_close(&e->zs);
+    udsota_coded_close(&e->cd);
     (void)fake_ota_abort(&e->ota);
 }
 
-/* The compressed stream's erase: fake_ota_begin, synchronous (the job wraps the whole zwrite). */
+/* The coded download's erase: fake_ota_begin, synchronous (the job wraps the whole zwrite). */
 static int z_begin(void *ctx, uint32_t size)
 {
     demo_engine_t *e = ctx;
     return fake_ota_begin(&e->ota, size);
 }
 
-/* The compressed stream's write, at the uncompressed offset where the last one ended. */
+/* The coded download's write, at the image offset where the last one ended. */
 static int z_write(void *ctx, uint32_t off, const uint8_t *d, size_t n)
 {
     demo_engine_t *e = ctx;
     return (off == e->ota.written) ? fake_ota_write(&e->ota, d, n) : -1;
 }
 
-/* engine.zbegin: opens a stream for size bytes over the vendored tinfl; UDSOTA_DL_NO_MEMORY when malloc fails. */
-static int eng_zbegin(void *ctx, uint32_t size, uint8_t dfi)
+/* A delta download's base: n bytes of the running slot at off; a read past the slot is refused. */
+static int base_read(void *ctx, uint32_t off, uint8_t *buf, size_t n)
 {
-    (void)dfi;
-    demo_engine_t *e = ctx;
-    udsota_zstream_close(&e->zs);
-    const udsota_inflate_t inf = udsota_tinfl_inflate(&e->tinfl);
-    const udsota_zsink_t sink = {.check_first = eng_check_first, .begin = z_begin, .write = z_write, .ctx = e};
-    return (int)udsota_zstream_open(&e->zs, &inf, &sink, e->zout, sizeof e->zout, size);
+    const demo_engine_t *e = ctx;
+    return fake_ota_slot_read(&e->ota, e->ota.running_slot, off, buf, n);
 }
 
-/* engine.zwrite: inflates one payload into the rules, erase and writes; a job like any other when job_ms is set. */
+/* A delta download's base identity: the running image's appended SHA-256, as esp_partition_get_sha256 gives it;
+ * computed once per boot. */
+static int base_hash(void *ctx, uint8_t out[UDSOTA_PATCH_HASH_LEN])
+{
+    demo_engine_t *e = ctx;
+    if (!e->base_hash_ok) {
+        e->base_hash_ok = fake_ota_slot_hash(&e->ota, e->ota.running_slot, e->base_hash);
+    }
+    if (!e->base_hash_ok) {
+        return -1;
+    }
+    memcpy(out, e->base_hash, UDSOTA_PATCH_HASH_LEN);
+    return 0;
+}
+
+/* engine.zbegin: opens the coded download for dfi and size bytes over the vendored tinfl and detools;
+ * UDSOTA_DL_NO_MEMORY when malloc fails. */
+static int eng_zbegin(void *ctx, uint32_t size, uint8_t dfi)
+{
+    demo_engine_t *e = ctx;
+    udsota_coded_close(&e->cd);
+    const udsota_inflate_t inf = udsota_tinfl_inflate(&e->tinfl);
+    const udsota_patch_t patch = udsota_detools_patch(&e->detools);
+    const udsota_pbase_t base = {.read = base_read, .hash = base_hash, .ctx = e};
+    const udsota_coded_cfg_t cfg = {
+        .sink = {.check_first = eng_check_first, .begin = z_begin, .write = z_write, .ctx = e},
+        .out = e->zout, .out_max = sizeof e->zout, .inflate = &inf, .patch = &patch, .base = &base,
+        .zbuf = e->pbuf, .zbuf_max = sizeof e->pbuf,
+    };
+    return (int)udsota_coded_open(&e->cd, dfi, size, &cfg);
+}
+
+/* engine.zwrite: decodes one payload into the rules, erase and writes; a job like any other when job_ms is set. */
 static int eng_zwrite(void *ctx, const uint8_t *d, size_t n)
 {
     demo_engine_t *e = ctx;
-    return job(e, (int)udsota_zstream_feed(&e->zs, d, n));
+    return job(e, (int)udsota_coded_feed(&e->cd, d, n));
 }
 
-/* engine.zwritten: the image bytes the stream has written, for progress. */
+/* engine.zwritten: the image bytes the download has written, for progress. */
 static uint32_t eng_zwritten(void *ctx)
 {
-    return ((const demo_engine_t *)ctx)->zs.image.written;
+    return udsota_coded_written(&((const demo_engine_t *)ctx)->cd);
 }
 
-/* engine.zend: the 37 check; frees the inflater. */
+/* engine.zend: the 37 check; frees the decoders. */
 static int eng_zend(void *ctx)
 {
     demo_engine_t *e = ctx;
-    return (int)udsota_zstream_end(&e->zs);
+    return (int)udsota_coded_end(&e->cd);
 }
 
 /* engine.unverify: an accepted 34 means the inactive slot no longer counts as verified. */
@@ -276,8 +304,9 @@ bool demo_engine_open(demo_engine_t *e, const char *dir, uint32_t slot_size, boo
 /* Simulated reset; see demo_engine.h. */
 void demo_engine_boot(demo_engine_t *e)
 {
-    udsota_zstream_close(&e->zs);
+    udsota_coded_close(&e->cd);
     fake_ota_boot(&e->ota);
+    e->base_hash_ok = false;                    /* the running slot may be the other one now */
     e->job_open = false;
     e->last_result = 0;
     rules_refresh(e);
@@ -286,7 +315,7 @@ void demo_engine_boot(demo_engine_t *e)
 /* Closes the slot files. */
 void demo_engine_close(demo_engine_t *e)
 {
-    udsota_zstream_close(&e->zs);
+    udsota_coded_close(&e->cd);
     fake_ota_close(&e->ota);
 }
 
@@ -300,7 +329,10 @@ udsota_engine_t demo_engine_ops(demo_engine_t *e)
         .slot_size = e->rules.slot_size, .ctx = e,
         .zbegin = e->compress ? eng_zbegin : NULL, .zwrite = e->compress ? eng_zwrite : NULL,
         .zend = e->compress ? eng_zend : NULL, .zwritten = e->compress ? eng_zwritten : NULL,
-        .zformats = e->compress ? UDSOTA_DL_FMT(UDSOTA_DL_DFI_DEFLATE) : 0u,
+        .zformats = !e->compress ? 0u
+                    : !e->delta  ? UDSOTA_DL_FMT(UDSOTA_DL_DFI_DEFLATE)
+                                 : (uint16_t)(UDSOTA_DL_FMT(UDSOTA_DL_DFI_DEFLATE) | UDSOTA_DL_FMT(UDSOTA_DL_DFI_DELTA) |
+                                              UDSOTA_DL_FMT(UDSOTA_DL_DFI_DELTA_DEFLATE)),
     };
 }
 

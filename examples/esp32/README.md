@@ -16,6 +16,8 @@ Plain `esp32` builds too. To take compressed downloads (`udsota flash --compress
 idf.py -C examples/esp32 -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.compression" set-target esp32s3 build
 ```
 
+`sdkconfig.delta` instead takes delta downloads as well (`udsota flash --diff-from`), which rebuild the new image from the running one and a patch. Keep the `.bin` of every build you flash: it is the base the next patch is made from.
+
 `PROJECT_VER` is pinned to `0.1.0-dev` in `CMakeLists.txt`, which makes the image a dev build. Set a clean `X.Y.Z` to build a release, which the unit accepts only when its version is newer than the running one.
 
 `partitions.csv` gives two 1.875 MB OTA slots and otadata on 4 MB flash. There is no factory app, so a serial flash boots `ota_0`. If you move a partition, bump `EXAMPLE_LAYOUT_ID` in `main.c`.

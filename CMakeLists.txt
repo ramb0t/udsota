@@ -300,6 +300,26 @@ if(UDSOTA_FUZZ AND UDSOTA_FUZZ_SAN_OK)
                                                      MINIZ_NO_STDIO
                                                      MINIZ_NO_TIME MINIZ_NO_ARCHIVE_APIS MINIZ_NO_ZLIB_APIS)
     set_tests_properties(fuzz_udsota_z PROPERTIES TIMEOUT 600)
+    # The delta patch path on mutated patches (test/fuzz_udsota_patch.c): udsota_coded over the real detools and
+    # tinfl, with AddressSanitizer where the toolchain has it, since the device parses these patches from the bus.
+    set(FUZZ_PATCH_SAN ${FUZZ_SAN})
+    set(CMAKE_REQUIRED_FLAGS "-fsanitize=address")
+    check_c_source_compiles("int main(void) { return 0; }" UDSOTA_FUZZ_ASAN_OK)
+    unset(CMAKE_REQUIRED_FLAGS)
+    if(UDSOTA_FUZZ_ASAN_OK)
+        list(APPEND FUZZ_PATCH_SAN -fsanitize=address)
+    endif()
+    add_executable(fuzz_udsota_patch test/fuzz_udsota_patch.c ${CORE_DIR}/udsota_coded.c ${CORE_DIR}/udsota_patch.c
+                   ${ZSTREAM_SRCS} ${DELTA_DIR}/udsota_detools.c ${DELTA_DIR}/detools/detools.c
+                   ${DELTA_DIR}/detools/heatshrink/heatshrink_decoder.c)
+    target_include_directories(fuzz_udsota_patch PRIVATE ${CORE_INC} ${TEST_DIR} ${INFLATE_DIR}/include ${INFLATE_DIR}
+                               ${DELTA_DIR}/include ${DELTA_DIR}/detools ${DELTA_DIR}/detools/heatshrink)
+    target_compile_definitions(fuzz_udsota_patch PRIVATE MINIZ_NO_STDIO MINIZ_NO_TIME MINIZ_NO_ARCHIVE_APIS
+                                                         MINIZ_NO_ZLIB_APIS ${UDSOTA_DETOOLS_DEFS})
+    target_compile_options(fuzz_udsota_patch PRIVATE -Wall -Wextra -Werror ${FUZZ_PATCH_SAN})
+    target_link_options(fuzz_udsota_patch PRIVATE ${FUZZ_PATCH_SAN})
+    add_test(NAME fuzz_udsota_patch COMMAND fuzz_udsota_patch)
+    set_tests_properties(fuzz_udsota_patch PROPERTIES TIMEOUT 600 PASS_REGULAR_EXPRESSION "^PASS fuzz_udsota_patch")
 endif()
 
 # ---- tools/image_check: the ESP32 port's first-block check as a host program, for checking a real

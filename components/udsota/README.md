@@ -245,6 +245,16 @@ A server takes DFI 0x10 when its engine sets `zbegin`, `zwrite` and `zend`. With
 
 Two things differ from an uncompressed download. A 37 sent before the stream has ended answers 0x72 and ends the download, where an uncompressed one sent early answers 0x24 and leaves the transfer open. And `udsota_init()` never calls `engine.abort`, so a `zbegin` must cope with a stream a lost session left open, closing it before it opens the next.
 
+## Delta downloads
+
+A 34 with dataFormatIdentifier 0x20 or 0x30 opens a download whose 36 blocks carry a patch from the image the device runs, and the device rebuilds the new image from its running slot into the other one. A small code change then costs kilobytes on the bus instead of the whole image: for the ESP32 example, a one-line change to its 314,112-byte image is a 5,493-byte patch under 0x20 and a 1,027-byte one under 0x30, against a 192,794-byte DEFLATE stream, so at about 3.2 KB/s the time on the bus drops from about a minute compressed to under 2 s. The rebuilt image goes through everything a full one does, the first-block check before any erase, FF01's hash and signature check, ActivateImage and the confirm, so a patch that is wrong or hostile can at worst produce an image that fails them. The running slot is only ever read.
+
+The patch is Espressif's `esp_delta_ota` format: a 64-byte header, the magic `0xfccdde10` (little-endian), the base image's 32-byte SHA-256 (the hash an ESP-IDF image appends, which `esp_partition_get_sha256()` returns) and 28 reserved bytes, then a detools sequential bsdiff patch. Under 0x20 the patch is heatshrink-compressed (window 8, lookahead 7), byte for byte what Espressif's `esp_delta_ota_patch_gen.py` writes. Under 0x30 it is uncompressed and the whole thing, header included, is one raw DEFLATE stream, which is usually several times smaller. The device takes either inner form under either DFI.
+
+memorySize is the new image's size, as for 0x10, and `UDSOTA_DL_Z_BOUND` bounds the bytes the 36s carry. Once the header is whole, and before anything is erased, a wrong magic is reason 13 and a base hash other than the running image's is reason 15, `UDSOTA_DL_BAD_BASE`; both answer the 36 with 0x31, and after reason 15 a full download works. So does a patch that would rebuild another size than memorySize (reason 13), and a rebuilt first block the image rules refuse (their reason). A corrupt patch, a read of the base outside the running image, or output past memorySize answers 0x31 with reason 13 at whichever 36 finds it. The 37 closes the transfer only once the patch has ended with nothing after it and the image is exactly memorySize bytes, all written; otherwise 0x72 and reason 13. F1F1 counts the coded bytes accepted, and progress the image bytes rebuilt. Delta downloads cannot resume.
+
+A server serves a coded DFI only when its engine names it in `engine.zformats` (`UDSOTA_DL_FMT(0x10) | ...`) and sets the z ops; `zbegin` gets the DFI. Any other DFI answers 0x31 before anything changes, exactly as an unknown one, with F1F1 untouched and an image that has not yet passed FF01 kept. The core includes no patch library. `udsota_patch.h` gives an engine the patch stage over any `udsota_patch_t` decoder (`init`, `feed`, `finish`) and a `udsota_pbase_t` for the running image (a bounded `read` and its `hash`), and `components/udsota_delta` supplies a decoder on detools 0.53.0's C side, vendored unpatched; its whole state is under 800 bytes. The rule "nothing is erased before the first block passes" lives in one place, the image sink (`udsota_isink.h`), which the compressed stream and the patch stage both write through, and `udsota_coded.h` chains the stages for a DFI (0x10 inflate → image, 0x20 patch → image, 0x30 inflate → patch → image), so an engine supplies only its sink, buffers and decoders. detools moves the base offset with no check of its own, so the decoder refuses a read that goes negative, and the engine's `read` must refuse one past the running image. The ESP32 port serves 0x20 and 0x30 with `UDSOTA_ESP32_DELTA`, and the client sends them with `flash --diff-from`.
+
 ## Client
 
 [`client/`](../../client/README.md) is a generic PC client for Linux and SocketCAN. A product's TOML profile holds everything product-specific; the built-in `example` profile carries the values used here, and `udsota --profile example flash <image>` runs the whole sequence, from the precheck to ConfirmImage.
@@ -261,9 +271,9 @@ Two things differ from an uncompressed download. A 37 sent before the stream has
 | 27 | SecurityAccess | `level_extended` and the next sub-function in extended, `level_programming` and the next in programming; a sendKey carries exactly 16 key bytes, or 64 in the ECDSA mode | extended, programming | – |
 | 2E | WriteDataByIdentifier | one DID and at least one value byte, through `did_write`; answers `6E <did>` | extended, programming | the app's choice |
 | 31 | RoutineControl | 01 startRoutine | per routine | per routine |
-| 34 | RequestDownload | DFI 00, or 10 (raw DEFLATE) when the engine has `zbegin`; ALFID 44, address 0, 0 < size ≤ slot, size being the uncompressed image; answers `74 20 0F FF` (`cfg.max_block_len`, 4,095 by default) | programming | programming |
-| 36 | TransferData | block counter from 01, wrapping FF to 00, and up to 4,093 data bytes, compressed after a DFI 10; a repeat of the last counter is answered and not rewritten | programming | programming |
-| 37 | RequestTransferExit | once every announced byte has arrived, or after a DFI 10 once the stream has ended at exactly the announced size | programming | programming |
+| 34 | RequestDownload | DFI 00, or 10 (raw DEFLATE), 20 (a delta patch) or 30 (a delta patch as raw DEFLATE) when `engine.zformats` names it; ALFID 44, address 0, 0 < size ≤ slot, size being the image; answers `74 20 0F FF` (`cfg.max_block_len`, 4,095 by default) | programming | programming |
+| 36 | TransferData | block counter from 01, wrapping FF to 00, and up to 4,093 data bytes, coded after a DFI 10, 20 or 30; a repeat of the last counter is answered and not rewritten | programming | programming |
+| 37 | RequestTransferExit | once every announced byte has arrived, or after a coded DFI once the stream or patch has ended at exactly the announced size | programming | programming |
 | 3E | TesterPresent | 00; 80 suppresses the answer | any | – |
 | 28 | CommunicationControl (with `comm_control` only) | controlType 00–03 and a communicationType naming normal or network-management messages; answers `68 xx` | extended, programming | – |
 | 85 | ControlDTCSetting (with `dtc_setting` only) | 01 on, 02 off, with any option record; answers `C5 xx` | extended, programming | – |
@@ -310,7 +320,7 @@ Every other DID goes to `did_read`, and so does any of these whose source is NUL
 | 0x21 | busyRepeatRequest | any request but 3E while a flash job or a pending app routine runs; or the gate's choice |
 | 0x22 | conditionsNotCorrect | a core-owned condition, the gate, or no memory for a compressed download's inflater |
 | 0x24 | requestSequenceError | a step out of order: 36 with no download open, 37 before the last byte, FF01 before 37, F001 before FF01, or a key with no live seed |
-| 0x31 | requestOutOfRange | an unknown DID or RID, 34 parameters or size (DFI 10 on a server without compressed downloads among them), a first block the image rules refuse, or a compressed block that is corrupt or inflates past the announced size |
+| 0x31 | requestOutOfRange | an unknown DID or RID, 34 parameters or size (a coded DFI the engine does not serve among them), a first block the image rules refuse, a coded block that is corrupt or decodes past the announced size, or a delta patch with the wrong magic, size or base |
 | 0x33 | securityAccessDenied | a keyed service while locked |
 | 0x35 | invalidKey | a wrong key |
 | 0x36 | exceedNumberOfAttempts | the third wrong key |
@@ -383,8 +393,9 @@ The FF01 status byte and F1F1 byte 0.
 | 10 | `UDSOTA_DL_WORKER_TIMEOUT` | a flash job passed 90 s |
 | 11 | `UDSOTA_DL_ABORTED` | ended early: a session change or S3, a gate deny mid-transfer, or an overrun (0x71) |
 | 12 | `UDSOTA_DL_FLASH_ERROR` | an erase or write failed, or at the first block there was no slot or worker |
-| 13 | `UDSOTA_DL_BAD_STREAM` | a compressed download's stream was corrupt, inflated past the announced size, or at 37 had not ended at exactly that size or carried bytes after its end |
-| 14 | `UDSOTA_DL_NO_MEMORY` | a 34 with DFI 10 found no memory for the inflater |
+| 13 | `UDSOTA_DL_BAD_STREAM` | a coded download's stream or patch was corrupt, had the wrong magic or size, read the base outside the running image, decoded past the announced size, or at 37 had not ended at exactly that size or carried bytes after its end |
+| 14 | `UDSOTA_DL_NO_MEMORY` | a coded 34 found no memory for its decoder |
+| 15 | `UDSOTA_DL_BAD_BASE` | a delta patch made from another image than the running one, or a running image the engine could not identify; a full download still works |
 
 ### Image descriptor
 
@@ -403,4 +414,4 @@ The FF01 status byte and F1F1 byte 0.
 
 ## Third-party code
 
-`components/isotp` vendors SimonCahill's isotp-c v1.9.3 (commit 1fc19e2, unpatched), which is MIT-licensed; its `LICENSE` sits beside it, and `isotp_port.c` gives each link its own block size and STmin. `components/udsota_inflate/miniz` vendors miniz 3.0.2 (unpatched, MIT), used only where no ROM copy of tinfl exists. The UDS server is udsota's own. driftregion's iso14229 (MIT) was the model for the fuzz harness and the 0x78 cadence, but none of its code is copied. udsota itself is MIT-licensed; see the repository's `LICENSE` and `THIRD_PARTY.md`.
+`components/isotp` vendors SimonCahill's isotp-c v1.9.3 (commit 1fc19e2, unpatched), which is MIT-licensed; its `LICENSE` sits beside it, and `isotp_port.c` gives each link its own block size and STmin. `components/udsota_inflate/miniz` vendors miniz 3.0.2 (unpatched, MIT), used only where no ROM copy of tinfl exists. `components/udsota_delta/detools` vendors detools 0.53.0's C side (unpatched, BSD-2-Clause) with the heatshrink decoder it bundles (ISC). The UDS server is udsota's own. driftregion's iso14229 (MIT) was the model for the fuzz harness and the 0x78 cadence, but none of its code is copied. udsota itself is MIT-licensed; see the repository's `LICENSE` and `THIRD_PARTY.md`.

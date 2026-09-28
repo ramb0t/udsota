@@ -314,6 +314,25 @@ static void test_rollback_off_activate_is_permanent(void)
 }
 
 /* Runs every fake OTA test. */
+/* A slot's bytes read back as loaded, a read past the slot refused; the slot's hash is the image's appended
+ * SHA-256, and a slot without a valid image has none (a delta download's base, as the demo server reads it). */
+static void test_slot_read_and_hash(void)
+{
+    TEST_ASSERT_EQUAL_INT(0, fake_ota_load_slot(&f, 1, img, img_len));
+    uint8_t back[64];
+    TEST_ASSERT_EQUAL_INT(0, fake_ota_slot_read(&f, 1, 100, back, sizeof back));
+    TEST_ASSERT_EQUAL_MEMORY(&img[100], back, sizeof back);
+    TEST_ASSERT_EQUAL_INT(0, fake_ota_slot_read(&f, 1, SLOT - 1u, back, 1));
+    TEST_ASSERT_EQUAL_INT(-1, fake_ota_slot_read(&f, 1, SLOT - 1u, back, 2));
+    TEST_ASSERT_EQUAL_INT(-1, fake_ota_slot_read(&f, 2, 0, back, 1));
+    uint8_t h[32];
+    TEST_ASSERT_TRUE(fake_ota_slot_hash(&f, 1, h));
+    TEST_ASSERT_EQUAL_MEMORY(&img[img_len - 32u], h, sizeof h);
+    img[img_len - 1u] ^= 0x01;                                  /* a hash that no longer matches */
+    TEST_ASSERT_EQUAL_INT(0, fake_ota_load_slot(&f, 1, img, img_len));
+    TEST_ASSERT_FALSE(fake_ota_slot_hash(&f, 1, h));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -328,6 +347,7 @@ int main(void)
     RUN_TEST(test_unverify_clears_verified);
     RUN_TEST(test_unconfirmed_image_rolls_back);
     RUN_TEST(test_rollback_off_activate_is_permanent);
+    RUN_TEST(test_slot_read_and_hash);
     RUN_TEST(test_activate_needs_fresh_verify);
     RUN_TEST(test_abort_keeps_partial_and_resume_point);
     RUN_TEST(test_state_survives_power_cut);

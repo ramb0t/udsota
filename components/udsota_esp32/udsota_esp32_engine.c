@@ -3,10 +3,11 @@
  * writes s_cache (eng_unverify only demotes VERIFIED), and every other task reads it under s_mux, so status
  * readers never wait behind an erase. With CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE an activated image boots
  * PENDING_VERIFY and needs confirm; without it the image is permanent and confirm does nothing. With
- * CONFIG_UDSOTA_ESP32_COMPRESSION the engine also serves compressed downloads: the diag task only copies each
- * compressed block into the worker's buffer, and the worker inflates it (udsota_zstream over tinfl), runs the
- * first-block check once 320 bytes are out, erases and writes. IDF v6.1 line numbers below are
- * components/app_update/esp_ota_ops.c unless another file is named. */
+ * CONFIG_UDSOTA_ESP32_COMPRESSION the engine also serves coded downloads: compressed ones (DFI 0x10), and with
+ * CONFIG_UDSOTA_ESP32_DELTA delta ones (0x20, 0x30) rebuilt from the running partition. The diag task only copies
+ * each coded block into the worker's buffer, and the worker decodes it (udsota_coded over tinfl and detools), runs
+ * the first-block check once the image's first 320 bytes are out, erases and writes. It never writes the running
+ * partition. IDF v6.1 line numbers below are components/app_update/esp_ota_ops.c unless another file is named. */
 #include "udsota_esp32.h"
 
 #include <inttypes.h>
@@ -16,6 +17,7 @@
 #include "sdkconfig.h"
 #include "esp_app_desc.h"
 #include "esp_app_format.h"
+#include "esp_image_format.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
@@ -34,8 +36,11 @@
 #include "udsota_esp32_priv.h"
 #if CONFIG_UDSOTA_ESP32_COMPRESSION
 #include "esp_memory_utils.h"   /* esp_ptr_external_ram(), logged only */
+#include "udsota_coded.h"
 #include "udsota_tinfl.h"
-#include "udsota_zstream.h"
+#endif
+#if CONFIG_UDSOTA_ESP32_DELTA
+#include "udsota_detools.h"
 #endif
 
 static const char *TAG = "udsota_eng";
@@ -63,6 +68,7 @@ _Static_assert(UDSOTA_ESP32_CHIP_ID_S3 == ESP_CHIP_ID_ESP32S3, "the host tests' 
 #define QUEUE_LEN       4       /* BEGIN + WRITE of the first block, plus slack */
 #define SHA_PREFIX      8u      /* status other_elf_sha_prefix */
 #define BLOCK_BUF       4096u   /* the worker's internal-RAM block buffer: one whole 0x36 payload */
+#define PATCH_BUF       1024u   /* DFI 0x30: inflated patch bytes on their way to detools */
 #define ERR_NOT_STARTED (-1)    /* engine not started, its allocation failed, or no inactive slot */
 #define ERR_BUSY        (-2)    /* job queue full, or the block buffer still holds an unwritten block */
 #define ERR_ARG         (-3)    /* NULL data, or a block longer than BLOCK_BUF */
@@ -75,8 +81,8 @@ typedef enum { JOB_REFRESH, JOB_BEGIN, JOB_WRITE, JOB_END, JOB_ABORT, JOB_ACTIVA
 
 typedef struct {
     uint8_t  kind;              /* job_kind_t */
-    uint32_t arg;               /* BEGIN: announced image size; WRITE, ZWRITE: bytes in s_buf; ABORT: the stream
-                                   generation it may free */
+    uint32_t arg;               /* BEGIN: announced image size; WRITE, ZWRITE: bytes in s_buf; ABORT: the coded
+                                   download generation it may free */
 } job_t;
 
 typedef struct {
@@ -103,6 +109,7 @@ static uint32_t s_unverify_gen;     /* bumped by every eng_unverify: a verify th
 static QueueHandle_t s_q;
 static uint8_t *s_buf;                      /* BLOCK_BUF bytes, internal RAM */
 static const esp_partition_t *s_target;     /* the inactive slot; NULL refuses every download */
+static const esp_partition_t *s_running;    /* the running slot: a delta download's base, only ever read */
 static udsota_image_ctx_t s_ctx;
 
 /* Worker only. */
@@ -387,15 +394,21 @@ static int job_write(uint32_t len)
 }
 
 #if CONFIG_UDSOTA_ESP32_COMPRESSION
-/* The compressed download. The diag task opens it at zbegin and closes it at zend, and the worker feeds it in
- * between and frees it at an abort. At zend the worker is idle (the server waits on every job). At zbegin it may
- * still run the abort of a finished image the same 34 released, whose stream zend already freed; s_z_gen keeps that
- * abort, or any older one, off the new stream. s_z_live and s_z_gen are read and written under s_mux. */
-static udsota_zstream_t s_zs;
+/* The coded download. The diag task opens it at zbegin and closes it at zend, and the worker feeds it in between
+ * and frees it at an abort. At zend the worker is idle (the server waits on every job). At zbegin it may still run
+ * the abort of a finished image the same 34 released, whose download zend already freed; s_z_gen keeps that abort,
+ * or any older one, off the new download. s_z_live and s_z_gen are read and written under s_mux. */
+static udsota_coded_t   s_cd;
 static udsota_tinfl_t   s_tinfl;
-static uint8_t         *s_zout;         /* BLOCK_BUF bytes, internal RAM: inflated bytes on their way to flash */
-static bool             s_z_live;       /* s_zs is open and its memory held */
+static uint8_t         *s_zout;         /* BLOCK_BUF bytes, internal RAM: image bytes on their way to flash */
+static bool             s_z_live;       /* s_cd is open and its memory held */
 static uint32_t         s_z_gen;        /* bumped by every zbegin, so an abort queued before it frees nothing new */
+#if CONFIG_UDSOTA_ESP32_DELTA
+static udsota_detools_t s_detools;
+static uint8_t         *s_pbuf;         /* PATCH_BUF bytes, internal RAM: DFI 0x30's inflated patch bytes */
+static uint8_t          s_base_hash[UDSOTA_PATCH_HASH_LEN];   /* worker only: the running image's appended SHA-256 */
+static bool             s_base_hash_ok; /* worker only: s_base_hash is computed; the running image never changes */
+#endif
 
 /* The inflater's state and dictionary: PSRAM first with UDSOTA_ESP32_INFLATE_PSRAM, else internal RAM. */
 static void *z_alloc(void *ctx, size_t n)
@@ -408,23 +421,27 @@ static void *z_alloc(void *ctx, size_t n)
 #endif
 }
 
-/* Frees what z_alloc gave. */
+/* Frees what z_alloc or internal_alloc gave. */
 static void z_free(void *ctx, void *p)
 {
     (void)ctx;
     heap_caps_free(p);
 }
 
-/* Closes the stream and frees the inflater and s_zout; the caller has cleared s_z_live. */
+/* Closes the download and frees its decoders and buffers; the caller has cleared s_z_live. */
 static void z_release(void)
 {
-    udsota_zstream_close(&s_zs);
+    udsota_coded_close(&s_cd);
     heap_caps_free(s_zout);
     s_zout = NULL;
+#if CONFIG_UDSOTA_ESP32_DELTA
+    heap_caps_free(s_pbuf);
+    s_pbuf = NULL;
+#endif
 }
 
-/* Worker, the stream's sink: the first-block check on the first inflated bytes, before any erase; a pass
- * stores the version. */
+/* Worker, the image's sink: the first-block check on the first image bytes, before any erase; a pass stores the
+ * version. */
 static int z_check(void *ctx, const uint8_t *first, size_t len, udsota_reason_t *why)
 {
     (void)ctx;
@@ -432,14 +449,14 @@ static int z_check(void *ctx, const uint8_t *first, size_t len, udsota_reason_t 
     return (*why == UDSOTA_DL_OK) ? 0 : 1;
 }
 
-/* Worker, the stream's sink: the erase, as JOB_BEGIN. */
+/* Worker, the image's sink: the erase, as JOB_BEGIN. */
 static int z_begin(void *ctx, uint32_t size)
 {
     (void)ctx;
     return (job_begin(size) == UDSOTA_DL_OK) ? 0 : 1;
 }
 
-/* Worker, the stream's sink: one buffer of inflated bytes; esp_ota_write is sequential, so off is not used. */
+/* Worker, the image's sink: one buffer of image bytes; esp_ota_write is sequential, so off is not used. */
 static int z_write(void *ctx, uint32_t off, const uint8_t *d, size_t n)
 {
     (void)ctx;
@@ -447,19 +464,67 @@ static int z_write(void *ctx, uint32_t off, const uint8_t *d, size_t n)
     return (ota_write(d, n) == UDSOTA_DL_OK) ? 0 : 1;
 }
 
-/* Worker: inflates the len compressed bytes waiting in s_buf into the check, the erase and the writes, then frees
- * s_buf. Returns the stream's reason. */
+#if CONFIG_UDSOTA_ESP32_DELTA
+/* The patch decoder's state: internal RAM, as it is small. */
+static void *internal_alloc(void *ctx, size_t n)
+{
+    (void)ctx;
+    return heap_caps_malloc(n, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+}
+
+/* Worker, the delta base: n bytes of the running partition at off, through esp_partition_read (which decrypts under
+ * flash encryption). detools seeks with no check, so a read that leaves the partition is refused here. */
+static int base_read(void *ctx, uint32_t off, uint8_t *buf, size_t n)
+{
+    (void)ctx;
+    if (s_running == NULL || (uint64_t)off + n > s_running->size) {
+        ESP_LOGW(TAG, "delta patch read %u B at %" PRIu32 ", outside the running partition", (unsigned)n, off);
+        return -1;
+    }
+    return esp_partition_read(s_running, off, buf, n) == ESP_OK ? 0 : -1;
+}
+
+/* Worker, the delta base's identity: the SHA-256 the running image appends, as esp_image_get_metadata reads it. The
+ * bootloader checked that hash when it booted the image, so it is not recomputed here (esp_partition_get_sha256
+ * would hash the whole image); a running image changed since would only rebuild an image FF01 then refuses. The
+ * first delta download reads it and later ones reuse it: the running image never changes. */
+static int base_hash(void *ctx, uint8_t out[UDSOTA_PATCH_HASH_LEN])
+{
+    (void)ctx;
+    if (!s_base_hash_ok && s_running != NULL) {
+        const esp_partition_pos_t pos = {.offset = s_running->address, .size = s_running->size};
+        esp_image_metadata_t md;
+        const esp_err_t err = esp_image_get_metadata(&pos, &md);
+        s_base_hash_ok = (err == ESP_OK && md.image.hash_appended == 1u);
+        if (s_base_hash_ok) {
+            memcpy(s_base_hash, md.image_digest, sizeof s_base_hash);
+        } else {
+            ESP_LOGE(TAG, "running image %s has no appended SHA-256 to match a patch against: %s", s_running->label,
+                     esp_err_to_name(err));
+        }
+    }
+    if (!s_base_hash_ok) {
+        return -1;
+    }
+    memcpy(out, s_base_hash, UDSOTA_PATCH_HASH_LEN);
+    return 0;
+}
+#endif
+
+/* Worker: decodes the len coded bytes waiting in s_buf into the check, the erase and the writes, then frees s_buf.
+ * Returns the download's reason. */
 static int job_zwrite(uint32_t len)
 {
 #if CONFIG_UDSOTA_ESP32_DEBUG_MEASURE
     const int64_t t0 = esp_timer_get_time();
-    const uint32_t before = s_zs.produced;
+    const uint32_t before = udsota_coded_written(&s_cd);
 #endif
-    const int r = udsota_zstream_feed(&s_zs, s_buf, len);
+    const int r = udsota_coded_feed(&s_cd, s_buf, len);
     buf_release();
 #if CONFIG_UDSOTA_ESP32_DEBUG_MEASURE
-    ESP_LOGI(TAG, "zwrite %" PRIu32 " B -> %" PRIu32 " B: %" PRId64 " us, reason %d, worker stack %u B unused", len,
-             s_zs.produced - before, esp_timer_get_time() - t0, r, (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    ESP_LOGI(TAG, "zwrite %" PRIu32 " B -> %" PRIu32 " image B: %" PRId64 " us, reason %d, worker stack %u B unused",
+             len, udsota_coded_written(&s_cd) - before, esp_timer_get_time() - t0, r,
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
 #endif
     return r;
 }
@@ -514,7 +579,7 @@ static int job_end(void)
 }
 
 /* Worker: 10 01 or S3 fallback mid-download. Closes an open handle and keeps the partial slot; a
- * verified slot is left alone, so a client can still activate it in a later session. Frees the compressed stream
+ * verified slot is left alone, so a client can still activate it in a later session. Frees the coded download
  * of generation gen, if it is still open. */
 static int job_abort(uint32_t gen)
 {
@@ -808,10 +873,17 @@ static int eng_write(void *ctx, uint32_t off, const uint8_t *d, size_t n)
 }
 
 #if CONFIG_UDSOTA_ESP32_COMPRESSION
-/* engine.zbegin, on the diag task: allocates s_zout (internal) and the inflater (z_alloc) and opens the stream, then
- * publishes it under a new generation. UDSOTA_DL_FLASH_ERROR without a worker or an inactive slot, UDSOTA_DL_NO_MEMORY when an
+/* True for a DFI whose download inflates: 0x10, and 0x30's outer layer. */
+static bool dfi_inflates(uint8_t dfi)
+{
+    return dfi == UDSOTA_DL_DFI_DEFLATE || dfi == UDSOTA_DL_DFI_DELTA_DEFLATE;
+}
+
+/* engine.zbegin, on the diag task: allocates s_zout (internal), the inflater (z_alloc) for 0x10 and 0x30, the patch
+ * decoder (internal) for 0x20 and 0x30 and s_pbuf (internal) for 0x30, and opens the download, then publishes it
+ * under a new generation. UDSOTA_DL_FLASH_ERROR without a worker or an inactive slot, UDSOTA_DL_NO_MEMORY when an
  * allocation fails. */
-static int eng_zbegin(void *ctx, uint32_t size)
+static int eng_zbegin(void *ctx, uint32_t size, uint8_t dfi)
 {
     (void)ctx;
     if (s_q == NULL || s_target == NULL) {
@@ -828,12 +900,29 @@ static int eng_zbegin(void *ctx, uint32_t size)
     s_zout = heap_caps_malloc(BLOCK_BUF, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     s_tinfl = (udsota_tinfl_t){.alloc = z_alloc, .free = z_free};
     const udsota_inflate_t inf = udsota_tinfl_inflate(&s_tinfl);
-    const udsota_zsink_t sink = {.check_first = z_check, .begin = z_begin, .write = z_write};
-    const udsota_reason_t r = (s_zout == NULL) ? UDSOTA_DL_NO_MEMORY
-                              : udsota_zstream_open(&s_zs, &inf, &sink, s_zout, BLOCK_BUF, size);
+    udsota_coded_cfg_t cfg = {
+        .sink = {.check_first = z_check, .begin = z_begin, .write = z_write},
+        .out = s_zout, .out_max = BLOCK_BUF, .inflate = &inf,
+    };
+    bool bufs = (s_zout != NULL);
+#if CONFIG_UDSOTA_ESP32_DELTA
+    s_detools = (udsota_detools_t){.alloc = internal_alloc, .free = z_free};
+    const udsota_patch_t patch = udsota_detools_patch(&s_detools);
+    static const udsota_pbase_t base = {.read = base_read, .hash = base_hash};
+    cfg.patch = &patch;
+    cfg.base = &base;
+    if (dfi == UDSOTA_DL_DFI_DELTA_DEFLATE) {
+        s_pbuf = heap_caps_malloc(PATCH_BUF, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        cfg.zbuf = s_pbuf;
+        cfg.zbuf_max = PATCH_BUF;
+        bufs = bufs && s_pbuf != NULL;
+    }
+#endif
+    const udsota_reason_t r = bufs ? udsota_coded_open(&s_cd, dfi, size, &cfg) : UDSOTA_DL_NO_MEMORY;
     if (r != UDSOTA_DL_OK) {
-        ESP_LOGW(TAG, "no memory for the inflater (%u B internal + %u B): 34 refused; internal heap largest block "
-                 "%u B", (unsigned)BLOCK_BUF, (unsigned)(udsota_tinfl_state_len() + UDSOTA_TINFL_DICT_LEN),
+        ESP_LOGW(TAG, "no memory for DFI 0x%02X's decoder (%u B internal + %u B): 34 refused; internal heap largest "
+                 "block %u B", dfi, (unsigned)BLOCK_BUF,
+                 (unsigned)(dfi_inflates(dfi) ? udsota_tinfl_state_len() + UDSOTA_TINFL_DICT_LEN : 0u),
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         z_release();
         udsota_esp32_zbegin_refused();
@@ -844,15 +933,23 @@ static int eng_zbegin(void *ctx, uint32_t size)
     s_z_live = true;
     taskEXIT_CRITICAL(&s_mux);
 #if CONFIG_UDSOTA_ESP32_DEBUG_MEASURE
-    ESP_LOGI(TAG, "inflater open for %" PRIu32 " B: %u B state + %u B dictionary (%s) + %u B buffer; internal heap "
-             "free %u B", size, (unsigned)udsota_tinfl_state_len(), (unsigned)UDSOTA_TINFL_DICT_LEN,
-             esp_ptr_external_ram(s_tinfl.dict) ? "PSRAM" : "internal", (unsigned)BLOCK_BUF,
+    ESP_LOGI(TAG, "DFI 0x%02X download open for %" PRIu32 " B: inflater %u B state + %u B dictionary (%s), %u B image "
+             "buffer; internal heap free %u B", dfi, size,
+             (unsigned)(dfi_inflates(dfi) ? udsota_tinfl_state_len() : 0u),
+             (unsigned)(dfi_inflates(dfi) ? UDSOTA_TINFL_DICT_LEN : 0u),
+             (dfi_inflates(dfi) && esp_ptr_external_ram(s_tinfl.dict)) ? "PSRAM" : "internal", (unsigned)BLOCK_BUF,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+#if CONFIG_UDSOTA_ESP32_DELTA
+    if (dfi != UDSOTA_DL_DFI_DEFLATE) {
+        ESP_LOGI(TAG, "patch decoder %u B, patch buffer %u B", (unsigned)udsota_detools_state_len(),
+                 (unsigned)(s_pbuf != NULL ? PATCH_BUF : 0u));
+    }
+#endif
 #endif
     return UDSOTA_DL_OK;
 }
 
-/* engine.zwrite: queue_block's JOB_ZWRITE; the worker inflates. */
+/* engine.zwrite: queue_block's JOB_ZWRITE; the worker decodes. */
 static int eng_zwrite(void *ctx, const uint8_t *d, size_t n)
 {
     (void)ctx;
@@ -860,14 +957,15 @@ static int eng_zwrite(void *ctx, const uint8_t *d, size_t n)
 }
 
 /* engine.zwritten, on the diag task once the worker has finished the block's job (engine.poll's lock orders the
- * two): the image bytes the stream has written. */
+ * two): the image bytes the download has written. */
 static uint32_t eng_zwritten(void *ctx)
 {
     (void)ctx;
-    return s_zs.written;
+    return udsota_coded_written(&s_cd);
 }
 
-/* engine.zend, on the diag task with the worker idle: the stream's 37 check, then its memory freed. */
+/* engine.zend, on the diag task with the worker idle: the download's 37 check, then its memory freed. A delta
+ * download's decoder may still hold the image's last bytes, which this writes. */
 static int eng_zend(void *ctx)
 {
     (void)ctx;
@@ -875,7 +973,7 @@ static int eng_zend(void *ctx)
     const bool live = s_z_live;
     s_z_live = false;
     taskEXIT_CRITICAL(&s_mux);
-    const int r = live ? (int)udsota_zstream_end(&s_zs) : (int)UDSOTA_DL_BAD_STREAM;
+    const int r = live ? (int)udsota_coded_end(&s_cd) : (int)UDSOTA_DL_BAD_STREAM;
     z_release();
     return r;
 }
@@ -907,8 +1005,8 @@ static int eng_confirm(void *ctx)
 #endif
 }
 
-/* engine.abort: queues the close of an open download, and the free of the compressed stream open now; never
- * blocks (a full queue drops it, and the next zbegin frees the stream). */
+/* engine.abort: queues the close of an open download, and the free of the coded download open now; never
+ * blocks (a full queue drops it, and the next zbegin frees the download). */
 static void eng_abort(void *ctx)
 {
     (void)ctx;
@@ -986,6 +1084,12 @@ static udsota_engine_t s_engine = {
     .ctx = NULL,
 #if CONFIG_UDSOTA_ESP32_COMPRESSION
     .zbegin = eng_zbegin, .zwrite = eng_zwrite, .zend = eng_zend, .zwritten = eng_zwritten,
+#if CONFIG_UDSOTA_ESP32_DELTA
+    .zformats = UDSOTA_DL_FMT(UDSOTA_DL_DFI_DEFLATE) | UDSOTA_DL_FMT(UDSOTA_DL_DFI_DELTA) |
+                UDSOTA_DL_FMT(UDSOTA_DL_DFI_DELTA_DEFLATE),
+#else
+    .zformats = UDSOTA_DL_FMT(UDSOTA_DL_DFI_DEFLATE),
+#endif
 #endif
 };
 
@@ -1004,6 +1108,7 @@ void udsota_esp32_engine_start(const udsota_config_t *cfg)
     }
     udsota_esp32_psa_lock_init();
     const esp_partition_t *run = esp_ota_get_running_partition();
+    s_running = run;
     s_target = esp_ota_get_next_update_partition(NULL);
     if (s_target == NULL || s_target == run) {
         ESP_LOGE(TAG, "no inactive OTA slot: every download will be refused");
