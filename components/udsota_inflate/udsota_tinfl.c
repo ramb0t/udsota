@@ -69,6 +69,9 @@ static int tf_init(void *ctx)
     }
     state_t *st = t->state;
     memset(st, 0, sizeof *st);
+    /* tinfl's wrapping dictionary lets a back-reference reach before the stream's first byte, which zlib refuses;
+     * cleared, it copies zeros rather than the heap's or the last stream's bytes. */
+    memset(t->dict, 0, TINFL_LZ_DICT_SIZE);
     tinfl_init(&st->r);
     st->status = TINFL_STATUS_NEEDS_MORE_INPUT;
     return 0;

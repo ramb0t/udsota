@@ -23,6 +23,8 @@ CONFIRM_TIMEOUT_S = 120.0   # a product's soak plus its health check, with margi
 DIFF_DFIS = {"auto": (DL_DFI_DELTA, DL_DFI_DELTA_DEFLATE), "heatshrink": (DL_DFI_DELTA,),
              "deflate": (DL_DFI_DELTA_DEFLATE,)}
 DELTA_NAMES = {DL_DFI_DELTA: "heatshrink patch", DL_DFI_DELTA_DEFLATE: "patch as raw DEFLATE"}
+DETOOLS_HINT = ('delta downloads need detools: pip install "./client[diff]" from the udsota repository (it builds '
+                "from source, so it needs a C and C++ compiler)")
 
 # The server-owned DIDs `info` reads first, with their labels and renderers.
 CORE_DIDS = ((DID_SESSION, "active session", lambda d: d.hex(" ")),
@@ -199,7 +201,9 @@ def send_payload(uds, image, payload, max_data, kind, drop_76=None, log=print, c
     except Nrc as e:
         if kind is None:
             raise
-        if kind == "delta" and (e.sid, e.code) == (0x36, NRC_OUT_OF_RANGE) and last_reason(uds) == "DL_BAD_BASE":
+        # 0x24: the server's 0x31 was lost and the resent block found the download it had already ended.
+        if (kind == "delta" and e.sid == 0x36 and e.code in (NRC_OUT_OF_RANGE, NRC_SEQUENCE)
+                and last_reason(uds) == "DL_BAD_BASE"):
             return False
         raise UpdateFailed("%s; %s" % (e, last_result(uds))) from e
     if kind is not None:
@@ -252,7 +256,12 @@ def plan_deltas(bases, image, running_sha, compress, diff_format, log=print, def
     full = len(image) if compress == "none" else len(deflate(image))
     out = []
     for dfi in dfis:
-        payload = build_delta(base, image, dfi)
+        try:
+            payload = build_delta(base, image, dfi)
+        except ImportError:
+            raise Refused(DETOOLS_HINT) from None
+        except Exception as e:                  # detools' own errors, which have no common base worth importing
+            raise UpdateFailed("building the DFI 0x%02X patch failed: %s" % (dfi, e)) from e
         if len(payload) < full:
             out.append((dfi, payload))
         else:
@@ -390,6 +399,8 @@ def read_status_precheck(uds):
 def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep=time.sleep,
           clock=time.monotonic, log=print, quiet=contextlib.nullcontext, compress=None, bases=None,
           diff_format="auto"):
+    if bases is not None and drop_76 is not None:
+        raise Refused("--drop-76 is for full and compressed downloads, not with --diff-from")
     deflate_ok = compress != "none"             # before the profile's default: see the comment above
     compress = profile.compression if compress is None else compress
     img = parse_image(profile, image)

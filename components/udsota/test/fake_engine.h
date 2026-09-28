@@ -71,8 +71,8 @@ bool fake_ota_slot_desc(const fake_ota_t *f, uint8_t slot, char version[33], uin
 bool fake_ota_slot_release(const fake_ota_t *f, uint8_t slot);
 /* Reads n bytes of slot at off (esp_partition_read): 0, or -1 when the read leaves the slot or fails. */
 int  fake_ota_slot_read(const fake_ota_t *f, uint8_t slot, uint32_t off, uint8_t *buf, size_t n);
-/* esp_partition_get_sha256 of an app slot: the SHA-256 its image appends, once fake_ota_verify_image passes on it.
- * False for a slot without a valid image. */
+/* The SHA-256 a slot's image appends, as the ESP32 port reads it with esp_image_get_metadata: walked to, not
+ * recomputed or checked (FF01 is the backstop). False for a slot whose header or segments do not walk. */
 bool fake_ota_slot_hash(const fake_ota_t *f, uint8_t slot, uint8_t out[32]);
 /* F1F0 from the fake's state. flags carries nothing. */
 void fake_ota_fill_status(const fake_ota_t *f, udsota_status_t *out);

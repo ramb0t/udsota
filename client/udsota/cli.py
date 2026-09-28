@@ -22,7 +22,7 @@ from .config import config_set, config_show, parse_writes, writable_keys
 from .image import parse_image
 from .keys import keygen, load_master, load_private_key
 from .transport import Transport
-from .update import confirm_cmd, flash, info, reset
+from .update import DETOOLS_HINT, confirm_cmd, flash, info, reset
 
 
 # Command-line arguments; every command but keygen needs --profile.
@@ -50,8 +50,8 @@ def parse_args(argv):
                    help="send the image uncompressed, whatever the profile says")
     f.add_argument("--diff-from", type=pathlib.Path, metavar="PATH",
                    help="offer a delta download from the image the server runs: PATH is that .bin, or a directory "
-                        "of .bin files to find it in (needs pip install udsota[diff])")
-    f.add_argument("--diff-format", choices=("auto", "heatshrink", "deflate"), default="auto",
+                        "of .bin files to find it in (needs detools: pip install \"./client[diff]\")")
+    f.add_argument("--diff-format", choices=("auto", "heatshrink", "deflate"),
                    help="with --diff-from, the delta modes to try: heatshrink (DFI 0x20), deflate (DFI 0x30) or "
                         "both (default auto)")
     sub.add_parser("confirm", help="ConfirmImage for a PENDING_VERIFY image")
@@ -89,9 +89,10 @@ def load_bases(path):
     try:
         import detools   # noqa: F401  (only checked here; delta.make_patch imports it)
     except ImportError:
-        raise Refused("--diff-from needs detools: pip install udsota[diff] (it builds from source, so it needs a C "
-                      "and C++ compiler)") from None
+        raise Refused(DETOOLS_HINT) from None
     files = sorted(f for f in path.glob("*.bin") if f.is_file()) if path.is_dir() else [path]
+    if not files:
+        raise Refused("--diff-from %s: the directory holds no .bin files" % path)
     try:
         return [(str(f), f.read_bytes()) for f in files]
     except OSError as e:
@@ -135,8 +136,10 @@ def main(argv=None, transport=Transport):
             parse_image(prof, image)
             if args.drop_76 is not None and args.drop_76 < 1:
                 raise Refused("--drop-76 takes a block number from 1")
+            if args.diff_format is not None and args.diff_from is None:
+                raise Refused("--diff-format needs --diff-from")
             if args.diff_from is not None:
-                if args.drop_76 is not None:
+                if args.drop_76 is not None:            # flash refuses it too; here before any key or bus
                     raise Refused("--drop-76 is for full and compressed downloads, not with --diff-from")
                 bases = load_bases(args.diff_from)
         if args.cmd == "config" and args.config_cmd == "set":
@@ -153,7 +156,7 @@ def main(argv=None, transport=Transport):
             if args.cmd == "flash":
                 return flash(uds, prof, image, secret, drop_76=args.drop_76, preroll=t.preroll,
                              quiet=getattr(t, "quiet", contextlib.nullcontext), compress=args.compress,
-                             bases=bases, diff_format=args.diff_format)
+                             bases=bases, diff_format=args.diff_format or "auto")
             if args.cmd == "confirm":
                 return confirm_cmd(uds)
             if args.cmd == "config":

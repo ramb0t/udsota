@@ -421,8 +421,8 @@ uint32_t fake_ota_resume_point(const fake_ota_t *f)
 }
 
 /* Where an image's appended SHA-256 starts: past the header, the segment walk and the checksum byte, which must
- * match. 0 for a malformed image, one without hash_appended or a wrong checksum. */
-static size_t hash_offset(const uint8_t *img, size_t len)
+ * match with check_sum. 0 for a malformed image, one without hash_appended or (with check_sum) a wrong checksum. */
+static size_t hash_offset(const uint8_t *img, size_t len, bool check_sum)
 {
     if (img == NULL || len < HDR_LEN + SEG_HDR_LEN || img[0] != 0xE9 || img[1] == 0 || img[1] > 16 ||
         img[23] != 1) {
@@ -445,7 +445,7 @@ static size_t hash_offset(const uint8_t *img, size_t len)
         off += dl;
     }
     size_t padded = (off + 1u + 15u) & ~(size_t)15u;    /* checksum byte ends a 16-byte block */
-    if (padded + HASH_LEN > len || img[padded - 1] != x) {
+    if (padded + HASH_LEN > len || (check_sum && img[padded - 1] != x)) {
         return 0;
     }
     return padded;
@@ -454,7 +454,7 @@ static size_t hash_offset(const uint8_t *img, size_t len)
 /* The fake's esp_ota_end check over a whole image; see fake_engine.h. */
 udsota_reason_t fake_ota_verify_image(const uint8_t *img, size_t len)
 {
-    const size_t padded = hash_offset(img, len);
+    const size_t padded = hash_offset(img, len, true);
     uint8_t d[HASH_LEN];
     if (padded == 0u || !sha256_host(img, padded, d)) {
         return UDSOTA_DL_VERIFY_FAILED;
@@ -471,17 +471,17 @@ int fake_ota_slot_read(const fake_ota_t *f, uint8_t slot, uint32_t off, uint8_t 
     return pread_all(f->fd[slot], buf, n, (off_t)off);
 }
 
-/* esp_partition_get_sha256 of a slot; see fake_engine.h. */
+/* A slot image's stored SHA-256, as esp_image_get_metadata reads it; see fake_engine.h. */
 bool fake_ota_slot_hash(const fake_ota_t *f, uint8_t slot, uint8_t out[32])
 {
     uint8_t *img = malloc(f->slot_size);
-    bool ok = img != NULL && fake_ota_slot_read(f, slot, 0, img, f->slot_size) == 0 &&
-              fake_ota_verify_image(img, f->slot_size) == UDSOTA_DL_OK;
-    if (ok) {
-        memcpy(out, &img[hash_offset(img, f->slot_size)], HASH_LEN);
+    const size_t at = (img != NULL && fake_ota_slot_read(f, slot, 0, img, f->slot_size) == 0)
+                          ? hash_offset(img, f->slot_size, false) : 0u;
+    if (at != 0u) {
+        memcpy(out, &img[at], HASH_LEN);
     }
     free(img);
-    return ok;
+    return at != 0u;
 }
 
 /* Builds a one-segment image that passes udsota_image_check and fake_ota_verify_image. */

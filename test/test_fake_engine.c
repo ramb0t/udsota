@@ -314,8 +314,8 @@ static void test_rollback_off_activate_is_permanent(void)
 }
 
 /* Runs every fake OTA test. */
-/* A slot's bytes read back as loaded, a read past the slot refused; the slot's hash is the image's appended
- * SHA-256, and a slot without a valid image has none (a delta download's base, as the demo server reads it). */
+/* A slot's bytes read back as loaded, a read past the slot refused; the slot's hash is the SHA-256 its image stores,
+ * not recomputed, and an erased slot has none (a delta download's base, as the demo server reads it). */
 static void test_slot_read_and_hash(void)
 {
     TEST_ASSERT_EQUAL_INT(0, fake_ota_load_slot(&f, 1, img, img_len));
@@ -328,9 +328,11 @@ static void test_slot_read_and_hash(void)
     uint8_t h[32];
     TEST_ASSERT_TRUE(fake_ota_slot_hash(&f, 1, h));
     TEST_ASSERT_EQUAL_MEMORY(&img[img_len - 32u], h, sizeof h);
-    img[img_len - 1u] ^= 0x01;                                  /* a hash that no longer matches */
+    img[img_len - 1u] ^= 0x01;                                  /* a stored hash that no longer matches */
     TEST_ASSERT_EQUAL_INT(0, fake_ota_load_slot(&f, 1, img, img_len));
-    TEST_ASSERT_FALSE(fake_ota_slot_hash(&f, 1, h));
+    TEST_ASSERT_TRUE(fake_ota_slot_hash(&f, 1, h));
+    TEST_ASSERT_EQUAL_MEMORY(&img[img_len - 32u], h, sizeof h);
+    TEST_ASSERT_FALSE(fake_ota_slot_hash(&f, 0, h));            /* slot 0 is erased */
 }
 
 int main(void)

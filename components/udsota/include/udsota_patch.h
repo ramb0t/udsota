@@ -42,7 +42,7 @@ typedef struct {
 
 /* The running image, as the stage needs it. Each returns 0 on success. */
 typedef struct {
-    int  (*read)(void *ctx, uint32_t off, uint8_t *buf, size_t n);   /* n bytes at off; refuse a read outside it */
+    int  (*read)(void *ctx, uint32_t off, uint8_t *buf, size_t n);   /* n bytes at off; refuse a read outside its slot */
     int  (*hash)(void *ctx, uint8_t out[UDSOTA_PATCH_HASH_LEN]);     /* its SHA-256, as the header names the base */
     void  *ctx;
 } udsota_pbase_t;
@@ -57,7 +57,6 @@ typedef struct {
     uint32_t         taken;        /* patch bytes taken so far, header included */
     bool             open;         /* patch.init succeeded and patch.finish has not run */
     bool             ended;        /* the decoder reported the end of the patch */
-    bool             trailing;     /* bytes arrived after the end */
     udsota_reason_t  failed;       /* the first failure (UDSOTA_DL_OK while none); every later push returns it */
 } udsota_pstream_t;
 
@@ -69,14 +68,15 @@ udsota_reason_t udsota_pstream_open(udsota_pstream_t *p, const udsota_patch_t *p
 /* Takes patch bytes, in order, in any split. Once the header is whole: a wrong magic is UDSOTA_DL_BAD_STREAM, and a
  * base hash other than base.hash's (or no hash) is UDSOTA_DL_BAD_BASE, both before any erase. Then the decoder
  * rebuilds the image into image: its reasons (the first-block check's, UDSOTA_DL_FLASH_ERROR), UDSOTA_DL_BAD_STREAM
- * for a corrupt patch, one for another size or one reading outside the base. At the patch's end the image gets
- * udsota_isink_finish. Bytes after the end are noted for udsota_pstream_end. */
+ * for a corrupt patch, one for another size, one reading outside the base, or any byte after the patch's end (at
+ * once, so a DEFLATE stream under DFI 0x30 stops being inflated). At the patch's end the image gets
+ * udsota_isink_finish. */
 udsota_reason_t udsota_pstream_push(udsota_pstream_t *p, const uint8_t *d, size_t n);
 /* A udsota_push_t push over udsota_pstream_push, for a udsota_zstream_t that inflates into the stage (DFI 0x30). */
 udsota_reason_t udsota_pstream_push_cb(void *p, const uint8_t *d, size_t n);
 /* The 37 check: tells the decoder the input has ended (a compressed patch's decoder may still hold the image's last
- * bytes), then UDSOTA_DL_OK when the patch ended with nothing after it and the image is complete (exactly memorySize
- * bytes, all written); else UDSOTA_DL_BAD_STREAM (or the earlier failure). Closes the stage either way. */
+ * bytes), then UDSOTA_DL_OK when the patch ended and the image is complete (exactly memorySize bytes, all written);
+ * else UDSOTA_DL_BAD_STREAM (or the earlier failure). Closes the stage either way. */
 udsota_reason_t udsota_pstream_end(udsota_pstream_t *p);
 /* Frees the decoder (patch.finish) if it is open; idempotent. */
 void udsota_pstream_close(udsota_pstream_t *p);

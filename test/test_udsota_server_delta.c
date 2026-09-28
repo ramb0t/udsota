@@ -37,6 +37,7 @@ typedef struct {
     unsigned         checks, begins, writes, zbegins, zwrites, zends, aborts, verifies;
     unsigned         allocs, frees;       /* live decoder memory = allocs - frees */
     bool             fail_alloc;          /* the decoders' next allocations fail */
+    unsigned         fail_nth;            /* 0, or the allocation (from 1) that fails */
     uint8_t          last_dfi;            /* the DFI zbegin got */
     uint32_t         next_off;            /* where the next write must land */
     bool             offsets_ok;          /* every write landed at next_off */
@@ -48,6 +49,7 @@ typedef struct {
     bool             zend_job;            /* zend answers UDSOTA_PENDING, as the ESP32 port's worker job does */
     int              job_result;          /* the pending zend's result */
     uint32_t         job_done_at;         /* when it is done */
+    uint32_t         job_ms;              /* how long a zend job runs: 100 ms unless a test sets it */
     bool             job_queued;
 } eng_t;
 
@@ -63,10 +65,10 @@ static udsota_mock_t g_mock;
 
 /* ---- the decoders' memory ---- */
 
-/* Counts an allocation; NULL while fail_alloc is set. */
+/* Counts an allocation; NULL while fail_alloc is set, and for the fail_nth-th. */
 static void *t_alloc(void *ctx, size_t n)
 {
-    if (e.fail_alloc) return NULL;
+    if (e.fail_alloc || (e.fail_nth != 0u && e.allocs + 1u == e.fail_nth)) return NULL;
     e.allocs++;
     return malloc(n);
 }
@@ -168,7 +170,7 @@ static int eng_zend(void *ctx)
     const int r = (int)udsota_coded_end(&e.cd);
     if (!e.zend_job) return r;
     e.job_result = r;
-    e.job_done_at = g_now + 100u;
+    e.job_done_at = g_now + (e.job_ms != 0u ? e.job_ms : 100u);
     e.job_queued = true;
     return UDSOTA_PENDING;
 }
@@ -573,26 +575,53 @@ static void test_truncated_patch_fails_at_37(void)
     TEST_ASSERT_EQUAL_UINT(e.allocs, e.frees);
 }
 
-/* Bytes after the patch's end fail the 37, in both inner forms: 7F 37 72, reason 13. */
-static void test_trailing_bytes_fail_at_37(void)
+/* Bytes after the patch's end fail the 36 that carries them, in every inner form: 7F 36 31, reason 13. */
+static void test_trailing_bytes_fail_their_36(void)
 {
     const struct { const uint8_t *p; size_t n; } forms[] = {{DELTA_P20, sizeof DELTA_P20},
-                                                            {DELTA_PNONE, sizeof DELTA_PNONE}};
-    for (size_t f = 0; f < 2u; f++) {
+                                                            {DELTA_PNONE, sizeof DELTA_PNONE},
+                                                            {DELTA_PTAIL, sizeof DELTA_PTAIL}};
+    for (size_t f = 0; f < 3u; f++) {
         setUp();
         set_payload(forms[f].p, forms[f].n);
         g_p[g_p_len++] = 0x00;
         enter_programming();
-        send_34(UDSOTA_DL_DFI_DELTA, IMG_LEN);
-        send_payload(BLOCK);
-        TEST_ASSERT_TRUE(e.cd.ps.trailing);                    /* seen at the 36, before the 37 */
-        send_37();
-        EXPECT(0x7F, 0x37, 0x72);
+        send_34(UDSOTA_DL_DFI_DELTA, (uint32_t)(f == 2u ? sizeof DELTA_TAIL : IMG_LEN));
+        uint8_t bsc = 1;
+        for (size_t off = 0; off < g_p_len; off += BLOCK, bsc++) {   /* the last 36 carries the extra byte */
+            send_36_data(bsc, &g_p[off], g_p_len - off < BLOCK ? g_p_len - off : BLOCK);
+            if (g_resp[0] != 0x76) break;
+        }
+        EXPECT(0x7F, 0x36, 0x31);
         expect_reason(UDSOTA_DL_BAD_STREAM);
+        TEST_ASSERT_EQUAL_UINT(e.allocs, e.frees);
     }
 }
 
-/* Bytes after the DEFLATE stream's end under 30 fail the 37 too. */
+/* Under 30, bytes inside the DEFLATE stream after the patch's end fail the 36 that inflates them, even a later one
+ * than the patch's end: the stream is not inflated on to the 37. */
+static void test_trailing_patch_bytes_under_30_fail_their_36(void)
+{
+    static uint8_t raw[sizeof DELTA_PNONE + 4096u], z[PATCH_CAP];
+    memcpy(raw, DELTA_PNONE, sizeof DELTA_PNONE);
+    memset(&raw[sizeof DELTA_PNONE], 0, 4096u);
+    const int flags = (int)tdefl_create_comp_flags_from_zip_params(9, -15, MZ_DEFAULT_STRATEGY);
+    const size_t zn = tdefl_compress_mem_to_mem(z, sizeof z, raw, sizeof raw, flags);
+    TEST_ASSERT_TRUE(zn > 8u);
+    enter_programming();
+    send_34(UDSOTA_DL_DFI_DELTA_DEFLATE, IMG_LEN);
+    size_t off = 0;
+    uint8_t bsc = 1;
+    for (; off < zn; off += 4u, bsc++) {                         /* 4-byte 36s until one is refused */
+        send_36_data(bsc, &z[off], zn - off < 4u ? zn - off : 4u);
+        if (g_resp[0] != 0x76) break;
+    }
+    EXPECT(0x7F, 0x36, 0x31);
+    expect_reason(UDSOTA_DL_BAD_STREAM);
+    TEST_ASSERT_TRUE(off < zn);
+}
+
+/* Bytes after the DEFLATE stream's end under 30 fail the 37, as under 10. */
 static void test_trailing_bytes_after_the_stream_under_30(void)
 {
     set_payload(DELTA_P30, sizeof DELTA_P30);
@@ -630,6 +659,16 @@ static void test_unserved_formats_answer_31_without_side_effects(void)
     TEST_ASSERT_EQUAL_UINT(0u, e.zbegins);
     TEST_ASSERT_EQUAL_UINT(aborts, e.aborts);
     expect_reason(UDSOTA_DL_NOT_NEWER);
+    udsota_engine_t all = ENGINE;                              /* a mask naming every nibble: 40 is still no coded DFI */
+    all.zformats = 0xFFFFu;
+    srv.engine = all;
+    const uint8_t unknown[] = {0x40, 0x11, 0x01, 0xF0};
+    for (size_t i = 0; i < sizeof unknown; i++) {
+        send_34(unknown[i], IMG_LEN);
+        EXPECT(0x7F, 0x34, 0x31);
+    }
+    TEST_ASSERT_EQUAL_UINT(0u, e.zbegins);
+    srv.engine = only10;
     srv.last_dl.reason_code = UDSOTA_DL_OK;
     send_routine(UDSOTA_RID_CHECK_PROG_DEPS);                  /* the unverified image is still there */
     EXPECT(0x71, 0x01, 0xFF, 0x01, UDSOTA_DL_OK);
@@ -659,6 +698,28 @@ static void test_no_memory_for_the_decoder(void)
     EXPECT(0x7F, 0x34, 0x22);
     expect_reason(UDSOTA_DL_NO_MEMORY);
     TEST_ASSERT_EQUAL_UINT(e.allocs, e.frees);
+}
+
+/* Under 30, a failure at each allocation of the 34 (the patch decoder, then the inflater's state and dictionary)
+ * answers 7F 34 22 with reason 14 and frees everything allocated before it. */
+static void test_no_memory_at_each_allocation_under_30(void)
+{
+    for (unsigned nth = 1u; nth <= 3u; nth++) {
+        setUp();
+        e.fail_nth = nth;
+        enter_programming();
+        send_34(UDSOTA_DL_DFI_DELTA_DEFLATE, IMG_LEN);
+        EXPECT(0x7F, 0x34, 0x22);
+        expect_reason(UDSOTA_DL_NO_MEMORY);
+        TEST_ASSERT_EQUAL_UINT(nth - 1u, e.allocs);
+        TEST_ASSERT_EQUAL_UINT(e.allocs, e.frees);
+    }
+    setUp();
+    e.fail_nth = 4u;                                           /* all three succeed */
+    enter_programming();
+    send_34(UDSOTA_DL_DFI_DELTA_DEFLATE, IMG_LEN);
+    EXPECT(0x74, 0x20, 0x0F, 0xFF);
+    TEST_ASSERT_EQUAL_UINT(3u, e.allocs);
 }
 
 /* An abort mid-patch (10 01) frees the decoders. */
@@ -730,6 +791,69 @@ static void test_37_as_a_worker_job(void)
     EXPECT(0x7F, 0x37, 0x72);
     expect_reason(UDSOTA_DL_BAD_STREAM);
     TEST_ASSERT_EQUAL_UINT(e.allocs, e.frees);
+}
+
+/* While the 37's job runs, every request but 3E answers 0x21 and changes nothing (a 36, a 34, a repeated 37, a 10
+ * xx), and the 37 then answers 77. */
+static void test_requests_during_the_37_job(void)
+{
+    e.zend_job = true;
+    e.job_ms = 500u;
+    enter_programming();
+    send_34(UDSOTA_DL_DFI_DELTA, IMG_LEN);
+    const uint8_t bsc = send_payload(BLOCK);
+    TEST_ASSERT_EQUAL_UINT(0u, send_37());
+    g_now += 20u;
+    send_36_data(bsc, g_p, 1);
+    EXPECT(0x7F, 0x36, 0x21);
+    send_34(UDSOTA_DL_DFI, IMG_LEN);
+    EXPECT(0x7F, 0x34, 0x21);
+    send_37();
+    EXPECT(0x7F, 0x37, 0x21);
+    const uint8_t dflt[] = {UDSOTA_SID_SESSION, UDSOTA_SESSION_DEFAULT};
+    send(dflt, sizeof dflt);
+    EXPECT(0x7F, 0x10, 0x21);
+    const uint8_t tp[] = {0x3E, 0x00};
+    send(tp, sizeof tp);
+    EXPECT(0x7E, 0x00);
+    unsigned pending = 0;
+    finish_job(&pending);
+    EXPECT(0x77);
+    TEST_ASSERT_EQUAL_UINT(1u, e.zends);
+    send_routine(UDSOTA_RID_CHECK_PROG_DEPS);
+    EXPECT(0x71, 0x01, 0xFF, 0x01, UDSOTA_DL_OK);
+}
+
+/* A 37 job that passes the 90 s cap answers 7F 37 72, the session ends and F1F1 reads reason 10; a session change
+ * latched meanwhile (udsota_end_session) is applied once a finished 37 has answered. */
+static void test_37_job_cap_and_a_latched_end(void)
+{
+    e.zend_job = true;
+    e.job_ms = UDSOTA_JOB_CAP_MS + 60000u;
+    enter_programming();
+    send_34(UDSOTA_DL_DFI_DELTA, IMG_LEN);
+    send_payload(BLOCK);
+    TEST_ASSERT_EQUAL_UINT(0u, send_37());
+    unsigned pending = 0;
+    finish_job(&pending);
+    EXPECT(0x7F, 0x37, 0x72);
+    expect_reason(UDSOTA_DL_WORKER_TIMEOUT);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_DEFAULT, srv.session);
+
+    setUp();
+    e.zend_job = true;
+    enter_programming();
+    send_34(UDSOTA_DL_DFI_DELTA, IMG_LEN);
+    send_payload(BLOCK);
+    TEST_ASSERT_EQUAL_UINT(0u, send_37());
+    udsota_end_session(&srv, g_now + 10u);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_PROGRAMMING, srv.session);   /* latched while the job runs */
+    pending = 0;
+    finish_job(&pending);
+    EXPECT(0x77);
+    g_now += 10u;
+    (void)udsota_poll(&srv, g_resp, sizeof g_resp, g_now);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_DEFAULT, srv.session);
 }
 
 /* A heatshrink patch whose decoder still holds the image's last bytes when the input ends (DELTA_PTAIL, rebuilding
@@ -844,15 +968,19 @@ int main(void)
     RUN_TEST(test_corrupt_stream_under_30);
     RUN_TEST(test_base_read_outside_the_running_image);
     RUN_TEST(test_truncated_patch_fails_at_37);
-    RUN_TEST(test_trailing_bytes_fail_at_37);
+    RUN_TEST(test_trailing_bytes_fail_their_36);
+    RUN_TEST(test_trailing_patch_bytes_under_30_fail_their_36);
     RUN_TEST(test_trailing_bytes_after_the_stream_under_30);
     RUN_TEST(test_unserved_formats_answer_31_without_side_effects);
     RUN_TEST(test_zformats_zero_serves_nothing);
     RUN_TEST(test_no_memory_for_the_decoder);
+    RUN_TEST(test_no_memory_at_each_allocation_under_30);
     RUN_TEST(test_abort_mid_patch_frees_the_decoders);
     RUN_TEST(test_progress_counts_image_bytes);
     RUN_TEST(test_37_as_a_worker_job);
     RUN_TEST(test_37_writes_the_last_image_bytes);
+    RUN_TEST(test_requests_during_the_37_job);
+    RUN_TEST(test_37_job_cap_and_a_latched_end);
     RUN_TEST(test_decoder_heap_cost);
     RUN_TEST(test_isink_holds_checks_batches_and_bounds);
     return UNITY_END();

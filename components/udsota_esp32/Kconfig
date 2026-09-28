@@ -45,7 +45,8 @@ menu "udsota ESP32 port"
             other slot, and the rebuilt image gets the same first-block check before any erase and the same
             FF01 verify as a full one. A patch made from any other image is refused before any erase with
             reason 15, and the client falls back to a full download. A patch names its base by the
-            SHA-256 the running image appends, which the bootloader checked at boot. Each 0x20 download
+            SHA-256 the running image stores, which FF01 backs up: a base that differs from it only
+            rebuilds an image FF01 refuses. Each 0x20 download
             allocates about 5 KB of internal RAM at its 34 (the 4 KB image buffer and the decoder's
             state), and a 0x30 one also the inflater and a 1 KB buffer; all of it is freed at the 37 or
             abort. Delta downloads cannot resume. Off, no detools code is linked and a 34 with DFI 0x20
@@ -57,7 +58,9 @@ menu "udsota ESP32 port"
         default y
         help
             Allocate the inflater's 43 KB in PSRAM, falling back to internal RAM, so only the 4 KB
-            buffer the worker writes flash from comes from internal RAM. Off, all of it is internal.
+            buffer the worker writes flash from comes from internal RAM, and for a delta download (DFI
+            0x30) also its 1 KB patch buffer and the patch decoder's state, under 1 KB. Off, all of it
+            is internal.
             Not offered for an ESP32 below revision 3: its PSRAM cache bug can lose a write when an
             interrupt lands, and the ROM's tinfl, which writes the dictionary, is not built with
             the compiler's workaround (ESP-IDF keeps ROM newlib off PSRAM there for the same reason).

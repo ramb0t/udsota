@@ -992,6 +992,33 @@ static void test_zstream_refuses_a_stuck_decompressor(void)
     udsota_zstream_close(&z);
 }
 
+/* Fills an allocation with 0xAA, as a reused heap block might hold. */
+static void *t_alloc_dirty(void *ctx, size_t n)
+{
+    void *p = t_alloc(ctx, n);
+    if (p != NULL) memset(p, 0xAA, n);
+    return p;
+}
+
+/* A back-reference before the stream's first byte (fixed block: length 3 at distance 1, then end), which zlib refuses
+ * as too far back, copies zeros from the cleared dictionary, never the heap's old bytes. */
+static void test_reference_before_the_start_reads_zeros(void)
+{
+    static const uint8_t z[] = {0x03, 0x02, 0x00};
+    e.tinfl.alloc = t_alloc_dirty;
+    const udsota_inflate_t inf = udsota_tinfl_inflate(&e.tinfl);
+    TEST_ASSERT_EQUAL_INT(0, inf.init(inf.ctx));
+    uint8_t out[8];
+    memset(out, 0x55, sizeof out);
+    size_t used = 0, made = 0;
+    const int rc = inf.feed(inf.ctx, z, sizeof z, out, sizeof out, &used, &made);
+    inf.finish(inf.ctx);
+    TEST_ASSERT_EQUAL_INT(UDSOTA_INFLATE_END, rc);
+    TEST_ASSERT_EQUAL_size_t(3u, made);
+    const uint8_t zeros[3] = {0};
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(zeros, out, 3);
+}
+
 /* The inflater's heap per stream: the state (8 to 11 KB by build; 11,008 B in the ESP32 ROM's layout) plus the 32 KB
  * dictionary. Printed for the port's docs. */
 static void test_inflater_heap_cost(void)
@@ -1033,6 +1060,7 @@ int main(void)
     RUN_TEST(test_zstream_refuses_over_reported_output);
     RUN_TEST(test_zstream_refuses_over_reported_input);
     RUN_TEST(test_zstream_refuses_a_stuck_decompressor);
+    RUN_TEST(test_reference_before_the_start_reads_zeros);
     RUN_TEST(test_inflater_heap_cost);
     return UNITY_END();
 }
