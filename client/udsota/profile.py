@@ -1,5 +1,5 @@
 """Client profiles: everything product-specific (CAN IDs, deny list, key derivation, image identity,
-busy detector, pre-roll, extra DIDs), read from a TOML file."""
+busy detector, pre-roll, extra DIDs, writable config DIDs and their commit), read from a TOML file."""
 import pathlib
 import re
 import tomllib
@@ -8,7 +8,9 @@ from dataclasses import dataclass
 from .errors import Refused
 
 PROFILE_DIR = pathlib.Path(__file__).resolve().parent / "profiles"
-DECODERS = ("hex", "ascii", "version3")
+DECODERS = ("hex", "ascii", "version3", "u8", "u16")
+TYPES = {"u8": 0xFF, "u16": 0xFFFF, "blob": None}   # a typed DID's value type and its largest value (blob: bytes)
+KEY_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")    # a writable DID's name, as `config set NAME=VALUE` takes it
 SLOT_SIZE_DEFAULT = 0x400000   # UDSOTA_SLOT_SIZE_DEFAULT
 KEYS = {"can": {"interface", "req_id", "resp_id", "deny_tx"},
         "security": {"mode", "label", "master_file", "private_key_file", "device_id_did", "level_extended",
@@ -18,7 +20,10 @@ KEYS = {"can": {"interface", "req_id", "resp_id", "deny_tx"},
         "busy": {"id", "byte", "values"},
         "preroll": {"tester_present_frames"},
         "functional": {"id", "quiet_bus"},
-        "dids": None}
+        "dids": None,
+        "config": {"commit_rid", "status_did", "hash"}}
+DID_KEYS = {"name", "decode", "type", "writable", "min", "max"}
+HASH_KEYS = {"did", "first", "last", "schema"}
 
 
 SECURITY_MODES = {"hmac": ("label", "master_file"), "ecdsa": ("private_key_file",)}   # mode: its required keys
@@ -46,13 +51,36 @@ class BusyDetector:
     values: tuple
 
 
-# One [dids] entry: DIDs first..last (equal for a single DID), shown as name and decoded with decode.
+# One [dids] entry: DIDs first..last (equal for a single DID), shown as name and decoded with decode. A writable
+# entry is one DID config set can write: type u8, u16 or blob, and for u8 and u16 the write range min..max.
 @dataclass(frozen=True)
 class DidEntry:
     first: int
     last: int
     name: str
     decode: str
+    type: str | None = None
+    writable: bool = False
+    min: int | None = None
+    max: int | None = None
+
+
+# [config] hash: SHA-256 of schema || (did BE16, len, value)* over every DID in first..last the device answers,
+# ascending, compared with DID did's record.
+@dataclass(frozen=True)
+class HashSpec:
+    did: int
+    first: int
+    last: int
+    schema: int
+
+
+# [config]: the routine that commits staged writes, an optional status DID and an optional hash check.
+@dataclass(frozen=True)
+class ConfigSpec:
+    commit_rid: int
+    status_did: int | None
+    hash: HashSpec | None
 
 
 # A loaded profile. None or empty means the feature is off; interface None means --interface must name one.
@@ -75,6 +103,7 @@ class Profile:
     dids: tuple
     func_id: int | None = None      # [functional] id: the only other ID the tool may transmit on
     quiet_bus: bool = False         # [functional] quiet_bus: silence the bus's other nodes while flashing
+    config: ConfigSpec | None = None   # [config]: config set's commit routine, status DID and hash check
 
 
 # Raise Refused naming the profile and the problem.
@@ -140,6 +169,59 @@ def _did_range(name, key):
     return first, last
 
 
+# One [dids] entry from its key and table: name and decode, and for a typed entry its type, writable flag and
+# write range (u8 and u16 only; min and max stay None when absent, meaning the type's bounds). A writable entry is
+# one DID with a type and a plain name. Entries may overlap (a range plus keys inside it).
+def _did_entry(name, key, entry):
+    first, last = _did_range(name, key)
+    if not isinstance(entry, dict) or set(entry) - DID_KEYS:
+        _bad(name, "[dids] %s must be { name = \"...\", decode = \"hex\" }" % key)
+    decode = _str(name, entry, "decode", required=True)
+    if decode not in DECODERS:
+        _bad(name, "[dids] %s decode must be one of %s" % (key, ", ".join(DECODERS)))
+    label = _str(name, entry, "name", required=True)
+    vtype = _str(name, entry, "type")
+    if vtype is not None and vtype not in TYPES:
+        _bad(name, "[dids] %s type must be one of %s" % (key, ", ".join(TYPES)))
+    writable = entry.get("writable", False)
+    if not isinstance(writable, bool):
+        _bad(name, "[dids] %s writable must be true or false" % key)
+    if writable and first != last:
+        _bad(name, "[dids] %s is a range: a writable entry is one DID" % key)
+    if writable and vtype is None:
+        _bad(name, "[dids] %s is writable and needs a type (u8, u16 or blob)" % key)
+    if writable and KEY_NAME.fullmatch(label) is None:
+        _bad(name, "[dids] %s name %r: a writable key's name is letters, digits and _" % (key, label))
+    top, lo, hi = TYPES.get(vtype), None, None
+    if top is None and ("min" in entry or "max" in entry):
+        _bad(name, "[dids] %s min and max need type u8 or u16" % key)
+    if top is not None:
+        lo, hi = _int(name, entry, "min", 0, top), _int(name, entry, "max", 0, top)
+        lo_eff, hi_eff = (0 if lo is None else lo), (top if hi is None else hi)
+        if lo_eff > hi_eff:
+            _bad(name, "[dids] %s min %d is above max %d" % (key, lo_eff, hi_eff))
+    return DidEntry(first, last, label, decode, vtype, writable, lo, hi)
+
+
+# [config] as a ConfigSpec (None when absent): commit_rid, the optional status_did and hash = { did, first, last,
+# schema }, all four required in the hash.
+def _config(name, t):
+    if t is None:
+        return None
+    spec, h = None, t.get("hash")
+    if h is not None:
+        if not isinstance(h, dict) or set(h) - HASH_KEYS:
+            _bad(name, "[config] hash must be { did = 0x..., first = 0x..., last = 0x..., schema = 1 }")
+        spec = HashSpec(_int(name, h, "did", 0, 0xFFFF, required=True),
+                        _int(name, h, "first", 0, 0xFFFF, required=True),
+                        _int(name, h, "last", 0, 0xFFFF, required=True),
+                        _int(name, h, "schema", 0, 0xFF, required=True))
+        if spec.first > spec.last:
+            _bad(name, "[config] hash first 0x%04X is above last 0x%04X" % (spec.first, spec.last))
+    return ConfigSpec(_int(name, t, "commit_rid", 0, 0xFFFF, required=True), _int(name, t, "status_did", 0, 0xFFFF),
+                      spec)
+
+
 # Build a Profile from parsed TOML; every problem raises Refused (exit 2, nothing sent).
 def from_dict(name, d):
     for table, value in d.items():
@@ -190,15 +272,11 @@ def from_dict(name, d):
     if busy_t is not None:
         busy = BusyDetector(_int(name, busy_t, "id", 0, 0x7FF, required=True),
                             _int(name, busy_t, "byte", 0, 7, required=True), _ints(name, busy_t, "values", 0, 0xFF))
-    dids = []
-    for key, entry in d.get("dids", {}).items():
-        first, last = _did_range(name, key)
-        if not isinstance(entry, dict) or set(entry) - {"name", "decode"}:
-            _bad(name, "[dids] %s must be { name = \"...\", decode = \"hex\" }" % key)
-        decode = _str(name, entry, "decode", required=True)
-        if decode not in DECODERS:
-            _bad(name, "[dids] %s decode must be one of %s" % (key, ", ".join(DECODERS)))
-        dids.append(DidEntry(first, last, _str(name, entry, "name", required=True), decode))
+    dids = tuple(_did_entry(name, key, entry) for key, entry in d.get("dids", {}).items())
+    names = [e.name for e in dids if e.writable]
+    for n in names:
+        if names.count(n) > 1:
+            _bad(name, "[dids] two writable keys are named %s" % n)
     return Profile(name=name, interface=_str(name, can_t, "interface"), req_id=req_id, resp_id=resp_id,
                    deny_tx=deny_tx, product=_str(name, img_t, "product"), hw_ids=_ints(name, img_t, "hw_ids", 0, 0xFF),
                    layout_id=_int(name, img_t, "layout_id", 0, 0xFF),
@@ -207,8 +285,9 @@ def from_dict(name, d):
                    board_did=None if board_t is None else _int(name, board_t, "did", 0, 0xFFFF, required=True),
                    board_names=board_names, busy=busy,
                    preroll_frames=_int(name, d.get("preroll", {}), "tester_present_frames", 0, 64, default=0),
-                   dids=tuple(dids), func_id=func_id,
-                   quiet_bus=func_t is not None and _bool(name, func_t, "quiet_bus", False))
+                   dids=dids, func_id=func_id,
+                   quiet_bus=func_t is not None and _bool(name, func_t, "quiet_bus", False),
+                   config=_config(name, d.get("config")))
 
 
 # Load a profile by name (a file in udsota/profiles) or by path (anything with a / or ending .toml).

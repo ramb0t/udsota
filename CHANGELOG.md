@@ -8,6 +8,8 @@ Apps can serve their own writes and routines. WriteDataByIdentifier (0x2E) goes 
 
 Additive: `udsota_hooks_t` gains `did_write`, `routine` and `routine_poll` after `ctx`. With them NULL every answer is byte for byte as in 0.2.0, so 2E answers 0x11 and an unknown RID 0x31.
 
+The client gains `config show` and `config set NAME=VALUE ... [--commit] [--reset]`. A `[dids]` entry can be a typed, writable key (`type`, `writable`, `min`, `max`), and `u8` and `u16` decode as decimal. A `[config]` table names the commit routine, a status DID and an optional config-hash check. A 0.1.0 client refuses a profile that uses them.
+
 ## [0.2.0] - unreleased
 
 The ESP32 port now derives the 0x27 keys from `cfg.device_id` when it is set (1 to 16 bytes), otherwise from the base MAC, so an app with its own device ID can unlock. Before, it always hashed the base MAC while F18C served the app's ID, and every key was refused (0x35, then 0x36 and 0x37). With `cfg.device_id` NULL, F18C and the keys are unchanged.

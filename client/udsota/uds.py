@@ -93,6 +93,12 @@ class Uds:
             raise UpdateFailed("DID echo %s does not match 0x%04X" % (d[:2].hex(), did))
         return d[2:]
 
+    # WriteDataByIdentifier: data to one DID; checks the DID echo.
+    def write_did(self, did, data):
+        d = self.request(services.WriteDataByIdentifier, data=did.to_bytes(2, "big") + bytes(data))
+        if d[:2] != did.to_bytes(2, "big"):
+            raise UpdateFailed("write echo %s does not match 0x%04X" % (d[:2].hex(), did))
+
     # RoutineControl startRoutine; returns the status record after the RID echo.
     def routine(self, rid, data=b""):
         d = self.request(services.RoutineControl, 0x01, rid.to_bytes(2, "big") + bytes(data))

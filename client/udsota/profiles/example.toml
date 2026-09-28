@@ -50,8 +50,19 @@ names = { 1 = "devkit" }              # board name for each hw_id; flash refuses
 # id = 0x7DF                          # the functional request ID
 # quiet_bus = false
 
-# [dids] lists extra DIDs `info` reads after the server's own, decoded as hex, ascii or version3.
-# A range stops at its first absent DID.
+# [dids] lists extra DIDs `info` reads after the server's own, decoded as hex, ascii, version3, u8 or u16 (u8
+# and u16 print as decimal). A range stops at its first absent DID. An entry with writable = true is a key
+# `config set` can write: one DID with a type (u8, u16 or blob) and, for u8 and u16, a write range min..max
+# (default the whole type). Its name is letters, digits and _, and is what `config set NAME=VALUE` takes.
 [dids]
 "0xF191" = { name = "board", decode = "ascii" }       # the board name, shown by info
 # "0x0200-0x02FF" = { name = "calibration", decode = "hex" }   # a range: read until the first absent DID
+# "0x0200" = { name = "mode", decode = "u8", type = "u8", writable = true, max = 2 }
+# "0x0201" = { name = "timeout_ms", decode = "u16", type = "u16", writable = true, min = 1000, max = 5000 }
+
+# [config] turns on `config set --commit`: the routine that stores the staged values and, optionally, a status
+# DID and a hash of the config DIDs that `config set --reset` checks after the restart.
+# [config]
+# commit_rid = 0x1234                 # RoutineControl RID that commits the staged values; status 00 = stored
+# status_did = 0xF1B2                 # a DID reporting the device's config state, printed as hex
+# hash = { did = 0xF1B0, first = 0x0200, last = 0x02FF, schema = 1 }   # SHA-256 check, see the client README

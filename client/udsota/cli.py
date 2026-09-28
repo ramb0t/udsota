@@ -1,8 +1,9 @@
 """udsota: firmware update client for a udsota server, UDS over ISO-TP (Linux: SocketCAN, kernel ISO-TP).
 
 Commands: info (identity, update state, the profile's DIDs), flash FILE (precheck to ConfirmImage),
-confirm (ConfirmImage after an update), reset (11 01, keyed when the profile has [security]) and keygen
-(a key pair for the ecdsa mode; it needs no profile and no bus).
+confirm (ConfirmImage after an update), reset (11 01, keyed when the profile has [security]), config show /
+config set NAME=VALUE... (the profile's writable DIDs: stage with 0x2E, --commit, --reset to apply and check)
+and keygen (a key pair for the ecdsa mode; it needs no profile and no bus).
 The profile (--profile NAME or a .toml path) holds everything product-specific. Every frame goes out on
 the profile's req_id only, never on a deny_tx ID. Before sending, the tool listens LISTEN_S seconds and
 stops on the profile's busy value or on any resp_id frame, then pre-rolls a quiet bus if the profile asks.
@@ -17,6 +18,7 @@ import can
 
 from .profile import load as load_profile
 from .errors import Refused, ToolError
+from .config import config_set, config_show, parse_writes, writable_keys
 from .image import parse_image
 from .keys import keygen, load_master, load_private_key
 from .transport import Transport
@@ -40,6 +42,14 @@ def parse_args(argv):
                    help="fault test: resend block N as if its 76 response were lost")
     sub.add_parser("confirm", help="ConfirmImage for a PENDING_VERIFY image")
     sub.add_parser("reset", help="ECUReset (rolls back an unconfirmed image)")
+    c = sub.add_parser("config", help="show or set the profile's writable DIDs")
+    csub = c.add_subparsers(dest="config_cmd", required=True)
+    csub.add_parser("show", help="each writable DID's value, the config status and the hash check")
+    s = csub.add_parser("set", help="stage NAME=VALUE for writable DIDs (0x2E); --commit stores, --reset applies")
+    s.add_argument("assignments", nargs="+", metavar="NAME=VALUE")
+    s.add_argument("--commit", action="store_true", help="run the profile's commit routine after staging")
+    s.add_argument("--reset", action="store_true",
+                   help="with --commit: keyed 11 01, then read every key back and check the config hash")
     k = sub.add_parser("keygen", help="write a new ecdsa-mode key pair: udsota_private.pem and udsota_pubkey.h")
     k.add_argument("--out", type=pathlib.Path, required=True, metavar="DIR", help="directory to write them in")
     args = p.parse_args(argv)
@@ -48,7 +58,7 @@ def parse_args(argv):
     return args
 
 
-# The profile's 0x27 secret for flash and reset: the master key (mode hmac) or the private key (mode ecdsa).
+# The profile's 0x27 secret for flash, reset and config set: the master key (mode hmac) or the private key (mode ecdsa).
 def load_secret(prof, args):
     if prof.security.mode == "ecdsa":
         if args.master:
@@ -87,7 +97,7 @@ def main(argv=None, transport=Transport):
         interface = args.interface or prof.interface
         if interface is None:
             raise Refused("profile %s names no CAN interface: pass --interface" % prof.name)
-        image = secret = None
+        image = secret = writes = None
         if args.cmd == "flash":
             try:
                 image = args.file.read_bytes()
@@ -96,7 +106,11 @@ def main(argv=None, transport=Transport):
             parse_image(prof, image)
             if args.drop_76 is not None and args.drop_76 < 1:
                 raise Refused("--drop-76 takes a block number from 1")
-        if args.cmd in ("flash", "reset") and prof.security is not None:
+        if args.cmd == "config" and args.config_cmd == "set":
+            writes = parse_writes(prof, args.assignments, args.commit, args.reset)
+        elif args.cmd == "config":
+            writable_keys(prof)
+        if (args.cmd in ("flash", "reset") or writes is not None) and prof.security is not None:
             secret = load_secret(prof, args)
         with transport(prof, interface) as t:
             t.preflight()
@@ -108,6 +122,11 @@ def main(argv=None, transport=Transport):
                              quiet=getattr(t, "quiet", contextlib.nullcontext))
             if args.cmd == "confirm":
                 return confirm_cmd(uds)
+            if args.cmd == "config":
+                if writes is None:
+                    return config_show(uds, prof)
+                return config_set(uds, prof, writes, secret, commit=args.commit, reset=args.reset,
+                                  preroll=t.preroll)
             return reset(uds, prof, secret)
     except ToolError as e:
         print("udsota: %s" % e, file=sys.stderr)

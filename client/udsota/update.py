@@ -28,7 +28,9 @@ CORE_DIDS = ((DID_SESSION, "active session", lambda d: d.hex(" ")),
              (DID_COUNTERS, "ISO-TP/UDS counters",
               lambda d: " ".join("%s=%d" % kv for kv in decode_counters(d).items())))
 DECODE = {"hex": lambda d: d.hex(" "), "ascii": cstr,
-          "version3": lambda d: "%d.%d.%d" % tuple(d) if len(d) == 3 else d.hex(" ")}
+          "version3": lambda d: "%d.%d.%d" % tuple(d) if len(d) == 3 else d.hex(" "),
+          "u8": lambda d: "%d" % d[0] if len(d) == 1 else d.hex(" "),
+          "u16": lambda d: "%d" % int.from_bytes(d, "big") if len(d) == 2 else d.hex(" ")}
 
 
 # `info`: the server-owned DIDs, then the profile's [dids] in file order; a range stops at its first absent DID.
@@ -120,19 +122,24 @@ def check_image(uds, log=print):
                            % (reason_name(status[0]) if status else "no status"))
 
 
-# After ActivateImage: wait for the restart, pre-rolling and polling the running SHA until the server answers.
-def wait_for_image(uds, sha, preroll, sleep=time.sleep, clock=time.monotonic):
+# Wait for a restarting server: pre-roll and poll the running SHA until it answers, and return it. after names what
+# restarted it, for the timeout message.
+def wait_for_boot(uds, preroll, after, sleep=time.sleep, clock=time.monotonic):
     sleep(REBOOT_WAIT_S)
     deadline = clock() + BOOT_TIMEOUT_S
     while True:
         preroll()
         try:
-            running = uds.read_did(DID_RUNNING_SHA)
-            break
+            return uds.read_did(DID_RUNNING_SHA)
         except (NoResponse, SendFailed):   # a rebooting server answers nothing, or leaves a send unacknowledged
             if clock() >= deadline:
-                raise UpdateFailed("the server did not answer within %d s of ActivateImage" % BOOT_TIMEOUT_S)
+                raise UpdateFailed("the server did not answer within %d s of %s" % (BOOT_TIMEOUT_S, after))
             sleep(BOOT_POLL_S)
+
+
+# After ActivateImage: wait for the restart, then check the server runs the new image sha.
+def wait_for_image(uds, sha, preroll, sleep=time.sleep, clock=time.monotonic):
+    running = wait_for_boot(uds, preroll, "ActivateImage", sleep=sleep, clock=clock)
     if running != sha:
         raise UpdateFailed("the server runs %s, not the new image %s: it reverted or never switched; "
                            "read F1F0 with `info`" % (running[:8].hex(), sha[:8].hex()))

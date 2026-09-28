@@ -11,6 +11,8 @@ udsota --profile example info                    # identity, update state, the p
 udsota --profile example flash build/example.bin # precheck, download, verify, activate, confirm
 udsota --profile example confirm                 # ConfirmImage for an image left unconfirmed
 udsota --profile example reset                   # 11 01; an unconfirmed image rolls back
+udsota --profile example config show             # the writable DIDs, the config status and hash
+udsota --profile example config set timeout_ms=3000 --commit --reset   # write, commit, restart, check
 udsota keygen --out keys                         # a new ecdsa-mode key pair; no profile, no bus
 ```
 
@@ -20,6 +22,8 @@ udsota keygen --out keys                         # a new ecdsa-mode key pair; no
 
 `flash` checks the image against the profile before it opens the bus, and reads the device before it writes anything. It does nothing when the device already runs the image, confirms it if an earlier run stopped short of that, and refuses while a different image is still unconfirmed. After ActivateImage it waits for the restart and retries ConfirmImage for up to 120 s, so the application's own post-update checks can pass.
 
+`config set NAME=VALUE ...` writes the profile's writable DIDs (the example's are commented out). It checks every value against the profile before it opens the bus. Then it opens the extended session, unlocks at `level_extended`, and stages each value with WriteDataByIdentifier (0x2E). `--commit` runs the profile's commit routine, which must answer status 00. `--reset` needs `--commit`. It sends the keyed 11 01, waits for the restart as `flash` does, reads back every key it wrote, and checks the device's config hash when the profile has one. Staged values that are never committed are dropped when the session ends. Firmware that answers 0x2E with NRC 0x11, or the commit routine with 0x31, has no config writes, and the tool stops with exit code 2. `config show` reads the keys, the status DID and the hash check without changing session.
+
 The tool transmits only on the profile's request ID and never on a `deny_tx` ID. Before its first frame it listens for 2 s and stops if it hears the response ID or the profile's busy value. During a run it stops if a response arrives that it did not ask for.
 
 The exit code says why it stopped:
@@ -28,7 +32,7 @@ The exit code says why it stopped:
 |---|---|
 | 0 | done |
 | 1 | the device refused or failed a step |
-| 2 | refused with nothing written: a bad profile, image or key file, or a precheck stop (an image for another board, a running image still unconfirmed, a device that does not serve the udsota status DID F1F0) |
+| 2 | refused with nothing written: a bad profile, image, key file or `config set` value, a precheck stop (an image for another board, a running image still unconfirmed, a device that does not serve the udsota status DID F1F0), or firmware without config writes |
 | 3 | another tester holds a session |
 | 4 | a second tester is on the bus |
 
@@ -45,7 +49,8 @@ Start from [`example.toml`](udsota/profiles/example.toml), which comments every 
 | `[busy]` | `id`, `byte`, `values` | a frame whose byte at `byte` holds one of `values` means another tester has a session |
 | `[preroll]` | `tester_present_frames` | TesterPresent frames sent first on a quiet bus, for a device whose CAN driver waits to hear traffic |
 | `[functional]` | `id`, `quiet_bus` (false) | the functional ID (0x7DF on most buses), the only ID besides `req_id` the tool may send on. With `quiet_bus`, `flash` first sends 10 83, 85 82 and 28 83 03 to every node, holds them there with 3E 80 every 2 s, and afterwards sends 28 80 03, 85 81 and 10 81, whether or not the update succeeded. Turn it on only on a bus where every node may stop its normal messages while you flash, never on a vehicle that is in use |
-| `[dids]` | `"0xNNNN"` or `"0xNNNN-0xNNNN"` = `{ name, decode }` | extra DIDs `info` reads after the server's own, decoded as `hex`, `ascii` or `version3`; a range stops at its first absent DID |
+| `[dids]` | `"0xNNNN"` or `"0xNNNN-0xNNNN"` = `{ name, decode, type, writable, min, max }` | extra DIDs `info` reads after the server's own, decoded as `hex`, `ascii`, `version3`, `u8` or `u16` (decimal); a range stops at its first absent DID. `writable = true` makes one DID a key for `config set`, with a `type` (`u8`, `u16` or `blob`), a `name` of letters, digits and `_`, and for u8 and u16 a write range `min`..`max` (default the whole type) |
+| `[config]` | `commit_rid`, `status_did`, `hash = { did, first, last, schema }` | the routine `config set --commit` runs; a DID shown as hex by `config show` and after a failed commit; and the hash check: SHA-256 of `schema`, then DID (big-endian), length and value for every DID from `first` to `last` the device answers, compared with DID `did` |
 
 ## Limits
 

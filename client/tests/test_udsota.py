@@ -25,7 +25,7 @@ from udsoncan.client import Client
 from udsoncan.connections import BaseConnection, IsoTPSocketConnection
 from udsoncan.exceptions import TimeoutException
 
-from udsota import cli, errors, keys, profile, transport, update, wire
+from udsota import cli, config, errors, keys, profile, transport, update, wire
 from udsota.image import parse_image
 from udsota.uds import BUSY_BACKOFF_S, KEEPALIVE_S, SA_DELAY_S, Uds
 
@@ -94,6 +94,8 @@ OLD_SHA = bytes([0x11]) * 32
 NEW_SHA = bytes(range(0xA0, 0xC0))
 STATUS_FIXTURE = bytes([0x01, 0x02, 0x01, 0x03, 0x00, 0x02, 0x07,
                     0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0x05])
+CFG_COMMIT_RID, CFG_HASH_DID, CFG_STATUS_DID = 0x1234, 0xF1B0, 0xF1B2   # CONF's commit routine, hash and status DIDs
+CFG_VALUES = {0x0200: b"\x01", 0x0201: b"\x07\xd0", 0x0202: b"\xaa\xbb", 0x0205: b"\x2a"}   # 0x0203 is absent
 
 
 # The ecdsa mode's known answers, pinned in udsota_keys.c (KAT_SIG_*) and test/test_udsota_keys.c too: the
@@ -156,13 +158,16 @@ class FakeTime:
 # services outside their sessions, and keeps the server's download state: 0x37 closes the transfer,
 # FF01 verifies it once (a repeat after a pass answers 00), F001 needs a verified slot (else 0x24),
 # and 10 02 is refused (0x22) while the boot slot is not the running one.
+# With cfg_keys it serves config writes: 0x2E stages a value, the commit routine CFG_COMMIT_RID stores the staged
+# set (answering 0x78 first), a restart serves the stored values, a session change drops the staged set, and
+# CFG_HASH_DID and CFG_STATUS_DID answer the config hash and status. Without cfg_keys, 0x2E answers 0x11.
 class FakeServer:
     # Knobs select the faults and states each test needs.
     def __init__(self, max_block=18, boot_silence=2, confirm_refusals=2, running_state=3, sha=OLD_SHA,
                  board=b"devkit", other_state=0, other_sha=bytes(32), lose_76_once=None, mute_block=None,
                  nrc_once=None, activate_refusals=0, ff01_status=0, config=None, lose_77_once=False,
                  lose_ff01_once=False, activate_nrcs=None, activate_fail=None, no_fc=None, security=True,
-                 pubkey=None):
+                 pubkey=None, cfg_keys=None, commit_status=0):
         self.max_block, self.boot_silence, self.confirm_refusals = max_block, boot_silence, confirm_refusals
         self.running_state, self.sha, self.board = running_state, sha, board
         self.other_state, self.other_sha = other_state, other_sha
@@ -176,6 +181,9 @@ class FakeServer:
         self.config = {} if config is None else config
         self.security = security
         self.pubkey = pubkey                    # a P-256 public key: the ecdsa mode, 64-byte signed keys
+        self.cfg_keys = None if cfg_keys is None else dict(cfg_keys)   # {DID: running value}; None: no config writes
+        self.nvs = None if cfg_keys is None else dict(cfg_keys)        # the stored values a restart serves
+        self.staged, self.commit_status, self.last_commit = {}, commit_status, 0
         self.log, self.written, self.writes = [], bytearray(), 0
         self.silence, self.announced, self.next_bsc, self.last_bsc = 0, None, 1, None
         self.session, self.unlocked, self.last_t, self.clock = 1, 0, 0.0, lambda: 0.0
@@ -188,6 +196,7 @@ class FakeServer:
         sid = req[0]
         arg = {0x10: lambda: req[1], 0x11: lambda: req[1], 0x27: lambda: req[1], 0x36: lambda: req[1],
                0x3E: lambda: req[1], 0x22: lambda: int.from_bytes(req[1:3], "big"),
+               0x2E: lambda: int.from_bytes(req[1:3], "big"),
                0x31: lambda: int.from_bytes(req[2:4], "big")}.get(sid, lambda: None)()
         if self.no_fc.get((sid, arg)):
             self.no_fc[(sid, arg)] -= 1         # FF seen, FC dropped: the request never arrives
@@ -219,6 +228,9 @@ class FakeServer:
             self.sha, self.running_state, self.boot_pending = self.boot_pending, 2, None
         self.silence = self.boot_silence
         self.session, self.unlocked, self.verified, self.dl_open, self.dl_complete = 1, 0, False, False, False
+        if self.nvs is not None:
+            self.cfg_keys = dict(self.nvs)
+        self.staged = {}
 
     # 0x10 DiagnosticSessionControl: 50 ss 00 32 01 F4; every session change relocks. 10 02 is
     # refused (0x22) while the boot slot is not the running one, as slots_settled() does.
@@ -226,6 +238,7 @@ class FakeServer:
         if sub == 2 and self.boot_pending is not None:
             return self.nrc(0x10, 0x22)
         self.session, self.unlocked = sub, 0
+        self.staged = {}                                # a session change drops the staged set (the epoch rule)
         return [bytes([0x50, sub, 0x00, 0x32, 0x01, 0xF4])]
 
     # 0x3E TesterPresent: 7E 00 (keeps S3 alive through handle()).
@@ -241,10 +254,39 @@ class FakeServer:
         result = bytes([self.last_dl[0]]) + self.last_dl[1].to_bytes(4, "big")
         records = {0xF186: b"\x01", 0xF189: b"v0.2.9-3-gabc", 0xF18C: MAC, 0xF191: self.board,
                    0xF1B0: bytes(32), 0xF1F0: status, 0xF1B1: b"\x01\x02\x03", 0xF1F3: self.sha,
-                   0xF1F1: result, 0xF1F2: bytes(16), **self.config}
+                   0xF1F1: result, 0xF1F2: bytes(16), **(self.cfg_keys or {}), **self.cfg_records(), **self.config}
         if did not in records:
             return self.nrc(0x22, 0x31)
         return [b"\x62" + did.to_bytes(2, "big") + records[did]]
+
+    # The config hash (schema 1, then DID BE16, length and value per key, ascending) and status (staged count,
+    # last commit) records when the server has config keys; none otherwise.
+    def cfg_records(self):
+        if self.cfg_keys is None:
+            return {}
+        enc = bytes([1]) + b"".join(did.to_bytes(2, "big") + bytes([len(v)]) + v
+                                    for did, v in sorted(self.cfg_keys.items()))
+        return {CFG_HASH_DID: hashlib.sha256(enc).digest(),
+                CFG_STATUS_DID: bytes([len(self.staged), self.last_commit])}
+
+    # 0x2E WriteDataByIdentifier: 0x11 without config keys; else 0x7F in the default session and 0x13 under 4 bytes
+    # (the core), then 0x31 outside the extended session or for a DID that is no key, 0x33 without the level-1
+    # unlock and 0x13 for a wrong length (the app); stages the value and answers 6E <did>.
+    def s2e(self, req, did):
+        if self.cfg_keys is None:
+            return self.nrc(0x2E, 0x11)
+        if self.session == 1:
+            return self.nrc(0x2E, 0x7F)
+        if len(req) < 4:
+            return self.nrc(0x2E, 0x13)
+        if self.session != 3 or did not in self.cfg_keys:
+            return self.nrc(0x2E, 0x31)
+        if self.security and self.unlocked != 1:
+            return self.nrc(0x2E, 0x33)
+        if len(req) - 3 != len(self.cfg_keys[did]):
+            return self.nrc(0x2E, 0x13)
+        self.staged[did] = bytes(req[3:])
+        return [b"\x6E" + req[1:3]]
 
     # 0x27 SecurityAccess: fixed seed; the key must match the udsota-example vector (KEYS) for the level, or with
     # a pubkey be exactly a 64-byte signature under it over the seed, level and MAC (the ecdsa mode).
@@ -339,6 +381,17 @@ class FakeServer:
                 return self.nrc(0x31, 0x22)
             self.running_state = 3
             return [echo]
+        if rid == CFG_COMMIT_RID and self.cfg_keys is not None:
+            if self.security and self.unlocked != 1:
+                return self.nrc(0x31, 0x33)
+            if not self.staged:
+                return self.nrc(0x31, 0x24)
+            if self.commit_status:                      # a cross-key rule refused the set: positive, status N
+                self.staged = {}
+                return [echo + bytes([self.commit_status])]
+            self.nvs.update(self.staged)
+            self.staged, self.last_commit = {}, 1
+            return [bytes([0x7F, 0x31, 0x78]), echo + b"\x00"]   # the write runs under 0x78
         return self.nrc(0x31, 0x31)
 
     # 0x11 ECUReset: keyed (either level unlocked), then the restart.
@@ -970,6 +1023,7 @@ WIRE_DEFINES = {"UDSOTA_DID_ACTIVE_SESSION": "DID_SESSION", "UDSOTA_DID_SW_VERSI
                 "UDSOTA_DID_RUNNING_SHA": "DID_RUNNING_SHA", "UDSOTA_RID_CHECK_PROG_DEPS": "RID_CHECK_DEPS",
                 "UDSOTA_RID_ACTIVATE_IMAGE": "RID_ACTIVATE", "UDSOTA_RID_CONFIRM_IMAGE": "RID_CONFIRM",
                 "UDSOTA_DL_DFI": "DL_DFI", "UDSOTA_DL_ALFID": "DL_ALFID", "UDSOTA_NRC_BUSY_REPEAT": "NRC_BUSY",
+                "UDSOTA_NRC_SERVICE_NOT_SUPPORTED": "NRC_NOT_SUPPORTED",
                 "UDSOTA_NRC_CONDITIONS_NOT_CORRECT": "NRC_CONDITIONS",
                 "UDSOTA_NRC_REQUEST_SEQUENCE_ERROR": "NRC_SEQUENCE",
                 "UDSOTA_NRC_REQUEST_OUT_OF_RANGE": "NRC_OUT_OF_RANGE",
@@ -1767,3 +1821,319 @@ def test_main_generic_flash_end_to_end(generic, tmp_path, monkeypatch):
     assert cli.main(["--profile", str(tmp_path / "widget.toml"), "flash", str(img)], transport=fake) == 0
     assert opened == [("widget", "vcan1")] and not any(e[0] == 0x27 for e in d.log)
     assert d.sha == NEW_SHA and d.running_state == 3
+
+
+# ---- config writes: profile ----
+
+# The [security] table of CONF: the udsota-example label, so FakeServer's key vectors unlock it.
+CONF_SECURITY = '[security]\nlabel = "udsota-example"\nmaster_file = "master.bin"\n'
+# A profile with config writes: four writable keys (u8 with a max only, u16 with a range, a blob, and one u8 the fake
+# server does not serve), a read-only u8 DID, a range overlapping them all, and [config] with a status DID and the
+# hash over 0x0200-0x020F.
+CONF = ('[can]\ninterface = "vcan0"\nreq_id = 0x710\nresp_id = 0x718\n' + CONF_SECURITY + """
+[dids]
+"0x0200" = { name = "mode", decode = "u8", type = "u8", writable = true, max = 2 }
+"0x0201" = { name = "timeout_ms", decode = "u16", type = "u16", writable = true, min = 1000, max = 5000 }
+"0x0202" = { name = "tag", decode = "hex", type = "blob", writable = true }
+"0x0203" = { name = "spare", decode = "u8", type = "u8", writable = true }
+"0x0205" = { name = "limit", decode = "u8" }
+"0x0200-0x020F" = { name = "settings", decode = "hex" }
+
+[config]
+commit_rid = 0x1234
+status_did = 0xF1B2
+hash = { did = 0xF1B0, first = 0x0200, last = 0x020F, schema = 1 }
+""")
+C = profile.from_dict("conf", tomllib.loads(CONF))
+# The start of a one-key [dids] table after CAN (the [can] table above): the base of the refusal cases.
+KEY = '[dids]\n"0x0200" = { name = "mode", decode = "u8", '
+
+
+# Check CONF's typed entries (an absent min or max stays None), the overlapping range, and its [config]; FULL has
+# no config and no typed DID.
+def test_config_profile_values():
+    assert [(e.first, e.last, e.name, e.decode, e.type, e.writable, e.min, e.max) for e in C.dids] == [
+        (0x0200, 0x0200, "mode", "u8", "u8", True, None, 2),
+        (0x0201, 0x0201, "timeout_ms", "u16", "u16", True, 1000, 5000),
+        (0x0202, 0x0202, "tag", "hex", "blob", True, None, None),
+        (0x0203, 0x0203, "spare", "u8", "u8", True, None, None),
+        (0x0205, 0x0205, "limit", "u8", None, False, None, None),
+        (0x0200, 0x020F, "settings", "hex", None, False, None, None)]
+    assert C.config == profile.ConfigSpec(0x1234, 0xF1B2, profile.HashSpec(0xF1B0, 0x0200, 0x020F, 1))
+    assert P.config is None and not any(e.writable or e.type for e in P.dids)
+
+
+# Check a broken [config] or typed [dids] entry is refused with its reason: each case breaks one rule.
+@pytest.mark.parametrize("text,why", [
+    (CAN + "[config]\ncommit_rid = 0x1234\nrid = 1\n", r"unknown key rid in \[config\]"),
+    (CAN + "[config]\nstatus_did = 0xF1B2\n", "missing commit_rid"),
+    (CAN + "[config]\ncommit_rid = 0x1234\nhash = { did = 0xF1B0, first = 0x0200, last = 0x020F, schema = 1, "
+           "size = 2 }\n", "hash must be"),
+    (CAN + "[config]\ncommit_rid = 0x1234\nhash = { did = 0xF1B0, first = 0x0200, last = 0x020F }\n",
+     "missing schema"),
+    (CAN + "[config]\ncommit_rid = 0x1234\nhash = { did = 0xF1B0, first = 0x0210, last = 0x020F, schema = 1 }\n",
+     "first 0x0210 is above last 0x020F"),
+    (CAN + KEY + 'type = "u8", writable = true, size = 1 }\n', r"must be \{ name"),
+    (CAN + '[dids]\n"0x0200-0x0203" = { name = "mode", decode = "u8", type = "u8", writable = true }\n',
+     "a writable entry is one DID"),
+    (CAN + KEY + "writable = true }\n", "needs a type"),
+    (CAN + KEY + 'type = "u32" }\n', "type must be one of"),
+    (CAN + KEY + 'type = "u8", writable = 1 }\n', "writable must be true or false"),
+    (CAN + KEY + 'type = "blob", writable = true, min = 1 }\n', "min and max need type u8 or u16"),
+    (CAN + KEY + 'type = "u8", writable = true, min = 9, max = 2 }\n', "min 9 is above max 2"),
+    (CAN + KEY + 'type = "u8", writable = true, max = 0x100 }\n', "max must be an integer from 0x0 to 0xFF"),
+    (CAN + '[dids]\n"0x0200" = { name = "a b", decode = "u8", type = "u8", writable = true }\n',
+     "letters, digits and _"),
+    (CAN + KEY + 'type = "u8", writable = true }\n"0x0201" = { name = "mode", decode = "u8", type = "u8", '
+                 "writable = true }\n", "two writable keys are named mode"),
+])
+def test_bad_config_profiles_are_refused(text, why):
+    with pytest.raises(errors.Refused, match=why):
+        profile.from_dict("bad", tomllib.loads(text))
+
+
+# Check the example's commented writable DIDs and [config] load once uncommented, so the syntax it documents is valid.
+def test_example_config_comments_load():
+    text = (profile.PROFILE_DIR / "example.toml").read_text()
+    live = re.sub(r'(?m)^# (?=(?:"0x020[01]" |\[config\]$|commit_rid |status_did |hash ))', "", text)
+    e = profile.from_dict("example", tomllib.loads(live))
+    assert [(d.name, d.type, d.min, d.max) for d in e.dids if d.writable] == [("mode", "u8", None, 2),
+                                                                            ("timeout_ms", "u16", 1000, 5000)]
+    assert e.config == profile.ConfigSpec(0x1234, 0xF1B2, profile.HashSpec(0xF1B0, 0x0200, 0x02FF, 1))
+
+
+# ---- config writes: decoders ----
+
+# Check u8 and u16 print as decimal, and a record of another length falls back to hex.
+def test_u8_u16_decoders():
+    assert (update.DECODE["u8"](b"\x2a"), update.DECODE["u16"](b"\x0b\xb8")) == ("42", "3000")
+    assert (update.DECODE["u8"](b"\x01\x02"), update.DECODE["u16"](b"\x05")) == ("01 02", "05")
+
+
+# Check info decodes CONF's u8 and u16 DIDs as decimal, a blob as hex, and reports the key the server lacks.
+def test_info_decodes_u8_and_u16():
+    ft, lines = FakeTime(), []
+    d = FakeServer(cfg_keys=CFG_VALUES)
+    assert update.info(uds_for(d, ft), C, log=lines.append) == 0
+    assert {"0200 mode: 1", "0201 timeout_ms: 2000", "0202 tag: aa bb", "0203 spare: not supported",
+            "0205 limit: 42"} <= set(lines)
+
+
+# ---- config writes: set and show ----
+
+UNLOCK_EXT = [(0x22, 0xF18C), (0x10, 3), (0x27, 1), (0x27, 2)]
+HASH_READS = [(0x22, did) for did in range(0x0200, 0x0210)] + [(0x22, CFG_HASH_DID)]
+
+
+# Run config set on server with profile C (or prof) and fake time; returns (rc, log lines, fake time).
+def run_config_set(server, args, prof=C, master=MASTER, commit=True, reset=True):
+    ft, lines = FakeTime(), []
+    writes = config.parse_writes(prof, args, commit, reset)
+    rc = config.config_set(uds_for(server, ft), prof, writes, master, commit=commit, reset=reset,
+                           sleep=ft.sleep, clock=ft.clock, log=lines.append)
+    return rc, lines, ft
+
+
+# Check config set's values encode by type (u8 one byte; u16 big-endian, decimal or 0x hex; blob from hex digits),
+# in argument order.
+def test_parse_writes_encodes_each_type():
+    writes = config.parse_writes(C, ["timeout_ms=0xBB8", "mode=2", "tag=0A1b"], commit=True, reset=True)
+    assert [(e.name, v) for e, v in writes] == [("timeout_ms", b"\x0b\xb8"), ("mode", b"\x02"), ("tag", b"\x0a\x1b")]
+
+
+# Check each bad argument is refused with its reason: an unknown, malformed or read-only name, a value that is no
+# integer, one outside the write range, bad hex, and a repeated name.
+@pytest.mark.parametrize("args,why", [
+    (["nosuch=1"], "is not NAME=VALUE for a writable key"),
+    (["mode"], "is not NAME=VALUE"),
+    (["limit=1"], "is not NAME=VALUE"),
+    (["mode=x"], "mode takes an integer"),
+    (["mode=3"], r"mode = 3 is outside 0\.\.2"),
+    (["timeout_ms=999"], r"timeout_ms = 999 is outside 1000\.\.5000"),
+    (["tag=0g"], "tag takes hex bytes"),
+    (["mode=1", "mode=2"], "mode is given twice"),
+])
+def test_parse_writes_refuses(args, why):
+    with pytest.raises(errors.Refused, match=why):
+        config.parse_writes(C, args, commit=False, reset=False)
+
+
+# Check set --commit --reset: device ID, 10 03 and the level-1 unlock, a 2E per key in argument order, the commit
+# (0x78, then 00), keyed 11 01, the restart poll, the read-back and the hash over 0x0200-0x020F, which skips the
+# absent DIDs and includes 0x0205, a DID the profile does not mark writable. The device hash is a pinned vector.
+def test_config_set_commit_reset_reads_back_and_checks_the_hash():
+    d = FakeServer(cfg_keys=CFG_VALUES)
+    rc, lines, ft = run_config_set(d, ["timeout_ms=3000", "mode=2"])
+    assert rc == 0
+    assert d.log == (UNLOCK_EXT + [(0x2E, 0x0201), (0x2E, 0x0200), (0x31, CFG_COMMIT_RID), (0x11, 1)]
+                     + [(0x22, 0xF1F3)] * 3 + [(0x22, 0x0201), (0x22, 0x0200)] + HASH_READS)
+    assert d.cfg_keys == {**CFG_VALUES, 0x0200: b"\x02", 0x0201: b"\x0b\xb8"}
+    assert ft.sleeps == [update.REBOOT_WAIT_S] + [update.BOOT_POLL_S] * 2
+    assert lines == ["staged timeout_ms = 3000", "staged mode = 2", "committed; the server restarts",
+                     "0201 timeout_ms: 3000", "0200 mode: 2",
+                     "F1B0 config hash: a96b56dc2467c1fd56c8c5a22018142e9bbd5453f8b8ecb6d0dd5d901a8bc6d6 matches "
+                     "the values read"]
+
+
+# Check the recomputed hash against a pinned vector: SHA-256 of 01 | 0200 01 01 | 0201 02 07d0 | 0202 02 aabb |
+# 0205 01 2a, the DIDs the server answers in 0x0200-0x020F. The scan reads past the gap at 0x0203.
+def test_config_hash_matches_a_pinned_vector():
+    ft, d = FakeTime(), FakeServer(cfg_keys=CFG_VALUES)
+    assert config.compute_hash(uds_for(d, ft), C.config.hash).hex() == \
+        "15bb680574feb9237e6d462886579533df0de8f18d62e71b6489a3e7bf8aebc3"
+    assert d.log == HASH_READS[:-1]
+
+
+# Check set without --commit only stages: nothing is stored, and the tool says the values die with the session.
+def test_config_set_without_commit_only_stages():
+    d = FakeServer(cfg_keys=CFG_VALUES)
+    rc, lines, _ = run_config_set(d, ["mode=2"], commit=False, reset=False)
+    assert rc == 0 and d.log == UNLOCK_EXT + [(0x2E, 0x0200)]
+    assert d.staged == {0x0200: b"\x02"} and d.nvs == CFG_VALUES
+    assert lines[-1] == "not committed: the staged values are dropped when the session ends"
+
+
+# Check set --commit without --reset stores the values (the commit answers 0x78, then 00) and sends no 11 01; the
+# server runs the old values until it restarts.
+def test_config_set_commit_without_reset():
+    d = FakeServer(cfg_keys=CFG_VALUES)
+    rc, lines, _ = run_config_set(d, ["mode=2"], reset=False)
+    assert rc == 0 and d.log == UNLOCK_EXT + [(0x2E, 0x0200), (0x31, CFG_COMMIT_RID)]
+    assert d.nvs[0x0200] == b"\x02" and d.cfg_keys[0x0200] == b"\x01"
+    assert lines[-1] == "committed: the new values apply at the next restart"
+
+
+# Check a commit reporting status 3 exits 1 naming the status, after reading the status DID; nothing is stored.
+def test_config_set_commit_status_fails():
+    d = FakeServer(cfg_keys=CFG_VALUES, commit_status=3)
+    with pytest.raises(errors.UpdateFailed, match="reported status 3") as e:
+        run_config_set(d, ["mode=2"])
+    assert e.value.exit_code == 1 and d.nvs == CFG_VALUES
+    assert d.log[-2:] == [(0x31, CFG_COMMIT_RID), (0x22, CFG_STATUS_DID)]
+
+
+# Check 0x72 to the commit exits 1 after reading the status DID, which says whether the write landed. A status
+# read that fails too (here 0x22) does not mask the commit's 0x72.
+def test_config_set_commit_programming_failure():
+    d = FakeServer(cfg_keys=CFG_VALUES, nrc_once={(0x31, CFG_COMMIT_RID): 0x72, (0x22, CFG_STATUS_DID): 0x22})
+    with pytest.raises(errors.UpdateFailed, match="answered NRC 0x72") as e:
+        run_config_set(d, ["mode=2"])
+    assert e.value.exit_code == 1 and d.log[-2:] == [(0x31, CFG_COMMIT_RID), (0x22, CFG_STATUS_DID)]
+
+
+# Check a keyed 11 01 refused with 0x22 exits 1, saying the values are committed and apply at the next restart.
+def test_config_set_reset_refused():
+    d = FakeServer(cfg_keys=CFG_VALUES, nrc_once={(0x11, 1): 0x22})
+    with pytest.raises(errors.UpdateFailed, match="committed, but the reset was refused"):
+        run_config_set(d, ["mode=2"])
+    assert d.nvs[0x0200] == b"\x02" and d.log[-1] == (0x11, 1)
+
+
+# Check a key that reads back other than written after the restart exits 1 naming it, before the hash is read.
+def test_config_set_read_back_mismatch():
+    d = FakeServer(cfg_keys=CFG_VALUES, config={0x0201: b"\x07\xd0"})   # 0x0201 keeps serving 2000
+    with pytest.raises(errors.UpdateFailed, match="timeout_ms reads 2000, not 3000"):
+        run_config_set(d, ["timeout_ms=3000"])
+    assert d.log[-1] == (0x22, 0x0201)
+
+
+# Check a device hash that differs from the one recomputed from the DIDs read exits 1 with both.
+def test_config_set_hash_mismatch():
+    d = FakeServer(cfg_keys=CFG_VALUES, config={CFG_HASH_DID: bytes(32)})
+    with pytest.raises(errors.UpdateFailed, match="config hash F1B0 reads 0{64} but the values read hash to a96b56dc"):
+        run_config_set(d, ["timeout_ms=3000", "mode=2"])
+
+
+# Check a key the server refuses with 0x31 exits 1 naming it, not 2: that server does serve 0x2E.
+def test_config_set_key_refused_by_the_server():
+    d = FakeServer(cfg_keys=CFG_VALUES)
+    with pytest.raises(errors.UpdateFailed, match=r"writing spare \(0x0203\) answered NRC 0x31") as e:
+        run_config_set(d, ["mode=2", "spare=1"])
+    assert e.value.exit_code == 1 and d.log[-1] == (0x2E, 0x0203) and d.nvs == CFG_VALUES
+
+
+# Check set with a profile without [security]: 10 03 with no device-ID read and no 0x27, then the 2E and the commit.
+def test_config_set_without_security():
+    nosec = profile.from_dict("nosec", tomllib.loads(CONF.replace(CONF_SECURITY, "")))
+    d = FakeServer(security=False, cfg_keys=CFG_VALUES)
+    rc, _, _ = run_config_set(d, ["mode=2"], prof=nosec, master=None, reset=False)
+    assert rc == 0 and d.log == [(0x10, 3), (0x2E, 0x0200), (0x31, CFG_COMMIT_RID)] and d.nvs[0x0200] == b"\x02"
+
+
+# Check config show reads each writable key with its range, the status DID and the hash check, with no session change.
+def test_config_show():
+    ft, lines = FakeTime(), []
+    d = FakeServer(cfg_keys=CFG_VALUES)
+    assert config.config_show(uds_for(d, ft), C, log=lines.append) == 0
+    assert d.log == [(0x22, did) for did in (0x0200, 0x0201, 0x0202, 0x0203, CFG_STATUS_DID)] + HASH_READS
+    assert lines == ["0200 mode: 1 (0..2)", "0201 timeout_ms: 2000 (1000..5000)", "0202 tag: aa bb",
+                     "0203 spare: not supported (0..255)", "F1B2 config status: 00 00",
+                     "F1B0 config hash: 15bb680574feb9237e6d462886579533df0de8f18d62e71b6489a3e7bf8aebc3 "
+                     "(matches the values read)"]
+
+
+# ---- config writes: main ----
+
+# CONF and the master key in tmp_path, for the tests that pass --profile to main; returns the profile path.
+@pytest.fixture
+def conf_path(tmp_path):
+    (tmp_path / "master.bin").write_bytes(MASTER)
+    p = tmp_path / "conf.toml"
+    p.write_text(CONF)
+    return str(p)
+
+
+# Check a config set whose arguments break the profile is refused (exit 2) before any bus opens.
+@pytest.mark.parametrize("args,why", [
+    (["nosuch=1"], "is not NAME=VALUE"),
+    (["mode=x"], "mode takes an integer"),
+    (["timeout_ms=6000"], r"outside 1000\.\.5000"),
+    (["mode=1", "--reset"], "--reset needs --commit"),
+])
+def test_main_config_set_refuses_before_opening_the_bus(conf_path, capsys, args, why):
+    master = str(pathlib.Path(conf_path).parent / "master.bin")
+    assert cli.main(["--profile", conf_path, "--master", master, "config", "set"] + args,
+                    transport=no_transport) == 2
+    assert re.search(why, capsys.readouterr().err)
+
+
+# Check --commit without [config], a missing master for set, and show on a profile with no writable DID are refused
+# (exit 2) before any bus opens.
+def test_main_config_refusals(tmp_path, conf_path, capsys):
+    noconf = tmp_path / "noconf.toml"
+    noconf.write_text(CONF.split("[config]")[0])
+    assert cli.main(["--profile", str(noconf), "--master", str(tmp_path / "master.bin"), "config", "set", "mode=1",
+                     "--commit"], transport=no_transport) == 2
+    assert "--commit needs a [config] table" in capsys.readouterr().err
+    assert cli.main(["--profile", conf_path, "--master", str(tmp_path / "absent"), "config", "set", "mode=1"],
+                    transport=no_transport) == 2
+    assert "cannot read the master key" in capsys.readouterr().err
+    widget = tmp_path / "widget.toml"
+    widget.write_text(GENERIC)
+    assert cli.main(["--profile", str(widget), "config", "show"], transport=no_transport) == 2
+    assert "has no writable [dids] entry" in capsys.readouterr().err
+
+
+# Check main's exit code for config set against three servers. A 2E answered 0x11, or a commit routine answered
+# 0x31, means the firmware has no config writes (exit 2). A 2E refused with 0x31 is the server refusing a key (exit 1).
+@pytest.mark.parametrize("server_kw,args,rc,text,last", [
+    ({}, ["mode=1", "--commit"], 2, "this firmware has no config writes", (0x2E, 0x0200)),
+    ({"cfg_keys": CFG_VALUES, "nrc_once": {(0x31, CFG_COMMIT_RID): 0x31}}, ["mode=1", "--commit"], 2,
+     "this firmware has no config writes", (0x31, CFG_COMMIT_RID)),
+    ({"cfg_keys": CFG_VALUES}, ["spare=1", "--commit"], 1, r"writing spare \(0x0203\) answered NRC 0x31",
+     (0x2E, 0x0203)),
+])
+def test_main_config_set_exit_codes(conf_path, capsys, server_kw, args, rc, text, last):
+    d = FakeServer(**server_kw)
+    master = str(pathlib.Path(conf_path).parent / "master.bin")
+    assert cli.main(["--profile", conf_path, "--master", master, "config", "set"] + args,
+                    transport=lambda p, i: FakeTransport(d, i)) == rc
+    assert re.search(text, capsys.readouterr().err) and d.log[-1] == last
+    assert d.nvs is None or d.nvs == CFG_VALUES
+
+
+# Check config show runs end to end through main without any master file and exits 0.
+def test_main_config_show_end_to_end(conf_path, capsys):
+    d = FakeServer(cfg_keys=CFG_VALUES)
+    assert cli.main(["--profile", conf_path, "config", "show"], transport=lambda p, i: FakeTransport(d, i)) == 0
+    assert "0201 timeout_ms: 2000 (1000..5000)" in capsys.readouterr().out
