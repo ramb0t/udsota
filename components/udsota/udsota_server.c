@@ -629,7 +629,7 @@ static uint32_t dl_limit(const udsota_server_t *s)
 /* A reason code from an engine result: r itself when it names one, else fallback. */
 static uint8_t dl_reason(int r, udsota_reason_t fallback)
 {
-    return (r > (int)UDSOTA_DL_OK && r < (int)UDSOTA_DL_REASON_COUNT) ? (uint8_t)r : (uint8_t)fallback;
+    return (r >= (int)UDSOTA_DL_OK && r < (int)UDSOTA_DL_REASON_COUNT) ? (uint8_t)r : (uint8_t)fallback;
 }
 
 /* 0x34: DFI 00 (or 10, 20 or 30 when engine.zformats names it), ALFID 44, address 0 (no resume point), 0 < size <=
@@ -941,8 +941,7 @@ static size_t reset_poll(udsota_server_t *s, uint32_t now_ms)
 static size_t check_done(udsota_server_t *s, int result, uint8_t *resp, size_t resp_max, uint32_t now_ms)
 {
     (void)now_ms;
-    const uint8_t reason = (result >= (int)UDSOTA_DL_OK && result < (int)UDSOTA_DL_REASON_COUNT)
-                         ? (uint8_t)result : (uint8_t)UDSOTA_DL_VERIFY_FAILED;
+    const uint8_t reason = dl_reason(result, UDSOTA_DL_VERIFY_FAILED);
     s->slot_verified = (reason == UDSOTA_DL_OK);
     s->last_dl.reason_code = reason;
     return routine_pos(resp, resp_max, UDSOTA_RID_CHECK_PROG_DEPS, &reason, 1);
