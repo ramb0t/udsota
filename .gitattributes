@@ -1,3 +1,6 @@
 # Vendored upstream code: keep its bytes (isotp.c ships with CRLF line endings).
 components/isotp/isotp-c/** -text
 components/udsota_inflate/miniz/** -text
+components/udsota_delta/detools/** -text
+# A binary fixture: Espressif's patch generator's output, byte for byte.
+test/fixtures/delta_espressif.patch binary

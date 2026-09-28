@@ -105,6 +105,29 @@ def elf_sha(image):
     return image[176:208]
 
 
+# An image of build_image's layout with its checksum byte and appended SHA-256 recomputed after an edit.
+def reseal(image):
+    img = bytearray(image)
+    unpadded = 32 + struct.unpack_from("<I", img, 28)[0]
+    padded = (unpadded + 1 + 15) & ~15
+    x = 0xEF
+    for b in img[32:unpadded]:
+        x ^= b
+    img[padded - 1] = x
+    img[padded:padded + 32] = hashlib.sha256(img[:padded]).digest()
+    return bytes(img)
+
+
+# A base and a new image for delta downloads, the pair test/fixtures/delta_fixtures.h holds: v0.2.0, and v0.3.0 with
+# one byte in every 50 changed over [4000, 8000), about what a small code change does to an app.
+def delta_pair(payload=12000):
+    base = build_image(version="v0.2.0", noise=True, payload=payload)
+    new = bytearray(build_image(version="v0.3.0", noise=True, payload=payload))
+    for i in range(4000, min(8000, 32 + payload), 50):
+        new[i] ^= 0x5A
+    return base, reseal(new)
+
+
 # One pipe line `<id>#<hex>` as a python-can message.
 def parse_line(line):
     ident, _, data = line.strip().partition("#")

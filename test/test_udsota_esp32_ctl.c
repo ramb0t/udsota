@@ -137,7 +137,7 @@ static int z_write(void *ctx, uint32_t off, const uint8_t *d, size_t n)
 
 /* engine.zbegin, as the port's: with s_zbegin_fail, empties the version and refuses for memory; else opens the
  * stream. */
-static int eng_zbegin(void *ctx, uint32_t size)
+static int eng_zbegin(void *ctx, uint32_t size, uint8_t dfi)
 {
     if (s_zbegin_fail) {
         udsota_esp32_ctl_clear_version(&s_ctl);
@@ -164,7 +164,7 @@ static int eng_zend(void *ctx)
 /* engine.zwritten: the image bytes written. */
 static uint32_t eng_zwritten(void *ctx)
 {
-    return s_zs.written;
+    return s_zs.image.written;
 }
 
 /* engine.abort: closes the stream. */
@@ -178,6 +178,7 @@ static const udsota_engine_t k_zengine = {
     .activate = eng_ok, .confirm = eng_confirm, .abort = eng_zabort, .unverify = NULL, .poll = eng_poll,
     .status = eng_status, .running_sha = NULL, .version = NULL, .slot_size = 0u, .ctx = NULL,
     .zbegin = eng_zbegin, .zwrite = eng_zwrite, .zend = eng_zend, .zwritten = eng_zwritten,
+    .zformats = UDSOTA_DL_FMT(UDSOTA_DL_DFI_DEFLATE),
 };
 
 static const udsota_engine_t k_engine = {

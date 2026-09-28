@@ -43,7 +43,7 @@ static int eng_ok(void *ctx) { return 0; }
 static void eng_abort(void *ctx) {}
 
 /* engine.zbegin: counted; the server must never call it. */
-static int eng_zbegin(void *ctx, uint32_t size)
+static int eng_zbegin(void *ctx, uint32_t size, uint8_t dfi)
 {
     g_z_calls++;
     return 0;
@@ -74,6 +74,7 @@ static const udsota_engine_t ENGINE = {
     .check_first = eng_check, .begin = eng_begin, .write = eng_write, .verify = eng_ok, .activate = eng_ok,
     .confirm = eng_ok, .abort = eng_abort, .poll = eng_ok, .status = udsota_mock_status, .ctx = &g_mock,
     .zbegin = eng_zbegin, .zwrite = eng_zwrite, .zend = eng_zend, .zwritten = eng_zwritten,
+    .zformats = UDSOTA_DL_FMT(UDSOTA_DL_DFI_DEFLATE),
 };
 
 /* A server without security, on ENGINE, in the programming session at T0. */

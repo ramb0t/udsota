@@ -33,6 +33,24 @@ menu "udsota ESP32 port"
             it at its 37 or abort; nothing at boot. A 34 that finds no memory is refused with 0x22.
             Compressed downloads cannot resume. Off, a 34 with DFI 0x10 answers 0x31 as before.
 
+    config UDSOTA_ESP32_DELTA
+        bool "Delta downloads (RequestDownload DFI 0x20 and 0x30, a patch from the running image)"
+        depends on UDSOTA_ESP32_COMPRESSION
+        default n
+        help
+            Also serve downloads whose 0x36 blocks carry a patch from the image this device runs: DFI 0x20
+            takes Espressif's esp_delta_ota format (a detools patch, heatshrink-compressed), and 0x30 the
+            same format with an uncompressed patch, all of it raw DEFLATE, which is usually smaller. The
+            flash worker rebuilds the new image from the running partition, which it only reads, into the
+            other slot, and the rebuilt image gets the same first-block check before any erase and the same
+            FF01 verify as a full one. A patch made from any other image is refused before any erase with
+            reason 15, and the client falls back to a full download. A patch names its base by the
+            SHA-256 the running image appends, which the bootloader checked at boot. Each 0x20 download
+            allocates about 5 KB of internal RAM at its 34 (the 4 KB image buffer and the decoder's
+            state), and a 0x30 one also the inflater and a 1 KB buffer; all of it is freed at the 37 or
+            abort. Delta downloads cannot resume. Off, no detools code is linked and a 34 with DFI 0x20
+            or 0x30 answers 0x31.
+
     config UDSOTA_ESP32_INFLATE_PSRAM
         bool "Inflater state and dictionary in PSRAM"
         depends on UDSOTA_ESP32_COMPRESSION && SPIRAM && !(IDF_TARGET_ESP32 && ESP32_REV_MIN_FULL < 300)

@@ -1,0 +1,4 @@
+# Delta downloads (DFI 0x20 and 0x30), which need compressed downloads: list this file after sdkconfig.defaults in
+# SDKCONFIG_DEFAULTS (see README.md).
+CONFIG_UDSOTA_ESP32_COMPRESSION=y
+CONFIG_UDSOTA_ESP32_DELTA=y

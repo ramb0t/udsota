@@ -48,6 +48,12 @@ def parse_args(argv):
                    help="as --compress, but send the image uncompressed to a server without compressed downloads")
     z.add_argument("--no-compress", dest="compress", action="store_const", const="none",
                    help="send the image uncompressed, whatever the profile says")
+    f.add_argument("--diff-from", type=pathlib.Path, metavar="PATH",
+                   help="offer a delta download from the image the server runs: PATH is that .bin, or a directory "
+                        "of .bin files to find it in (needs pip install udsota[diff])")
+    f.add_argument("--diff-format", choices=("auto", "heatshrink", "deflate"), default="auto",
+                   help="with --diff-from, the delta modes to try: heatshrink (DFI 0x20), deflate (DFI 0x30) or "
+                        "both (default auto)")
     sub.add_parser("confirm", help="ConfirmImage for a PENDING_VERIFY image")
     sub.add_parser("reset", help="ECUReset (rolls back an unconfirmed image)")
     c = sub.add_parser("config", help="show or set the profile's writable DIDs")
@@ -75,6 +81,21 @@ def load_secret(prof, args):
     if args.private_key:
         raise Refused("--private-key is for mode ecdsa; profile %s uses mode hmac (--master)" % prof.name)
     return load_master(args.master or prof.security.master_file)
+
+
+# The base images --diff-from names, as (name, bytes) pairs: path itself, or every *.bin directly in a directory.
+# Refuses when detools, which builds the patches, is not installed.
+def load_bases(path):
+    try:
+        import detools   # noqa: F401  (only checked here; delta.make_patch imports it)
+    except ImportError:
+        raise Refused("--diff-from needs detools: pip install udsota[diff] (it builds from source, so it needs a C "
+                      "and C++ compiler)") from None
+    files = sorted(f for f in path.glob("*.bin") if f.is_file()) if path.is_dir() else [path]
+    try:
+        return [(str(f), f.read_bytes()) for f in files]
+    except OSError as e:
+        raise Refused("cannot read %s: %s" % (e.filename, e.strerror))
 
 
 # `keygen`: writes the key pair and says where the private key belongs.
@@ -105,7 +126,7 @@ def main(argv=None, transport=Transport):
         interface = args.interface or prof.interface
         if interface is None:
             raise Refused("profile %s names no CAN interface: pass --interface" % prof.name)
-        image = secret = writes = None
+        image = secret = writes = bases = None
         if args.cmd == "flash":
             try:
                 image = args.file.read_bytes()
@@ -114,6 +135,10 @@ def main(argv=None, transport=Transport):
             parse_image(prof, image)
             if args.drop_76 is not None and args.drop_76 < 1:
                 raise Refused("--drop-76 takes a block number from 1")
+            if args.diff_from is not None:
+                if args.drop_76 is not None:
+                    raise Refused("--drop-76 is for full and compressed downloads, not with --diff-from")
+                bases = load_bases(args.diff_from)
         if args.cmd == "config" and args.config_cmd == "set":
             writes = parse_writes(prof, args.assignments, args.commit, args.reset)
         elif args.cmd == "config":
@@ -127,7 +152,8 @@ def main(argv=None, transport=Transport):
                 return info(uds, prof)
             if args.cmd == "flash":
                 return flash(uds, prof, image, secret, drop_76=args.drop_76, preroll=t.preroll,
-                             quiet=getattr(t, "quiet", contextlib.nullcontext), compress=args.compress)
+                             quiet=getattr(t, "quiet", contextlib.nullcontext), compress=args.compress,
+                             bases=bases, diff_format=args.diff_format)
             if args.cmd == "confirm":
                 return confirm_cmd(uds)
             if args.cmd == "config":

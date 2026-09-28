@@ -21,9 +21,10 @@
  * running; the server then waits on routine_poll. INT32_MAX: never an esp_err_t, never 0. */
 #define UDSOTA_PENDING  0x7FFFFFFF
 
-/* 1: the server serves compressed downloads (DFI 0x10) when the engine sets zbegin, zwrite and zend. 0: none of that
- * is compiled in, and a 34 with DFI 0x10 answers 0x31 whatever the engine sets; the structs keep their layout either
- * way. Only udsota_server.c reads it, so define it for that file (the ESP32 port sets 0 while its compression is off). */
+/* 1: the server serves coded downloads (DFI 0x10, 0x20, 0x30) when the engine sets zbegin, zwrite and zend and names
+ * the format in zformats. 0: none of that is compiled in, and a 34 with any DFI but 00 answers 0x31 whatever the engine
+ * sets; the structs keep their layout either way. Only udsota_server.c reads it, so define it for that file (the ESP32
+ * port sets 0 while its compression is off). */
 #ifndef UDSOTA_COMPRESSION
 #define UDSOTA_COMPRESSION 1
 #endif
@@ -53,7 +54,7 @@ typedef enum {
 typedef enum {
     UDSOTA_STAGE_IDLE = 0,          /* everything below does not hold: no download, or it ended (last_reason says how) */
     UDSOTA_STAGE_ERASING,           /* from an accepted 34 until the first 36 is accepted: the first-block check and
-                                       the erase run in that 36's job (a compressed one may write nothing yet) */
+                                       the erase run in that 36's job (a coded one may write nothing yet) */
     UDSOTA_STAGE_WRITING,           /* from the first written block until FF01 starts; done == total after the 37 */
     UDSOTA_STAGE_VERIFYING,         /* while the FF01 job runs */
     UDSOTA_STAGE_ACTIVATING,        /* the phase of the same name: from a positive ActivateImage until the restart */
@@ -77,7 +78,7 @@ typedef struct {   /* required; only unverify, status, running_sha, version and 
     int    (*verify)(void *ctx);            /* FF01; result 0 or a udsota_reason_t; may return UDSOTA_PENDING */
     int    (*activate)(void *ctx);          /* set the boot slot; the restart follows via hooks.reset */
     int    (*confirm)(void *ctx);           /* no-op returning 0 when the platform has no rollback */
-    void   (*abort)(void *ctx);             /* never blocks: queue it if a worker is busy; also frees zbegin's inflater */
+    void   (*abort)(void *ctx);             /* never blocks: queue it if a worker is busy; also frees zbegin's decoder */
     void   (*unverify)(void *ctx);          /* nullable: every accepted 34 calls it */
     int    (*poll)(void *ctx);              /* UDSOTA_PENDING while any worker job is queued or running, else the last result */
     void   (*status)(void *ctx, udsota_status_t *out);                       /* 0xF1F0; nullable:
@@ -86,25 +87,31 @@ typedef struct {   /* required; only unverify, status, running_sha, version and 
     size_t (*version)(void *ctx, char *out, size_t max);                     /* nullable: F189 */
     uint32_t slot_size;                     /* bytes a 34 may announce; 0 = UDSOTA_SLOT_SIZE_DEFAULT (0x400000) */
     void  *ctx;
-    /* Compressed downloads (DFI 0x10, raw DEFLATE): zbegin, zwrite and zend, all or none, and zwritten for progress.
-     * With zbegin NULL a 34 with DFI 10 answers 0x31 as it always has. memorySize is the uncompressed size, so the slot
-     * rule, the erase and the image rules see the image as before; udsota_zstream.h does the inflating behind these
-     * ops wherever the engine writes flash. */
-    int    (*zbegin)(void *ctx, uint32_t size);   /* accepted 34, after any abort it queues: allocate the inflater for
-                                                     size bytes; 0, or a udsota_reason_t (34 answers 0x22 and F1F1
-                                                     records it; anything else records UDSOTA_DL_NO_MEMORY). Then
-                                                     abort also frees the inflater */
-    int    (*zwrite)(void *ctx, const uint8_t *d, size_t n);   /* one 36's compressed bytes, in order; copies d before
-                                                     it returns. Inflates them, runs check_first once the first 320
-                                                     bytes are out, then begin, then writes at uncompressed offsets.
-                                                     0, a udsota_reason_t or UDSOTA_PENDING */
-    int    (*zend)(void *ctx);                    /* 37: 0 when the stream ended at exactly size bytes, all written,
-                                                     with nothing after it, else a udsota_reason_t; frees the
-                                                     inflater either way. Never UDSOTA_PENDING */
+    /* Coded downloads: DFI 0x10 (raw DEFLATE), 0x20 (a delta patch) and 0x30 (a delta patch as raw DEFLATE). zbegin,
+     * zwrite and zend, all or none, and zwritten for progress; zformats names the DFIs served. A DFI the engine does
+     * not serve answers 0x31 as an unknown one does, before anything changes. memorySize is the image's size, so the
+     * slot rule, the erase and the image rules see the image as before; udsota_zstream.h, udsota_patch.h and
+     * udsota_isink.h do the decoding behind these ops wherever the engine writes flash. */
+    int    (*zbegin)(void *ctx, uint32_t size, uint8_t dfi);   /* accepted 34 with a DFI in zformats, after any abort
+                                                     it queues: allocate the decoder for dfi and a size-byte image;
+                                                     0, or a udsota_reason_t (34 answers 0x22 and F1F1 records it;
+                                                     anything else records UDSOTA_DL_NO_MEMORY). Then abort also frees
+                                                     the decoder */
+    int    (*zwrite)(void *ctx, const uint8_t *d, size_t n);   /* one 36's coded bytes, in order; copies d before it
+                                                     returns. Decodes them, runs check_first once the image's first 320
+                                                     bytes are out, then begin, then writes at image offsets. 0, a
+                                                     udsota_reason_t or UDSOTA_PENDING */
+    int    (*zend)(void *ctx);                    /* 37: 0 when the stream or patch ended at exactly size bytes, all
+                                                     written, with nothing after it, else a udsota_reason_t; frees the
+                                                     decoder either way. May return UDSOTA_PENDING, as zwrite does:
+                                                     a delta patch's decoder may still hold the image's last bytes,
+                                                     so its end can read and write flash */
     uint32_t (*zwritten)(void *ctx);              /* nullable, with or without the others: the image bytes the open
-                                                     stream has written so far (udsota_zstream_t.written), read after
-                                                     each compressed 76 for progress. NULL: done stays 0 until the 37
-                                                     sets it to total */
+                                                     download has written so far (udsota_isink_t.written), read after
+                                                     each coded 76 for progress. NULL: done stays 0 until the 37 sets
+                                                     it to total */
+    uint16_t zformats;                            /* the coded DFIs served: UDSOTA_DL_FMT(0x10) | ...; 0 serves none,
+                                                     whatever zbegin is */
 } udsota_engine_t;
 
 typedef struct {   /* udsota_init() with security == NULL: 27 answers 0x11, and nothing needs a key */
@@ -267,12 +274,13 @@ typedef struct udsota_server {
     /* Download. */
     bool              download_active;   /* between an accepted 0x34 and 0x37 or an abort */
     bool              ota_open;          /* the engine holds an open image: from the first 0x36's begin (from the 34's
-                                            zbegin when compressed) to FF01 or an abort */
+                                            zbegin when coded) to FF01 or an abort */
     uint8_t           next_bsc;          /* expected blockSequenceCounter (1 after 0x34, wraps 0xFF->0x00) */
     uint32_t          dl_announced;      /* memorySize from 0x34 */
-    uint32_t          dl_received;       /* data bytes accepted; the offset engine.write gets (compressed bytes with
+    uint32_t          dl_received;       /* data bytes accepted; the offset engine.write gets (coded bytes with
                                             dl_compressed) */
-    bool              dl_compressed;     /* the 34 had DFI 0x10: 36 goes to engine.zwrite and 37 asks engine.zend */
+    bool              dl_compressed;     /* the 34 had a coded DFI (10, 20 or 30): 36 goes to engine.zwrite and 37
+                                            asks engine.zend */
     bool              slot_verified;     /* FF01 passed since the last download or reboot; survives session changes */
     bool              dl_complete;       /* 0x37 accepted: FF01 may verify the open image */
     uint32_t          cf_median_us;      /* 64-CF median from the last FC point (UDSOTA_CF_MEDIAN_NONE before one) */
@@ -293,9 +301,9 @@ typedef struct udsota_server {
     /* Progress (udsota_progress). */
     uint32_t          dl_written;        /* image bytes written in this download, udsota_progress_t.done: set by the
                                             34 and advanced with dl_received after each 76. A download whose 36s carry
-                                            other than image bytes (a compressed one) sets it from the engine's count */
+                                            other than image bytes (a coded one) sets it from the engine's count */
     uint8_t           progress_stage;    /* udsota_stage_t last reported to hooks.progress */
-    uint8_t           progress_reason;   /* last_reason last reported to hooks.progress: a compressed 34 refused for
+    uint8_t           progress_reason;   /* last_reason last reported to hooks.progress: a coded 34 refused for
                                             memory changes it without changing the stage */
     bool              progress_block;    /* a block was written since the last report */
 } udsota_server_t;

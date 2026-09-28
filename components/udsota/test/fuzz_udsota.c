@@ -61,8 +61,9 @@
 /* Every engine and hook callback is mocked; these trip if the API structs gain a callback. */
 _Static_assert(offsetof(udsota_engine_t, slot_size) == 12u * sizeof(void (*)(void)),
                "udsota_engine_t gained a callback: mock it in FUZZ_ENGINE and update this count");
-_Static_assert(offsetof(udsota_engine_t, zwritten) + sizeof(void (*)(void)) == sizeof(udsota_engine_t),
-               "udsota_engine_t gained a member after zwritten: mock it in FUZZ_ENGINE and move this check");
+_Static_assert(offsetof(udsota_engine_t, zformats) == offsetof(udsota_engine_t, zwritten) + sizeof(void (*)(void)) &&
+               offsetof(udsota_engine_t, zformats) + _Alignof(udsota_engine_t) == sizeof(udsota_engine_t),
+               "udsota_engine_t gained a member after zformats: mock it in FUZZ_ENGINE and move this check");
 _Static_assert(offsetof(udsota_hooks_t, ctx) == 7u * sizeof(void (*)(void)),
                "udsota_hooks_t gained a callback: mock it in FUZZ_HOOKS and update this count");
 _Static_assert(offsetof(udsota_hooks_t, progress) + sizeof(void (*)(void)) == sizeof(udsota_hooks_t),
@@ -679,7 +680,7 @@ static int z_sink_write(void *ctx, uint32_t off, const uint8_t *d, size_t n)
         fail("the stream wrote more than its buffer holds", NULL, 0, NULL, 0);
     }
     touch(d, n);
-    if (g_z_expect != NULL && !g_in_preamble && g_zs.size == g_z_expect_len &&
+    if (g_z_expect != NULL && !g_in_preamble && g_zs.image.size == g_z_expect_len &&
         ((size_t)off + n > g_z_expect_len || memcmp(d, g_z_expect + off, n) != 0)) {
         fail("the stream wrote bytes the image does not hold at that offset", NULL, 0, d, n);
     }
@@ -687,8 +688,9 @@ static int z_sink_write(void *ctx, uint32_t off, const uint8_t *d, size_t n)
 }
 
 /* engine.zbegin: opens a stream over tinfl and the mock sink. */
-static int mock_zbegin(void *ctx, uint32_t size)
+static int mock_zbegin(void *ctx, uint32_t size, uint8_t dfi)
 {
+    (void)dfi;
     count_op(OP_ZBEGIN);
     z_close();                                  /* the server released the last one: nothing may be open */
     g_tinfl.alloc = z_alloc;
@@ -717,7 +719,7 @@ static int mock_zwrite(void *ctx, const uint8_t *d, size_t n)
 /* engine.zwritten: the image bytes the stream has written, for progress. */
 static uint32_t mock_zwritten(void *ctx)
 {
-    return g_zs.written;
+    return g_zs.image.written;
 }
 
 /* engine.zend: the 37 check; frees the stream. */
@@ -741,6 +743,7 @@ static const udsota_engine_t FUZZ_ENGINE = {
     .running_sha = mock_running_sha, .version = mock_version, .slot_size = 0u, .ctx = NULL,
 #ifdef UDSOTA_FUZZ_Z
     .zbegin = mock_zbegin, .zwrite = mock_zwrite, .zend = mock_zend, .zwritten = mock_zwritten,
+    .zformats = UDSOTA_DL_FMT(UDSOTA_DL_DFI_DEFLATE),
 #endif
 };
 static const udsota_security_t FUZZ_SECURITY = {.rng16 = mock_rng16, .key = mock_key, .ctx = NULL};

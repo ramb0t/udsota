@@ -420,23 +420,24 @@ uint32_t fake_ota_resume_point(const fake_ota_t *f)
     return f->slot_size - FAKE_OTA_SECTOR;
 }
 
-/* The fake's esp_ota_end check: segment walk, checksum byte and the appended SHA-256 over [0, padded). */
-udsota_reason_t fake_ota_verify_image(const uint8_t *img, size_t len)
+/* Where an image's appended SHA-256 starts: past the header, the segment walk and the checksum byte, which must
+ * match. 0 for a malformed image, one without hash_appended or a wrong checksum. */
+static size_t hash_offset(const uint8_t *img, size_t len)
 {
     if (img == NULL || len < HDR_LEN + SEG_HDR_LEN || img[0] != 0xE9 || img[1] == 0 || img[1] > 16 ||
         img[23] != 1) {
-        return UDSOTA_DL_VERIFY_FAILED;
+        return 0;
     }
     size_t off = HDR_LEN;
     uint8_t x = 0xEF;                                   /* ESP_ROM_CHECKSUM_INITIAL */
     for (uint8_t i = 0; i < img[1]; i++) {
         if (len - off < SEG_HDR_LEN) {
-            return UDSOTA_DL_VERIFY_FAILED;
+            return 0;
         }
         uint32_t dl = le32(&img[off + 4]);
         off += SEG_HDR_LEN;
         if (dl > len - off) {
-            return UDSOTA_DL_VERIFY_FAILED;
+            return 0;
         }
         for (uint32_t k = 0; k < dl; k++) {
             x ^= img[off + k];
@@ -445,13 +446,42 @@ udsota_reason_t fake_ota_verify_image(const uint8_t *img, size_t len)
     }
     size_t padded = (off + 1u + 15u) & ~(size_t)15u;    /* checksum byte ends a 16-byte block */
     if (padded + HASH_LEN > len || img[padded - 1] != x) {
-        return UDSOTA_DL_VERIFY_FAILED;
+        return 0;
     }
+    return padded;
+}
+
+/* The fake's esp_ota_end check over a whole image; see fake_engine.h. */
+udsota_reason_t fake_ota_verify_image(const uint8_t *img, size_t len)
+{
+    const size_t padded = hash_offset(img, len);
     uint8_t d[HASH_LEN];
-    if (!sha256_host(img, padded, d)) {
+    if (padded == 0u || !sha256_host(img, padded, d)) {
         return UDSOTA_DL_VERIFY_FAILED;
     }
     return memcmp(d, &img[padded], HASH_LEN) == 0 ? UDSOTA_DL_OK : UDSOTA_DL_VERIFY_FAILED;
+}
+
+/* Reads n bytes of a slot at off; see fake_engine.h. */
+int fake_ota_slot_read(const fake_ota_t *f, uint8_t slot, uint32_t off, uint8_t *buf, size_t n)
+{
+    if (slot > 1 || f->fd[slot] < 0 || (uint64_t)off + n > f->slot_size) {
+        return -1;
+    }
+    return pread_all(f->fd[slot], buf, n, (off_t)off);
+}
+
+/* esp_partition_get_sha256 of a slot; see fake_engine.h. */
+bool fake_ota_slot_hash(const fake_ota_t *f, uint8_t slot, uint8_t out[32])
+{
+    uint8_t *img = malloc(f->slot_size);
+    bool ok = img != NULL && fake_ota_slot_read(f, slot, 0, img, f->slot_size) == 0 &&
+              fake_ota_verify_image(img, f->slot_size) == UDSOTA_DL_OK;
+    if (ok) {
+        memcpy(out, &img[hash_offset(img, f->slot_size)], HASH_LEN);
+    }
+    free(img);
+    return ok;
 }
 
 /* Builds a one-segment image that passes udsota_image_check and fake_ota_verify_image. */

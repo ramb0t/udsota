@@ -69,6 +69,11 @@ int  fake_ota_confirm(fake_ota_t *f);
 bool fake_ota_slot_desc(const fake_ota_t *f, uint8_t slot, char version[33], uint8_t elf_sha[32]);
 /* True when the slot holds a udsota descriptor (magic and desc_version) with UDSOTA_IMG_FLAG_RELEASE set. */
 bool fake_ota_slot_release(const fake_ota_t *f, uint8_t slot);
+/* Reads n bytes of slot at off (esp_partition_read): 0, or -1 when the read leaves the slot or fails. */
+int  fake_ota_slot_read(const fake_ota_t *f, uint8_t slot, uint32_t off, uint8_t *buf, size_t n);
+/* esp_partition_get_sha256 of an app slot: the SHA-256 its image appends, once fake_ota_verify_image passes on it.
+ * False for a slot without a valid image. */
+bool fake_ota_slot_hash(const fake_ota_t *f, uint8_t slot, uint8_t out[32]);
 /* F1F0 from the fake's state. flags carries nothing. */
 void fake_ota_fill_status(const fake_ota_t *f, udsota_status_t *out);
 /* Stateless resume point of the inactive slot (for a future resume): C = S - 4096 for the first all-0xFF

@@ -28,6 +28,7 @@ set(CORE_PRIV  ${CORE_DIR}/priv)
 set(ISOTP_DIR  ${ROOT}/components/isotp)
 set(ESP32_DIR  ${ROOT}/components/udsota_esp32)
 set(INFLATE_DIR ${ROOT}/components/udsota_inflate)
+set(DELTA_DIR  ${ROOT}/components/udsota_delta)
 
 # ---- Libraries: isotp (vendored isotp-c v1.9.3, unpatched, plus the per-link BS/STmin port) and
 # udsota_core, the portability target. udsota_core is every core .c, compiled with nothing on its
@@ -36,6 +37,7 @@ set(INFLATE_DIR ${ROOT}/components/udsota_inflate)
 add_subdirectory(components/isotp)
 add_subdirectory(components/udsota)
 add_subdirectory(components/udsota_inflate)
+add_subdirectory(components/udsota_delta)
 target_compile_options(isotp PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter)
 target_compile_options(udsota_core PRIVATE -Wall -Wextra -Werror)
 
@@ -127,12 +129,24 @@ udsota_test(test_udsota_server_progress
 
 # Compressed downloads: the stream and the real tinfl behind an engine's z ops, with the core image rules. The test
 # compiles its own miniz with deflate on, to make the streams it sends.
-set(ZSTREAM_SRCS ${CORE_DIR}/udsota_zstream.c ${INFLATE_DIR}/udsota_tinfl.c ${INFLATE_DIR}/miniz/miniz.c)
+set(ZSTREAM_SRCS ${CORE_DIR}/udsota_isink.c ${CORE_DIR}/udsota_zstream.c ${INFLATE_DIR}/udsota_tinfl.c
+                 ${INFLATE_DIR}/miniz/miniz.c)
 udsota_test(test_udsota_server_compress
     SOURCES  test/test_udsota_server_compress.c ${SERVER_SRCS} ${ZSTREAM_SRCS} ${CORE_DIR}/udsota_image.c
     INCLUDES ${CORE_INC} ${CORE_PRIV} ${TEST_DIR} ${INFLATE_DIR}/include ${INFLATE_DIR})
 target_compile_definitions(test_udsota_server_compress PRIVATE MINIZ_NO_STDIO MINIZ_NO_TIME MINIZ_NO_ARCHIVE_APIS
                                                                MINIZ_NO_ZLIB_APIS)
+
+# Delta downloads (DFI 0x20 and 0x30): udsota_coded over the real detools and tinfl, with the core image rules, on the
+# fixtures tools/make_delta_fixtures.py generates; and the image sink on its own. miniz is built with deflate on, to
+# wrap a patch in DEFLATE.
+udsota_test(test_udsota_server_delta
+    SOURCES  test/test_udsota_server_delta.c ${SERVER_SRCS} ${ZSTREAM_SRCS} ${CORE_DIR}/udsota_patch.c
+             ${CORE_DIR}/udsota_coded.c ${CORE_DIR}/udsota_image.c
+    INCLUDES ${CORE_INC} ${CORE_PRIV} ${TEST_DIR} ${INFLATE_DIR}/include ${INFLATE_DIR} ${DELTA_DIR}/include
+    LIBS     udsota_delta)
+target_compile_definitions(test_udsota_server_delta PRIVATE MINIZ_NO_STDIO MINIZ_NO_TIME MINIZ_NO_ARCHIVE_APIS
+                                                            MINIZ_NO_ZLIB_APIS)
 
 # The server with compressed downloads compiled out (UDSOTA_COMPRESSION=0): its own test, and the download and progress
 # tests again, which must pass unchanged.
@@ -286,6 +300,26 @@ if(UDSOTA_FUZZ AND UDSOTA_FUZZ_SAN_OK)
                                                      MINIZ_NO_STDIO
                                                      MINIZ_NO_TIME MINIZ_NO_ARCHIVE_APIS MINIZ_NO_ZLIB_APIS)
     set_tests_properties(fuzz_udsota_z PROPERTIES TIMEOUT 600)
+    # The delta patch path on mutated patches (test/fuzz_udsota_patch.c): udsota_coded over the real detools and
+    # tinfl, with AddressSanitizer where the toolchain has it, since the device parses these patches from the bus.
+    set(FUZZ_PATCH_SAN ${FUZZ_SAN})
+    set(CMAKE_REQUIRED_FLAGS "-fsanitize=address")
+    check_c_source_compiles("int main(void) { return 0; }" UDSOTA_FUZZ_ASAN_OK)
+    unset(CMAKE_REQUIRED_FLAGS)
+    if(UDSOTA_FUZZ_ASAN_OK)
+        list(APPEND FUZZ_PATCH_SAN -fsanitize=address)
+    endif()
+    add_executable(fuzz_udsota_patch test/fuzz_udsota_patch.c ${CORE_DIR}/udsota_coded.c ${CORE_DIR}/udsota_patch.c
+                   ${ZSTREAM_SRCS} ${DELTA_DIR}/udsota_detools.c ${DELTA_DIR}/detools/detools.c
+                   ${DELTA_DIR}/detools/heatshrink/heatshrink_decoder.c)
+    target_include_directories(fuzz_udsota_patch PRIVATE ${CORE_INC} ${TEST_DIR} ${INFLATE_DIR}/include ${INFLATE_DIR}
+                               ${DELTA_DIR}/include ${DELTA_DIR}/detools ${DELTA_DIR}/detools/heatshrink)
+    target_compile_definitions(fuzz_udsota_patch PRIVATE MINIZ_NO_STDIO MINIZ_NO_TIME MINIZ_NO_ARCHIVE_APIS
+                                                         MINIZ_NO_ZLIB_APIS ${UDSOTA_DETOOLS_DEFS})
+    target_compile_options(fuzz_udsota_patch PRIVATE -Wall -Wextra -Werror ${FUZZ_PATCH_SAN})
+    target_link_options(fuzz_udsota_patch PRIVATE ${FUZZ_PATCH_SAN})
+    add_test(NAME fuzz_udsota_patch COMMAND fuzz_udsota_patch)
+    set_tests_properties(fuzz_udsota_patch PROPERTIES TIMEOUT 600 PASS_REGULAR_EXPRESSION "^PASS fuzz_udsota_patch")
 endif()
 
 # ---- tools/image_check: the ESP32 port's first-block check as a host program, for checking a real
