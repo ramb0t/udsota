@@ -19,8 +19,8 @@
 
 #define UDSOTA_ISOTP_RX_MAX            4095u  /* largest request: one 0x36 block, FF_DL 0xFFF */
 #define UDSOTA_ISOTP_RX_LIMIT_IDLE     256u   /* receive limit outside a download */
-#define UDSOTA_ISOTP_TX_MAX            512u   /* isotp-c send buffer */
 #define UDSOTA_ISOTP_RESP_MAX          256u   /* largest answer the server may build */
+#define UDSOTA_ISOTP_TX_MAX            UDSOTA_ISOTP_RESP_MAX   /* isotp-c send buffer: one whole answer */
 #define UDSOTA_ISOTP_WAIT_SEND_MS      1u     /* service() wait while an answer, its CFs or an FC wait for the bus */
 #define UDSOTA_ISOTP_WAIT_OPEN_MS      10u    /* longest wait in a non-default session or mid-message */
 #define UDSOTA_ISOTP_WAIT_IDLE_MS      100u   /* longest wait otherwise */
@@ -34,7 +34,7 @@ typedef struct {
     void     *ctx;
 } udsota_can_t;
 
-/* The adapter's large buffers, 9,214 B; the caller places them (the ESP32 port: PSRAM). Only the adapter touches them. */
+/* The adapter's large buffers, 8,958 B; the caller places them (the ESP32 port: PSRAM). Only the adapter touches them. */
 typedef struct {
     uint8_t rx[UDSOTA_ISOTP_RX_MAX];         /* isotp-c reassembly */
     uint8_t tx[UDSOTA_ISOTP_TX_MAX];         /* isotp-c send */

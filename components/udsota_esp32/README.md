@@ -58,7 +58,7 @@ The diag task sleeps on its frame queue until the adapter's next deadline, and t
 | `UDSOTA_ESP32_TASK_PRIO` | 5 | its priority: below the app's CAN task, above the app's other tasks and the flash worker |
 | `UDSOTA_ESP32_TASK_STACK` | 6144 | its stack, in bytes; the 0x27 check runs on it too (an ECDSA verify in that mode) |
 | `UDSOTA_ESP32_TASK_STACK_PSRAM` | y | put the diag task's stack in PSRAM |
-| `UDSOTA_ESP32_BUFS_PSRAM` | y | put the ISO-TP adapter's 9,214 bytes of buffers in PSRAM |
+| `UDSOTA_ESP32_BUFS_PSRAM` | y | put the ISO-TP adapter's 8,958 bytes of buffers in PSRAM |
 | `UDSOTA_ESP32_WORKER_CORE` | 0 | core of the flash worker (erase, write, verify, activate, confirm) |
 | `UDSOTA_ESP32_WORKER_PRIO` | 3 | its priority; below the app's own tasks (a UI, say), so they keep running during an erase |
 | `UDSOTA_ESP32_WORKER_STACK` | 8192 | its stack, in bytes, sized for the RSA-3072 verify inside `esp_ota_end()` |
