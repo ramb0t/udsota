@@ -2632,15 +2632,6 @@ def test_flash_delta_profile_none_still_tries_0x30():
     assert rc == 0 and d.dfis == [0x30, 0x20, 0x00] and bytes(d.written) == DELTA_NEW
 
 
-# Check a lost 7F 36 31 for a patch from another base still falls back: the resent block finds the download ended
-# (0x24), F1F1 reads DL_BAD_BASE, and the full download goes.
-def test_flash_delta_wrong_base_with_the_answer_lost():
-    d = delta_server(base=resigned(DELTA_BASE), lose_bad_base=True)
-    rc, lines = run_delta(d, [("a.bin", DELTA_BASE)], compress="auto")
-    assert rc == 0 and d.dfis == [0x30, 0x10] and bytes(d.written) == DELTA_NEW
-    assert any(ln.startswith("the device is not running the base this patch was made from") for ln in lines)
-
-
 # Check flash() itself refuses --drop-76 with bases, before any request, for a library caller as for the CLI.
 def test_flash_drop_76_with_bases_is_refused():
     d = delta_server()
@@ -2711,13 +2702,15 @@ def test_flash_delta_falls_back_on_0x31_at_the_34(served, dfis):
 
 
 # Check a 36 refused with 0x31 and F1F1 DL_BAD_BASE (the server runs a re-signed build: same app_elf_sha256, other
-# image) skips every other delta mode and sends the full download with a new 34.
-def test_flash_delta_wrong_base_falls_back_to_a_full_download():
-    d = delta_server(base=resigned(DELTA_BASE))
+# image) skips every other delta mode and sends the full download with a new 34; or, with the 7F 36 31 lost, the
+# resent block finds the download ended (0x24) and F1F1 reads DL_BAD_BASE, and the same fallback follows.
+@pytest.mark.parametrize("lost", [False, True], ids=["refused", "answer_lost"])
+def test_flash_delta_wrong_base_falls_back_to_a_full_download(lost):
+    d = delta_server(base=resigned(DELTA_BASE), lose_bad_base=lost)
     rc, lines = run_delta(d, [("a.bin", DELTA_BASE)], compress="auto")
     assert rc == 0 and d.dfis == [0x30, 0x10] and bytes(d.written) == DELTA_NEW
     assert any(ln.startswith("the device is not running the base this patch was made from") for ln in lines)
-    d = delta_server(base=resigned(DELTA_BASE))
+    d = delta_server(base=resigned(DELTA_BASE), lose_bad_base=lost)
     assert run_delta(d, [("a.bin", DELTA_BASE)], compress="none")[0] == 0 and d.dfis == [0x20, 0x00]
 
 
