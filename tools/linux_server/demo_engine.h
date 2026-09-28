@@ -3,7 +3,7 @@
  * block; FF01 is fake_ota_end (segment walk and a real SHA-256 over the image), then the same first-block
  * rules again on the bytes in the slot, as the port does. A simulated reset (demo_engine_boot) runs the
  * boot slot: an activated image boots PENDING_VERIFY, and one rebooted before ConfirmImage rolls back.
- * With job_ms set, begin, verify, activate and confirm (and the writes queued behind an erase) answer
+ * With job_ms set, begin, verify, activate, confirm, zwrite and zend (and the writes queued behind an erase) answer
  * UDSOTA_PENDING and finish job_ms later, like the port's flash worker, so the server sends 0x78. With compress set it
  * also serves compressed downloads (DFI 0x10), and with delta set too delta ones (0x20, 0x30) rebuilt from the
  * running slot: zbegin, zwrite and zend run udsota_coded over the vendored tinfl and detools into the same

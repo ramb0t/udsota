@@ -1,6 +1,6 @@
 # udsota Linux demo server
 
-`udsota_demo_server` runs the portable core on Linux, so the client can be tested end to end without a board. The real UDS server (`udsota_server.c`) and ISO-TP adapter (`udsota_isotp.c`) serve one request/response pair over SocketCAN or over a frame pipe on stdin and stdout. Behind them is an update engine on two file-backed A/B slots (`components/udsota/test/fake_engine.c`), which runs the ESP32 port's first-block check and the core's `udsota_image_check` rules, and checks a real SHA-256 in FF01. It serves compressed downloads (DFI 0x10) through `udsota_zstream` and the vendored tinfl in `components/udsota_inflate`, so `flash --compress` works against it too.
+`udsota_demo_server` runs the portable core on Linux, so the client can be tested end to end without a board. The real UDS server (`udsota_server.c`) and ISO-TP adapter (`udsota_isotp.c`) serve one request/response pair over SocketCAN or over a frame pipe on stdin and stdout. Behind them is an update engine on two file-backed A/B slots (`components/udsota/test/fake_engine.c`), which runs the ESP32 port's first-block check and the core's `udsota_image_check` rules, and checks a real SHA-256 in FF01. It serves compressed and delta downloads (DFI 0x10, 0x20 and 0x30) through `udsota_coded`, on the vendored tinfl and detools, so `flash --compress` and `flash --diff-from` work against it too.
 
 Rollback is emulated. ActivateImage and 11 01 end in the reset hook, and the process then "reboots" without exiting. The engine runs the boot slot, the bus stays silent for `--boot-ms`, and a fresh server starts. An activated image therefore boots PENDING_VERIFY and stays there until ConfirmImage. If it restarts before that, the old image runs again and F1F0 reports the new one as rolled back. The client's whole `flash` sequence completes against it, from the precheck to ConfirmImage.
 
@@ -14,7 +14,7 @@ It is built from the root `CMakeLists.txt` on Linux only:
 cmake -S . -B build && cmake --build build --target udsota_demo_server
 ```
 
-The binary is `build/tools/linux_server/udsota_demo_server`. ctest checks its host HMAC against `udsota_keys.c`'s known answers, runs one request over the pipe, and runs an image from `--make-image` through `tools/image_check`.
+The binary is `build/tools/linux_server/udsota_demo_server`. ctest checks its host HMAC against `udsota_keys.c`'s known answers, runs one request over the pipe, runs an image from `--make-image` through `tools/image_check`, and checks that `--socketcan` refuses an interface that is not vcan.
 
 ## Run it on vcan
 
@@ -52,13 +52,14 @@ A pipe carries no timing, so each frame's arrival stamp is the time the server r
 | `--state-dir DIR`, `--fresh` | a temporary directory | where the slots live, and whether to wipe them first |
 | `--slot-size N` | 0x1E0000 | bytes per slot, a multiple of 4,096 |
 | `--running-version V` | v0.1.0 | the version of the image seeded into an empty running slot |
-| `--no-compress` | off | a build without a decompressor: a 34 with DFI 0x10 answers 0x31 |
+| `--no-compress` | off | a build without coded downloads: a 34 with DFI 0x10, 0x20 or 0x30 answers 0x31 |
+| `--no-delta` | off | a build without delta downloads: 0x20 and 0x30 answer 0x31, and 0x10 is still served |
 | `--no-rollback` | off | a build without rollback: an activated image boots UNDEFINED and ConfirmImage changes nothing |
 | `--label LABEL`, `--master FILE` | off | security on: `udsota_keys.c`'s derivation over the host HMAC-SHA256 with this label and the 32-byte master. A label without a master keeps security on and refuses every key, as the ESP32 port does |
 | `--device-id HEX` | 02:00:00:00:00:01 | F18C, and the device ID the keys are derived from |
 | `--skip-boot-delay` | off | starts each boot's clock at 10 s, so 0x27 answers without the post-boot 0x37 delay; a lockout still delays |
 | `--boot-ms N` | 500 | how long a restart stays silent |
-| `--job-ms N` | 0 | erase, FF01, ActivateImage and ConfirmImage run as a worker job this long, so the server answers 0x78 first |
+| `--job-ms N` | 0 | erase, FF01, ActivateImage, ConfirmImage and a coded download's 36s and 37 run as a worker job this long, so the server answers 0x78 first |
 | `--soak-ms N` | 0 | the gate refuses CONFIRM with 0x22 for this long after each boot, like an app's soak |
 | `--stmin-us`, `--block-size`, `--stmin-monitor` | 2000, 64, off | the flow control the server sends, and the STmin monitor |
 | `--withhold-fc-after N` | off | once: the gate refuses the FC point after a message's Nth CF (so the FC is withheld and the download ends), and the next FF is then ignored, as by a server on an erroring bus. N should be a multiple of the block size |
@@ -74,4 +75,4 @@ The engine checks what an ESP-IDF build would carry, but it does not run a real 
 
 ## Tests
 
-`client/tests/test_e2e_pipe.py` starts the demo in pipe mode and drives it with the client itself. The client's `cli.main`, `update` and `Uds` run over can-isotp's pure-Python ISO-TP stack, behind the same guarded bus, pre-flight and second-tester monitor that `transport.Transport` uses. They cover `info`, a full `flash`, a keyed `flash`, each first-block refusal with its F1F1 reason, an FF01 failure, rollback, the confirm soak, 0x78 on slow jobs, `--drop-76`, answers the pipe drops or delays, a withheld flow control (exit 1 with F1F1's reason) and a lost one (resent). For compressed downloads they cover `flash --compress` and the profile's `compression`, `--compress` and `--compress-auto` against the demo's `--no-compress`, a resent block, a request frame lost and answers lost mid-stream, and corrupt, truncated and refused streams. `client/tests/test_e2e_vcan.py` runs the demo on vcan0 (or `$UDSOTA_VCAN`) through its SocketCAN backend and flashes it two ways. The client over can-isotp's Python stack on a python-can SocketCAN bus needs only the `vcan` module, so these run on GitHub's hosted runners, whose kernel has no ISO-TP module. The installed `udsota` command over the kernel's ISO-TP socket also needs `can-isotp`, so those run on a Linux machine that has it. Each skips without what it needs. Both skip when the binary is not built, and they find it in `build/` or through `$UDSOTA_DEMO_SERVER`.
+`client/tests/test_e2e_pipe.py` starts the demo in pipe mode and drives it with the client itself. The client's `cli.main`, `update` and `Uds` run over can-isotp's pure-Python ISO-TP stack, behind the same guarded bus, pre-flight and second-tester monitor that `transport.Transport` uses. They cover `info`, a full `flash`, a keyed `flash`, each first-block refusal with its F1F1 reason, an FF01 failure, rollback, the confirm soak, 0x78 on slow jobs, `--drop-76`, answers the pipe drops or delays, a withheld flow control (exit 1 with F1F1's reason) and a lost one (resent). For compressed downloads they cover `flash --compress` and the profile's `compression`, `--compress` and `--compress-auto` against the demo's `--no-compress`, a resent block, a request frame lost and answers lost mid-stream, and corrupt, truncated and refused streams. For delta downloads they cover `flash --diff-from` under both DFIs, a wrong base falling back to a full download, a server without delta, and a 37 answering 0x78. `client/tests/test_e2e_vcan.py` runs the demo on vcan0 (or `$UDSOTA_VCAN`) through its SocketCAN backend and flashes it two ways. The client over can-isotp's Python stack on a python-can SocketCAN bus needs only the `vcan` module, so these run on GitHub's hosted runners, whose kernel has no ISO-TP module. The installed `udsota` command over the kernel's ISO-TP socket also needs `can-isotp`, so those run on a Linux machine that has it. Each skips without what it needs. Both skip when the binary is not built, and they find it in `build/` or through `$UDSOTA_DEMO_SERVER`.
