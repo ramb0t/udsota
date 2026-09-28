@@ -874,12 +874,6 @@ static int eng_write(void *ctx, uint32_t off, const uint8_t *d, size_t n)
 }
 
 #if CONFIG_UDSOTA_ESP32_COMPRESSION
-/* True for a DFI whose download inflates: 0x10, and 0x30's outer layer. */
-static bool dfi_inflates(uint8_t dfi)
-{
-    return dfi == UDSOTA_DL_DFI_DEFLATE || dfi == UDSOTA_DL_DFI_DELTA_DEFLATE;
-}
-
 /* engine.zbegin, on the diag task: allocates s_zout (internal), the inflater (z_alloc) for 0x10 and 0x30, the patch
  * decoder (internal) for 0x20 and 0x30 and s_pbuf (internal) for 0x30, and opens the download, then publishes it
  * under a new generation. UDSOTA_DL_FLASH_ERROR without a worker or an inactive slot, UDSOTA_DL_NO_MEMORY when an
@@ -921,9 +915,7 @@ static int eng_zbegin(void *ctx, uint32_t size, uint8_t dfi)
 #endif
     const udsota_reason_t r = bufs ? udsota_coded_open(&s_cd, dfi, size, &cfg) : UDSOTA_DL_NO_MEMORY;
     if (r != UDSOTA_DL_OK) {
-        ESP_LOGW(TAG, "no memory for DFI 0x%02X's decoder (%u B internal + %u B): 34 refused; internal heap largest "
-                 "block %u B", dfi, (unsigned)BLOCK_BUF,
-                 (unsigned)(dfi_inflates(dfi) ? udsota_tinfl_state_len() + UDSOTA_TINFL_DICT_LEN : 0u),
+        ESP_LOGW(TAG, "no memory for DFI 0x%02X's decoder: 34 refused; internal heap largest block %u B", dfi,
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         z_release();
         udsota_esp32_zbegin_refused();
@@ -934,11 +926,11 @@ static int eng_zbegin(void *ctx, uint32_t size, uint8_t dfi)
     s_z_live = true;
     taskEXIT_CRITICAL(&s_mux);
 #if CONFIG_UDSOTA_ESP32_DEBUG_MEASURE
+    const bool inflates = dfi == UDSOTA_DL_DFI_DEFLATE || dfi == UDSOTA_DL_DFI_DELTA_DEFLATE;   /* 0x30's outer layer */
     ESP_LOGI(TAG, "DFI 0x%02X download open for %" PRIu32 " B: inflater %u B state + %u B dictionary (%s), %u B image "
-             "buffer; internal heap free %u B", dfi, size,
-             (unsigned)(dfi_inflates(dfi) ? udsota_tinfl_state_len() : 0u),
-             (unsigned)(dfi_inflates(dfi) ? UDSOTA_TINFL_DICT_LEN : 0u),
-             (dfi_inflates(dfi) && esp_ptr_external_ram(s_tinfl.dict)) ? "PSRAM" : "internal", (unsigned)BLOCK_BUF,
+             "buffer; internal heap free %u B", dfi, size, (unsigned)(inflates ? udsota_tinfl_state_len() : 0u),
+             (unsigned)(inflates ? UDSOTA_TINFL_DICT_LEN : 0u),
+             (inflates && esp_ptr_external_ram(s_tinfl.dict)) ? "PSRAM" : "internal", (unsigned)BLOCK_BUF,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 #if CONFIG_UDSOTA_ESP32_DELTA
     if (dfi != UDSOTA_DL_DFI_DEFLATE) {
