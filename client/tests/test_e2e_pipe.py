@@ -330,8 +330,7 @@ def test_lost_activate_answer_still_confirms(demo, tmp_path):
     s = demo()
     s.drop = lambda m: is_activate_answer(m) and not s.dropped
     image = build_image("v0.2.0")
-    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash", image_file(tmp_path, image)],
-                   p2_s=transport.P2_S) == 0
+    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash", image_file(tmp_path, image)]) == 0
     assert len(s.dropped) == 1
     status, _, version = read_state(s)
     assert (status["running_slot"], status["running_state"], version) == (1, VALID, "v0.2.0")
@@ -386,7 +385,7 @@ def test_late_answer_is_not_the_next_blocks(demo, tmp_path):
 
     s.drop, s.tap = drop, tap
     assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash",
-                       image_file(tmp_path, build_image("v0.2.0"))], p2_s=transport.P2_S) == 0
+                       image_file(tmp_path, build_image("v0.2.0"))]) == 0
 
 
 # Suspected in the client audit, confirmed here, and fixed: when the first 0x78 of a job longer than the 0x21
@@ -397,7 +396,7 @@ def test_lost_response_pending_on_a_long_job(demo, tmp_path):
     s = demo("--job-ms", "8000")
     s.drop = lambda m: is_nrc(m, 0x36, 0x78) and not s.dropped
     assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash",
-                       image_file(tmp_path, build_image("v0.2.0"))], p2_s=transport.P2_S) == 0
+                       image_file(tmp_path, build_image("v0.2.0"))]) == 0
 
 
 # ---- compressed downloads (DFI 0x10) ----

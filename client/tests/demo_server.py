@@ -34,7 +34,7 @@ ISOTP_PARAMS = {"tx_padding": transport.PAD, "tx_data_min_length": 8, "blocking_
 
 # PipeTransport's default P2, in place of the client's 150 ms (transport.P2_S). A shared CI runner can stall the
 # demo or the client's threads past 150 ms, and the late answer then fails the next request too. A test of the
-# timeout path itself (a lost answer) passes p2_s=transport.P2_S.
+# test whose client must resend during a 1 s job, to meet the server's 0x21, passes p2_s=transport.P2_S.
 PIPE_P2_S = 1.0
 
 
