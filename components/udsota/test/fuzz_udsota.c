@@ -733,8 +733,9 @@ static void check_phase(void)
 }
 
 #if UDSOTA_FUZZ_PROGRESS
-/* After one server call: the hook ran at most once, and udsota_progress() reads what it last got, so every change
- * of stage and every written block was reported. Clears the call count for the next call. */
+/* After one server call: the hook ran at most once, and udsota_progress() reads what it last got, last_reason
+ * included, so every change of stage, written block and reason was reported (the ESP32 port's snapshot follows
+ * only the hook). Clears the call count for the next call. */
 static void check_progress(void)
 {
     udsota_progress_t now;
@@ -745,7 +746,7 @@ static void check_progress(void)
         fail("progress hook ran more than once in one server call", NULL, 0, NULL, 0);
     }
     if (now.stage != M.progress.stage || now.done != M.progress.done || now.total != M.progress.total ||
-        now.done > now.total) {
+        now.last_reason != M.progress.last_reason || now.done > now.total) {
         fail("udsota_progress() differs from what the progress hook last got", NULL, 0, NULL, 0);
     }
 }

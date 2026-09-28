@@ -58,7 +58,9 @@ typedef struct {
     udsota_stage_t stage;
     uint32_t       done;
     uint32_t       total;
-    uint8_t        last_reason;     /* udsota_reason_t of the last download, as F1F1 reports it */
+    uint8_t        last_reason;     /* udsota_reason_t of the last download, as F1F1 reports it. It describes a finished
+                                       download, so read it only in IDLE: during FF01 it reads UDSOTA_DL_WORKER_TIMEOUT
+                                       until the verdict replaces it */
 } udsota_progress_t;
 
 typedef struct {   /* required; only unverify, status, running_sha and version may be NULL */

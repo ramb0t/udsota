@@ -159,7 +159,7 @@ The hooks run in the server's context, which in the ESP32 port is the diag task.
 
 ## Progress
 
-An app that draws an update, with a bar or a percentage, reads the download's stage and bytes from `udsota_progress()` in the server's context, or takes them from the optional `progress` hook as they change; in the ESP32 port any task reads them with `udsota_esp32_progress()`. The phase alone cannot drive a bar: it reads TRANSFERRING from the 34 to the 37 and PROGRAMMING through the erase and the verify. Both give a `udsota_progress_t`: the `stage`, `done` and `total` in image bytes, and `last_reason`, the last download's F1F1 reason, so a display that falls back to IDLE can say that the update failed, and why. `udsota_progress_permille()` turns `done` and `total` into 0 to 1000 with 64-bit arithmetic.
+An app that draws an update, with a bar or a percentage, reads the download's stage and bytes from `udsota_progress()` in the server's context, or takes them from the optional `progress` hook as they change; in the ESP32 port any task reads them with `udsota_esp32_progress()`. The phase alone cannot drive a bar: it reads TRANSFERRING from the 34 to the 37 and PROGRAMMING through the erase and the verify. Both give a `udsota_progress_t`: the `stage`, `done` and `total` in image bytes, and `last_reason`, the last download's F1F1 reason, so a display that falls back to IDLE can say that the update failed, and why. `udsota_progress_permille()` turns `done` and `total` into 0 to 1000 with 64-bit arithmetic. `last_reason` describes a finished download, so read it only in IDLE: during FF01 it reads 10 (worker timeout), as F1F1 does, until the verdict replaces it.
 
 | Stage | From | Until | `done` / `total` |
 |---|---|---|---|
@@ -169,7 +169,7 @@ An app that draws an update, with a bar or a percentage, reads the download's st
 | VERIFYING | FF01's job starts | its verdict, then IDLE | 0 / 0: engines report no hash progress, so it is indeterminate |
 | ACTIVATING | a positive ActivateImage | the restart | 0 / 0 |
 
-A download also returns to IDLE when it ends early: an abort, a session change, S3, the 90 s cap, a refused first block or a failed write. `last_reason` then says which, as F1F1 does (reason 11, 10, 1 to 7 or 12). Within a download `done` only grows and never passes `total`: a resent block, a 36 refused for its counter or with 0x21, and a 0x78 leave it where it was. A new 34 starts it at the download's offset, which is 0 while GetResumePoint answers "not available".
+A download also returns to IDLE when it ends early: an abort, a session change, S3, the 90 s cap, a refused first block or a failed write. `last_reason` then says which, as F1F1 does (reason 11, 10, 1 to 7 or 12). Within a download `done` only grows and never passes `total`: a resent block, a 36 refused for its counter or with 0x21, and a 0x78 leave it where it was. A new 34 starts it at the download's offset, which is 0 while GetResumePoint answers "not available". Between a passed FF01 and a positive ActivateImage the stage reads IDLE with reason 0, so a display that saw VERIFYING can hold at "verified" there rather than treat it as idle.
 
 The hook runs at the end of the call that changed the stage or wrote a block, and never more than once per call, so during a transfer of 4 KB blocks it runs about once a second. A 0x78 never calls it. Like every hook, it runs in the server's context and must not block; with it NULL, every answer is the same bytes.
 

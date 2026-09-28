@@ -1,6 +1,7 @@
 /* Host tests for udsota_progress() and hooks.progress: the stage, bytes and last reason after each step of a
- * download, a resent block and a refused 36, every way a download ends early, a new download after GetResumePoint,
- * and when the hook runs: once per change of stage or written block, and at most once per server call. */
+ * download, a resent block and a refused 36, every way a download ends early (a withheld flow control included),
+ * a new download after GetResumePoint, and when the hook runs: once per change of stage or written block, and at
+ * most once per server call. */
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
@@ -386,6 +387,30 @@ static void test_session_change_is_idle_aborted(void)
     expect_ended(before, UDSOTA_DL_ABORTED);
 }
 
+/* A download stopped at a flow-control point, from either exit of udsota_fc_check(): the gate refusing
+ * CONTINUE_TRANSFER, and an udsota_end_session latched during a block's job and applied there. Each withholds the
+ * FC and ends the download: IDLE, UDSOTA_DL_ABORTED, and one hook call. */
+static void test_withheld_flow_control_is_idle_aborted(void)
+{
+    open_download();
+    write_block(1);
+    size_t before = g_log.n;
+    g_mock.gate_nrc[UDSOTA_OP_CONTINUE_TRANSFER] = UDSOTA_NRC_CONDITIONS_NOT_CORRECT;
+    TEST_ASSERT_FALSE(udsota_fc_check(&srv, 2000u, 2000u, g_now));
+    expect_ended(before, UDSOTA_DL_ABORTED);
+
+    g_mock.gate_nrc[UDSOTA_OP_CONTINUE_TRANSFER] = 0u;
+    open_download();
+    write_block(1);
+    TEST_ASSERT_EQUAL_UINT(0u, send_block(2));
+    udsota_end_session(&srv, g_now);                           /* latched: the block's job still runs */
+    (void)finish();
+    EXPECT(0x76, 0x02);                                        /* the job's answer still goes out */
+    before = g_log.n;
+    TEST_ASSERT_FALSE(udsota_fc_check(&srv, 2000u, 2000u, g_now));
+    expect_ended(before, UDSOTA_DL_ABORTED);
+}
+
 /* S3 runs out mid-transfer: the next poll ends the session and the download, IDLE, UDSOTA_DL_ABORTED. */
 static void test_s3_is_idle_aborted(void)
 {
@@ -506,6 +531,7 @@ int main(void)
     RUN_TEST(test_resent_block_and_refused_36_leave_done);
     RUN_TEST(test_abort_mid_transfer_is_idle_aborted);
     RUN_TEST(test_session_change_is_idle_aborted);
+    RUN_TEST(test_withheld_flow_control_is_idle_aborted);
     RUN_TEST(test_s3_is_idle_aborted);
     RUN_TEST(test_90s_cap_is_idle_worker_timeout);
     RUN_TEST(test_refusals_are_idle_with_their_reason);
