@@ -306,22 +306,6 @@ static uint8_t transfer_nrc(udsota_server_t *s)
     return g;
 }
 
-/* A DID the app serves: hooks.did_read, or 0 (NRC 0x31) when none is registered. */
-static size_t app_did(const udsota_server_t *s, uint16_t did, uint8_t *out, size_t room)
-{
-    return s->hooks.did_read != NULL ? s->hooks.did_read(s->hooks.ctx, did, out, room) : 0u;
-}
-
-/* Copies n bytes of src to out; 0 (NRC 0x31) when out has less room. */
-static size_t copy_did(uint8_t *out, size_t room, const uint8_t *src, size_t n)
-{
-    if (n > room) {
-        return 0;
-    }
-    memcpy(out, src, n);
-    return n;
-}
-
 /* The phase the server's state implies. */
 static udsota_phase_t phase_of(const udsota_server_t *s)
 {
@@ -530,7 +514,7 @@ static size_t handle_read_did(udsota_server_t *s, const uint8_t *req, size_t len
     const uint16_t did = udsota_get_u16be(&req[1]);
     uint8_t *out = &resp[3];
     const size_t room = resp_max - 3;
-    size_t n;
+    size_t n = 0;                                 /* 0: no one serves the DID, 0x31 */
     if (did == UDSOTA_DID_ACTIVE_SESSION) {
         out[0] = s->session;
         n = 1;
@@ -541,15 +525,18 @@ static size_t handle_read_did(udsota_server_t *s, const uint8_t *req, size_t len
     } else if (did == UDSOTA_DID_SW_VERSION && s->engine.version != NULL) {
         n = s->engine.version(s->engine.ctx, (char *)out, room);
     } else if (did == UDSOTA_DID_SERIAL && s->cfg.device_id != NULL && s->cfg.device_id_len != 0u) {
-        n = copy_did(out, room, s->cfg.device_id, s->cfg.device_id_len);
+        n = s->cfg.device_id_len;
+        if (n <= room) {
+            memcpy(out, s->cfg.device_id, n);     /* longer: 0x31 below */
+        }
     } else if (did == UDSOTA_DID_STATUS && s->engine.status != NULL) {
         udsota_status_t st;
         status_now(s, &st);
         n = udsota_pack_status(out, room, &st);
     } else if (did == UDSOTA_DID_RUNNING_SHA && s->engine.running_sha != NULL) {
         n = s->engine.running_sha(s->engine.ctx, out, room);
-    } else {
-        n = app_did(s, did, out, room);
+    } else if (s->hooks.did_read != NULL) {
+        n = s->hooks.did_read(s->hooks.ctx, did, out, room);
     }
     if (n == 0 || n > room) {
         return udsota_nrc(resp, resp_max, UDSOTA_SID_READ_DID, UDSOTA_NRC_REQUEST_OUT_OF_RANGE);
