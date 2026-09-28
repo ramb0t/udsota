@@ -7,8 +7,8 @@ import time
 
 from .errors import Nrc, Refused, ToolError, UpdateFailed
 from .profile import TYPES
-from .update import DECODE, device_keys, wait_for_boot
-from .wire import NRC_CONDITIONS, NRC_NOT_SUPPORTED, NRC_OUT_OF_RANGE, NRC_SEQUENCE, SESSION_EXTENDED
+from .update import device_keys, wait_for_boot
+from .wire import DECODE, NRC_CONDITIONS, NRC_NOT_SUPPORTED, NRC_OUT_OF_RANGE, NRC_SEQUENCE, SESSION_EXTENDED
 
 NO_CONFIG_WRITES = "this firmware has no config writes"
 

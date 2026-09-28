@@ -64,6 +64,18 @@ def decode_result(d):
     return reason_name(d[0]), int.from_bytes(d[1:5], "big")
 
 
+# F1F1's value d as `info` and the errors show it: "DL_ABORTED, 0 bytes received".
+def describe_result(d):
+    return "%s, %d bytes received" % decode_result(d)
+
+
+# A [dids] entry's decode, by the name the profile gives it, as its renderer.
+DECODE = {"hex": lambda d: d.hex(" "), "ascii": cstr,
+          "version3": lambda d: "%d.%d.%d" % tuple(d) if len(d) == 3 else d.hex(" "),
+          "u8": lambda d: "%d" % d[0] if len(d) == 1 else d.hex(" "),
+          "u16": lambda d: "%d" % int.from_bytes(d, "big") if len(d) == 2 else d.hex(" ")}
+
+
 # The counters DID (udsota_counters_t) as {counter name: value}.
 def decode_counters(d):
     if len(d) < 16:

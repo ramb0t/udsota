@@ -6,9 +6,9 @@ import tomllib
 from dataclasses import dataclass
 
 from .errors import Refused
+from .wire import DECODE
 
 PROFILE_DIR = pathlib.Path(__file__).resolve().parent / "profiles"
-DECODERS = ("hex", "ascii", "version3", "u8", "u16")
 TYPES = {"u8": 0xFF, "u16": 0xFFFF, "blob": None}   # a typed DID's value type and its largest value (blob: bytes)
 KEY_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")    # a writable DID's name, as `config set NAME=VALUE` takes it
 SLOT_SIZE_DEFAULT = 0x400000   # UDSOTA_SLOT_SIZE_DEFAULT
@@ -179,8 +179,8 @@ def _did_entry(name, key, entry):
     if not isinstance(entry, dict) or set(entry) - DID_KEYS:
         _bad(name, "[dids] %s must be { name = \"...\", decode = \"hex\" }" % key)
     decode = _str(name, entry, "decode", required=True)
-    if decode not in DECODERS:
-        _bad(name, "[dids] %s decode must be one of %s" % (key, ", ".join(DECODERS)))
+    if decode not in DECODE:
+        _bad(name, "[dids] %s decode must be one of %s" % (key, ", ".join(DECODE)))
     label = _str(name, entry, "name", required=True)
     vtype = _str(name, entry, "type")
     if vtype is not None and vtype not in TYPES:

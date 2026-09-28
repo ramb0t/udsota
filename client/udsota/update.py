@@ -10,8 +10,8 @@ from .keys import DeviceKeys, SigningKeys
 from .wire import (DID_COUNTERS, DID_DEVICE_ID, DID_RESULT, DID_RUNNING_SHA, DID_SESSION, DID_STATUS, DID_VERSION,
                    DL_DFI, DL_DFI_DEFLATE, DL_DFI_DELTA, DL_DFI_DELTA_DEFLATE, IMG_PENDING_VERIFY, IMG_STATES,
                    NRC_CONDITIONS, NRC_OUT_OF_RANGE, NRC_PROGRAMMING_FAILURE, NRC_SEQUENCE, OTHER_VERIFIED,
-                   RID_ACTIVATE, RID_CHECK_DEPS, RID_CONFIRM, SESSION_EXTENDED, SESSION_PROGRAMMING, cstr,
-                   decode_counters, decode_result, decode_status, describe_status, reason_name)
+                   RID_ACTIVATE, RID_CHECK_DEPS, RID_CONFIRM, SESSION_EXTENDED, SESSION_PROGRAMMING, DECODE, cstr,
+                   decode_counters, decode_result, decode_status, describe_result, describe_status, reason_name)
 
 REBOOT_WAIT_S = 3.0
 BOOT_TIMEOUT_S = 60.0
@@ -26,18 +26,14 @@ DETOOLS_HINT = ('delta downloads need detools: pip install "./client[diff]" from
                 "from source, so it needs a C and C++ compiler)")
 
 # The server-owned DIDs `info` reads first, with their labels and renderers.
-CORE_DIDS = ((DID_SESSION, "active session", lambda d: d.hex(" ")),
+CORE_DIDS = ((DID_SESSION, "active session", DECODE["hex"]),
              (DID_VERSION, "version", cstr),
              (DID_DEVICE_ID, "device ID", lambda d: ":".join("%02x" % b for b in d)),
-             (DID_RUNNING_SHA, "running app_elf_sha256", lambda d: d.hex(" ")),
+             (DID_RUNNING_SHA, "running app_elf_sha256", DECODE["hex"]),
              (DID_STATUS, "update status", lambda d: describe_status(decode_status(d))),
-             (DID_RESULT, "last download", lambda d: describe_result(d)),
+             (DID_RESULT, "last download", describe_result),
              (DID_COUNTERS, "ISO-TP/UDS counters",
               lambda d: " ".join("%s=%d" % kv for kv in decode_counters(d).items())))
-DECODE = {"hex": lambda d: d.hex(" "), "ascii": cstr,
-          "version3": lambda d: "%d.%d.%d" % tuple(d) if len(d) == 3 else d.hex(" "),
-          "u8": lambda d: "%d" % d[0] if len(d) == 1 else d.hex(" "),
-          "u16": lambda d: "%d" % int.from_bytes(d, "big") if len(d) == 2 else d.hex(" ")}
 
 
 # `info`: the server-owned DIDs, then the profile's [dids] in file order; a range stops at its first absent DID.
@@ -69,11 +65,6 @@ def send_block(uds, bsc, chunk):
         uds.transfer(bsc, chunk)
     except NoResponse:
         uds.transfer(bsc, chunk)
-
-
-# F1F1's value d as `info` and the errors show it: "DL_ABORTED, 0 bytes received".
-def describe_result(d):
-    return "%s, %d bytes received" % decode_result(d)
 
 
 # F1F1 as an error quotes it, or that it could not be read, so a failed read never hides the error being reported.
