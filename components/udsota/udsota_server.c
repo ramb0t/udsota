@@ -1599,10 +1599,7 @@ static size_t poll_step(udsota_server_t *s, uint8_t *resp, size_t resp_max, uint
     }
     apply_end_pending(s);                             /* then, at the next poll, a latched end_session */
     phase_sync(s);                                    /* reported at once, as on_request does */
-    if (s->session == UDSOTA_SESSION_DEFAULT) {
-        return 0;
-    }
-    if (s->s3_running && (now_ms - s->s3_start_ms) >= s->cfg.s3_ms) {
+    if (s->s3_running && (now_ms - s->s3_start_ms) >= s->cfg.s3_ms) {   /* never running in default */
         enter_session(s, UDSOTA_SESSION_DEFAULT);
     }
     return 0;
