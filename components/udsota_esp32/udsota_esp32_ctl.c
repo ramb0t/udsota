@@ -58,6 +58,28 @@ static void w_dtc_setting(void *ctx, bool on)
     ctl->app.dtc_setting(ctl->app.ctx, on);
 }
 
+/* did_write hook: the app's did_write with the app's ctx (installed only when the app has one). */
+static uint8_t w_did_write(void *ctx, uint16_t did, const uint8_t *data, size_t len, udsota_access_t access)
+{
+    const udsota_esp32_ctl_t *ctl = ctx;
+    return ctl->app.did_write(ctl->app.ctx, did, data, len, access);
+}
+
+/* routine hook: the app's routine with the app's ctx (installed only when the app has one). */
+static int w_routine(void *ctx, uint16_t rid, const uint8_t *in, size_t in_len,
+                     uint8_t *out, size_t out_max, size_t *out_len, udsota_access_t access)
+{
+    const udsota_esp32_ctl_t *ctl = ctx;
+    return ctl->app.routine(ctl->app.ctx, rid, in, in_len, out, out_max, out_len, access);
+}
+
+/* routine_poll hook: the app's routine_poll with the app's ctx (installed only when the app has one). */
+static int w_routine_poll(void *ctx, uint8_t *out, size_t out_max, size_t *out_len)
+{
+    const udsota_esp32_ctl_t *ctl = ctx;
+    return ctl->app.routine_poll(ctl->app.ctx, out, out_max, out_len);
+}
+
 /* Copies the app's hooks and builds the wrapped set (see the header). */
 void udsota_esp32_ctl_init(udsota_esp32_ctl_t *ctl, const udsota_hooks_t *app,
                            bool (*default_reset)(void *ctx), udsota_hooks_t *out)
@@ -68,14 +90,17 @@ void udsota_esp32_ctl_init(udsota_esp32_ctl_t *ctl, const udsota_hooks_t *app,
     atomic_store_explicit(&ctl->phase, (unsigned)UDSOTA_PHASE_IDLE, memory_order_release);
     atomic_store_explicit(&ctl->end_req, false, memory_order_release);
     *out = (udsota_hooks_t){
-        .gate     = (ctl->app.gate != NULL) ? w_gate : NULL,
-        .phase    = w_phase,
-        .did_read = (ctl->app.did_read != NULL) ? w_did_read : NULL,
-        .stmin_us = (ctl->app.stmin_us != NULL) ? w_stmin_us : NULL,
-        .reset    = (ctl->app.reset != NULL || default_reset != NULL) ? w_reset : NULL,
+        .gate         = (ctl->app.gate != NULL) ? w_gate : NULL,
+        .phase        = w_phase,
+        .did_read     = (ctl->app.did_read != NULL) ? w_did_read : NULL,
+        .stmin_us     = (ctl->app.stmin_us != NULL) ? w_stmin_us : NULL,
+        .reset        = (ctl->app.reset != NULL || default_reset != NULL) ? w_reset : NULL,
         .comm_control = (ctl->app.comm_control != NULL) ? w_comm_control : NULL,
         .dtc_setting  = (ctl->app.dtc_setting != NULL) ? w_dtc_setting : NULL,
-        .ctx      = ctl,
+        .ctx          = ctl,
+        .did_write    = (ctl->app.did_write != NULL) ? w_did_write : NULL,
+        .routine      = (ctl->app.routine != NULL) ? w_routine : NULL,
+        .routine_poll = (ctl->app.routine_poll != NULL) ? w_routine_poll : NULL,
     };
 }
 

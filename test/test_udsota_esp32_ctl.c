@@ -1,7 +1,8 @@
 /* Host tests for the ESP32 port's control block (components/udsota_esp32/udsota_esp32_ctl.c) with the
  * real udsota server: an app phase hook that calls back into the port neither deadlocks nor recurses,
- * an end-session it requests runs after the current request, and one requested during a job runs
- * after that job's answer. */
+ * an end-session it requests runs after the current request, one requested during a job runs after
+ * that job's answer, and the app's did_write, routine and routine_poll reach the app through the
+ * port's wrappers with its ctx, the request's bytes and the session's access state. */
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -26,6 +27,13 @@ static bool               s_end_from_hook;   /* the app phase hook asks for an e
 static int                s_default_resets, s_app_resets;
 static uint8_t            s_running_state;   /* the mock engine's running image state */
 static int                s_poll;            /* the mock engine's poll() and confirm() result */
+static int                s_writes, s_routines, s_routine_polls;   /* app write and routine hook calls */
+static uint16_t           s_write_did, s_routine_rid;
+static uint8_t            s_write_data[4];   /* the first bytes of the last value written */
+static size_t             s_write_len, s_routine_in_len;
+static uint8_t            s_routine_in0;     /* the first option byte of the last routine */
+static udsota_access_t    s_write_access, s_routine_access;
+static int                s_routine_poll_ret;   /* what app_routine_poll returns */
 
 /* Mock engine: the first block passes. */
 static int eng_check_first(void *ctx, const uint8_t *first, size_t len, udsota_reason_t *why)
@@ -131,6 +139,45 @@ static bool app_reset(void *ctx)
     return false;
 }
 
+/* The app's did_write: records what arrived and accepts the write. */
+static uint8_t app_did_write(void *ctx, uint16_t did, const uint8_t *data, size_t len, udsota_access_t access)
+{
+    s_ctx_seen = ctx;
+    s_writes++;
+    s_write_did = did;
+    s_write_len = len;
+    memcpy(s_write_data, data, (len < sizeof s_write_data) ? len : sizeof s_write_data);
+    s_write_access = access;
+    return 0u;
+}
+
+/* The app's routine: records what arrived and leaves the routine pending. */
+static int app_routine(void *ctx, uint16_t rid, const uint8_t *in, size_t in_len,
+                       uint8_t *out, size_t out_max, size_t *out_len, udsota_access_t access)
+{
+    s_ctx_seen = ctx;
+    s_routines++;
+    s_routine_rid = rid;
+    s_routine_in_len = in_len;
+    s_routine_in0 = (in_len > 0u) ? in[0] : 0u;
+    s_routine_access = access;
+    *out_len = 0u;
+    return UDSOTA_PENDING;
+}
+
+/* The app's routine_poll: returns s_routine_poll_ret, with one status byte 00 when that is 0. */
+static int app_routine_poll(void *ctx, uint8_t *out, size_t out_max, size_t *out_len)
+{
+    s_ctx_seen = ctx;
+    s_routine_polls++;
+    *out_len = 0u;
+    if (s_routine_poll_ret == 0 && out_max >= 1u) {
+        out[0] = 0x00u;
+        *out_len = 1u;
+    }
+    return s_routine_poll_ret;
+}
+
 /* Wraps app's hooks and starts a server on them with default config and no security. */
 static void start(const udsota_hooks_t *app)
 {
@@ -163,6 +210,18 @@ void setUp(void)
     s_app_resets = 0;
     s_running_state = UDSOTA_IMG_VALID;
     s_poll = 0;
+    s_writes = 0;
+    s_routines = 0;
+    s_routine_polls = 0;
+    s_write_did = 0u;
+    s_routine_rid = 0u;
+    memset(s_write_data, 0, sizeof s_write_data);
+    s_write_len = 0u;
+    s_routine_in_len = 0u;
+    s_routine_in0 = 0u;
+    s_write_access = (udsota_access_t){0};
+    s_routine_access = (udsota_access_t){0};
+    s_routine_poll_ret = 0;
 }
 
 /* Unity hook: nothing to undo. */
@@ -287,6 +346,131 @@ static void test_wrapped_hooks_forward_app_ctx_and_keep_nulls(void)
     TEST_ASSERT_EQUAL_PTR(&s_marker, s_ctx_seen);
 }
 
+/* 2E and 31 01 on an app RID reach the app's did_write, routine and routine_poll through the port and the
+ * real server, with the app's ctx, the request's bytes and the session's access state. The pending routine
+ * answers from its poll, and a repeat 10 03 hands the next write the next epoch. */
+static void test_write_and_routine_hooks_reach_the_app(void)
+{
+    const udsota_hooks_t app = {
+        .did_write = app_did_write, .routine = app_routine, .routine_poll = app_routine_poll, .ctx = &s_marker,
+    };
+    start(&app);
+    enter_extended(NOW);
+    uint8_t resp[16];
+
+    const uint8_t wr[] = {0x2E, 0x02, 0x00, 0xAB};
+    TEST_ASSERT_EQUAL_UINT(3u, udsota_on_request(&s_srv, wr, sizeof wr, resp, sizeof resp, NOW + 1u));
+    TEST_ASSERT_EQUAL_HEX8(0x6E, resp[0]);
+    TEST_ASSERT_EQUAL_HEX8(0x02, resp[1]);
+    TEST_ASSERT_EQUAL_HEX8(0x00, resp[2]);
+    TEST_ASSERT_EQUAL_INT(1, s_writes);
+    TEST_ASSERT_EQUAL_PTR(&s_marker, s_ctx_seen);
+    TEST_ASSERT_EQUAL_HEX16(0x0200, s_write_did);
+    TEST_ASSERT_EQUAL_UINT(1u, s_write_len);
+    TEST_ASSERT_EQUAL_HEX8(0xAB, s_write_data[0]);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_EXTENDED, s_write_access.session);
+    TEST_ASSERT_EQUAL_UINT8(0u, s_write_access.unlocked_level);   /* no security: nothing unlocked */
+
+    s_ctx_seen = NULL;
+    s_routine_poll_ret = UDSOTA_PENDING;
+    const uint8_t rc[] = {0x31, 0x01, 0x12, 0x34, 0x07};
+    TEST_ASSERT_EQUAL_UINT(0u, udsota_on_request(&s_srv, rc, sizeof rc, resp, sizeof resp, NOW + 2u));
+    TEST_ASSERT_EQUAL_INT(1, s_routines);
+    TEST_ASSERT_EQUAL_PTR(&s_marker, s_ctx_seen);
+    TEST_ASSERT_EQUAL_HEX16(0x1234, s_routine_rid);
+    TEST_ASSERT_EQUAL_UINT(1u, s_routine_in_len);
+    TEST_ASSERT_EQUAL_HEX8(0x07, s_routine_in0);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_EXTENDED, s_routine_access.session);
+    TEST_ASSERT_EQUAL_UINT32(s_write_access.epoch, s_routine_access.epoch);   /* same session, same epoch */
+
+    s_ctx_seen = NULL;
+    TEST_ASSERT_EQUAL_UINT(0u, udsota_poll(&s_srv, resp, sizeof resp, NOW + 3u));   /* pending, before any 0x78 */
+    TEST_ASSERT_TRUE(s_routine_polls >= 1);
+    TEST_ASSERT_EQUAL_PTR(&s_marker, s_ctx_seen);
+    s_routine_poll_ret = 0;
+    TEST_ASSERT_EQUAL_UINT(5u, udsota_poll(&s_srv, resp, sizeof resp, NOW + 4u));
+    TEST_ASSERT_EQUAL_HEX8(0x71, resp[0]);
+    TEST_ASSERT_EQUAL_HEX8(0x01, resp[1]);
+    TEST_ASSERT_EQUAL_HEX8(0x12, resp[2]);
+    TEST_ASSERT_EQUAL_HEX8(0x34, resp[3]);
+    TEST_ASSERT_EQUAL_HEX8(0x00, resp[4]);
+
+    enter_extended(NOW + 5u);                         /* a repeat 10 03 enters the session again */
+    TEST_ASSERT_EQUAL_UINT(3u, udsota_on_request(&s_srv, wr, sizeof wr, resp, sizeof resp, NOW + 6u));
+    TEST_ASSERT_EQUAL_HEX8(0x6E, resp[0]);
+    TEST_ASSERT_EQUAL_INT(2, s_writes);
+    TEST_ASSERT_EQUAL_UINT32(s_routine_access.epoch + 1u, s_write_access.epoch);
+}
+
+/* Each of did_write, routine and routine_poll is wrapped only when the app sets it, and a direct call
+ * through the wrapper reaches the app's hook with the app's ctx and the caller's access state unchanged. */
+static void test_write_and_routine_wrappers_follow_each_app_hook(void)
+{
+    const udsota_access_t acc = { .session = UDSOTA_SESSION_PROGRAMMING, .unlocked_level = 0x03u, .epoch = 7u };
+    uint8_t out[4];
+    size_t n = 99u;
+
+    const udsota_hooks_t only_poll = { .routine_poll = app_routine_poll, .ctx = &s_marker };
+    udsota_esp32_ctl_init(&s_ctl, &only_poll, default_reset, &s_hooks);
+    TEST_ASSERT_NULL(s_hooks.did_write);
+    TEST_ASSERT_NULL(s_hooks.routine);
+    TEST_ASSERT_NOT_NULL(s_hooks.routine_poll);
+    TEST_ASSERT_EQUAL_INT(0, s_hooks.routine_poll(s_hooks.ctx, out, sizeof out, &n));
+    TEST_ASSERT_EQUAL_UINT(1u, n);
+    TEST_ASSERT_EQUAL_PTR(&s_marker, s_ctx_seen);
+
+    const udsota_hooks_t only_write = { .did_write = app_did_write, .ctx = &s_marker };
+    udsota_esp32_ctl_init(&s_ctl, &only_write, default_reset, &s_hooks);
+    TEST_ASSERT_NOT_NULL(s_hooks.did_write);
+    TEST_ASSERT_NULL(s_hooks.routine);
+    TEST_ASSERT_NULL(s_hooks.routine_poll);
+    const uint8_t v[] = {0x01, 0x02};
+    s_ctx_seen = NULL;
+    TEST_ASSERT_EQUAL_HEX8(0x00, s_hooks.did_write(s_hooks.ctx, 0xF1B0u, v, sizeof v, acc));
+    TEST_ASSERT_EQUAL_PTR(&s_marker, s_ctx_seen);
+    TEST_ASSERT_EQUAL_HEX16(0xF1B0, s_write_did);
+    TEST_ASSERT_EQUAL_UINT(2u, s_write_len);
+    TEST_ASSERT_EQUAL_HEX8(0x02, s_write_data[1]);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_PROGRAMMING, s_write_access.session);
+    TEST_ASSERT_EQUAL_UINT8(0x03u, s_write_access.unlocked_level);
+    TEST_ASSERT_EQUAL_UINT32(7u, s_write_access.epoch);
+
+    const udsota_hooks_t only_routine = { .routine = app_routine, .ctx = &s_marker };
+    udsota_esp32_ctl_init(&s_ctl, &only_routine, default_reset, &s_hooks);
+    TEST_ASSERT_NULL(s_hooks.did_write);
+    TEST_ASSERT_NOT_NULL(s_hooks.routine);
+    TEST_ASSERT_NULL(s_hooks.routine_poll);
+    const uint8_t in[] = {0x07};
+    s_ctx_seen = NULL;
+    TEST_ASSERT_EQUAL_INT(UDSOTA_PENDING, s_hooks.routine(s_hooks.ctx, 0x1234u, in, sizeof in, out, sizeof out, &n, acc));
+    TEST_ASSERT_EQUAL_PTR(&s_marker, s_ctx_seen);
+    TEST_ASSERT_EQUAL_HEX16(0x1234, s_routine_rid);
+    TEST_ASSERT_EQUAL_UINT(1u, s_routine_in_len);
+    TEST_ASSERT_EQUAL_HEX8(0x07, s_routine_in0);
+    TEST_ASSERT_EQUAL_UINT8(0x03u, s_routine_access.unlocked_level);
+    TEST_ASSERT_EQUAL_UINT32(7u, s_routine_access.epoch);
+}
+
+/* With no app write or routine hooks the port leaves all three NULL, so the core answers as it always has:
+ * 2E is 0x11 and an app RID is 0x31. */
+static void test_without_write_and_routine_hooks_the_core_answers_as_before(void)
+{
+    start(NULL);
+    TEST_ASSERT_TRUE(s_hooks.did_write == NULL && s_hooks.routine == NULL && s_hooks.routine_poll == NULL);
+    enter_extended(NOW);
+    uint8_t resp[16];
+    const uint8_t wr[] = {0x2E, 0x02, 0x00, 0xAB};
+    TEST_ASSERT_EQUAL_UINT(3u, udsota_on_request(&s_srv, wr, sizeof wr, resp, sizeof resp, NOW + 1u));
+    TEST_ASSERT_EQUAL_HEX8(0x7F, resp[0]);
+    TEST_ASSERT_EQUAL_HEX8(0x2E, resp[1]);
+    TEST_ASSERT_EQUAL_HEX8(0x11, resp[2]);
+    const uint8_t rc[] = {0x31, 0x01, 0x12, 0x34, 0x07};
+    TEST_ASSERT_EQUAL_UINT(3u, udsota_on_request(&s_srv, rc, sizeof rc, resp, sizeof resp, NOW + 2u));
+    TEST_ASSERT_EQUAL_HEX8(0x7F, resp[0]);
+    TEST_ASSERT_EQUAL_HEX8(0x31, resp[1]);
+    TEST_ASSERT_EQUAL_HEX8(0x31, resp[2]);
+}
+
 /* Waits become ticks rounded down, never 0 for a real wait: 5 ms is 1 tick at 100 Hz (not 0, which spun the
  * diag task) and 5 at 1 kHz; 0 stays 0 and a huge wait saturates. */
 static void test_wait_ticks_never_round_a_wait_to_zero(void)
@@ -308,6 +492,9 @@ int main(void)
     RUN_TEST(test_end_requested_during_a_job_applies_after_its_answer);
     RUN_TEST(test_requests_coalesce_and_phase_tracks_without_app_hooks);
     RUN_TEST(test_wrapped_hooks_forward_app_ctx_and_keep_nulls);
+    RUN_TEST(test_write_and_routine_hooks_reach_the_app);
+    RUN_TEST(test_write_and_routine_wrappers_follow_each_app_hook);
+    RUN_TEST(test_without_write_and_routine_hooks_the_core_answers_as_before);
     RUN_TEST(test_wait_ticks_never_round_a_wait_to_zero);
     return UNITY_END();
 }

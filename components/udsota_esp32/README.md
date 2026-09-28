@@ -25,6 +25,8 @@ udsota_esp32 is the ESP-IDF port of [udsota](../udsota/README.md). It runs the U
 
 The device ID is `cfg.device_id` (1 to 16 bytes) when set, else the 6-byte base MAC. Start copies it once, serves the copy as F18C and derives or checks the 0x27 keys over the same bytes, so the key a client makes from F18C always matches. A set `device_id` of any other length makes start return `ESP_ERR_INVALID_ARG`. A custom ID must be unique per device, or devices share K_dev (HMAC) or accept each other's signatures (ECDSA).
 
+Start passes every hook in `udsota_hooks_t` to the core with the app's own `ctx`, `did_write`, `routine` and `routine_poll` included, and a hook the app leaves NULL stays NULL, so the core's default holds. The port adds only its phase copy and the `esp_restart()` default for `reset`.
+
 ### Security config
 
 Start reads these `udsota_config_t` fields for 0x27; the core README's [Security](../udsota/README.md#security) describes the two modes.
@@ -63,7 +65,9 @@ The diag task sleeps on its frame queue until the adapter's next deadline, and t
 
 ## Memory and tasks
 
-`udsota_esp32_start()` allocates everything once, and nothing after. By default the ISO-TP adapter's buffers (`UDSOTA_ESP32_BUFS_PSRAM`) and the diag task's stack (`UDSOTA_ESP32_TASK_STACK_PSRAM`) go in PSRAM. That needs `CONFIG_SPIRAM`, and the stack also needs `CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM`; it is safe because the diag task never touches flash. The app's hooks (`gate`, `did_read`, `phase`, `reset`) run on the diag task too, so with the stack in PSRAM a hook must not touch flash either (NVS, `esp_partition_*`): turn `UDSOTA_ESP32_TASK_STACK_PSRAM` off if one does. The flash worker's stack and its 4 KB block buffer stay in internal RAM, because flash operations disable the cache that PSRAM is reached through, and so do the request queue (which the app's CAN task writes), the worker's job queue and the PSA lock.
+`udsota_esp32_start()` allocates everything once, and nothing after. By default the ISO-TP adapter's buffers (`UDSOTA_ESP32_BUFS_PSRAM`) and the diag task's stack (`UDSOTA_ESP32_TASK_STACK_PSRAM`) go in PSRAM. That needs `CONFIG_SPIRAM`, and the stack also needs `CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM`; it is safe because the diag task never touches flash. The app's hooks run on the diag task too, so with the stack in PSRAM a hook must not touch flash either (NVS, `esp_partition_*`): turn `UDSOTA_ESP32_TASK_STACK_PSRAM` off if one does. The flash worker's stack and its 4 KB block buffer stay in internal RAM, because flash operations disable the cache that PSRAM is reached through, and so do the request queue (which the app's CAN task writes), the worker's job queue and the PSA lock.
+
+A hook that blocks stalls the diag task, and every answer and 0x78 with it, wherever its stack is. A `routine` that writes flash or NVS hands the work to a task with an internal-RAM stack, returns `UDSOTA_PENDING`, and reports the result from `routine_poll`; `did_write` should only stage values in RAM.
 
 With security on, start enables the SAR-ADC entropy source (`bootloader_random_enable()`) and leaves it on, so seeds are truly random without Wi-Fi or Bluetooth. ESP-IDF's `random.rst` says the source must be disabled before the app uses the ADC, Wi-Fi or Bluetooth, so an app that uses any of them needs this changed first.
 

@@ -7,7 +7,7 @@ This component is the portable core: C11, with no platform headers. It builds as
 ## Layers
 
 ```
-app            CAN driver · gate and phase hooks · its own DIDs · product policy
+app            CAN driver · gate and phase hooks · its own DIDs, writes and routines · product policy
   │
 udsota         ISO-TP adapter (udsota_isotp) → UDS server (udsota_server) → engine interface
                image rules (descriptor, version) · key derivation · boot-loop counter
@@ -126,6 +126,9 @@ Every struct carries its own `ctx`, which is passed back to its callbacks. A NUL
 | `gate(ctx, op)` | at each enforcement point in the next table: after the core's own checks, except CONFIRM, where it is asked first | allow |
 | `phase(ctx, p)` | on every phase change | nobody is told |
 | `did_read(ctx, did, buf, max)` | for a 22 on any DID the core does not serve; returns the bytes written, 0 for "no such DID" | every such DID answers 0x31 |
+| `did_write(ctx, did, data, len, access)` | for a 2E outside the default session with at least one value byte (the core answers 0x7F in the default session and 0x13 under 4 bytes first); `data` is the value after the DID. Returns 0 to answer `6E <did>`, else the NRC | 2E answers 0x11 |
+| `routine(ctx, rid, in, in_len, out, out_max, out_len, access)` | for 31 01 on a RID the core doesn't own, outside the default session; `in` is the option record after the RID. Returns 0 to answer `71 01 <rid>` and `out_len` bytes of `out`, an NRC, or `UDSOTA_PENDING` | such RIDs answer 0x31 |
+| `routine_poll(ctx, out, out_max, out_len)` | on every `udsota_poll` while a routine is pending or orphaned; returns as `routine` does | a routine that returns `UDSOTA_PENDING` answers 0x10 at the first poll |
 | `stmin_us(ctx)` | when a request's first frame arrives, for that message's flow control | `cfg.stmin_us` (2 ms) |
 | `reset(ctx)` | once the answer to 11 01 or ActivateImage has left (the transport's `tx_pending` reads 0, or after 100 ms); it returns only on failure, and the server then re-opens | in the core, 11 01 answers 0x11 and ActivateImage answers positive without a restart, so the new image boots at the next power cycle. The ESP32 port uses `esp_restart()` |
 | `comm_control(ctx, control, comm_type)` | for a 28 that passed the core's checks; returns 0 once the app has stopped or resumed its own frames as asked, else the NRC. Called again with 00 and 03 (enable everything) when the session returns to default after a change | 28 answers 0x11 |
@@ -147,7 +150,11 @@ A deny during a transfer ends it, except 0x21 on a 36, which the client may retr
 
 The phase is IDLE in the default session, and EXTENDED or PROGRAMMING in those sessions. It is TRANSFERRING from an accepted 34 until 37, an abort or a session change, and ACTIVATING from a positive ActivateImage until the restart.
 
-The hooks run in the server's context, which in the ESP32 port is the diag task. The gate is asked at flow-control points while frames stream in, so it must read a snapshot the app keeps current, return at once and never block. The phase hook must not wait on anything either.
+`did_write` and `routine` get a `udsota_access_t` by value. `session` is the session in force, and `unlocked_level` is the requestSeed level unlocked in it, or 0 for none. `epoch` goes up by one on every session entry, whatever causes it: each accepted 10 0x (a repeat of the current session included), the S3 timeout, `udsota_end_session`, the 90 s cap, the restart, a refused 36 and a withheld flow control. The core applies only the ISO session rule, so the app decides which session and level each write or routine needs. An app that keeps state across requests, such as writes staged for a later commit routine, records the epoch it started under and drops the state when the epoch changes, so a second tester never inherits the first one's session. `udsota_init` restarts the epoch at 0, so such state must not outlive a re-init either.
+
+A routine that returns `UDSOTA_PENDING` is a job like FF01: the core answers 0x78 on the flash-job cadence and every other request but 3E with 0x21, and at 90 s answers 0x72 and ends the session. The routine is then orphaned. Until `routine_poll` stops returning `UDSOTA_PENDING`, every "no flash job runs" condition in the op table fails, so 10 02, 34, ActivateImage and 11 01 answer 0x22, and so does a 31 01 on any app RID, without calling `routine`. A routine that can outlast 90 s should leave its outcome where a client can read it, such as a DID.
+
+The hooks run in the server's context, which in the ESP32 port is the diag task. The gate is asked at flow-control points while frames stream in, so it must read a snapshot the app keeps current, return at once and never block. The phase hook must not wait on anything either, and neither may `did_write`, `routine` or `routine_poll`: work that takes time runs elsewhere, and the routine reports it through `UDSOTA_PENDING` and `routine_poll`.
 
 ## Integrating safely
 
@@ -219,6 +226,7 @@ The first 36 block is checked before anything is erased, and FF01 checks the who
 | 11 | ECUReset | 01 hardReset: answers, then restarts through `reset` | extended, programming | either level |
 | 22 | ReadDataByIdentifier | one DID per request | any | – |
 | 27 | SecurityAccess | `level_extended` and the next sub-function in extended, `level_programming` and the next in programming; a sendKey carries exactly 16 key bytes, or 64 in the ECDSA mode | extended, programming | – |
+| 2E | WriteDataByIdentifier | one DID and at least one value byte, through `did_write`; answers `6E <did>` | extended, programming | the app's choice |
 | 31 | RoutineControl | 01 startRoutine | per routine | per routine |
 | 34 | RequestDownload | DFI 00, ALFID 44, address 0, 0 < size ≤ slot; answers `74 20 0F FF` (`cfg.max_block_len`, 4,095 by default) | programming | programming |
 | 36 | TransferData | block counter from 01, wrapping FF to 00, and up to 4,093 data bytes; a repeat of the last counter is answered and not rewritten | programming | programming |
@@ -227,7 +235,7 @@ The first 36 block is checked before anything is erased, and FF01 checks the who
 | 28 | CommunicationControl (with `comm_control` only) | controlType 00–03 and a communicationType naming normal or network-management messages; answers `68 xx` | extended, programming | – |
 | 85 | ControlDTCSetting (with `dtc_setting` only) | 01 on, 02 off, with any option record; answers `C5 xx` | extended, programming | – |
 
-Any other SID answers 0x11. While a flash job runs, every request but 3E answers 0x21. The key column applies only with security on. A return to the default session, by 10 01, S3 or an end of session, undoes 28 and 85 through their hooks.
+Any other SID answers 0x11, and so does 2E without `did_write`. While a flash job or a pending app routine runs, every request but 3E answers 0x21. The key column applies only with security on. A return to the default session, by 10 01, S3 or an end of session, undoes 28 and 85 through their hooks.
 
 ### Functional addressing
 
@@ -242,7 +250,7 @@ With `cfg.func_id` set (OBD's broadcast ID is 0x7DF), the port hands single fram
 | F001 | ActivateImage | programming, programming | needs the slot verified (else 0x24); makes it the boot slot, answers, then restarts |
 | F002 | ConfirmImage | extended, none | needs the boot slot; confirms a pending-verify image, answers positive for one already valid or undefined, else 0x22 |
 
-A 31 in the default session answers 0x7F. A RID that isn't served in the current session answers 0x31.
+A 31 in the default session answers 0x7F, and a sub-function other than 01 answers 0x12. A RID in this table that isn't served in the current session answers 0x31. Every other RID goes to `routine` with its option record, and answers 0x31 when `routine` is NULL.
 
 ### Data identifiers
 
@@ -262,10 +270,10 @@ Every other DID goes to `did_read`, and so does any of these whose source is NUL
 
 | NRC | Name | udsota sends it for |
 |---|---|---|
-| 0x11 | serviceNotSupported | an unknown SID; 27 with security off; 11 01 with no `reset` hook; 28 with no `comm_control` hook; 85 with no `dtc_setting` hook |
+| 0x11 | serviceNotSupported | an unknown SID; 27 with security off; 11 01 with no `reset` hook; 28 with no `comm_control` hook; 85 with no `dtc_setting` hook; 2E with no `did_write` hook |
 | 0x12 | subFunctionNotSupported | an unknown sub-function |
 | 0x13 | incorrectMessageLengthOrInvalidFormat | a wrong length, or more than one DID in a 22 |
-| 0x21 | busyRepeatRequest | any request but 3E while a flash job runs; or the gate's choice |
+| 0x21 | busyRepeatRequest | any request but 3E while a flash job or a pending app routine runs; or the gate's choice |
 | 0x22 | conditionsNotCorrect | a core-owned condition, or the gate |
 | 0x24 | requestSequenceError | a step out of order: 36 with no download open, 37 before the last byte, FF01 before 37, F001 before FF01, or a key with no live seed |
 | 0x31 | requestOutOfRange | an unknown DID or RID, 34 parameters or size, or a first block the image rules refuse |
@@ -274,15 +282,17 @@ Every other DID goes to `did_read`, and so does any of these whose source is NUL
 | 0x36 | exceedNumberOfAttempts | the third wrong key |
 | 0x37 | requiredTimeDelayNotExpired | 27 within 10 s of boot or of a lockout |
 | 0x71 | transferDataSuspended | a 36 that would overrun the announced size; the download ends |
-| 0x72 | generalProgrammingFailure | an erase, write, activate or confirm failure, or a flash job past 90 s |
+| 0x72 | generalProgrammingFailure | an erase, write, activate or confirm failure, or a flash job or app routine past 90 s |
 | 0x73 | wrongBlockSequenceCounter | a 36 counter that is neither the next nor a repeat |
-| 0x78 | responsePending | a flash job still running after 40 ms, repeated every 1.5 s |
+| 0x78 | responsePending | a flash job or app routine still running after 40 ms, repeated every 1.5 s |
 | 0x7E | subFunctionNotSupportedInActiveSession | a 27 level that belongs to the other session |
-| 0x7F | serviceNotSupportedInActiveSession | 11, 27, 28, 31 or 85 in the default session; 34, 36 or 37 outside programming |
+| 0x7F | serviceNotSupportedInActiveSession | 11, 27, 28, 31 or 85 in the default session, and 2E there when `did_write` is set; 34, 36 or 37 outside programming |
+
+`did_write`, `routine` and `routine_poll` may answer any NRC the app picks but 0x78. A `routine` or `routine_poll` that returns anything but 0, an NRC or `UDSOTA_PENDING`, or sets `out_len` over `out_max`, answers 0x10 generalReject.
 
 ### Timing
 
-P2 is 50 ms and P2\* 5,000 ms (`cfg.p2_ms`, `cfg.p2star_ms`); the programming session can have its own (`cfg.p2_prog_ms`, `cfg.p2star_prog_ms`), which its 10 02 answer carries and its 0x78 cadence follows. S3 is 5 s after the last answer (`cfg.s3_ms`); it pauses while a multi-frame request arrives, and its expiry returns the server to the default session, which aborts a download. A flash job not done within four fifths of P2 (40 ms) gets 0x78, repeated every three tenths of P2\* (1.5 s), and at 90 s the server answers 0x72 and ends the session.
+P2 is 50 ms and P2\* 5,000 ms (`cfg.p2_ms`, `cfg.p2star_ms`); the programming session can have its own (`cfg.p2_prog_ms`, `cfg.p2star_prog_ms`), which its 10 02 answer carries and its 0x78 cadence follows. S3 is 5 s after the last answer (`cfg.s3_ms`); it pauses while a multi-frame request arrives, and its expiry returns the server to the default session, which aborts a download. A flash job or app routine not done within four fifths of P2 (40 ms) gets 0x78, repeated every three tenths of P2\* (1.5 s), and at 90 s the server answers 0x72 and ends the session.
 
 ISO-TP flow control uses a block size of 64 (`cfg.block_size`) and an STmin of 2 ms, with frames padded with 0xAA. N_Cr is 1 s. The receive limit is 256 bytes, or 4,095 while a download is open.
 
