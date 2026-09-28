@@ -60,15 +60,6 @@ static void sa_relock(udsota_server_t *s)
     sa_forget_seed(s);
 }
 
-/* Boot state: locked, no seed, no failed attempts, and the post-boot delay running from clock 0. */
-static void sa_init(udsota_server_t *s)
-{
-    sa_relock(s);
-    s->sa_failed = 0;
-    s->sa_delay_active = true;
-    s->sa_delay_start_ms = 0;
-}
-
 /* True while the boot or lockout delay runs (wrap-safe); clears the flag once it has passed. */
 static bool sa_delay_running(udsota_server_t *s, uint32_t now_ms)
 {
@@ -1392,10 +1383,7 @@ bool udsota_init(udsota_server_t *s, const udsota_config_t *cfg, const udsota_en
         s->hooks = *hooks;
     }
     s->session = UDSOTA_SESSION_DEFAULT;
-    s->phase = UDSOTA_PHASE_IDLE;
-    s->progress_stage = UDSOTA_STAGE_IDLE;
-    s->next_bsc = 1;
-    sa_init(s);
+    s->sa_delay_active = true;   /* boot: locked, no seed, and the post-boot 0x27 delay runs from clock 0 */
     return security == NULL || (security->rng16 != NULL && (security->key != NULL || security->verify != NULL));
 }
 
