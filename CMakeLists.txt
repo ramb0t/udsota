@@ -307,11 +307,14 @@ if(UDSOTA_FUZZ)
     endif()
 endif()
 if(UDSOTA_FUZZ AND UDSOTA_FUZZ_SAN_OK)
-    # udsota_fuzz(<name> <timeout> [SOURCES..] [INCLUDES..] [DEFS..]): fuzz_udsota.c over the server, with FUZZ_SAN
-    # on the link line too, or gcc wants libubsan.
+    # udsota_fuzz(<name> <timeout> [SERVER..] [SOURCES..] [INCLUDES..] [DEFS..]): fuzz_udsota.c over the server
+    # (SERVER_SRCS unless SERVER names another list), with FUZZ_SAN on the link line too, or gcc wants libubsan.
     function(udsota_fuzz name timeout)
-        cmake_parse_arguments(F "" "DIGEST" "SOURCES;INCLUDES;DEFS" ${ARGN})
-        udsota_test(${name} SOURCES ${CORE_TEST}/fuzz_udsota.c ${SERVER_SRCS} ${F_SOURCES}
+        cmake_parse_arguments(F "" "DIGEST" "SERVER;SOURCES;INCLUDES;DEFS" ${ARGN})
+        if(NOT F_SERVER)
+            set(F_SERVER ${SERVER_SRCS})
+        endif()
+        udsota_test(${name} SOURCES ${CORE_TEST}/fuzz_udsota.c ${F_SERVER} ${F_SOURCES}
                             INCLUDES ${F_INCLUDES})
         target_compile_options(${name} PRIVATE ${FUZZ_SAN})
         target_link_options(${name} PRIVATE ${FUZZ_SAN})
@@ -339,10 +342,11 @@ if(UDSOTA_FUZZ AND UDSOTA_FUZZ_SAN_OK)
     # hook set so that its checks hold on the compressed path too.
     udsota_fuzz(fuzz_udsota_z 600 DIGEST 2488a2952adadc9e SOURCES ${ZSTREAM_SRCS} INCLUDES ${ZSTREAM_INC}
                 DEFS UDSOTA_FUZZ_Z=1 UDSOTA_FUZZ_PROGRESS=1 ${MINIZ_TEST_DEFS})
-    # The same harness with no update service (udsota_init given a NULL engine), from the five states a download
-    # isn't needed for: 34, 36 and 37 get only 0x11 (0x21 while an app routine runs), and the app hooks give 0x31
-    # its positive answers.
-    udsota_fuzz(fuzz_udsota_no_update 300 DIGEST 7e2cee56a31e126f DEFS UDSOTA_FUZZ_NO_UPDATE=1 UDSOTA_FUZZ_APP_HOOKS=1)
+    # The same harness with no update service (udsota_core_init, which is udsota_init given a NULL engine), from the
+    # five states a download isn't needed for: 34, 36 and 37 get only 0x11 (0x21 while an app routine runs), and the
+    # app hooks give 0x31 its positive answers. Built from the core list, so the updater isn't even linked.
+    udsota_fuzz(fuzz_udsota_no_update 300 DIGEST 7e2cee56a31e126f SERVER ${UDSOTA_SERVER_CORE_SRCS}
+                DEFS UDSOTA_FUZZ_NO_UPDATE=1 UDSOTA_FUZZ_APP_HOOKS=1)
     # The same harness with the DTC hooks set over a 90-DTC table: 19 01, 02, 06 and 0A and 14 served, lists past the
     # response buffer (0x14), and every status sent a subset of the availability mask.
     udsota_fuzz(fuzz_udsota_dtc 300 DIGEST 93368578353e39a1 DEFS UDSOTA_FUZZ_DTC=1)

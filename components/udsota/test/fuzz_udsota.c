@@ -23,8 +23,9 @@
  * streams of random images, intact and mutated, sent as whole 34/36/37/FF01 sequences, and the progress checks
  * hold on the compressed path too.
  *
- * A fifth build, fuzz_udsota_no_update (UDSOTA_FUZZ_NO_UPDATE=1 with UDSOTA_FUZZ_APP_HOOKS=1), gives udsota_init a
- * NULL engine, so no update service is registered: it replays from the five states a download isn't needed for,
+ * A fifth build, fuzz_udsota_no_update (UDSOTA_FUZZ_NO_UPDATE=1 with UDSOTA_FUZZ_APP_HOOKS=1), starts the server with
+ * udsota_core_init, which is udsota_init given a NULL engine, and links no updater (UDSOTA_SERVER_CORE_SRCS), so no
+ * update service is registered: it replays from the five states a download isn't needed for,
  * 34, 36 and 37 count as unserved and must only ever get NRC 0x11 (0x21 while an app routine runs), and its
  * coverage floor needs the reset and app hooks only.
  *
@@ -75,7 +76,7 @@
 #define UDSOTA_FUZZ_PROGRESS 0    /* 1: FUZZ_HOOKS also sets progress */
 #endif
 #ifndef UDSOTA_FUZZ_NO_UPDATE
-#define UDSOTA_FUZZ_NO_UPDATE 0   /* 1: udsota_init gets a NULL engine, so no update service answers */
+#define UDSOTA_FUZZ_NO_UPDATE 0   /* 1: udsota_core_init, no engine, so no update service answers */
 #endif
 #ifndef UDSOTA_FUZZ_DTC
 #define UDSOTA_FUZZ_DTC 0         /* 1: FUZZ_HOOKS also sets dtc_get, dtc_ext_data and dtc_clear */
@@ -1437,7 +1438,7 @@ static uint32_t start_run(state_t st, unsigned variant, bool async)
     }
 #if UDSOTA_FUZZ_NO_UPDATE
     (void)engine;
-    udsota_init(&S, &FUZZ_CFG, NULL, &FUZZ_SECURITY, &FUZZ_HOOKS);   /* the server alone: no update service */
+    udsota_core_init(&S, &FUZZ_CFG, &FUZZ_SECURITY, &FUZZ_HOOKS);   /* udsota_init with a NULL engine, unlinked */
 #else
     udsota_init(&S, &FUZZ_CFG, &engine, &FUZZ_SECURITY, &FUZZ_HOOKS);
 #endif

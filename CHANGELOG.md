@@ -4,6 +4,9 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ## [Unreleased]
 
+- Host builds: `sources.cmake` gains `UDSOTA_SERVER_CORE_SRCS`, the server with neither the updater nor the transport (`udsota_server.c`, `udsota_codec.c` and `udsota_keys.c`), for a host build that brings its own isotp-c and so can't link `udsota_isotp.c`, which defines isotp-c's `isotp_user_*` callbacks. The existing lists are unchanged.
+- Internal: `fuzz_udsota_no_update` builds from `UDSOTA_SERVER_CORE_SRCS` and starts the server with `udsota_core_init`, so it links no updater; its digest is unchanged.
+
 ## [0.10.0] - 2026-09-29
 
 udsota serves ReadDTCInformation (0x19: 01, 02, 06, 0A) and ClearDiagnosticInformation (0x14) through three new app hooks, so any UDS tool can read and clear a device's faults, and the client gains `udsota dtc show` and `udsota dtc clear`. Not breaking: with the hooks unset nothing changes on the wire.
