@@ -1,4 +1,4 @@
-/* Host tests for the ESP32 port's control block (components/udsota_esp32/udsota_esp32_ctl.c) with the
+/* Host tests for the ESP32 port's control block (components/udsota_esp32/server/udsota_esp32_ctl.c) with the
  * real udsota server: an app phase hook that calls back into the port neither deadlocks nor recurses,
  * an end-session it requests runs after the current request, one requested during a job runs after
  * that job's answer, the app's did_write, routine and routine_poll reach the app through the

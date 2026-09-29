@@ -23,12 +23,16 @@
  * streams of random images, intact and mutated, sent as whole 34/36/37/FF01 sequences, and the progress checks
  * hold on the compressed path too.
  *
+ * The PASS line ends with digest=, an FNV-1a hash of every request fed to the server and every answer it gave
+ * (empty ones too), so an answer that changes shows there even where the counts don't. It draws no rnd().
+ *
  * libFuzzer, on a machine with clang:
  *   clang -g -O1 -fsanitize=fuzzer,address,undefined -DUDSOTA_LIBFUZZER <includes> fuzz_udsota.c
  *         udsota_server.c udsota_codec.c -o fuzz_udsota_lf && ./fuzz_udsota_lf -max_len=8192 <corpus>
  */
 #define _DEFAULT_SOURCE   /* MAP_ANONYMOUS, sigaction, fork, prctl under -std=c11 */
 #include <dirent.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -161,6 +165,22 @@ static char         g_label[256];              /* what is being replayed, for fa
 static volatile unsigned g_rec;                /* sequence-mode record index, for crash reports */
 static volatile uint8_t  g_sink;               /* every byte an op is handed is folded in here */
 static bool         g_in_preamble;             /* reach() is running: answers are checked but not counted */
+static uint64_t     g_digest = 0xCBF29CE484222325u; /* FNV-1a 64 over every exchange with the server */
+
+/* Folds one exchange into g_digest: a tag ('Q' request, 'A' its answer, 'P' a poll's answer), the length as 8
+ * bytes little-endian, then the bytes. Reads only, so it changes nothing the server or the mutator sees. */
+static void digest_fold(uint8_t tag, const uint8_t *b, size_t n)
+{
+    uint8_t head[9] = {tag};
+    for (unsigned i = 0; i < 8u; i++) {
+        head[1u + i] = (uint8_t)((uint64_t)n >> (8u * i));
+    }
+    uint64_t h = g_digest;
+    for (size_t i = 0; i < sizeof head + n; i++) {
+        h = (h ^ (i < sizeof head ? head[i] : b[i - sizeof head])) * 0x100000001B3u;
+    }
+    g_digest = h;
+}
 
 /* Counts one fuzz-phase call of op for the coverage floor; preamble calls do not count. */
 static void count_op(op_id_t op)
@@ -994,6 +1014,8 @@ static size_t fuzz_request(const uint8_t *in, size_t len, layout_t lay, size_t r
     const size_t n = udsota_on_request(&S, req, len, resp, resp_max, now);
     check_canary(resp, req, len);
     check_request_answer(req, len, resp, n, resp_max);
+    digest_fold('Q', req, len);
+    digest_fold('A', resp, n);
     check_phase();
     check_progress();
 #if UDSOTA_FUZZ_APP_HOOKS
@@ -1018,6 +1040,7 @@ static void fuzz_poll(size_t resp_max, uint32_t now)
     const size_t n = udsota_poll(&S, resp, resp_max, now);
     check_canary(resp, NULL, 0);
     check_poll_answer(resp, n, resp_max);
+    digest_fold('P', resp, n);
     check_phase();
     check_progress();
 #if UDSOTA_FUZZ_APP_HOOKS
@@ -1035,6 +1058,8 @@ static size_t pre_exchange(uint32_t *now, state_t st, const uint8_t *req, size_t
     M.now = *now;
     size_t n = udsota_on_request(&S, req, len, g_pre_resp, sizeof g_pre_resp, *now);
     check_request_answer(req, len, g_pre_resp, n, sizeof g_pre_resp);
+    digest_fold('Q', req, len);
+    digest_fold('A', g_pre_resp, n);
     check_progress();
     for (unsigned k = 0; k < 1000u && (n == 0 || (g_pre_resp[0] == UDSOTA_NEG_RESPONSE &&
                                                    g_pre_resp[2] == UDSOTA_NRC_RESPONSE_PENDING)); k++) {
@@ -1042,6 +1067,7 @@ static size_t pre_exchange(uint32_t *now, state_t st, const uint8_t *req, size_t
         M.now = *now;
         n = udsota_poll(&S, g_pre_resp, sizeof g_pre_resp, *now);
         check_poll_answer(g_pre_resp, n, sizeof g_pre_resp);
+        digest_fold('P', g_pre_resp, n);
         check_progress();
     }
     if (n == 0 || g_pre_resp[0] != UDSOTA_POS(req[0])) {
@@ -1848,9 +1874,9 @@ int main(int argc, char **argv)
         reached += g_stats.reached[st] ? 1 : 0;
     }
     printf("fuzz_udsota: PASS %lu inputs, %lu runs, %lu requests (%lu positive, %lu NRC, %lu silent), "
-           "%lu poll answers, %d/%d states reached\n",
+           "%lu poll answers, %d/%d states reached, digest=%016" PRIx64 "\n",
            g_stats.inputs, g_stats.runs, g_stats.requests, g_stats.positive, g_stats.nrc, g_stats.silent,
-           g_stats.poll_answers, reached, (int)ST_COUNT);
+           g_stats.poll_answers, reached, (int)ST_COUNT, g_digest);
     return 0;
 }
 #endif

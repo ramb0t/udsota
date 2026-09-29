@@ -1,4 +1,4 @@
-/* Host tests for the ESP32 port's device ID (components/udsota_esp32/udsota_esp32_devid.c) with the real
+/* Host tests for the ESP32 port's device ID (components/udsota_esp32/server/udsota_esp32_devid.c) with the real
  * server and key derivation: F18C serves the stored ID, and a key a client derives from F18C's bytes is the
  * key the port's security callback expects, for a custom ID and for the base MAC. The HMAC is a stand-in
  * that mixes every key and message byte, so a key over the wrong ID cannot match by accident. */

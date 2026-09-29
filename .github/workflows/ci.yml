@@ -92,7 +92,9 @@ jobs:
         shell: bash
         run: |
           case "${{ matrix.target }}" in esp32) chip=0x0000 ;; esp32s3) chip=0x0009 ;; esac
-          gcc -std=c11 -Wall -Wextra -Werror -Icomponents/udsota/include -Icomponents/udsota_esp32/include \
-              tools/image_check.c components/udsota_esp32/udsota_esp32_image.c components/udsota/udsota_image.c \
+          gcc -std=c11 -Wall -Wextra -Werror -Icomponents/udsota/include -Icomponents/udsota/update/include \
+              -Icomponents/udsota_esp32/include -Icomponents/udsota_esp32/update/include \
+              tools/image_check.c components/udsota_esp32/update/udsota_esp32_image.c \
+              components/udsota/update/udsota_image.c \
               -o /tmp/image_check
           /tmp/image_check "examples/esp32/build/${{ matrix.target }}/example.bin" "$chip"

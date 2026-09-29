@@ -4,6 +4,8 @@ udsota installs firmware over CAN. A UDS (ISO 14229) server on ISO-TP writes a n
 
 This component is the portable core: C11, with no platform headers. It builds as an ESP-IDF component, or in plain CMake as the library `udsota` (add `components/isotp` first). [udsota_esp32](../udsota_esp32/README.md) is the ESP-IDF port, and [examples/esp32](../../examples/esp32/README.md) is a minimal integration over TWAI. [`tools/linux_server`](../../tools/linux_server/README.md) runs the core on Linux as a demo server for the client's end-to-end tests.
 
+The sources sit in three directories, here and in the port: `server/`, the generic UDS server and its transport; `update/`, the firmware updater; and `bootloop/`, the boot-loop breaker, which the app drives and which the updater only reports in F1F0. `udsota.h` and `udsota_wire.h` stay in `include/`. For now `server/udsota_server.c` and `server/udsota_codec.c` still hold the updater's services as well. A host build names no file: it `include()`s `sources.cmake` from this component and from `udsota_esp32` and takes their lists, `UDSOTA_SRCS`, `UDSOTA_INCLUDE_DIRS` and `UDSOTA_PRIV_INCLUDE_DIRS` for the whole core, or one unit's, such as `UDSOTA_SERVICES_SRCS` (`udsota_init()` and every service, no transport), `UDSOTA_IMAGE_SRCS` or `UDSOTA_ESP32_IMAGE_SRCS`, for a test that links part of it. Each file's header lists the rest.
+
 ## Layers
 
 ```

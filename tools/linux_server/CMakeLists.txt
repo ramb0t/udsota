@@ -4,8 +4,8 @@
 # from the root CMakeLists.txt on Linux only. client/tests/test_e2e_*.py drive it with the client.
 add_executable(udsota_demo_server
     demo_server.c demo_engine.c demo_can.c hmac_sha256_host.c
-    ${CORE_DIR}/test/fake_engine.c ${CORE_DIR}/test/sha256_host.c ${ESP32_DIR}/udsota_esp32_image.c)
-target_include_directories(udsota_demo_server PRIVATE ${CMAKE_CURRENT_LIST_DIR} ${CORE_DIR}/test ${ESP32_DIR}/include)
+    ${CORE_TEST}/fake_engine.c ${CORE_TEST}/sha256_host.c ${UDSOTA_ESP32_IMAGE_SRCS})
+target_include_directories(udsota_demo_server PRIVATE ${CMAKE_CURRENT_LIST_DIR} ${CORE_TEST} ${UDSOTA_ESP32_INCLUDE_DIRS})
 target_compile_options(udsota_demo_server PRIVATE -Wall -Wextra -Werror)
 target_link_libraries(udsota_demo_server PRIVATE udsota_core udsota_inflate udsota_delta)
 
