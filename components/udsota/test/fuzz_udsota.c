@@ -3,10 +3,12 @@
  * req_len, never writes past resp_max or into the request, and always answers with a well-formed
  * positive response, a known NRC, or nothing.
  *
- * This host has no libasan or clang, so guard pages (mmap + PROT_NONE) stand in for ASan: every
+ * Guard pages (mmap + PROT_NONE) are the bounds detector, so the default build needs no ASan: every
  * request sits flush against a guard page on one side, and every response buffer ends at one. UBSan
- * runs in trap mode (the top-level CMakeLists.txt), which needs no runtime library. A fork()ed self-test
- * proves each detector really kills the process before any replay counts as a pass.
+ * runs in trap mode (the top-level CMakeLists.txt), which needs no runtime library. Under
+ * -DUDSOTA_SANITIZE=ON ASan runs as well, with handle_segv=0 so a guard page still faults as a plain
+ * signal. A fork()ed self-test proves each detector really kills the process before any replay counts
+ * as a pass.
  *
  * Inputs: built-in seeds, deterministic mutations of them, then every file named on the command line
  * (for example iso14229's libFuzzer corpus, used here only as arbitrary bytes). Sequence mode borrows

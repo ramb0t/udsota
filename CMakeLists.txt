@@ -297,7 +297,8 @@ set_tests_properties(udsota_seam_grep PROPERTIES PASS_REGULAR_EXPRESSION "check_
 
 # ---- UDS request-parser fuzz harness (on by default; -DUDSOTA_FUZZ=OFF skips it) ----
 # Replays built-in seeds and their mutants (and any corpus in UDSOTA_FUZZ_CORPUS) through the pure
-# server, with guard pages in place of ASan and UBSan in trap mode (no runtime library needed).
+# server, with guard pages in place of ASan and UBSan in trap mode (no runtime library needed). -DUDSOTA_SANITIZE=ON
+# adds ASan on top; the harness keeps SIGSEGV from it (handle_segv=0), so the guard pages still fault as before.
 option(UDSOTA_FUZZ "Build and run the UDS request-parser fuzz harness (fuzz_udsota)" ON)
 set(UDSOTA_FUZZ_CORPUS "" CACHE PATH "Extra corpus directory for the fuzz_udsota_corpus test (off when empty)")
 if(CMAKE_C_COMPILER_ID STREQUAL "GNU")

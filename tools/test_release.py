@@ -50,13 +50,13 @@ def test_mismatches_are_named(tag, init, want):
 
 
 # Check a header that disagrees with the tag fails the check, in its string or in any of its three numbers, and one
-# without the macros too.
+# missing the string or a number too. The string-missing case keeps the numbers, so only its own message can match.
 @pytest.mark.parametrize("header, want", [
     (HEADER.replace('"0.4.0"', '"0.3.0"'), "UDSOTA_VERSION '0.3.0', not '0.4.0'"),
     (HEADER.replace("MAJOR 0", "MAJOR 1"), "_PATCH 1.4.0, not 0.4.0"),
     (HEADER.replace("MINOR 4", "MINOR 3"), "_PATCH 0.3.0, not 0.4.0"),
     (HEADER.replace("PATCH 0", "PATCH 2"), "_PATCH 0.4.2, not 0.4.0"),
-    ("#pragma once\n", "defines no UDSOTA_VERSION"),
+    (HEADER.replace('#define UDSOTA_VERSION       "0.4.0"\n', ""), "defines no UDSOTA_VERSION"),
     (HEADER.replace("#define UDSOTA_VERSION_MINOR 4\n", ""), "defines no UDSOTA_VERSION_MAJOR, _MINOR and _PATCH"),
 ])
 def test_header_mismatches_fail(header, want):
