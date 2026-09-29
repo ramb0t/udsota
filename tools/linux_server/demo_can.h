@@ -41,8 +41,8 @@ bool demo_can_open_socketcan(demo_can_t *c, const char *ifname, uint16_t req_id,
 bool demo_can_is_vcan(const char *ifname);
 /* The descriptor to poll for input. */
 int  demo_can_fd(const demo_can_t *c);
-/* Reads every frame available now and calls fn for each standard frame on req_id. Returns the frames read, or
- * -1 at EOF or on a read error (the server stops). */
+/* Reads every frame available now and calls fn for each standard frame on req_id. Returns 0, or -1 at EOF or on a
+ * read error (the server stops). */
 int  demo_can_read(demo_can_t *c, void (*fn)(void *ctx, const demo_frame_t *f), void *ctx);
 /* udsota_can_t.send with ctx a demo_can_t: 0 sent, UDSOTA_TX_RETRY when the socket's queue is full, -1 dropped. */
 int  demo_can_send(void *ctx, uint16_t id, const uint8_t data[8], uint8_t len);

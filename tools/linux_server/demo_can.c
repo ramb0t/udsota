@@ -86,9 +86,8 @@ static void deliver(demo_can_t *c, demo_frame_t *f, bool extended, void (*fn)(vo
 }
 
 /* Takes the pipe bytes in buf: complete lines are parsed and delivered, a partial one is kept for the next read. */
-static int pipe_take(demo_can_t *c, const char *buf, size_t n, void (*fn)(void *, const demo_frame_t *), void *ctx)
+static void pipe_take(demo_can_t *c, const char *buf, size_t n, void (*fn)(void *, const demo_frame_t *), void *ctx)
 {
-    int frames = 0;
     for (size_t i = 0; i < n; i++) {
         if (buf[i] != '\n') {
             if (c->line_len < DEMO_CAN_LINE_MAX) {
@@ -107,12 +106,10 @@ static int pipe_take(demo_can_t *c, const char *buf, size_t n, void (*fn)(void *
             fprintf(stderr, "udsota_demo_server: dropped a malformed pipe line: %.*s\n", (int)c->line_len, c->line);
         } else {
             deliver(c, &f, ext, fn, ctx);
-            frames++;
         }
         c->line_len = 0u;
         c->line_long = false;
     }
-    return frames;
 }
 
 /* Opens the pipe backend; see demo_can.h. */
@@ -240,14 +237,17 @@ int demo_can_read(demo_can_t *c, void (*fn)(void *ctx, const demo_frame_t *f), v
         if (n < 0 && (errno == EINTR || errno == EAGAIN)) {
             return 0;
         }
-        return (n <= 0) ? -1 : pipe_take(c, buf, (size_t)n, fn, ctx);
+        if (n <= 0) {
+            return -1;
+        }
+        pipe_take(c, buf, (size_t)n, fn, ctx);
+        return 0;
     }
-    int frames = 0;
     for (;;) {
         struct can_frame cf;
         const ssize_t n = read(c->fd_in, &cf, sizeof cf);
         if (n < 0) {
-            return (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) ? frames : -1;
+            return (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) ? 0 : -1;
         }
         if ((size_t)n != sizeof cf || (cf.can_id & (CAN_ERR_FLAG | CAN_RTR_FLAG)) != 0u || cf.can_dlc > 8u) {
             continue;
@@ -255,7 +255,6 @@ int demo_can_read(demo_can_t *c, void (*fn)(void *ctx, const demo_frame_t *f), v
         demo_frame_t f = { .id = (uint16_t)(cf.can_id & CAN_SFF_MASK), .dlc = cf.can_dlc };
         memcpy(f.data, cf.data, cf.can_dlc);
         deliver(c, &f, (cf.can_id & CAN_EFF_FLAG) != 0u, fn, ctx);
-        frames++;
     }
 }
 

@@ -125,9 +125,7 @@ static esp_err_t can_send(void *ctx, uint16_t id, const uint8_t data[8], uint8_t
         return ESP_ERR_NO_MEM;
     }
     const uint8_t n = (len > 8u) ? 8u : len;
-    for (uint8_t k = 0; k < n; k++) {
-        s_tx_data[i][k] = data[k];
-    }
+    memcpy(s_tx_data[i], data, n);
     s_tx[i] = (twai_frame_t){ .header = { .id = id, .dlc = n }, .buffer = s_tx_data[i], .buffer_len = n };
     atomic_fetch_or_explicit(&s_tx_busy, 1u << i, memory_order_release);   /* before on_tx_done can run */
     const esp_err_t err = twai_node_transmit(s_node, &s_tx[i], 0);
