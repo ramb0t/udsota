@@ -67,7 +67,7 @@ The diag task sleeps on its frame queue until the adapter's next deadline, and t
 | `UDSOTA_ESP32_COMPRESSION` | n | serve [compressed downloads](../udsota/README.md#compressed-downloads) (34 with DFI 0x10) |
 | `UDSOTA_ESP32_DELTA` | n | with compression, also serve [delta downloads](../udsota/README.md#delta-downloads) (34 with DFI 0x20 or 0x30), rebuilt from the running slot |
 | `UDSOTA_ESP32_INFLATE_PSRAM` | y (with `SPIRAM`; not offered on an ESP32 below revision 3) | put the inflater's state and dictionary in PSRAM |
-| `UDSOTA_ESP32_DEBUG_MEASURE` | n | bench only: log update timings, stack headroom and internal heap |
+| `UDSOTA_ESP32_DEBUG_MEASURE` | n | bench only: log update timings, stack headroom, internal heap and whether flash writes run with the cache off |
 
 ## Memory and tasks
 

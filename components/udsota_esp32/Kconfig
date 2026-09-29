@@ -89,13 +89,14 @@ menu "udsota ESP32 port"
             the compiler's workaround (ESP-IDF keeps ROM newlib off PSRAM there for the same reason).
 
     config UDSOTA_ESP32_DEBUG_MEASURE
-        bool "Log update timings, stack headroom and internal heap"
+        bool "Log update timings, stack headroom, internal heap and cache-off writes"
         default n
         help
             Bench measurement only. Logs at INFO: the erase time (esp_ota_begin), the FF01 verify and
             ActivateImage times with the worker's unused stack and the internal heap around them, the
             diag task's stack headroom and internal-heap low-water mark, the heap the start took, and a
-            warning when flash writes run with the cache off.
+            warning when flash writes run with the cache off, which on a build running code from flash is
+            every download.
 
     config UDSOTA_ESP32_TASK_CORE
         int "Diag task core"

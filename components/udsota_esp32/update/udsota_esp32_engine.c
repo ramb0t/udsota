@@ -28,7 +28,7 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #if CONFIG_UDSOTA_ESP32_DEBUG_MEASURE
-#include "esp_private/flash_mmap.h"   /* flash_mmap_remain(): the cache-off check, logged only */
+#include "esp_private/flash_mmap.h"   /* MMAP_EXECUTABLES_FROM_FLASH, flash_mmap_remain(): logged only */
 #endif
 
 #include "udsota_esp32_ctl.h"
@@ -112,7 +112,26 @@ static esp_ota_handle_t s_handle;
 static bool s_handle_open;
 #if CONFIG_UDSOTA_ESP32_DEBUG_MEASURE
 static uint32_t s_writes;           /* blocks written since the last BEGIN */
-static uint32_t s_mmap_writes;      /* of those, blocks written while a flash mmap was held (cache off) */
+static uint32_t s_cache_off_writes; /* of those, blocks written with the cache off */
+
+/* For the log only: whether IDF turns the cache off, stalling the CPUs, for an erase or write issued now. On the
+ * ESP32 it always does (spi1_start(), spi_flash_os_func_app.c:122-151). On the other targets spi1_start()
+ * (:204-257) keeps it on under CONFIG_SPI_FLASH_AUTO_SUSPEND, turns it off for every erase and write unless code
+ * and read-only data are both in PSRAM or it is a RAM app (MMAP_EXECUTABLES_FROM_FLASH), and otherwise only while a
+ * flash mmap is held. flash_mmap_remain() exists on those targets only; the read is unlocked. */
+#ifndef MMAP_EXECUTABLES_FROM_FLASH
+#error "esp_private/flash_mmap.h no longer defines MMAP_EXECUTABLES_FROM_FLASH: recheck cache_off_for_writes()"
+#endif
+static bool cache_off_for_writes(void)
+{
+#if CONFIG_SPI_FLASH_AUTO_SUSPEND
+    return false;
+#elif MMAP_EXECUTABLES_FROM_FLASH || CONFIG_IDF_TARGET_ESP32
+    return true;
+#else
+    return flash_mmap_remain();
+#endif
+}
 #endif
 
 /* Status slot number of an app partition: ota_0 -> 0, ota_1 -> 1, anything else (or NULL) -> NONE. */
@@ -320,10 +339,8 @@ static int job_begin(uint32_t size)
     s_handle = 0;
 #if CONFIG_UDSOTA_ESP32_DEBUG_MEASURE
     s_writes = 0;
-    s_mmap_writes = 0;
-    /* An unlocked read, for the log only: true means a flash mmap is held, so IDF turns the cache off for
-     * every erase and write command and both cores stall (spi_flash_os_func_app.c:242). */
-    const bool mmap_before = flash_mmap_remain();
+    s_cache_off_writes = 0;
+    const bool cache_off_before = cache_off_for_writes();
     int64_t t0 = esp_timer_get_time();
 #endif
     esp_err_t err = esp_ota_begin(s_target, size, &s_handle);
@@ -335,8 +352,9 @@ static int job_begin(uint32_t size)
     }
     s_handle_open = true;
 #if CONFIG_UDSOTA_ESP32_DEBUG_MEASURE
-    ESP_LOGI(TAG, "esp_ota_begin(%s, %" PRIu32 " B): %" PRId64 " ms, flash_mmap_remain %d before, %d after",
-             s_target->label, size, (esp_timer_get_time() - t0) / 1000, (int)mmap_before, (int)flash_mmap_remain());
+    ESP_LOGI(TAG, "esp_ota_begin(%s, %" PRIu32 " B): %" PRId64 " ms, cache off for writes %d before, %d after",
+             s_target->label, size, (esp_timer_get_time() - t0) / 1000, (int)cache_off_before,
+             (int)cache_off_for_writes());
 #endif
     return UDSOTA_DL_OK;
 }
@@ -349,9 +367,8 @@ static int ota_write(const uint8_t *d, size_t len)
     if (s_handle_open) {
 #if CONFIG_UDSOTA_ESP32_DEBUG_MEASURE
         s_writes++;
-        if (flash_mmap_remain() && s_mmap_writes++ == 0) {   /* unlocked read, for the log only */
-            ESP_LOGW(TAG, "flash_mmap_remain() is true at block %" PRIu32 ": flash writes run with the cache off",
-                     s_writes);
+        if (cache_off_for_writes() && s_cache_off_writes++ == 0) {
+            ESP_LOGW(TAG, "flash writes run with the cache off, first at block %" PRIu32, s_writes);
         }
 #endif
         int64_t t0 = esp_timer_get_time();
@@ -560,9 +577,9 @@ static int job_end(void)
         r = recheck_slot();
     }
 #if CONFIG_UDSOTA_ESP32_DEBUG_MEASURE
-    ESP_LOGI(TAG, "FF01 verify: reason %d, %" PRId64 " ms, worker stack %u B unused; flash mmap held on %" PRIu32
+    ESP_LOGI(TAG, "FF01 verify: reason %d, %" PRId64 " ms, worker stack %u B unused; cache off on %" PRIu32
              " of %" PRIu32 " writes; internal heap free %u B, min %u -> %u B", (int)r,
-             (esp_timer_get_time() - t0) / 1000, (unsigned)uxTaskGetStackHighWaterMark(NULL), s_mmap_writes,
+             (esp_timer_get_time() - t0) / 1000, (unsigned)uxTaskGetStackHighWaterMark(NULL), s_cache_off_writes,
              s_writes, (unsigned)heap_free, (unsigned)heap_min,
              (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
 #endif

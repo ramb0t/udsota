@@ -24,6 +24,8 @@ idf.py -C examples/esp32 -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.com
 idf.py -C examples/esp32 -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.noupdater" set-target esp32s3 build
 ```
 
+`sdkconfig.debugmeasure`, listed after the others, adds bench logs of update timings, stack headroom, internal heap and whether flash writes run with the cache off (`CONFIG_UDSOTA_ESP32_DEBUG_MEASURE`).
+
 `PROJECT_VER` is pinned to `0.1.0-dev` in `CMakeLists.txt`, which makes the image a dev build. Set a clean `X.Y.Z` to build a release, which the unit accepts only when its version is newer than the running one.
 
 `partitions.csv` gives two 1.875 MB OTA slots and otadata on 4 MB flash. There is no factory app, so a serial flash boots `ota_0`. If you move a partition, bump `EXAMPLE_LAYOUT_ID` in `main.c`.
