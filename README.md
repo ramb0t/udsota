@@ -38,19 +38,17 @@ sequenceDiagram
 
 The client runs this whole sequence with one command, `udsota flash`. Each step is there so that a bad update fails safe:
 
-**Precheck.** Before it opens a session, the client checks the image file against the product profile and reads the device's update status (F1F0), running image (F1F3) and board. It does nothing if the device already runs the image, only confirms it if an earlier run stopped short of that, and skips the download if the spare slot already holds the image, verified.
+**Precheck.** Before it opens a session, the client checks the image file against the product profile and reads the device's update status (F1F0), running image (F1F3) and board. It does nothing if the device already runs the image, only confirms it if an earlier run stopped short of that, and skips the download if the spare slot already holds the image, verified since the device last booted.
 
 **Unlock.** The programming session (`10 02`), then, with security on, SecurityAccess (`27`), which proves the tester holds the key (see [Key management](#key-management)).
 
-**Download.** RequestDownload (`34`) announces the image's size, TransferData (`36`) blocks carry it, and RequestTransferExit (`37`) ends it. The device holds the first 320 bytes until it has checked the product, board, partition layout, CAN IDs and version against its own, and only then erases the spare slot, so a wrong image costs nothing. The blocks carry the image as it is, compressed as raw DEFLATE (usually 50–65 % of the time on the bus), or as a patch from the image the device runs (kilobytes for a small change). The device writes the same bytes whichever way they come.
+**Download.** RequestDownload (`34`) announces the image's size, TransferData (`36`) blocks carry it, and RequestTransferExit (`37`) ends it. The device holds the first 320 bytes until it has checked the product, board, partition layout, CAN IDs and version against its own, and only then erases the spare slot, so a wrong image costs nothing. The blocks carry the image as it is, compressed as raw DEFLATE (usually 50–65 % of the time on the bus), or as a patch from the image the device runs (kilobytes for a small change).
 
 **Verify.** Routine `FF01` checks the whole image in flash: its hash, its signature when the build checks signatures, and the first-block rules again.
 
-**Activate.** Routine `F001` makes the spare slot the boot slot and restarts the device. The new image boots "pending verify".
+**Activate and confirm.** Routine `F001` makes the spare slot the boot slot and restarts the device. Once the device answers again and reports the new image, the client sends routine `F002` in the extended session, retrying for up to 120 s while your app's own health checks run. With ESP-IDF's rollback on (step 3), the image stays "pending verify" until then, and its next reset (a power cycle, crash or watchdog) boots the old image again, so an image whose CAN path is broken does not stick.
 
-**Confirm.** Once the device answers again and reports the new image, the client sends routine `F002` in the extended session. It retries for up to 120 s while your app's own health checks run. Until the image is confirmed, any reset boots the old image again, so an image whose CAN path is broken rolls itself back.
-
-A lost frame or answer is resent where the protocol makes that safe, and a slow flash job answers `0x78` (response pending) instead of timing out. The [wire reference](components/udsota/README.md#wire-reference) has every byte.
+The [wire reference](components/udsota/README.md#wire-reference) has every byte, and the retries the client makes when a frame or an answer is lost.
 
 ## How it fits together
 
@@ -126,6 +124,7 @@ The whole integration is one C file. This is the core of it:
 
 ```c
 #include "udsota_esp32.h"
+#include "udsota_pubkey.h"   /* from `udsota keygen`: the public key, so it unlocks nothing (Key management) */
 
 /* Allow updates only while parked. */
 static uint8_t gate(void *ctx, udsota_op_t op)
@@ -138,6 +137,7 @@ void app_updater_start(void)
     static const udsota_config_t cfg = {
         .req_id = 0x710, .resp_id = 0x718,          /* the CAN IDs the tester uses */
         .product = "my-product", .hw_id = 1, .layout_id = 1,
+        .key_pubkey = udsota_pubkey, .key_pubkey_len = sizeof udsota_pubkey,
     };
     const udsota_hooks_t hooks = { .gate = gate };
     const udsota_esp32_can_t can = { .can_send = app_can_send };
@@ -180,49 +180,51 @@ mode = "ecdsa"
 private_key_file = "udsota_private.pem"   # from `udsota keygen`
 ```
 
-[Key management](#key-management) covers the key file. The [client README](client/README.md) lists every option.
+Save it as `my-product.toml` and pass that path to `--profile`. [Key management](#key-management) covers the key file, and the [client README](client/README.md) lists every option.
 
 ### 3. Build an image
 
 An update is the ordinary `.bin` ESP-IDF builds, such as `examples/esp32/build/example.bin`. udsota needs nothing added to it beyond the descriptor from step 1.
 
-`PROJECT_VER` in the project's `CMakeLists.txt` is the image's version. A clean `X.Y.Z` or `vX.Y.Z` makes a release, which a device takes only when it is newer than the image it runs, so a fleet only ever rolls forward. Anything else (`1.3.0-dev`, say) makes a dev build, for the bench; the [image rules](components/udsota/README.md#image-rules) have the details. For a product, turn on ESP-IDF's app signing or Secure Boot v2 and sign every build, so that the device's verify step refuses an image you did not sign ([Signing](components/udsota/README.md#signing)).
+`PROJECT_VER` in the project's `CMakeLists.txt` is the image's version. A clean `X.Y.Z` or `vX.Y.Z` makes a release, which a device takes only when it is newer than the image it runs, so a fleet only ever rolls forward. A version with a suffix (`1.3.0-dev`) makes a dev build, for the bench, which a device takes when its `X.Y.Z` is at least the running one's; a version that doesn't start with `X.Y.Z`, such as the git hash ESP-IDF uses when `PROJECT_VER` is unset, is refused ([image rules](components/udsota/README.md#image-rules)). For a product, turn on ESP-IDF's app signing or Secure Boot v2 and sign every build, so that the device's verify step refuses an image you did not sign ([Signing](components/udsota/README.md#signing)).
 
-Compressed and delta downloads need nothing from the image: the device accepts them when it was built with `CONFIG_UDSOTA_ESP32_COMPRESSION` or `CONFIG_UDSOTA_ESP32_DELTA`. The example's `sdkconfig.compression` and `sdkconfig.delta` turn them on.
+Set `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y`, as the example's `sdkconfig.defaults` does. ESP-IDF leaves it off, and without it the restart after ActivateImage makes the new image permanent, confirmed or not.
 
-`build/udsota_image_check <image.bin> <chip_id> [product hw_id layout req_id resp_id slot_size]`, from the host build below, runs the device's first-block check on a built image, so a wrong project name, board, layout or CAN ID shows before the image reaches a device. Without the optional arguments it checks against the example's values.
+Compressed and delta downloads need nothing from the image being sent: a device takes them when the image it runs was built with `CONFIG_UDSOTA_ESP32_COMPRESSION` (0x10), plus `CONFIG_UDSOTA_ESP32_DELTA` for patches. The example's `sdkconfig.compression` and `sdkconfig.delta` turn them on.
 
-Keep the exact `.bin` of every build you ship. A delta download is a patch from the image the device runs, and a rebuild of the same source is generally not byte-identical, so the file you flashed is the only base a patch can be made from.
+`build/udsota_image_check <image.bin> <chip_id> [product hw_id layout req_id resp_id slot_size]`, from the host build below, runs the device's first-block check on a built image, so a wrong project name, board, layout or CAN ID shows before the image reaches a device. `chip_id` is ESP-IDF's `esp_chip_id_t` (0 for esp32, 9 for esp32s3), the optional arguments default to the example's values, and it exits 0 or the [reason](components/udsota/README.md#reason-codes) it refused with.
+
+Keep the exact `.bin` of every build you ship. A delta download is a patch from the image the device runs, and a rebuild of the same source is not byte-identical (ESP-IDF stamps the build time into the image), so the file you flashed is the only base a patch can be made from.
 
 ### 4. Flash an update
 
 ```sh
-udsota --profile my-product --interface can0 flash build/my-product.bin                 # the whole image
-udsota --profile my-product --interface can0 flash --compress build/my-product.bin      # as raw DEFLATE
-udsota --profile my-product --interface can0 flash --diff-from releases/ build/my-product.bin   # a patch, if one fits
+udsota --profile my-product.toml --interface can0 flash build/my-product.bin                 # the whole image
+udsota --profile my-product.toml --interface can0 flash --compress build/my-product.bin      # as raw DEFLATE
+udsota --profile my-product.toml --interface can0 flash --diff-from releases/ build/my-product.bin   # a patch, if one fits
 ```
 
-`--diff-from` takes a directory of past release images and picks the one whose app_elf_sha256 the device reports. It falls back to a full download when none matches, when the patch would be no smaller, or when the device refuses it. `confirm` finishes an update that stopped before ConfirmImage, and `reset` restarts the device, which rolls back an unconfirmed image. The exit code says why a run stopped ([client README](client/README.md)).
+`--diff-from` takes a directory of past release images and picks the one whose app_elf_sha256 the device reports. It falls back to a full download when none matches, when the patch would be no smaller, when the device has no delta downloads or no memory for one (0x31, or 0x22 with F1F1 reason 14), or when it runs another build than the base (`DL_BAD_BASE`). `confirm` finishes an update that stopped before ConfirmImage, and `reset` restarts the device, which rolls back an unconfirmed image. The exit code says why a run stopped ([client README](client/README.md)).
 
 ### 5. Or flash from your own tool
 
-When something other than this client sends updates, such as a telematics unit that fetches them from your server, `udsota pack` writes the bytes `flash` would send for each mode, with a JSON manifest holding the sizes, hashes and identities the flasher needs:
+When something other than this client sends updates, such as a telematics unit that fetches them from your server, `udsota pack` writes the payloads `flash` sends, byte for byte, with a JSON manifest holding the sizes, hashes and identities the flasher needs:
 
 ```sh
-udsota --profile my-product pack build/my-product.bin --out dist/ --diff-from releases/v1.4.0.bin
+udsota --profile my-product.toml pack build/my-product.bin --out dist/ --diff-from releases/v1.4.0.bin
 ```
 
-It needs no bus, and it uses the same code `flash` does, so the two cannot drift. The flasher then runs the sequence in [Flashing without the client](components/udsota/README.md#flashing-without-the-client): precheck, unlock, the payloads in the manifest's order with their fallbacks, verify, activate and confirm. It still has to unlock the device; [Key management](#key-management) says how to do that without giving it the private key.
+The flasher then runs the sequence in [Flashing without the client](components/udsota/README.md#flashing-without-the-client). It still has to unlock the device; [Key management](#key-management) says how without giving it the private key.
 
 ## Key management
 
-Two keys protect an update, and neither belongs in a repository or an image. The **unlock key** decides who may program a device. The **signing key** decides which images it will run. With only the first, whoever has it can install any image the image rules accept; with only the second, anyone on the bus can install any image you signed.
+Two keys protect an update, and neither belongs in a repository, nor (in the ECDSA mode) in an image. The **unlock key** decides who may program a device. The **signing key** decides which images it will run. With only the first, whoever has it can install any image the image rules accept; with only the second, anyone on the bus can install any image you signed.
 
-**The unlock key** answers SecurityAccess (`27`). Use the ECDSA mode for a product. `udsota keygen --out keys/` writes `udsota_private.pem` and `udsota_pubkey.h`. The header is public: build it into the firmware as `cfg.key_pubkey`, so a device holds nothing that unlocks it, and a flash dump yields only a public key. To unlock, the tester signs a fresh random seed from the device, bound to that device's ID and the access level. A seed is used once and expires after 30 s, so a captured signature cannot be replayed. Three wrong keys bring a 10 s delay before the next try, and the same delay follows every boot. Keep the private key in an HSM or a signing service; the client reads a PEM file (`--private-key`, or the profile's `private_key_file`) for the bench or a signing host.
+**The unlock key** answers SecurityAccess (`27`). Use the ECDSA mode for a product. `udsota keygen --out keys/` writes `udsota_private.pem` and `udsota_pubkey.h`. The header is public: build it into the firmware as `cfg.key_pubkey` (step 1). To unlock, the tester signs a fresh seed from the device, bound to its ID and the access level; the [Security](components/udsota/README.md#security) section gives the message and why a dump or a captured signature unlocks nothing. Three wrong keys bring a 10 s delay before the next try, and the same delay follows every boot. Keep the private key in an HSM or a signing service; the client reads a PEM file (`--private-key`, or the profile's `private_key_file`) for the bench or a signing host.
 
-A flasher that is not a trusted host, such as an edge device, should not hold the private key either. Have it forward the seed, level and device ID to your signing service and send back the 64-byte signature it returns; the [Security](components/udsota/README.md#security) section gives the exact message. The HMAC mode instead derives each device's key from a 32-byte master that every image must carry, so one leaked image or flash dump unlocks the whole fleet. It suits a bench, or a fleet whose flash is encrypted.
+A flasher that is not a trusted host, such as an edge device, should not hold the private key either. Have it forward the seed, the level and the device ID (F18C) to your signing service and send back the 64-byte signature it returns. Keep the session open while it waits, with TesterPresent (`3E 00`) at least every 2 s, since the device drops the session and the seed after 5 s of silence. Send the signature within 30 s of the seed, and don't ask for another seed meanwhile, which replaces it. The HMAC mode instead derives each device's key from a 32-byte master that every image must carry, so one leaked image or flash dump unlocks the whole fleet. It suits a bench, or a fleet whose images and flash are both protected and whose master can be rotated.
 
-To rotate the unlock key, build a release with the new public key and flash it, unlocking with the old one. A device checks the key built into the image it runs, so once the new image is confirmed only the new key works. A device that rolls back returns to the old key, so keep it until the whole fleet has confirmed.
+To rotate the unlock key, build a release with the new public key and flash it, unlocking with the old one. A device checks the key built into the image it runs, so from the moment the new image boots, confirmed or not, only the new key unlocks it; ConfirmImage needs no key, so the update still completes. A device that rolls back returns to the old key, so keep both until the whole fleet has confirmed.
 
 **The signing key** is ESP-IDF's own (app signing, or Secure Boot v2), and udsota adds nothing to it: the verify step reports a bad or missing signature. F1F0's flag 0x01 tells a client whether the running build checks signatures. Keep it in a signing service too, not on a developer's machine.
 

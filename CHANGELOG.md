@@ -5,8 +5,8 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 ## [Unreleased]
 
 `udsota pack`, for updates that a flasher other than the client sends, and a README that walks through using udsota and managing its keys.
-- Client: `udsota pack FILE --out DIR [--dfi XX]... [--diff-from BASE]` writes the payloads `flash` would send (DFI 0x00, 0x10, and 0x20 and 0x30 from a base) and a JSON manifest, for a flasher that is not this client, such as an edge device that gets its updates from a server. Each manifest entry gives the DFI, memorySize, the payload's size and SHA-256, the new image's app_elf_sha256, version, hw_id and board, and for a delta the base's app_elf_sha256 and validation hash; entries are in the order `flash` tries them, and a delta no smaller than the 0x10 payload is kept but flagged. `flash` and `pack` build payloads with the same code. It needs no bus, so it runs on any platform. The core README's new "Flashing without the client" gives the sequence and fallbacks; the 0x27 key stays the product's to hold.
-- Docs: the README gains a how-to-use walk-through (integrate, profile, build, flash, pack), a step-by-step account of an update, and a key-management section covering both keys, remote unlocking without the private key, and rotation.
+- Client: `udsota pack FILE --out DIR [--dfi XX]... [--diff-from BASE]` writes the payloads `flash` sends, byte for byte, for DFI 0x00, 0x10, and 0x20 and 0x30 from a base, with a JSON manifest of what a flasher needs to send them, for a flasher that is not this client, such as an edge device that gets its updates from a server (client README). It needs no bus. The core README's new "Flashing without the client" gives the sequence and its fallbacks.
+- Docs: the README gains a how-to-use walk-through (integrate, profile, build, flash, pack), a step-by-step account of an update, and a key-management section: both keys, unlocking from an edge device without the private key, and rotation. It now says that rollback needs `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`, which ESP-IDF leaves off.
 
 ## [0.7.0] - 2026-09-29
 
