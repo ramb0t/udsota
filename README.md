@@ -192,6 +192,8 @@ See [`tools/linux_server`](tools/linux_server/README.md) for its options.
 | [`components/udsota`](components/udsota/README.md) | The portable core. Its README is the integration guide and the protocol reference |
 | [`components/udsota_esp32`](components/udsota_esp32/README.md) | The ESP-IDF port: A/B slots and rollback on `esp_ota_*`, keys, tasks |
 | [`components/isotp`](components/isotp) | Vendored [isotp-c](https://github.com/SimonCahill/isotp-c) v1.9.3 |
+| [`components/udsota_inflate`](components/udsota_inflate) | Raw DEFLATE for compressed downloads, on the ROM's tinfl or vendored miniz 3.0.2 |
+| [`components/udsota_delta`](components/udsota_delta) | Delta-patch decoding for delta downloads, on vendored detools 0.53.0 |
 | [`examples/esp32`](examples/esp32/README.md) | A minimal app that takes updates over the ESP32's CAN controller |
 | [`client`](client/README.md) | The `udsota` command-line tool |
 | [`tools/linux_server`](tools/linux_server/README.md) | The Linux demo server |
