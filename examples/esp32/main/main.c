@@ -260,10 +260,20 @@ void app_main(void)
      * verify, and the client's ConfirmImage (31 01 F002) keeps it. The app never calls
      * esp_ota_mark_app_valid_cancel_rollback() itself; it holds the confirm with its gate if it wants a say.
      * A reset before the confirm boots the previous image again. Being healthy, below, is a separate matter:
-     * it clears the boot-loop count and confirms nothing. */
+     * it clears the boot-loop count and confirms nothing. Built without the updater there is no F002, and
+     * sdkconfig.noupdater turns rollback off: a device that takes its images some other way with rollback on
+     * confirms them there, since udsota_esp32_image_unconfirmed() then reads false without looking. */
 
     /* The app decides when it is healthy; here, after HEALTHY_AFTER_MS up. */
     vTaskDelay(pdMS_TO_TICKS(HEALTHY_AFTER_MS));
     udsota_esp32_bootloop_mark_healthy();
     ESP_LOGI(TAG, "healthy%s", udsota_esp32_image_unconfirmed() ? "; image not yet confirmed, a reset rolls it back" : "");
+
+    /* The local status snapshot, for a UI or a log: what F1F0 reports with the updater. Built without it
+     * (sdkconfig.noupdater), nothing serves F1F0 unless did_read does (udsota_pack_status() over this), both
+     * slots read UDSOTA_SLOT_NONE and the updater is never busy; only the flags remain. */
+    udsota_status_t st;
+    udsota_esp32_status(&st);
+    ESP_LOGI(TAG, "slots: running %u, boot %u, flags 0x%02X%s", (unsigned)st.running_slot, (unsigned)st.boot_slot,
+             (unsigned)st.flags, udsota_esp32_engine_busy() ? "; an update job is running" : "");
 }

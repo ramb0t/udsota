@@ -1,13 +1,34 @@
 menu "udsota ESP32 port"
 
+    config UDSOTA_ESP32_UPDATER
+        bool "Firmware updater (RequestDownload and the flash worker)"
+        default y
+        help
+            On: the port serves firmware updates. RequestDownload, TransferData and RequestTransferExit
+            (0x34, 0x36, 0x37), the routines FF01 and F000-F002 and the DIDs F189, F1F0, F1F1 and F1F3
+            are udsota's, and a flash worker writes each download to the inactive OTA slot.
+            Off: a UDS server alone. 0x34, 0x36 and 0x37 answer 0x11, and those routines and DIDs go to
+            the app's hooks (0x31 when the app serves none of them; F189 included, which the app can
+            serve from esp_app_get_description()). Everything else works as before. There is no flash
+            worker (its stack and 4 KB buffer), no engine, no core updater and no OTA write path
+            (esp_ota_begin, write, end and set_boot_partition; ESP-IDF's own esp_partition still links
+            esp_ota_get_running_partition), and a partition table with only a factory app works.
+            udsota_esp32_engine() returns NULL, udsota_esp32_engine_busy() false,
+            udsota_esp32_image_unconfirmed() false without reading the OTA state (with rollback on,
+            confirming an image is then the other updater's job), udsota_esp32_status() no slots,
+            udsota_esp32_progress() IDLE and udsota_esp32_incoming_version() "". The ISO-TP
+            buffers stay sized for a download block.
+
     config UDSOTA_ESP32_WORKER_CORE
         int "Flash worker core"
+        depends on UDSOTA_ESP32_UPDATER
         range 0 0 if FREERTOS_UNICORE
         range 0 1
         default 0
 
     config UDSOTA_ESP32_WORKER_PRIO
         int "Flash worker priority"
+        depends on UDSOTA_ESP32_UPDATER
         range 1 24
         default 3
         help
@@ -16,6 +37,7 @@ menu "udsota ESP32 port"
 
     config UDSOTA_ESP32_WORKER_STACK
         int "Flash worker stack (bytes)"
+        depends on UDSOTA_ESP32_UPDATER
         range 4096 32768
         default 8192
         help
@@ -24,6 +46,7 @@ menu "udsota ESP32 port"
 
     config UDSOTA_ESP32_COMPRESSION
         bool "Compressed downloads (RequestDownload DFI 0x10, raw DEFLATE)"
+        depends on UDSOTA_ESP32_UPDATER
         default n
         help
             Serve downloads whose 0x36 blocks carry a raw DEFLATE stream of the image. The flash worker

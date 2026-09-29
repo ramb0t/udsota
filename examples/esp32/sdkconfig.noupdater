@@ -1,0 +1,6 @@
+# A UDS server without the updater (no downloads): list this file after sdkconfig.defaults in SDKCONFIG_DEFAULTS (see README.md).
+# CONFIG_UDSOTA_ESP32_UPDATER is not set
+
+# Nothing in this build confirms an image (no ConfirmImage), so rollback is off; a device that takes its images some
+# other way with rollback on confirms them there.
+# CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE is not set

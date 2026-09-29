@@ -1,5 +1,5 @@
-/* Private to components/udsota_esp32: the start hooks udsota_esp32_start() (udsota_esp32.c) calls, and what
- * one port file needs from another. */
+/* Private to components/udsota_esp32: the start hooks udsota_esp32_start() (udsota_esp32.c) calls, among them
+ * the one seam call into the updater (udsota_esp32_server_init), and what one port file needs from another. */
 #pragma once
 #include <stdbool.h>
 #include <stddef.h>
@@ -14,17 +14,13 @@ void udsota_esp32_psa_lock_init(void);
  * (1 to UDSOTA_KEYS_ID_MAX bytes), else of the base MAC. *dev (dev may be NULL) gets the stored ID, which
  * F18C serves and the 0x27 key hashes. Start code only (udsota_esp32_start() and udsota_esp32_security()). */
 udsota_esp32_devid_fix_t udsota_esp32_id_fix(const uint8_t *id, size_t id_len, const udsota_esp32_devid_t **dev);
-/* Starts the engine once, before anything uses it. Creates the flash worker (Kconfig core, priority and
- * stack; internal RAM; off the task watchdog), its 4 KB block buffer and job queue. Takes the image identity
- * from cfg (product, hw_id, layout_id, req_id, resp_id; the product string must stay valid), the running
- * version from esp_app_desc and the release flag from udsota_image_desc, and puts the inactive slot's size
- * in udsota_esp32_engine()->slot_size. The worker reads the OTA state before its first job. Idempotent. A failed
- * allocation or a missing inactive slot is logged, and every download is then refused. Links against
- * udsota_image_desc, so the app places one with UDSOTA_ESP32_IMAGE_DESC. */
-void udsota_esp32_engine_start(const udsota_config_t *cfg);
-/* Installs the function the flash worker calls after each finished job, from the worker's task, so the diag
- * task answers at once instead of at its next poll. Call before udsota_esp32_engine_start(); NULL = none. */
-void udsota_esp32_engine_set_wake(void (*wake)(void));
+/* Initialises the server once per boot, from udsota_esp32_start() before the diag task exists. With
+ * CONFIG_UDSOTA_ESP32_UPDATER (udsota_esp32_engine.c) it installs wake (the function the flash worker calls after
+ * each finished job, from its own task, so the diag task answers at once), starts the engine and calls
+ * udsota_init() with udsota_esp32_engine(); without it (udsota_esp32_noupdater.c) it calls udsota_core_init(), so
+ * no updater is registered or linked, and ignores wake. Returns what that init returns. */
+bool udsota_esp32_server_init(udsota_server_t *srv, const udsota_config_t *cfg, const udsota_security_t *sec,
+                              const udsota_hooks_t *hooks, void (*wake)(void));
 /* The engine's first-block check, on whichever task runs it, once it has judged a first block with reason r: the
  * control block keeps an accepted block's version as the incoming version (udsota_esp32_ctl_first_block). */
 void udsota_esp32_first_block_checked(udsota_reason_t r, const uint8_t *first, size_t len);
