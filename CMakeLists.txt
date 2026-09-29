@@ -337,30 +337,30 @@ if(UDSOTA_FUZZ AND UDSOTA_FUZZ_SAN_OK)
             set_tests_properties(${name} PROPERTIES PASS_REGULAR_EXPRESSION "fuzz_udsota: PASS .* digest=${F_DIGEST}")
         endif()
     endfunction()
-    udsota_fuzz(fuzz_udsota 300 DIGEST c2a27ece321ea94d)
+    udsota_fuzz(fuzz_udsota 300 DIGEST 167b0bb1e30d7960)
     if(UDSOTA_FUZZ_CORPUS)
         add_test(NAME fuzz_udsota_corpus COMMAND fuzz_udsota ${UDSOTA_FUZZ_CORPUS})
         set_tests_properties(fuzz_udsota_corpus PROPERTIES TIMEOUT 1800)
     endif()
     # The same harness with did_write, routine and routine_poll set: 0x2E served, app routines answered at once,
     # after 0x78s and orphaned at the 90 s cap, each with exactly one owner.
-    udsota_fuzz(fuzz_udsota_app_hooks 300 DIGEST 835eca2454905330 DEFS UDSOTA_FUZZ_APP_HOOKS=1)
+    udsota_fuzz(fuzz_udsota_app_hooks 300 DIGEST f89754fc3ef5118b DEFS UDSOTA_FUZZ_APP_HOOKS=1)
     # The same harness with the progress hook set: done never passes total nor shrinks within a download, and the
     # hook runs at most once per call and reports every change of stage. Its PASS line matches fuzz_udsota's.
-    udsota_fuzz(fuzz_udsota_progress 300 DIGEST c2a27ece321ea94d DEFS UDSOTA_FUZZ_PROGRESS=1)
+    udsota_fuzz(fuzz_udsota_progress 300 DIGEST 167b0bb1e30d7960 DEFS UDSOTA_FUZZ_PROGRESS=1)
     # The same harness with compressed downloads served: the z ops over udsota_zstream and the real tinfl, a
     # compressed preamble, and generated DEFLATE streams (miniz built with deflate on, to make them), with the progress
     # hook set so that its checks hold on the compressed path too.
-    udsota_fuzz(fuzz_udsota_z 600 DIGEST 2488a2952adadc9e SOURCES ${ZSTREAM_SRCS} INCLUDES ${ZSTREAM_INC}
+    udsota_fuzz(fuzz_udsota_z 600 DIGEST 744cebe8b3e84bd0 SOURCES ${ZSTREAM_SRCS} INCLUDES ${ZSTREAM_INC}
                 DEFS UDSOTA_FUZZ_Z=1 UDSOTA_FUZZ_PROGRESS=1 ${MINIZ_TEST_DEFS})
     # The same harness with no update service (udsota_core_init, which is udsota_init given a NULL engine), from the
     # five states a download isn't needed for: 34, 36 and 37 get only 0x11 (0x21 while an app routine runs), and the
     # app hooks give 0x31 its positive answers. Built from the core list, so the updater isn't even linked.
-    udsota_fuzz(fuzz_udsota_no_update 300 DIGEST 7e2cee56a31e126f SERVER ${UDSOTA_SERVER_CORE_SRCS}
+    udsota_fuzz(fuzz_udsota_no_update 300 DIGEST 9f7c2932c2332507 SERVER ${UDSOTA_SERVER_CORE_SRCS}
                 DEFS UDSOTA_FUZZ_NO_UPDATE=1 UDSOTA_FUZZ_APP_HOOKS=1)
     # The same harness with the DTC hooks set over a 90-DTC table: 19 01, 02, 06 and 0A and 14 served, lists past the
     # response buffer (0x14), and every status sent a subset of the availability mask.
-    udsota_fuzz(fuzz_udsota_dtc 300 DIGEST 93368578353e39a1 DEFS UDSOTA_FUZZ_DTC=1)
+    udsota_fuzz(fuzz_udsota_dtc 300 DIGEST e05a7138b28a2a22 DEFS UDSOTA_FUZZ_DTC=1)
     # The delta patch path on mutated patches (test/fuzz_udsota_patch.c): udsota_coded over the real detools and
     # tinfl, with AddressSanitizer where the toolchain has it, since the device parses these patches from the bus.
     set(FUZZ_PATCH_SAN ${FUZZ_SAN})

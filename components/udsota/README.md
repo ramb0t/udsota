@@ -129,7 +129,7 @@ Every struct carries its own `ctx`, which is passed back to its callbacks. A NUL
 |---|---|---|
 | `gate(ctx, op)` | at each enforcement point in the next table: after the core's own checks, except CONFIRM, where it is asked first | allow |
 | `phase(ctx, p)` | on every phase change | nobody is told |
-| `did_read(ctx, did, buf, max)` | for a 22 on any DID the core does not serve; returns the bytes written, 0 for "no such DID" | every such DID answers 0x31 |
+| `did_read(ctx, did, buf, max)` | for a 22 on any DID the core does not serve; returns the bytes written, 0 for "no such DID" (0x31), or for a DID longer than `max` its length, writing nothing (0x14) | every such DID answers 0x31 |
 | `did_write(ctx, did, data, len, access)` | for a 2E outside the default session with at least one value byte (the core answers 0x7F in the default session and 0x13 under 4 bytes first); `data` is the value after the DID, valid only during the call. Returns 0 to answer `6E <did>`, else the NRC | 2E answers 0x11 |
 | `routine(ctx, rid, in, in_len, out, out_max, out_len, access)` | for 31 01 on a RID the core doesn't own, outside the default session; `in` is the option record after the RID. `in` and `out` are valid only during the call, so a pending routine copies what it needs. Returns 0 to answer `71 01 <rid>` and `out_len` bytes of `out`, an NRC, or `UDSOTA_PENDING` | such RIDs answer 0x31 |
 | `routine_poll(ctx, out, out_max, out_len)` | on every `udsota_poll` while a routine is pending or orphaned; returns as `routine` does, and `out` is again valid only during the call | a routine that returns `UDSOTA_PENDING` answers 0x10 at the first poll |
@@ -286,7 +286,7 @@ A server serves a coded DFI only when its engine names it in `engine.zformats` (
 | 27 | SecurityAccess | `level_extended` and the next sub-function in extended, `level_programming` and the next in programming; a sendKey carries exactly 16 key bytes, or 64 in the ECDSA mode | extended, programming | – |
 | 2E | WriteDataByIdentifier | one DID and at least one value byte, through `did_write`; answers `6E <did>` | extended, programming | the app's choice |
 | 31 | RoutineControl | 01 startRoutine | per routine | per routine |
-| 34 | RequestDownload | DFI 00, or 10 (raw DEFLATE), 20 (a delta patch) or 30 (a delta patch as raw DEFLATE) when `engine.zformats` names it; ALFID 44, address 0, 0 < size ≤ slot, size being the image; answers `74 20 0F FF` (`cfg.max_block_len`, 4,095 by default) | programming | programming |
+| 34 | RequestDownload | DFI 00, or 10 (raw DEFLATE), 20 (a delta patch) or 30 (a delta patch as raw DEFLATE) when `engine.zformats` names it; any ALFID whose nibbles are each 1–4, the low one the address's bytes and the high one the size's (the client sends 44), address 0, 0 < size ≤ slot, size being the image; answers `74 20 0F FF` (`cfg.max_block_len`, 4,095 by default) | programming | programming |
 | 36 | TransferData | block counter from 01, wrapping FF to 00, and up to 4,093 data bytes, coded after a DFI 10, 20 or 30; a repeat of the last counter is answered and not rewritten | programming | programming |
 | 37 | RequestTransferExit | once every announced byte has arrived, or after a coded DFI once the stream or patch has ended at exactly the announced size | programming | programming |
 | 3E | TesterPresent | 00; 80 suppresses the answer | any | – |
@@ -334,11 +334,11 @@ Every other DID goes to `did_read`, and so does any of these whose source is NUL
 | 0x11 | serviceNotSupported | an unknown SID; 27 with security off; 11 01 with no `reset` hook; 28 with no `comm_control` hook; 85 with no `dtc_setting` hook; 2E with no `did_write` hook; 19 with no `dtc_get`, 14 with no `dtc_clear` |
 | 0x12 | subFunctionNotSupported | an unknown sub-function, and 19 06 with no `dtc_ext_data` |
 | 0x13 | incorrectMessageLengthOrInvalidFormat | a wrong length, or more than one DID in a 22 |
-| 0x14 | responseTooLong | a 19 answer past the response buffer, or `dtc_ext_data`'s records past its `max` |
+| 0x14 | responseTooLong | a 22 or 19 answer past the response buffer, or `dtc_ext_data`'s records past its `max` |
 | 0x21 | busyRepeatRequest | any request but 3E while a flash job or a pending app routine runs; or the gate's choice |
 | 0x22 | conditionsNotCorrect | a core-owned condition, the gate, or no memory, slot or worker for a coded download's decoder |
 | 0x24 | requestSequenceError | a step out of order: 36 with no download open, 37 before the last byte, FF01 before 37, F001 before FF01, or a key with no live seed |
-| 0x31 | requestOutOfRange | an unknown DID or RID, 34 parameters or size (a coded DFI the engine does not serve among them), a first block the image rules refuse, a coded block that is corrupt or decodes past the announced size, or a delta patch with the wrong magic, size or base; a 19 06 for a DTC `dtc_get` doesn't report or for record 00 |
+| 0x31 | requestOutOfRange | an unknown DID or RID, 34 parameters or size (an ALFID nibble outside 1–4, or a coded DFI the engine does not serve, among them), a first block the image rules refuse, a coded block that is corrupt or decodes past the announced size, or a delta patch with the wrong magic, size or base; a 19 06 for a DTC `dtc_get` doesn't report or for record 00 |
 | 0x33 | securityAccessDenied | a keyed service while locked |
 | 0x35 | invalidKey | a wrong key |
 | 0x36 | exceedNumberOfAttempts | the third wrong key |

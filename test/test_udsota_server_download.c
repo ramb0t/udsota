@@ -161,6 +161,28 @@ static void build_34(uint8_t *r, uint8_t dfi, uint8_t alfid, uint32_t addr, uint
     r[7] = (uint8_t)(size >> 24); r[8] = (uint8_t)(size >> 16); r[9] = (uint8_t)(size >> 8); r[10] = (uint8_t)size;
 }
 
+/* Room for a 34 whose ALFID nibbles are both 0xF: 34, DFI, ALFID and two 15-byte fields. */
+#define REQ_34_MAX  (UDSOTA_DL_REQ_MIN + 2u * 15u)
+
+/* Builds 34 <dfi> <alfid> into r with addr and size big-endian in as many bytes as the ALFID's low and high nibbles
+ * give, leading zeros past 4; returns the request's length. */
+static size_t build_34w(uint8_t *r, uint8_t dfi, uint8_t alfid, uint32_t addr, uint32_t size)
+{
+    const size_t al = alfid & 0x0Fu, sl = alfid >> 4;
+    r[0] = UDSOTA_SID_REQUEST_DOWNLOAD;
+    r[1] = dfi;
+    r[2] = alfid;
+    for (size_t i = 0; i < al; i++) {
+        const size_t k = al - 1u - i;              /* byte k from the value's low end */
+        r[UDSOTA_DL_REQ_MIN + i] = k < 4u ? (uint8_t)(addr >> (8u * k)) : 0u;
+    }
+    for (size_t i = 0; i < sl; i++) {
+        const size_t k = sl - 1u - i;
+        r[UDSOTA_DL_REQ_MIN + al + i] = k < 4u ? (uint8_t)(size >> (8u * k)) : 0u;
+    }
+    return UDSOTA_DL_REQ_MIN + al + sl;
+}
+
 /* Sends 34 00 44 <addr 0> <size> and asserts 74 20 0F FF. */
 static void request_download(uint32_t size)
 {
@@ -192,7 +214,7 @@ static void test_request_download_bad_format(void)
     enter_programming();
     uint8_t r[UDSOTA_DL_REQ_LEN];
     build_34(r, 0x11, UDSOTA_DL_ALFID, 0u, 4096u);                       send(r, sizeof r); EXPECT(0x7F, 0x34, 0x31);
-    build_34(r, UDSOTA_DL_DFI, 0x24, 0u, 4096u);                         send(r, sizeof r); EXPECT(0x7F, 0x34, 0x31);
+    build_34(r, UDSOTA_DL_DFI, 0x45, 0u, 4096u);                         send(r, sizeof r); EXPECT(0x7F, 0x34, 0x31);
     build_34(r, UDSOTA_DL_DFI, UDSOTA_DL_ALFID, 0x1000u, 4096u);            send(r, sizeof r); EXPECT(0x7F, 0x34, 0x31);
     build_34(r, UDSOTA_DL_DFI, UDSOTA_DL_ALFID, 0u, 0u);                    send(r, sizeof r); EXPECT(0x7F, 0x34, 0x31);
     build_34(r, UDSOTA_DL_DFI, UDSOTA_DL_ALFID, 0u, UDSOTA_SLOT_SIZE_DEFAULT + 1u);
@@ -201,6 +223,105 @@ static void test_request_download_bad_format(void)
     send(r, UDSOTA_DL_REQ_LEN - 1u); EXPECT(0x7F, 0x34, 0x13);
     TEST_ASSERT_FALSE(srv.update.download_active);
     request_download(UDSOTA_SLOT_SIZE_DEFAULT);                        /* exactly the slot fits */
+}
+
+/* Any ALFID whose nibbles are each 1..4 is taken, the address in the low nibble's bytes and the size in the high's:
+ * 11, 22, 44, 24 and 42 each open a download of the size they carry. */
+static void test_request_download_any_alfid_width(void)
+{
+    static const struct { uint8_t alfid; uint32_t size; } CASES[] = {
+        {0x11, 0xFFu}, {0x22, 0x1234u}, {0x44, 0x00012345u}, {0x24, 0x4000u}, {0x42, UDSOTA_SLOT_SIZE_DEFAULT},
+    };
+    for (size_t i = 0; i < sizeof CASES / sizeof CASES[0]; i++) {
+        boot(&ENGINE);
+        enter_programming();
+        uint8_t r[REQ_34_MAX];
+        send(r, build_34w(r, UDSOTA_DL_DFI, CASES[i].alfid, 0u, CASES[i].size));
+        EXPECT(0x74, 0x20, 0x0F, 0xFF);
+        TEST_ASSERT_TRUE(srv.update.download_active);
+        TEST_ASSERT_EQUAL_UINT32(CASES[i].size, srv.update.dl_announced);
+    }
+}
+
+/* A valid ALFID fixes the length: its fields one byte short or over, or the client's 11 bytes with ALFID 11, are
+ * 0x13, and so is anything under 3 bytes, whatever the ALFID. */
+static void test_request_download_length_by_alfid(void)
+{
+    enter_programming();
+    uint8_t r[REQ_34_MAX] = {0};
+    const size_t n22 = build_34w(r, UDSOTA_DL_DFI, 0x22, 0u, 4096u);
+    send(r, n22 - 1u);           EXPECT(0x7F, 0x34, 0x13);
+    send(r, n22 + 1u);           EXPECT(0x7F, 0x34, 0x13);
+    build_34w(r, UDSOTA_DL_DFI, 0x11, 0u, 16u);
+    send(r, UDSOTA_DL_REQ_LEN);  EXPECT(0x7F, 0x34, 0x13);
+    send(r, 2u);                 EXPECT(0x7F, 0x34, 0x13);
+    send(r, 1u);                 EXPECT(0x7F, 0x34, 0x13);
+    r[2] = 0x05;
+    send(r, 2u);                 EXPECT(0x7F, 0x34, 0x13);
+    TEST_ASSERT_FALSE(srv.update.download_active);
+}
+
+/* A nibble outside 1..4 sizes no field, so any length from 3 bytes is 0x31: 05, 50, 45, 54 and 00, each at its
+ * nibbles' own length, at the client's 11 bytes and bare. */
+static void test_request_download_bad_alfid(void)
+{
+    static const uint8_t BAD[] = {0x05, 0x50, 0x45, 0x54, 0x00};
+    enter_programming();
+    for (size_t i = 0; i < sizeof BAD; i++) {
+        uint8_t r[REQ_34_MAX] = {0};
+        send(r, build_34w(r, UDSOTA_DL_DFI, BAD[i], 0u, 4096u));   EXPECT(0x7F, 0x34, 0x31);
+        send(r, UDSOTA_DL_REQ_LEN);                                 EXPECT(0x7F, 0x34, 0x31);
+        send(r, UDSOTA_DL_REQ_MIN);                                 EXPECT(0x7F, 0x34, 0x31);
+    }
+    TEST_ASSERT_FALSE(srv.update.download_active);
+}
+
+/* The conditions come before the format: with a bad ALFID the gate's refusal, a boot slot that is not the running
+ * one and an open download still answer 0x22, at any length from 3 bytes. */
+static void test_request_download_conditions_before_alfid(void)
+{
+    enter_programming();
+    uint8_t r[UDSOTA_DL_REQ_LEN];
+    build_34(r, UDSOTA_DL_DFI, 0x45, 0u, 4096u);
+    g_mock.gate_nrc[UDSOTA_OP_START_DOWNLOAD] = 0x22;   send(r, sizeof r);  EXPECT(0x7F, 0x34, 0x22);
+    g_mock.gate_nrc[UDSOTA_OP_START_DOWNLOAD] = 0;
+    g_mock.status.boot_slot = UDSOTA_SLOT_OTA1;         send(r, sizeof r);  EXPECT(0x7F, 0x34, 0x22);
+    g_mock.status.boot_slot = UDSOTA_SLOT_OTA0;
+    request_download(4096u);
+    send(r, sizeof r);           EXPECT(0x7F, 0x34, 0x22);
+    r[2] = 0x00;
+    send(r, UDSOTA_DL_REQ_MIN);  EXPECT(0x7F, 0x34, 0x22);
+    TEST_ASSERT_EQUAL_UINT32(4096u, srv.update.dl_announced);
+}
+
+/* Address and size are read at their ALFID's widths: a non-zero address in a 1- or a 4-byte field, size 0 in a 1-byte
+ * field and one byte over the slot in a 3-byte field are 0x31; a 4-byte field holding 16 is taken. */
+static void test_request_download_fields_by_width(void)
+{
+    enter_programming();
+    uint8_t r[REQ_34_MAX];
+    send(r, build_34w(r, UDSOTA_DL_DFI, 0x11, 0x01u, 16u));                           EXPECT(0x7F, 0x34, 0x31);
+    send(r, build_34w(r, UDSOTA_DL_DFI, 0x44, 0x00000100u, 16u));                     EXPECT(0x7F, 0x34, 0x31);
+    send(r, build_34w(r, UDSOTA_DL_DFI, 0x14, 0u, 0u));                               EXPECT(0x7F, 0x34, 0x31);
+    send(r, build_34w(r, UDSOTA_DL_DFI, 0x31, 0u, UDSOTA_SLOT_SIZE_DEFAULT + 1u));    EXPECT(0x7F, 0x34, 0x31);
+    TEST_ASSERT_FALSE(srv.update.download_active);
+    send(r, build_34w(r, UDSOTA_DL_DFI, 0x41, 0u, 16u));                              EXPECT(0x74, 0x20, 0x0F, 0xFF);
+    TEST_ASSERT_EQUAL_UINT32(16u, srv.update.dl_announced);
+}
+
+/* The session and key checks come first: a 34 too short or with a bad ALFID answers 0x7F outside programming and 0x33
+ * locked. */
+static void test_request_download_access_before_format(void)
+{
+    uint8_t r[UDSOTA_DL_REQ_LEN];
+    build_34(r, UDSOTA_DL_DFI, 0x45, 0u, 4096u);
+    send(r, 1u);         EXPECT(0x7F, 0x34, 0x7F);
+    send(r, sizeof r);   EXPECT(0x7F, 0x34, 0x7F);
+    const uint8_t sess[] = {UDSOTA_SID_SESSION, UDSOTA_SESSION_PROGRAMMING};
+    send(sess, sizeof sess);
+    send(r, 1u);         EXPECT(0x7F, 0x34, 0x33);
+    send(r, sizeof r);   EXPECT(0x7F, 0x34, 0x33);
+    TEST_ASSERT_FALSE(srv.update.download_active);
 }
 
 /* 34/36/37 outside programming get 0x7F; 34 in programming without the level-03 key gets 0x33. */
@@ -849,6 +970,12 @@ int main(void)
     UNITY_BEGIN();
     RUN_TEST(test_request_download_accepts);
     RUN_TEST(test_request_download_bad_format);
+    RUN_TEST(test_request_download_any_alfid_width);
+    RUN_TEST(test_request_download_length_by_alfid);
+    RUN_TEST(test_request_download_bad_alfid);
+    RUN_TEST(test_request_download_conditions_before_alfid);
+    RUN_TEST(test_request_download_fields_by_width);
+    RUN_TEST(test_request_download_access_before_format);
     RUN_TEST(test_request_download_bounded_by_engine_slot_size);
     RUN_TEST(test_download_needs_programming_and_key);
     RUN_TEST(test_request_download_refused_by_core_and_gate);

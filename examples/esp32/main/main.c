@@ -179,16 +179,19 @@ static esp_err_t can_start(void)
 }
 
 /* udsota_hooks_t.did_read (diag task): F191 answers the board name, and 0 for every other DID means "no
- * such DID" (NRC 0x31); the core serves its own DIDs without asking. The client profile's [board] and
- * [dids] sections read F191, and flash refuses to start without it. */
+ * such DID" (NRC 0x31); a name longer than max returns its length unwritten (NRC 0x14). The core serves its
+ * own DIDs without asking. The client profile's [board] and [dids] sections read F191, and flash refuses to
+ * start without it. */
 static size_t did_read(void *ctx, uint16_t did, uint8_t *buf, size_t max)
 {
     (void)ctx;
     const size_t n = sizeof EXAMPLE_BOARD_NAME - 1u;   /* ASCII, no NUL */
-    if (did != DID_BOARD_NAME || n > max) {
+    if (did != DID_BOARD_NAME) {
         return 0;
     }
-    memcpy(buf, EXAMPLE_BOARD_NAME, n);
+    if (n <= max) {
+        memcpy(buf, EXAMPLE_BOARD_NAME, n);
+    }
     return n;
 }
 
