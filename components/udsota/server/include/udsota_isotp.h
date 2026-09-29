@@ -28,7 +28,7 @@
 #define UDSOTA_ISOTP_PARK_MAX_MS       1000u  /* a parked answer the bus keeps refusing is dropped after this long */
 
 typedef struct {
-    int      (*send)(void *ctx, uint16_t id, const uint8_t data[8], uint8_t len);   /* 0 queued, UDSOTA_TX_RETRY, else dropped */
+    int      (*send)(void *ctx, uint16_t id, const uint8_t data[8], uint8_t len);   /* 11-bit CAN IDs only; 0 queued, UDSOTA_TX_RETRY, else dropped */
     uint32_t (*tx_pending)(void *ctx);       /* nullable: frames still queued in the app's CAN driver; NULL = unknown, so a restart waits the full 100 ms */
     uint32_t (*now_us)(void *ctx);           /* monotonic microseconds (isotp_user_get_us) */
     void     *ctx;
@@ -53,7 +53,7 @@ struct udsota_isotp {
     uint32_t           (*stmin_us)(void *ctx);   /* hooks.stmin_us, copied at init; NULL = stmin_default_us */
     void                *stmin_ctx;          /* hooks.ctx */
     uint32_t             stmin_default_us;   /* s->cfg.stmin_us, rounded up to what an FC carries */
-    uint16_t             resp_id;
+    uint16_t             resp_id;            /* cfg.resp_id (11-bit CAN IDs only) */
     uint32_t             rx_limit_dl;        /* receive limit while a download is open: s->cfg.max_block_len */
     uint32_t             rx_limit_idle;      /* receive limit otherwise */
     uint32_t             rx_limit;           /* the link's current receive buffer size */

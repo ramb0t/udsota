@@ -12,6 +12,7 @@
 
 #define UDSOTA_ESP32_CTL_VERSION_MAX 32u   /* UDSOTA_ESP32_VERSION_MAX: up to 31 characters and a NUL */
 #define UDSOTA_ESP32_CTL_VERSION_OFF 48u   /* esp_app_desc_t.version in a first block: 24 + 8 header bytes, then 16 */
+#define UDSOTA_ESP32_CTL_ID_MAX      0x7FFu   /* the largest 11-bit CAN ID: the port serves no other */
 
 typedef struct {
     atomic_uint    phase;                    /* udsota_phase_t, stored before the app's phase hook runs */
@@ -65,3 +66,7 @@ bool udsota_esp32_ctl_run_end(udsota_esp32_ctl_t *ctl, udsota_server_t *s, uint3
  * overslept by more than one tick, but at least 1 for any wait above 0, so a short wait never becomes a
  * non-blocking poll (pdMS_TO_TICKS(5) is 0 at 100 Hz, which spun the diag task). 0 stays 0. */
 uint32_t udsota_esp32_ctl_ticks(uint32_t ms, uint32_t tick_hz);
+/* True when cfg's CAN IDs are ones the port can serve: req_id and resp_id 11-bit (at most UDSOTA_ESP32_CTL_ID_MAX)
+ * and distinct, and func_id, when set (0 = no functional addressing), 11-bit and equal to neither.
+ * udsota_esp32_start() refuses any other with ESP_ERR_INVALID_ARG. */
+bool udsota_esp32_ctl_ids_ok(const udsota_config_t *cfg);

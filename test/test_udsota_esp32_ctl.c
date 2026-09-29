@@ -6,7 +6,7 @@
  * snapshot copies what the server reported, under the port's lock, before the app's own hook runs, and the
  * incoming version is read from an accepted first block, plain or inflated from a compressed download, kept
  * after the download ends, and cleared by the next accepted 34 in the same locked copy as its report or by a
- * compressed 34 the engine refuses. */
+ * compressed 34 the engine refuses. Also the start check that the CAN IDs are 11-bit and distinct. */
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -1038,6 +1038,41 @@ static void test_wait_ticks_never_round_a_wait_to_zero(void)
     TEST_ASSERT_EQUAL_UINT32(UINT32_MAX, udsota_esp32_ctl_ticks(UINT32_MAX, 10000000u));
 }
 
+/* The IDs start accepts: 11-bit request and response IDs that differ, and a functional ID only when it is 0 (none)
+ * or an 11-bit ID of its own; anything above 0x7FF, which an extended frame's ID truncated to 16 bits could be,
+ * is refused wherever it sits. */
+static void test_ids_must_be_11_bit_and_distinct(void)
+{
+    const udsota_config_t ok = {.req_id = 0x710, .resp_id = 0x718};
+    TEST_ASSERT_TRUE(udsota_esp32_ctl_ids_ok(&ok));
+    udsota_config_t c = ok;
+    c.func_id = 0x7DF;
+    TEST_ASSERT_TRUE(udsota_esp32_ctl_ids_ok(&c));
+    c = (udsota_config_t){.req_id = 0x000, .resp_id = 0x7FF, .func_id = 0x7FE};   /* the whole range's ends */
+    TEST_ASSERT_TRUE(udsota_esp32_ctl_ids_ok(&c));
+
+    c = ok;
+    c.req_id = 0x800;
+    TEST_ASSERT_FALSE(udsota_esp32_ctl_ids_ok(&c));
+    c = ok;
+    c.resp_id = 0xFFFF;
+    TEST_ASSERT_FALSE(udsota_esp32_ctl_ids_ok(&c));
+    c = ok;
+    c.func_id = 0x800;
+    TEST_ASSERT_FALSE(udsota_esp32_ctl_ids_ok(&c));
+    c = ok;
+    c.resp_id = ok.req_id;
+    TEST_ASSERT_FALSE(udsota_esp32_ctl_ids_ok(&c));
+    c = ok;
+    c.func_id = ok.req_id;
+    TEST_ASSERT_FALSE(udsota_esp32_ctl_ids_ok(&c));
+    c = ok;
+    c.func_id = ok.resp_id;
+    TEST_ASSERT_FALSE(udsota_esp32_ctl_ids_ok(&c));
+    c = (udsota_config_t){.req_id = 0x710, .resp_id = 0x000};   /* 0 is "none" only for func_id */
+    TEST_ASSERT_TRUE(udsota_esp32_ctl_ids_ok(&c));
+}
+
 /* Runs every udsota_esp32_ctl test. */
 int main(void)
 {
@@ -1051,6 +1086,7 @@ int main(void)
     RUN_TEST(test_without_write_and_routine_hooks_the_core_answers_as_before);
     RUN_TEST(test_dtc_hooks_reach_the_app);
     RUN_TEST(test_wait_ticks_never_round_a_wait_to_zero);
+    RUN_TEST(test_ids_must_be_11_bit_and_distinct);
     RUN_TEST(test_progress_snapshot_copies_the_report_and_forwards_it);
     RUN_TEST(test_progress_snapshot_without_an_app_hook);
     RUN_TEST(test_version_is_empty_after_init);

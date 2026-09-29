@@ -28,7 +28,7 @@ typedef enum { UDSOTA_RESTART_RESET = 0, UDSOTA_RESTART_ACTIVATE } udsota_restar
 typedef struct { uint8_t session; bool unlocked; } udsota_svc_access_t;
 
 /* Registers svc on s; once, right after udsota_core_init: registering while a job or orphan exists would change
- * which poll answers it. */
+ * which poll answers it. NULL registers none; a non-NULL svc with a NULL member fails an assert(). */
 void    udsota_register_service(udsota_server_t *s, const udsota_service_t *svc);
 /* Writes 7F <sid> <nrc>; returns 3, or 0 without writing when resp_max < 3. */
 size_t  udsota_nrc(uint8_t *resp, size_t resp_max, uint8_t sid, uint8_t nrc);

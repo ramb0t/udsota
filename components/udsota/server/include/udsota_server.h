@@ -2,6 +2,7 @@
  * udsota_update.h), the server context and its entry points, over the wire contract in udsota_server_wire.h. Pure C:
  * shared by the host tests and the firmware. A service such as the firmware updater builds on udsota_service.h. */
 #pragma once
+#include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -21,6 +22,7 @@
  * hooks.routine and hooks.routine_poll return it too, for an app routine still running; the server then waits on
  * routine_poll. INT32_MAX: never an esp_err_t, never 0. */
 #define UDSOTA_PENDING  0x7FFFFFFF
+_Static_assert(INT_MAX >= UDSOTA_PENDING, "UDSOTA_PENDING is returned through int");
 
 #define UDSOTA_STMIN_DEFAULT_US    2000u      /* the transport's FC STmin while cfg.stmin_us is 0 */
 #define UDSOTA_BLOCK_SIZE_DEFAULT  64u        /* the transport's FC BS while cfg.block_size is 0 */
@@ -158,9 +160,10 @@ typedef struct {   /* all optional */
 } udsota_hooks_t;
 
 typedef struct {
-    uint16_t    req_id, resp_id;       /* ISO-TP adapter; the server ignores them */
-    uint16_t    func_id;               /* the port: functional request ID (OBD's is 0x7DF), whose single frames go to
-                                          udsota_isotp_on_func_frame(); 0 = no functional addressing */
+    uint16_t    req_id, resp_id;       /* ISO-TP adapter, 11-bit CAN IDs only; the server ignores them */
+    uint16_t    func_id;               /* the port: functional request ID (OBD's is 0x7DF; 11-bit CAN IDs only), whose
+                                          single frames go to udsota_isotp_on_func_frame(); 0 = no functional
+                                          addressing */
     uint16_t    p2_ms, p2star_ms, s3_ms;   /* 0 = 50 / 5000 / 5000 */
     uint16_t    p2_prog_ms, p2star_prog_ms;   /* P2 and P2* in the programming session; 0 = p2_ms and p2star_ms */
     uint16_t    max_block_len;         /* 34's maxNumberOfBlockLength and the 36 length limit; 0 = 4095, and more is
