@@ -9,7 +9,7 @@
 #include <string.h>
 #include "unity.h"
 #include "udsota.h"
-#include "udsota_mock.h"
+#include "udsota_dl_harness.h"
 #include "udsota_image.h"
 #include "udsota_tinfl.h"
 #include "udsota_zstream.h"
@@ -42,15 +42,10 @@ typedef struct {
 } eng_t;
 
 static eng_t e;
-static uint32_t g_now;
-static udsota_server_t srv;
-static uint8_t g_resp[64];
-static size_t g_resp_len;
 static uint8_t g_req[UDSOTA_DL_MAX_BLOCK_LEN];
 static uint8_t g_img[IMG_LEN];
 static uint8_t g_z[Z_CAP];
 static size_t g_z_len;
-static udsota_mock_t g_mock;
 static unsigned g_fake_finishes;       /* the fake decompressor's finish calls */
 
 /* ---- the inflater's memory ---- */
@@ -226,31 +221,16 @@ static void stored_block(const uint8_t *data, uint16_t n, bool final)
     g_z_len += n;
 }
 
+/* The image as stored blocks of 95 bytes, each sent as one 100-byte 36, so the first three hold their bytes back. */
+static void stored_stream(void)
+{
+    for (size_t off = 0; off < IMG_LEN; off += 95u) {
+        const uint16_t n = (uint16_t)((IMG_LEN - off < 95u) ? IMG_LEN - off : 95u);
+        stored_block(&g_img[off], n, off + n == IMG_LEN);
+    }
+}
+
 /* ---- the server ---- */
-
-/* Fixed non-zero seed pattern 01..10. */
-static bool mock_rng16(void *ctx, uint8_t out[16])
-{
-    for (int i = 0; i < 16; i++) out[i] = (uint8_t)(i + 1);
-    return true;
-}
-
-/* security.key stand-in: expected key = seed XOR 0x5A. */
-static bool mock_key(void *ctx, const uint8_t seed[16], uint8_t level, uint8_t out[16])
-{
-    for (int i = 0; i < 16; i++) out[i] = (uint8_t)(seed[i] ^ 0x5A);
-    return true;
-}
-
-static const udsota_security_t SECURITY = {.rng16 = mock_rng16, .key = mock_key};
-
-/* Boots the server on engine with the mock's config and hooks. */
-static void boot(const udsota_engine_t *engine)
-{
-    const udsota_config_t cfg = udsota_mock_cfg();
-    const udsota_hooks_t hooks = udsota_mock_hooks(&g_mock);
-    udsota_init(&srv, &cfg, engine, &SECURITY, &hooks);
-}
 
 /* Fresh engine, image and server at T0. */
 void setUp(void)
@@ -274,77 +254,20 @@ void tearDown(void)
     udsota_zstream_close(&e.zs);
 }
 
-/* Asserts the last response is exactly the bytes listed. */
-#define EXPECT(...) do {                                                       \
-        const uint8_t e_[] = {__VA_ARGS__};                                    \
-        TEST_ASSERT_EQUAL_UINT(sizeof e_, g_resp_len);                         \
-        TEST_ASSERT_EQUAL_HEX8_ARRAY(e_, g_resp, sizeof e_);                   \
-    } while (0)
-
-/* Sends one request at g_now; keeps the immediate response in g_resp. */
-static size_t send(const uint8_t *req, size_t len)
-{
-    g_resp_len = udsota_on_request(&srv, req, len, g_resp, sizeof g_resp, g_now);
-    return g_resp_len;
-}
-
-/* Polls every 10 ms until a final response, counting 0x78s; fails after 100 s. */
-static size_t finish_job(unsigned *pending)
-{
-    for (uint32_t waited = 0; waited < 100000u; waited += 10u) {
-        g_now += 10u;
-        const size_t n = udsota_poll(&srv, g_resp, sizeof g_resp, g_now);
-        if (n == 3u && g_resp[0] == UDSOTA_NEG_RESPONSE && g_resp[2] == UDSOTA_NRC_RESPONSE_PENDING) {
-            if (pending != NULL) (*pending)++;
-            continue;
-        }
-        if (n > 0u) {
-            g_resp_len = n;
-            return n;
-        }
-    }
-    TEST_FAIL_MESSAGE("the job never finished");
-    return 0;
-}
-
-/* 10 02 and the level-03 unlock. */
-static void enter_programming(void)
-{
-    const uint8_t sess[] = {UDSOTA_SID_SESSION, UDSOTA_SESSION_PROGRAMMING};
-    send(sess, sizeof sess);
-    TEST_ASSERT_EQUAL_HEX8(0x50, g_resp[0]);
-    const uint8_t seed_req[] = {UDSOTA_SID_SECURITY, UDSOTA_SA_SEED_PROGRAMMING};
-    send(seed_req, sizeof seed_req);
-    uint8_t key[2u + UDSOTA_KEY_LEN] = {UDSOTA_SID_SECURITY, UDSOTA_SA_KEY_PROGRAMMING};
-    for (size_t i = 0; i < UDSOTA_KEY_LEN; i++) key[2u + i] = (uint8_t)(g_resp[2u + i] ^ 0x5A);
-    send(key, sizeof key);
-    EXPECT(0x67, 0x04);
-}
-
-/* Sends 34 <dfi> 44 <address 0> <size>. */
-static size_t send_34(uint8_t dfi, uint32_t size)
-{
-    const uint8_t r[UDSOTA_DL_REQ_LEN] = {
-        UDSOTA_SID_REQUEST_DOWNLOAD, dfi, UDSOTA_DL_ALFID, 0, 0, 0, 0,
-        (uint8_t)(size >> 24), (uint8_t)(size >> 16), (uint8_t)(size >> 8), (uint8_t)size,
-    };
-    return send(r, sizeof r);
-}
-
 /* Sends 36 <bsc> with n bytes of g_z from off, and waits out any job; returns the final response length. */
 static size_t send_36(uint8_t bsc, size_t off, size_t n)
 {
     g_req[0] = UDSOTA_SID_TRANSFER_DATA;
     g_req[1] = bsc;
     memcpy(&g_req[2], &g_z[off], n);
-    return send(g_req, n + 2u) != 0u ? g_resp_len : finish_job(NULL);
+    return send(g_req, n + 2u) != 0u ? g_resp_len : finish_job(NULL, 0);
 }
 
-/* Sends g_z in blocks of chunk bytes, asserting 76 <bsc> for each; returns the next counter. */
-static uint8_t send_stream(size_t chunk)
+/* Sends g_z from off on in blocks of chunk bytes, counters from bsc, asserting 76 <bsc> for each; returns the next
+ * counter. */
+static uint8_t send_stream_from(uint8_t bsc, size_t off, size_t chunk)
 {
-    uint8_t bsc = 1;
-    for (size_t off = 0; off < g_z_len; off += chunk, bsc++) {
+    for (; off < g_z_len; off += chunk, bsc++) {
         const size_t n = (g_z_len - off < chunk) ? g_z_len - off : chunk;
         send_36(bsc, off, n);
         EXPECT(0x76, bsc);
@@ -352,18 +275,14 @@ static uint8_t send_stream(size_t chunk)
     return bsc;
 }
 
-/* Sends 37. */
-static size_t send_37(void)
-{
-    const uint8_t r[] = {UDSOTA_SID_TRANSFER_EXIT};
-    return send(r, sizeof r);
-}
+/* Sends all of g_z in blocks of chunk bytes, from counter 1. */
+static uint8_t send_stream(size_t chunk) { return send_stream_from(1, 0, chunk); }
 
 /* Sends 31 01 <rid>, and waits out any job. */
 static size_t send_routine(uint16_t rid)
 {
     const uint8_t r[] = {UDSOTA_SID_ROUTINE, UDSOTA_RC_START, (uint8_t)(rid >> 8), (uint8_t)rid};
-    return send(r, sizeof r) != 0u ? g_resp_len : finish_job(NULL);
+    return send(r, sizeof r) != 0u ? g_resp_len : finish_job(NULL, 0);
 }
 
 /* Asserts F1F1: reason and bytes received. */
@@ -408,10 +327,7 @@ static void test_compressed_happy_path(void)
  * then the erase, then the writes from offset 0. */
 static void test_first_block_buffered_across_blocks(void)
 {
-    for (size_t off = 0; off < IMG_LEN; off += 95u) {
-        const uint16_t n = (uint16_t)((IMG_LEN - off < 95u) ? IMG_LEN - off : 95u);
-        stored_block(&g_img[off], n, off + n == IMG_LEN);
-    }
+    stored_stream();
     enter_programming();
     send_34(UDSOTA_DL_DFI_DEFLATE, IMG_LEN);
     EXPECT(0x74, 0x20, 0x0F, 0xFF);
@@ -428,11 +344,7 @@ static void test_first_block_buffered_across_blocks(void)
     TEST_ASSERT_EQUAL_UINT(1u, e.checks);
     TEST_ASSERT_EQUAL_UINT(380u, e.check_len);
     TEST_ASSERT_EQUAL_UINT(1u, e.begins);
-    uint8_t bsc = 5;
-    for (size_t off = 400u; off < g_z_len; off += BLOCK, bsc++) {
-        send_36(bsc, off, (g_z_len - off < BLOCK) ? g_z_len - off : BLOCK);
-        EXPECT(0x76, bsc);
-    }
+    send_stream_from(5, 400u, BLOCK);
     send_37();
     EXPECT(0x77);
     TEST_ASSERT_TRUE(e.offsets_ok);
@@ -644,11 +556,7 @@ static void test_repeated_block_is_not_fed_twice(void)
     send_36(1, 0u, 2000u);
     EXPECT(0x76, 0x01);
     TEST_ASSERT_EQUAL_UINT(1u, e.zwrites);
-    uint8_t bsc = 2;
-    for (size_t off = 2000u; off < g_z_len; off += BLOCK, bsc++) {
-        send_36(bsc, off, (g_z_len - off < BLOCK) ? g_z_len - off : BLOCK);
-        EXPECT(0x76, bsc);
-    }
+    send_stream_from(2, 2000u, BLOCK);
     send_37();
     EXPECT(0x77);
     TEST_ASSERT_EQUAL_MEMORY(g_img, e.flash, IMG_LEN);
@@ -721,7 +629,7 @@ static void test_worker_jobs_answer_pending_then_final(void)
     memcpy(&g_req[2], g_z, BLOCK);
     TEST_ASSERT_EQUAL_UINT(0u, send(g_req, BLOCK + 2u));
     unsigned pending = 0;
-    finish_job(&pending);
+    finish_job(&pending, 0);
     EXPECT(0x76, 0x01);
     TEST_ASSERT_EQUAL_UINT(1u, pending);
 
@@ -774,15 +682,6 @@ static void expect_progress(udsota_stage_t stage, uint32_t done, uint32_t total)
     TEST_ASSERT_EQUAL_UINT32(total, p.total);
 }
 
-/* The image as stored blocks of 95 bytes, each sent as one 100-byte 36, so the first three hold their bytes back. */
-static void stored_stream(void)
-{
-    for (size_t off = 0; off < IMG_LEN; off += 95u) {
-        const uint16_t n = (uint16_t)((IMG_LEN - off < 95u) ? IMG_LEN - off : 95u);
-        stored_block(&g_img[off], n, off + n == IMG_LEN);
-    }
-}
-
 /* Progress on a compressed download counts image bytes. ERASING from the 34 through the first 36's job; WRITING
  * from its 76, with done 0 while the stream holds its first bytes back, then done equal to the bytes the stream
  * wrote (never the compressed bytes received), only growing; done == total by the last 76 and after the 37;
@@ -799,7 +698,7 @@ static void test_compressed_progress_counts_image_bytes(void)
     memcpy(&g_req[2], g_z, 100u);
     TEST_ASSERT_EQUAL_UINT(0u, send(g_req, 102u));            /* the first block's job runs */
     expect_progress(UDSOTA_STAGE_ERASING, 0u, IMG_LEN);
-    finish_job(NULL);
+    finish_job(NULL, 0);
     EXPECT(0x76, 0x01);
     expect_progress(UDSOTA_STAGE_WRITING, 0u, IMG_LEN);        /* accepted, but nothing written yet */
     uint32_t last = 0u;
@@ -824,7 +723,7 @@ static void test_compressed_progress_counts_image_bytes(void)
     const uint8_t ff01[] = {UDSOTA_SID_ROUTINE, UDSOTA_RC_START, 0xFF, 0x01};
     TEST_ASSERT_EQUAL_UINT(0u, send(ff01, sizeof ff01));
     expect_progress(UDSOTA_STAGE_VERIFYING, 0u, 0u);
-    finish_job(NULL);
+    finish_job(NULL, 0);
     EXPECT(0x71, 0x01, 0xFF, 0x01, 0x00);
     expect_progress(UDSOTA_STAGE_IDLE, 0u, 0u);
     TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_OK, progress_now().last_reason);
@@ -878,7 +777,7 @@ static void test_compressed_34_without_memory_reports_its_reason(void)
     const udsota_config_t cfg = udsota_mock_cfg();
     udsota_hooks_t hooks = udsota_mock_hooks(&g_mock);
     hooks.progress = progress_hook;
-    udsota_init(&srv, &cfg, &ENGINE, &SECURITY, &hooks);
+    udsota_init(&srv, &cfg, &ENGINE, udsota_mock_security(), &hooks);
     enter_programming();
     g_progress_calls = 0;
     e.fail_alloc = true;

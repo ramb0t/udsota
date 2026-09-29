@@ -51,24 +51,6 @@ static void eng_abort(void *ctx) {}
 /* engine.poll: the fake worker's state the test chose. */
 static int eng_poll(void *ctx) { return job_result; }
 
-/* security.rng16: 10..1F, never zero. */
-static bool sec_rng16(void *ctx, uint8_t out[16])
-{
-    for (int i = 0; i < 16; i++) {
-        out[i] = (uint8_t)(0x10 + i);
-    }
-    return true;
-}
-
-/* security.key: seed ^ level ^ 0xA5 per byte, as the other server suites. */
-static bool sec_key(void *ctx, const uint8_t seed[16], uint8_t level, uint8_t out[16])
-{
-    for (int i = 0; i < 16; i++) {
-        out[i] = (uint8_t)(seed[i] ^ level ^ 0xA5u);
-    }
-    return true;
-}
-
 /* hooks.did_write: records its arguments (the first sizeof w.data data bytes) and answers w.nrc. */
 static uint8_t app_did_write(void *ctx, uint16_t did, const uint8_t *data, size_t len, udsota_access_t access)
 {
@@ -89,7 +71,6 @@ static const udsota_engine_t ENGINE = {
     .activate = eng_op, .confirm = eng_op, .abort = eng_abort, .poll = eng_poll,
     .status = udsota_mock_status, .ctx = &g_mock,
 };
-static const udsota_security_t SECURITY = {.rng16 = sec_rng16, .key = sec_key, .ctx = NULL};
 
 /* Boots a server on g_cfg with sec and hooks (NULL = none); the clock restarts at T0. */
 static void boot(const udsota_security_t *sec, const udsota_hooks_t *hooks)
@@ -107,7 +88,7 @@ void setUp(void)
     g_cfg = udsota_mock_cfg();
     g_hooks = udsota_mock_hooks(&g_mock);
     g_hooks.did_write = app_did_write;
-    boot(&SECURITY, &g_hooks);
+    boot(udsota_mock_security(), &g_hooks);
 }
 
 /* Unity hook: nothing to undo. */
@@ -136,9 +117,7 @@ static void unlock(uint8_t level)
     uint8_t req[2u + UDSOTA_KEY_LEN] = {0x27, level};
     TEST_ASSERT_EQUAL_UINT(2u + UDSOTA_SEED_LEN, txn(req, 2));
     req[1] = (uint8_t)(level + 1u);
-    for (size_t i = 0; i < UDSOTA_KEY_LEN; i++) {
-        req[2u + i] = (uint8_t)(resp[2u + i] ^ level ^ 0xA5u);
-    }
+    udsota_mock_key_for(&resp[2], level, &req[2]);
     txn(req, sizeof req);
     EXPECT(0x67, (uint8_t)(level + 1u));
 }
@@ -165,7 +144,7 @@ static void test_null_did_write_is_service_not_supported(void)
     for (size_t i = 0; i < sizeof STATES / sizeof STATES[0]; i++) {
         for (size_t len = 1; len <= sizeof WR; len++) {
             const udsota_hooks_t h = udsota_mock_hooks(&g_mock);   /* did_write NULL */
-            boot(&SECURITY, &h);
+            boot(udsota_mock_security(), &h);
             STATES[i]();
             txn(WR, len);
             EXPECT(0x7F, 0x2E, 0x11);

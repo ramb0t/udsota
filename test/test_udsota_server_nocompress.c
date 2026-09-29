@@ -1,6 +1,7 @@
 /* Host test for the server built with UDSOTA_COMPRESSION 0: an engine that offers every compressed-download op still
- * gets a 34 with DFI 0x10 answered 0x31, as a server without them answers it, and none of those ops is ever called;
- * an uncompressed download runs as before. The other download and progress tests also run in this build. */
+ * gets a 34 with DFI 0x10, 0x20 or 0x30 answered 0x31, as a server without them answers it, and none of those ops is
+ * ever called; an uncompressed download runs as before. The other download and progress tests also run in this
+ * build. */
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
@@ -110,7 +111,7 @@ static void send(const uint8_t *req, size_t len)
 
 /* A 34 with DFI 0x10, 0x20 or 0x30 answers 0x31 though the engine sets the ops and names all three in zformats, and
  * leaves F1F1, the download and the engine untouched. */
-static void test_dfi_10_answers_0x31_with_the_ops_set(void)
+static void test_coded_dfis_answer_0x31_with_the_ops_set(void)
 {
     srv.last_dl.reason_code = UDSOTA_DL_VERIFY_FAILED;
     const uint8_t dfis[] = {UDSOTA_DL_DFI_DEFLATE, UDSOTA_DL_DFI_DELTA, UDSOTA_DL_DFI_DELTA_DEFLATE};
@@ -151,7 +152,7 @@ static void test_uncompressed_download_runs_as_before(void)
 int main(void)
 {
     UNITY_BEGIN();
-    RUN_TEST(test_dfi_10_answers_0x31_with_the_ops_set);
+    RUN_TEST(test_coded_dfis_answer_0x31_with_the_ops_set);
     RUN_TEST(test_uncompressed_download_runs_as_before);
     return UNITY_END();
 }
