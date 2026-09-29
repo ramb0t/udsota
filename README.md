@@ -2,14 +2,15 @@
 
 [![ci](https://github.com/ramb0t/udsota/actions/workflows/ci.yml/badge.svg)](https://github.com/ramb0t/udsota/actions/workflows/ci.yml)
 
-**Firmware updates over CAN, using standard UDS diagnostics.**
+**A device's UDS server over CAN, with firmware update as its main service.**
 
-udsota puts a small update server on your device and gives you a command-line tool to drive it. The new firmware goes into a spare slot. The device only keeps it once it has booted and been confirmed, so a bad update rolls back instead of bricking the unit.
+udsota puts a small UDS diagnostic server on your device, whose main service installs firmware, and gives you a command-line tool to drive it. The new firmware goes into a spare slot. The device only keeps it once it has booted and been confirmed, so a bad update rolls back instead of bricking the unit.
 
 - **Works with standard tools.** The device speaks UDS (ISO 14229) over ISO-TP, so any UDS tester can drive it. A Python client is included.
 - **Safe A/B updates.** The running firmware is never overwritten. A new image that is never confirmed is dropped at the next reset.
 - **Checked before anything is erased.** The first block of an image is checked for product, board and version, and the whole image is verified before the device switches to it.
 - **Your product decides when.** Optional hooks let the app refuse any step, for example while a vehicle is moving.
+- **Your own diagnostics too.** The same server answers the app's own DIDs, writes and routines through hooks ([how](components/udsota/README.md#adding-dids-routines-and-services)).
 - **Locked down.** Unlocking uses ECDSA signatures (the device holds only a public key) or HMAC keys.
 - **Portable.** The core is plain C11 with no platform headers. An ESP-IDF port for the ESP32 family is included.
 

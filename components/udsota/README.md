@@ -1,6 +1,6 @@
 # udsota
 
-udsota installs firmware over CAN. A UDS (ISO 14229) server on ISO-TP writes a new image into the inactive A/B slot, and, with rollback on, the device keeps it only once the installing client confirms it. It exists so that any UDS tester can drive a product's updates while the product keeps every "is it safe to update now?" decision for itself.
+udsota is a device's UDS (ISO 14229) server on ISO-TP over CAN, with firmware update as its main service: the updater writes a new image into the inactive A/B slot, and, with rollback on, the device keeps it only once the installing client confirms it. It exists so that any UDS tester can drive a product's updates while the product keeps every "is it safe to update now?" decision for itself.
 
 This component is the portable core: C11, with no platform headers. It builds as an ESP-IDF component, or in plain CMake as the library `udsota` (add `components/isotp` first). [udsota_esp32](../udsota_esp32/README.md) is the ESP-IDF port, and [examples/esp32](../../examples/esp32/README.md) is a minimal integration over TWAI. [`tools/linux_server`](../../tools/linux_server/README.md) runs the core on Linux as a demo server for the client's end-to-end tests.
 
@@ -11,7 +11,7 @@ The sources sit in three directories, here and in the port: `server/`, the gener
 ```
 app            CAN driver · gate and phase hooks · its own DIDs, writes and routines · product policy
   │
-udsota         ISO-TP adapter (udsota_isotp) → UDS server (udsota_server) → engine interface
+udsota         ISO-TP adapter (udsota_isotp) → UDS server (udsota_server) → updater (udsota_update) → engine interface
                image rules (descriptor, version) · key derivation · boot-loop counter
   │
 udsota_esp32   diag task and flash worker · engine on esp_ota_* · PSA ECDSA or HMAC, and RNG · RTC boot-loop storage
@@ -161,6 +161,12 @@ A routine that returns `UDSOTA_PENDING` is a job like FF01: the core answers 0x7
 
 The hooks run in the server's context, which in the ESP32 port is the diag task. The gate is asked at flow-control points while frames stream in, so it must read a snapshot the app keeps current, return at once and never block. The phase hook must not wait on anything either, and neither may `did_write`, `routine`, `routine_poll` or `progress`: work that takes time runs elsewhere, and the routine reports it through `UDSOTA_PENDING` and `routine_poll`. The progress hook must not call any udsota function.
 
+## Adding DIDs, routines and services
+
+An app adds its own diagnostics through the hooks, without touching udsota. A 22 on a DID the server doesn't serve goes to `did_read`, a 2E to `did_write`, and a 31 01 on a RID the server doesn't own to `routine`, which answers at once or returns `UDSOTA_PENDING` and finishes through `routine_poll` ([Hooks](#hooks)). `did_write` and `routine` get the session, unlocked level and epoch in `udsota_access_t`, so the app decides what each one needs; `gate` is its say over the server's own steps. Without the updater the updater's DIDs and RIDs reach the same hooks ([Data identifiers](#data-identifiers)).
+
+A new UDS service, a SID of its own, belongs in the server core on the pattern of 28 and 85: a handler in `server/udsota_server.c` that makes the core's checks (session, length, sub-function) and hands the app's part to a new hook in `udsota_hooks_t`, whose NULL answers 0x11, and a CHANGELOG entry, since the SID is on the wire. `udsota_service.h` is how the updater registers, one service per server; it is not an app API.
+
 ## Progress
 
 An app that draws an update, with a bar or a percentage, reads the download's stage and bytes from `udsota_progress()` in the server's context, or takes them from the optional `progress` hook as they change; in the ESP32 port any task reads them with `udsota_esp32_progress()`. The phase alone cannot drive a bar: it reads TRANSFERRING from the 34 to the 37, erase included, and PROGRAMMING through the verify. Both give a `udsota_progress_t`: the `stage`, `done` and `total` in image bytes, and `last_reason`, the last download's F1F1 reason, so a display that falls back to IDLE can say that the update failed, and why. `udsota_progress_permille()` turns `done` and `total` into 0 to 1000 with 64-bit arithmetic. `last_reason` describes a finished download, so read it only in IDLE: during FF01 it reads 10 (worker timeout), as F1F1 does, until the verdict replaces it. In the ESP32 port `udsota_esp32_incoming_version()` also names the image arriving, so a display can say "Installing v0.3.1".
@@ -243,7 +249,7 @@ A 34 with dataFormatIdentifier 0x10 opens a download whose 36 blocks carry the i
 
 The 34's memorySize is the uncompressed size, so the slot-size check, the erase and the image rules see the image as before. The block counter, 36 lengths, maxNumberOfBlockLength and the 0x78 pacing are those of any download, and a repeated block is answered without being inflated twice. The server holds the inflated bytes until 320 of them are out, across as many 36s as that takes, then runs the first-block check, and only then erases, so nothing is erased for an image the rules refuse. A block the rules refuse answers 0x31 with their reason in F1F1, as an uncompressed first block does. So does a corrupt stream or one inflating past memorySize, with reason 13, and a stream that ends before 320 bytes are out, with reason 1. The compressed bytes may exceed memorySize by at most an eighth plus 1,024 (`UDSOTA_DL_Z_BOUND`), past which a 36 is an overrun (0x71). The 37 closes the transfer only once the stream has ended at exactly memorySize bytes with nothing after it; otherwise it answers 0x72, the download ends and F1F1 reads reason 13. F1F1's byte count is the compressed bytes accepted.
 
-A server takes DFI 0x10 when its engine sets `zbegin`, `zwrite` and `zend` and names it in `zformats` (`UDSOTA_DL_FMT(0x10)`). With them NULL, a 34 with DFI 0x10 answers 0x31, and every answer is byte for byte what it was before compression existed. A product that never takes compressed downloads can also build `update/udsota_update.c` with `UDSOTA_COMPRESSION` defined as 0: the server then answers the same way whatever the engine sets, and none of the compressed handling is compiled in. The structs keep their layout either way. The ESP32 port defines it for the core while `UDSOTA_ESP32_COMPRESSION` is off. The core includes no compression library. Instead `udsota_zstream.h` gives an engine the stream logic over any `udsota_inflate_t` (`init`, `feed`, `finish`), and `components/udsota_inflate` supplies one on miniz's tinfl: the ROM's copy under ESP-IDF, which every v6.1 target has, and miniz 3.0.2, vendored unpatched, elsewhere (the host). `zbegin` opens the stages with `udsota_coded_open()` (a `udsota_zstream_t` for 0x10) over the engine's synchronous check, erase and write, `zwrite` feeds them, and `zend` runs their 37 check; the engine decides where the inflating runs, which in the ESP32 port is the flash worker. tinfl needs a 32 KB dictionary and its state, which is 11,008 bytes for the ROM's copy and 8,408 for the vendored miniz on a 64-bit host, both allocated at the 34 and freed at the 37 or abort, never at boot. A 34 that finds no memory answers 0x22 with reason 14 in F1F1. It opens no download, but a finished image that never passed FF01 has already been released by then, so FF01 answers 0x24 and the client downloads the image again. The image sink's `written` count is the image bytes written so far, which the optional fourth op, `zwritten`, hands the server for [progress](#progress); F1F1 counts compressed bytes.
+A server takes DFI 0x10 when its engine sets `zbegin`, `zwrite` and `zend` and names it in `zformats` (`UDSOTA_DL_FMT(0x10)`). With them NULL, a 34 with DFI 0x10 answers 0x31, and every answer is byte for byte what it was before compression existed. A product that never takes compressed downloads can also build `update/udsota_update.c` with `UDSOTA_COMPRESSION` defined as 0: the server then answers the same way whatever the engine sets, and none of the compressed handling is compiled in. The structs keep their layout either way. The ESP32 port defines it for the `udsota` component while `UDSOTA_ESP32_COMPRESSION` is off. The core includes no compression library. Instead `udsota_zstream.h` gives an engine the stream logic over any `udsota_inflate_t` (`init`, `feed`, `finish`), and `components/udsota_inflate` supplies one on miniz's tinfl: the ROM's copy under ESP-IDF, which every v6.1 target has, and miniz 3.0.2, vendored unpatched, elsewhere (the host). `zbegin` opens the stages with `udsota_coded_open()` (a `udsota_zstream_t` for 0x10) over the engine's synchronous check, erase and write, `zwrite` feeds them, and `zend` runs their 37 check; the engine decides where the inflating runs, which in the ESP32 port is the flash worker. tinfl needs a 32 KB dictionary and its state, which is 11,008 bytes for the ROM's copy and 8,408 for the vendored miniz on a 64-bit host, both allocated at the 34 and freed at the 37 or abort, never at boot. A 34 that finds no memory answers 0x22 with reason 14 in F1F1. It opens no download, but a finished image that never passed FF01 has already been released by then, so FF01 answers 0x24 and the client downloads the image again. The image sink's `written` count is the image bytes written so far, which the optional fourth op, `zwritten`, hands the server for [progress](#progress); F1F1 counts compressed bytes.
 
 Two things differ from an uncompressed download. A 37 sent before the stream has ended answers 0x72 and ends the download, where an uncompressed one sent early answers 0x24 and leaves the transfer open. And `udsota_init()` never calls `engine.abort`, so a `zbegin` must cope with a stream a lost session left open, closing it before it opens the next.
 
@@ -280,7 +286,7 @@ A server serves a coded DFI only when its engine names it in `engine.zformats` (
 | 28 | CommunicationControl (with `comm_control` only) | controlType 00–03 and a communicationType naming normal or network-management messages; answers `68 xx` | extended, programming | – |
 | 85 | ControlDTCSetting (with `dtc_setting` only) | 01 on, 02 off, with any option record; answers `C5 xx` | extended, programming | – |
 
-Any other SID answers 0x11, and so does 2E without `did_write`. While a flash job or a pending app routine runs, every request but 3E answers 0x21. The key column applies only with security on. A return to the default session, by 10 01, S3 or an end of session, undoes 28 and 85 through their hooks.
+Any other SID answers 0x11, and so do 2E without `did_write` and, without the updater, 34, 36 and 37. While a flash job or a pending app routine runs, every request but 3E answers 0x21. The key column applies only with security on. A return to the default session, by 10 01, S3 or an end of session, undoes 28 and 85 through their hooks.
 
 ### Functional addressing
 
@@ -295,7 +301,7 @@ With `cfg.func_id` set (OBD's broadcast ID is 0x7DF), the port hands single fram
 | F001 | ActivateImage | programming, programming | needs the slot verified (else 0x24); makes it the boot slot, answers, then restarts |
 | F002 | ConfirmImage | extended, none | needs the boot slot; confirms a pending-verify image, answers positive for one already valid or undefined, else 0x22 |
 
-A 31 in the default session answers 0x7F, and a sub-function other than 01 answers 0x12. A RID in this table that isn't served in the current session answers 0x31. Every other RID goes to `routine` with its option record, and answers 0x31 when `routine` is NULL.
+A 31 in the default session answers 0x7F, and a sub-function other than 01 answers 0x12. A RID in this table that isn't served in the current session answers 0x31. Every other RID goes to `routine` with its option record, and answers 0x31 when `routine` is NULL. These four are the updater's: without it they go to `routine` like any other.
 
 ### Data identifiers
 
@@ -305,11 +311,11 @@ A 31 in the default session answers 0x7F, and a sub-function other than 01 answe
 | F189 | running version string | `engine.version` |
 | F18C | device ID | `cfg.device_id` (the ESP32 port's base MAC when it is NULL) |
 | F1F0 | update status, 16 bytes | `engine.status` |
-| F1F1 | last download result, 5 bytes | the server |
+| F1F1 | last download result, 5 bytes | the updater |
 | F1F2 | counters, 16 bytes | the server and the transport |
 | F1F3 | running image `app_elf_sha256`, 32 bytes | `engine.running_sha` |
 
-Every other DID goes to `did_read`, and so does any of these whose source is NULL.
+Every other DID goes to `did_read`, and so does any of these whose source is NULL. Without the updater (`udsota_core_init`, or `udsota_init` with a NULL engine) only F186, F18C and F1F2 are the server's: F189, F1F0, F1F1 and F1F3 go to `did_read` too.
 
 ### Negative responses
 

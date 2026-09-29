@@ -13,7 +13,7 @@
  * iso14229's fuzz_server.cc idea (MIT, Nick James Kirkby & Co-Operators): a stream of requests with
  * fuzzed waits between them. No iso14229 code is copied.
  *
- * Built four times: fuzz_udsota with the app hooks NULL; fuzz_udsota_app_hooks (UDSOTA_FUZZ_APP_HOOKS=1) with
+ * Built four times, plus the no-update build below: fuzz_udsota with the app hooks NULL; fuzz_udsota_app_hooks (UDSOTA_FUZZ_APP_HOOKS=1) with
  * did_write, routine and routine_poll set, where it also checks that an app routine has exactly one owner;
  * fuzz_udsota_progress (UDSOTA_FUZZ_PROGRESS=1) with the progress hook set, where it also checks that done never
  * passes total nor shrinks within a download, and that the hook runs at most once per call and reports every
@@ -33,7 +33,7 @@
  *
  * libFuzzer, on a machine with clang:
  *   clang -g -O1 -fsanitize=fuzzer,address,undefined -DUDSOTA_LIBFUZZER <includes> fuzz_udsota.c
- *         udsota_server.c udsota_codec.c -o fuzz_udsota_lf && ./fuzz_udsota_lf -max_len=8192 <corpus>
+ *         <UDSOTA_SERVICES_SRCS> -o fuzz_udsota_lf && ./fuzz_udsota_lf -max_len=8192 <corpus>
  */
 #define _DEFAULT_SOURCE   /* MAP_ANONYMOUS, sigaction, fork, prctl under -std=c11 */
 #include <dirent.h>
