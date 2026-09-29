@@ -858,7 +858,7 @@ void udsota_set_tx_pending(udsota_server_t *s, uint32_t (*tx_pending)(void *ctx)
     s->tx_pending_ctx = ctx;
 }
 
-/* Ends the session from the app (see udsota.h): at once, or latched until a running job has answered, so no job
+/* Ends the session from the app (see udsota_server.h): at once, or latched until a running job has answered, so no job
  * loses its final answer. */
 void udsota_end_session(udsota_server_t *s, uint32_t now_ms)
 {
@@ -975,7 +975,7 @@ static bool functional_suppressed(const uint8_t *resp, size_t n)
     }
 }
 
-/* See udsota.h: the functional subset, through the same path as a physical request, with the functional NRCs
+/* See udsota_server.h: the functional subset, through the same path as a physical request, with the functional NRCs
  * suppressed. While a job runs only 3E is served (a busy 0x21 to a broadcast would be noise). */
 size_t udsota_on_functional_request(udsota_server_t *s, const uint8_t *req, size_t req_len,
                                     uint8_t *resp, size_t resp_max, uint32_t now_ms)
@@ -1054,8 +1054,8 @@ static size_t poll_step(udsota_server_t *s, uint8_t *resp, size_t resp_max, uint
     return 0;
 }
 
-/* See udsota.h: one poll step, then the phase hook if the phase changed and the progress hook if the stage changed
- * or a block was written. */
+/* See udsota_server.h: one poll step, then the phase hook if the phase changed and the progress hook if the stage
+ * changed or a block was written. */
 size_t udsota_poll(udsota_server_t *s, uint8_t *resp, size_t resp_max, uint32_t now_ms)
 {
     const size_t n = poll_step(s, resp, resp_max, now_ms);

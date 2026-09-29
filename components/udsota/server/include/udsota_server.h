@@ -218,7 +218,9 @@ typedef struct udsota_server {
 
 /* udsota_init without the updater: resets s to the default session, locked and idle, and copies cfg (NULL = every
  * default), security (NULL = none: 0x27 answers 0x11 and nothing needs a key) and hooks (NULL = none). Silent: no
- * phase call. Returns as udsota_init does. A service (udsota_service.h) registers right after it.
+ * phase call. Returns false for a security with no rng16, or with neither key nor verify; s is still initialised,
+ * with security on and every requestSeed (no rng16) or sendKey (no key or verify) answered 0x22, so nothing unlocks.
+ * A service (udsota_service.h) registers right after it.
  * Every now_ms below is milliseconds since boot (wrapping at 2^32): the post-boot 0x27 delay is measured from
  * now_ms 0, so a clock that starts elsewhere shortens or skips it. */
 bool   udsota_core_init(udsota_server_t *s, const udsota_config_t *cfg, const udsota_security_t *security,

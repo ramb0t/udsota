@@ -1,6 +1,7 @@
 /* The firmware updater as the UDS server's one registered service (udsota_service.h): 0x34, 0x36 and 0x37, the
  * RIDs FF01 and F000-F002, the DIDs F189, F1F0, F1F1 and F1F3, the slot rule 10 02 asks, and download progress, over
- * the engine udsota_init was given. It reaches the core only through udsota_service.h; the core never names it. */
+ * the engine udsota_init was given. It reaches the core only through udsota_service.h and the core's public headers
+ * (udsota_rxwatch.h, for UDSOTA_CF_MEDIAN_NONE); the core never calls it. */
 #include <string.h>
 #include "udsota_service.h"
 #include "udsota_update.h"

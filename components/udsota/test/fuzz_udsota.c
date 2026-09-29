@@ -808,7 +808,8 @@ static int dl_sid_index(uint8_t sid)
 }
 #endif
 
-/* True for the SIDs the server serves; every other SID must get NRC 0x11 or 0x7F. */
+/* True for the SIDs the server serves. check_request_answer fails a positive answer to any other SID, but takes any
+ * known NRC for it; only the digest pins which (check_no_update pins 34, 36 and 37 without the update service). */
 static bool sid_served(uint8_t sid)
 {
 #if UDSOTA_FUZZ_NO_UPDATE

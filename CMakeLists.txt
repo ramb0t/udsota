@@ -29,8 +29,10 @@ set(CORE_TEST  ${ROOT}/components/udsota/test)
 set(INFLATE_DIR ${ROOT}/components/udsota_inflate)
 set(DELTA_DIR  ${ROOT}/components/udsota_delta)
 
-# sources.cmake is what each component compiles, so a .c file it doesn't list would go unbuilt without a word:
-# stop on any difference between the files on disk and the list.
+# sources.cmake is what each component compiles, so a .c file it doesn't list would go unbuilt without a word, and
+# one listed under another directory's list would reach the wrong build (a server/ file under the update list escapes
+# the core-only build below): stop unless the component's .c files are exactly its whole list, and each directory's
+# exactly that directory's list.
 function(udsota_check_srcs dir listed)
     file(GLOB found CONFIGURE_DEPENDS ${dir}/*.c ${dir}/server/*.c ${dir}/update/*.c ${dir}/bootloop/*.c)
     list(SORT found)
@@ -39,9 +41,24 @@ function(udsota_check_srcs dir listed)
         message(FATAL_ERROR "${dir}/sources.cmake does not list exactly the .c files there:\n"
                             "  on disk: ${found}\n  listed:  ${listed}")
     endif()
+    foreach(pair IN LISTS ARGN)                      # <subdir>=<list variable>
+        string(REPLACE "=" ";" pair "${pair}")
+        list(GET pair 0 sub)
+        list(GET pair 1 var)
+        file(GLOB found CONFIGURE_DEPENDS ${dir}/${sub}/*.c)
+        set(own ${${var}})
+        list(SORT found)
+        list(SORT own)
+        if(NOT found STREQUAL own)
+            message(FATAL_ERROR "${dir}/sources.cmake's ${var} is not exactly the .c files in ${sub}/:\n"
+                                "  on disk: ${found}\n  listed:  ${own}")
+        endif()
+    endforeach()
 endfunction()
-udsota_check_srcs(${ROOT}/components/udsota "${UDSOTA_SRCS}")
-udsota_check_srcs(${ROOT}/components/udsota_esp32 "${UDSOTA_ESP32_SRCS}")
+udsota_check_srcs(${ROOT}/components/udsota "${UDSOTA_SRCS}"
+    server=UDSOTA_SERVER_SRCS update=UDSOTA_UPDATE_SRCS bootloop=UDSOTA_BOOTLOOP_SRCS)
+udsota_check_srcs(${ROOT}/components/udsota_esp32 "${UDSOTA_ESP32_SRCS}"
+    server=UDSOTA_ESP32_SERVER_SRCS update=UDSOTA_ESP32_UPDATE_SRCS bootloop=UDSOTA_ESP32_BOOTLOOP_SRCS)
 # ESP-IDF stops on an include dir that doesn't exist and a plain CMake build doesn't notice one: stop here too.
 foreach(d IN LISTS UDSOTA_INCLUDE_DIRS UDSOTA_PRIV_INCLUDE_DIRS UDSOTA_ESP32_INCLUDE_DIRS UDSOTA_ESP32_PRIV_INCLUDE_DIRS)
     if(NOT IS_DIRECTORY "${d}")
@@ -219,7 +236,8 @@ set_tests_properties(udsota_core_probe_freertos PROPERTIES
 
 # ---- The server without the updater. udsota_server_only is server/ alone (UDSOTA_SERVER_SRCS), compiled with
 # server/include, isotp and a build-dir copy of udsota_update_state.h (the one updater header the server context may
-# name) on its include path: a core file that includes any other updater header fails to compile. An OBJECT library,
+# name) on its include path: a core file that includes any other updater header through the include path fails to
+# compile, and tools/check_seam.sh catches one included by a relative path. An OBJECT library,
 # not an archive, so every object reaches the link: test_udsota_core_only links it alone, and a core call into the
 # updater fails that link. It runs the no-updater rows through udsota_core_init, a test-local service and the
 # ISO-TP adapter.
@@ -256,9 +274,11 @@ add_test(NAME udsota_core_only_link_updater
                  -o ${CMAKE_CURRENT_BINARY_DIR}/udsota_core_only_link_updater
          COMMAND_EXPAND_LISTS)
 set_tests_properties(udsota_core_only_link_updater PROPERTIES
-    PASS_REGULAR_EXPRESSION "undefined reference to .?udsota_pack_result")
+    PASS_REGULAR_EXPRESSION   # GNU ld and gold; lld and mold; ld64, which names the symbol on the next line
+    "undefined reference to .?udsota_pack_result;undefined symbol: .?udsota_pack_result;Undefined symbols[^\n]*\n[^\n]*\"_udsota_pack_result\"")
 
-# The seam's other direction: no server/ source, the port's included, touches the updater's member of the context.
+# The seam's other direction: no server/ source, the port's included, touches the updater's member of the context or
+# includes an updater header but udsota_update_state.h, by any path.
 add_test(NAME udsota_seam_grep COMMAND sh ${ROOT}/tools/check_seam.sh)
 set_tests_properties(udsota_seam_grep PROPERTIES PASS_REGULAR_EXPRESSION "check_seam: PASS")
 

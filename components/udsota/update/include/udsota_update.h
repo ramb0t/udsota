@@ -22,9 +22,7 @@
 void   udsota_update_init(udsota_server_t *s, const udsota_engine_t *engine);
 /* Resets s to the default session, locked and idle, and copies cfg (NULL = every default), engine (NULL = no
  * updater: the server alone, see udsota_core_init), security (NULL = none: 0x27 answers 0x11 and nothing needs a key)
- * and hooks (NULL = none). Silent: no phase call. Returns false for a security with no rng16, or with neither key
- * nor verify; s is still initialised, with security on and every requestSeed (no rng16) or sendKey (no key or
- * verify) answered 0x22, so nothing unlocks.
+ * and hooks (NULL = none). Silent: no phase call. Returns as udsota_core_init does.
  * Every now_ms below is milliseconds since boot (wrapping at 2^32): the post-boot 0x27 delay is measured from
  * now_ms 0, so a clock that starts elsewhere shortens or skips it. */
 bool   udsota_init(udsota_server_t *s, const udsota_config_t *cfg, const udsota_engine_t *engine,
