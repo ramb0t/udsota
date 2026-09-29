@@ -113,7 +113,7 @@ menu "udsota ESP32 port"
         depends on SPIRAM
         default y
         help
-            9,214 B, touched only by the diag task with the cache on.
+            8,958 B, touched only by the diag task with the cache on.
 
     config UDSOTA_ESP32_RX_QUEUE_LEN
         int "Request frame queue depth"

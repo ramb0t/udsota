@@ -24,21 +24,16 @@ static void start_message(udsota_rxwatch_t *w, uint32_t len, uint32_t got)
     w->in_msg = true;
     w->msg_len = len;
     w->msg_got = got;
-    w->next_sn = 1u;
 }
 
-/* Records the interval since this message's previous CF (unsigned, so a clock wrap is harmless). */
+/* Records the interval since this message's previous CF (unsigned, so a clock wrap is harmless).
+ * Runs after cf_count++, so CF 1 has no interval and CF k fills slot (k - 2) % UDSOTA_RXW_INTERVALS. */
 static void push_interval(udsota_rxwatch_t *w, uint32_t t_us)
 {
-    if (w->have_last) {
-        w->iv[w->iv_head] = t_us - w->last_cf_us;
-        w->iv_head = (uint8_t)((w->iv_head + 1u) % UDSOTA_RXW_INTERVALS);
-        if (w->iv_n < UDSOTA_RXW_INTERVALS) {
-            w->iv_n++;
-        }
+    if (w->cf_count > 1u) {
+        w->iv[(w->cf_count - 2u) % UDSOTA_RXW_INTERVALS] = t_us - w->last_cf_us;
     }
     w->last_cf_us = t_us;
-    w->have_last = true;
 }
 
 /* Single Frame: SF_DL 1..DLC-1 and within the limit is a request, anything else leaves isotp-c unchanged. */
@@ -81,7 +76,7 @@ static udsota_rxw_kind_t on_consec(udsota_rxwatch_t *w, const uint8_t *d, uint8_
     if (!w->in_msg) {
         return UDSOTA_RXW_IGNORE;
     }
-    if ((d[0] & 0x0Fu) != w->next_sn) {
+    if ((d[0] & 0x0Fu) != ((w->cf_count + 1u) & 0x0Fu)) {   /* CF k carries SN k mod 16 */
         udsota_rxwatch_reset(w);           /* isotp-c: WRONG_SN, receive idle */
         return UDSOTA_RXW_BROKEN;
     }
@@ -93,7 +88,6 @@ static udsota_rxw_kind_t on_consec(udsota_rxwatch_t *w, const uint8_t *d, uint8_
         return UDSOTA_RXW_IGNORE;          /* isotp-c: "Consecutive frame too short", state unchanged */
     }
     w->msg_got += take;
-    w->next_sn = (uint8_t)((w->next_sn + 1u) & 0x0Fu);
     w->cf_count++;
     push_interval(w, t_us);
     if (w->msg_got >= w->msg_len) {
@@ -126,7 +120,7 @@ udsota_rxw_kind_t udsota_rxwatch_frame(udsota_rxwatch_t *w, const uint8_t *data,
 /* Median of the window's 63 intervals, sorted in a local copy (once per FC point). */
 uint32_t udsota_rxwatch_median_us(const udsota_rxwatch_t *w)
 {
-    if (w->iv_n < UDSOTA_RXW_INTERVALS) {
+    if (w->cf_count < UDSOTA_RXW_WINDOW) {
         return UDSOTA_CF_MEDIAN_NONE;
     }
     uint32_t a[UDSOTA_RXW_INTERVALS];
