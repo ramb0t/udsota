@@ -4,6 +4,8 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-29
+
 `udsota pack`, for updates that a flasher other than the client sends, and a README that walks through using udsota and managing its keys.
 - Client: `udsota pack FILE --out DIR [--dfi XX]... [--diff-from BASE]` writes the payloads `flash` sends, byte for byte, for DFI 0x00, 0x10, and 0x20 and 0x30 from a base, with a JSON manifest of what a flasher needs to send them, for a flasher that is not this client, such as an edge device that gets its updates from a server (client README). It needs no bus. The core README's new "Flashing without the client" gives the sequence and its fallbacks.
 - Fixed, client: a delta download whose 0x31 naming `DL_BAD_BASE` is lost now falls back to the full download, as when it arrives. The resent block, over 256 bytes, found the download ended and got no flow control, and `flash` stopped with exit 1.
