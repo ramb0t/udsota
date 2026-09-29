@@ -1049,28 +1049,33 @@ static void eng_status(void *ctx, udsota_status_t *out)
     udsota_esp32_status(out);
 }
 
-/* engine.running_sha: the running image's app_elf_sha256 (0xF1F3); 0 when max is short. */
+/* engine.running_sha: the running image's app_elf_sha256 (0xF1F3); its length, unwritten, when max is short. */
 static size_t eng_running_sha(void *ctx, uint8_t *out, size_t max)
 {
     (void)ctx;
     const esp_app_desc_t *app = esp_app_get_description();
-    if (out == NULL || max < sizeof app->app_elf_sha256) {
+    if (out == NULL) {
         return 0;
     }
-    memcpy(out, app->app_elf_sha256, sizeof app->app_elf_sha256);
+    if (max >= sizeof app->app_elf_sha256) {
+        memcpy(out, app->app_elf_sha256, sizeof app->app_elf_sha256);
+    }
     return sizeof app->app_elf_sha256;
 }
 
-/* engine.version: the running esp_app_desc version string (F189), unterminated; 0 when max is short. */
+/* engine.version: the running esp_app_desc version string (F189), unterminated; its length, unwritten, when max is
+ * short. */
 static size_t eng_version(void *ctx, char *out, size_t max)
 {
     (void)ctx;
     const esp_app_desc_t *app = esp_app_get_description();
     const size_t n = strnlen(app->version, sizeof app->version);
-    if (out == NULL || n > max) {
+    if (out == NULL) {
         return 0;
     }
-    memcpy(out, app->version, n);
+    if (n <= max) {
+        memcpy(out, app->version, n);
+    }
     return n;
 }
 

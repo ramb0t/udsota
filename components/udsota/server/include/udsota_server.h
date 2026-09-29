@@ -80,7 +80,8 @@ typedef struct {   /* all optional */
     uint8_t  (*gate)(void *ctx, udsota_op_t op);   /* 0 = allow, else the NRC to send (0x22, 0x88, 0x21, ...) */
     void     (*phase)(void *ctx, udsota_phase_t p);/* on every change, from the server's context; it may read
                                                       udsota_phase() but must not call other udsota functions */
-    size_t   (*did_read)(void *ctx, uint16_t did, uint8_t *buf, size_t max);  /* 0 = no such DID (0x31) */
+    size_t   (*did_read)(void *ctx, uint16_t did, uint8_t *buf, size_t max);  /* 0 = no such DID (0x31); a DID
+                                                      longer than max returns its length, unwritten (0x14) */
     uint32_t (*stmin_us)(void *ctx);               /* STmin for the next message's first FC; NULL = cfg.stmin_us */
     bool     (*reset)(void *ctx);                  /* restart; returns only on failure (false), then the server re-opens.
                                                       NULL: 11 01 answers 0x11 and ActivateImage answers positive

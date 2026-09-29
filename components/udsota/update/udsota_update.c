@@ -180,9 +180,28 @@ static uint8_t dl_reason(int r, udsota_reason_t fallback)
     return (r >= (int)UDSOTA_DL_OK && r < (int)UDSOTA_DL_REASON_COUNT) ? (uint8_t)r : (uint8_t)fallback;
 }
 
-/* 0x34: DFI 00 (or 10, 20 or 30 when engine.zformats names it), ALFID 44, address 0 (no resume point), 0 < size <=
- * slot, gated like 10 02; 74 20 0F FF. With a coded DFI a failed zbegin answers 0x22 before anything else changes,
- * save an unverified image the same 34 released. */
+/* Bytes of a 34 field an ALFID nibble gives: 1..UDSOTA_DL_FIELD_MAX, else 0 (an ALFID the server refuses). */
+static size_t dl_field_len(uint8_t nibble)
+{
+    return (nibble >= 1u && nibble <= UDSOTA_DL_FIELD_MAX) ? nibble : 0u;
+}
+
+/* Reads a big-endian field of n bytes (1..UDSOTA_DL_FIELD_MAX) from p. */
+static uint32_t dl_get_field(const uint8_t *p, size_t n)
+{
+    uint32_t v = 0u;
+    for (size_t i = 0; i < n; i++) {
+        v = (v << 8) | p[i];
+    }
+    return v;
+}
+
+/* 0x34: DFI 00 (or 10, 20 or 30 when engine.zformats names it), any ALFID with 1..4-byte fields (the client sends
+ * 44), address 0 (no resume point), 0 < size <= slot, gated like 10 02; 74 20 0F FF. Check order: access, length
+ * (under 3 bytes, or with a valid ALFID not exactly its fields: 0x13), conditions, then format and range (0x31). An
+ * invalid ALFID sizes no fields, so it skips the exact length and gets the conditions' answer, then 0x31. With a
+ * coded DFI a failed zbegin answers 0x22 before anything else changes, save an unverified image the same 34
+ * released. */
 static size_t handle_request_download(udsota_server_t *s, const uint8_t *req, size_t req_len,
                                       uint8_t *resp, size_t resp_max)
 {
@@ -191,16 +210,25 @@ static size_t handle_request_download(udsota_server_t *s, const uint8_t *req, si
     if (access != 0u) {
         return udsota_nrc(resp, resp_max, sid, access);
     }
-    if (req_len != UDSOTA_DL_REQ_LEN) {
+    if (req_len < UDSOTA_DL_REQ_MIN) {
+        return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_INCORRECT_LENGTH);
+    }
+    const size_t addr_len = dl_field_len(req[2] & 0x0Fu);
+    const size_t size_len = dl_field_len((uint8_t)(req[2] >> 4));
+    const bool alfid_ok = addr_len != 0u && size_len != 0u;
+    if (alfid_ok && req_len != UDSOTA_DL_REQ_MIN + addr_len + size_len) {
         return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_INCORRECT_LENGTH);
     }
     const uint8_t cond = download_nrc(s, UDSOTA_OP_START_DOWNLOAD);   /* before the format check */
     if (cond != 0u) {
         return udsota_nrc(resp, resp_max, sid, cond);
     }
-    const uint32_t addr = udsota_get_u32be(&req[3]);
-    const uint32_t size = udsota_get_u32be(&req[7]);
-    if (!dl_dfi_ok(s, req[1]) || req[2] != UDSOTA_DL_ALFID || addr != 0u || size == 0u || size > dl_slot_size(s)) {
+    if (!alfid_ok || !dl_dfi_ok(s, req[1])) {
+        return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_REQUEST_OUT_OF_RANGE);
+    }
+    const uint32_t addr = dl_get_field(&req[UDSOTA_DL_REQ_MIN], addr_len);
+    const uint32_t size = dl_get_field(&req[UDSOTA_DL_REQ_MIN + addr_len], size_len);
+    if (addr != 0u || size == 0u || size > dl_slot_size(s)) {
         return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_REQUEST_OUT_OF_RANGE);
     }
     if (resp_max < 4u) {
@@ -616,16 +644,20 @@ static size_t upd_request(udsota_server_t *s, const uint8_t *req, size_t len, ui
 }
 
 /* The updater's DIDs: F1F1 from its own state; F189, F1F0 and F1F3 from engine.version, engine.status and
- * engine.running_sha, each passed back (to hooks.did_read) while its source is NULL. An engine's SIZE_MAX answers
- * 0x31, as before, and never reaches the app's hook. */
+ * engine.running_sha, each passed back (to hooks.did_read) while its source is NULL. F1F0 and F1F1 return their
+ * length when room is short, as an engine op returns its own, and the server answers 0x14. An engine's
+ * SIZE_MAX answers 0x31, as before, and never reaches the app's hook. */
 static size_t upd_read_did(const udsota_server_t *s, uint16_t did, uint8_t *out, size_t room)
 {
     size_t n;
     if (did == UDSOTA_DID_RESULT) {
-        n = udsota_pack_result(out, room, &s->update.last_dl);
+        n = room < UDSOTA_RESULT_LEN ? UDSOTA_RESULT_LEN : udsota_pack_result(out, room, &s->update.last_dl);
     } else if (did == UDSOTA_DID_SW_VERSION && s->update.engine.version != NULL) {
         n = s->update.engine.version(s->update.engine.ctx, (char *)out, room);
     } else if (did == UDSOTA_DID_STATUS && s->update.engine.status != NULL) {
+        if (room < UDSOTA_STATUS_LEN) {
+            return UDSOTA_STATUS_LEN;
+        }
         udsota_status_t st;
         status_now(s, &st);
         n = udsota_pack_status(out, room, &st);

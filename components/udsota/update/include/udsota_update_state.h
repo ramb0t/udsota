@@ -89,7 +89,8 @@ typedef struct {   /* required; only unverify, status, running_sha, version and 
     void   (*status)(void *ctx, udsota_status_t *out);                       /* 0xF1F0; nullable:
                                                                                  then the core skips its slot conditions */
     size_t (*running_sha)(void *ctx, uint8_t *out, size_t max);              /* nullable: 0xF1F3 */
-    size_t (*version)(void *ctx, char *out, size_t max);                     /* nullable: F189 */
+    size_t (*version)(void *ctx, char *out, size_t max);                     /* nullable: F189. Either: a length
+                                                                                 over max, unwritten, answers 0x14 */
     uint32_t slot_size;                     /* bytes a 34 may announce; 0 = UDSOTA_SLOT_SIZE_DEFAULT (0x400000) */
     void  *ctx;
     /* Coded downloads: DFI 0x10 (raw DEFLATE), 0x20 (a delta patch) and 0x30 (a delta patch as raw DEFLATE). zbegin,
