@@ -110,6 +110,7 @@ foreach(t IN ITEMS server server_security server_routines server_matrix server_h
                    server_functional server_progress server_no_engine)
     udsota_test(test_udsota_${t} SOURCES test/test_udsota_${t}.c ${SERVER_SRCS})
 endforeach()
+target_include_directories(test_udsota_server_no_engine PRIVATE ${TEST_DIR}/core_only)   # the rows it shares
 
 # The download test also runs the real first-block rules behind engine.check_first.
 udsota_test(test_udsota_server_download
@@ -215,6 +216,51 @@ add_test(NAME udsota_core_probe_freertos
          COMMAND ${UDSOTA_PROBE_CC} -DPROBE_FREERTOS ${TEST_DIR}/fixtures/udsota_portable_probe.c)
 set_tests_properties(udsota_core_probe_freertos PROPERTIES
     PASS_REGULAR_EXPRESSION "error: (freertos/FreeRTOS\\.h: No such file|'freertos/FreeRTOS\\.h' file not found)")
+
+# ---- The server without the updater. udsota_server_only is server/ alone (UDSOTA_SERVER_SRCS), compiled with
+# server/include, isotp and a build-dir copy of udsota_update_state.h (the one updater header the server context may
+# name) on its include path: a core file that includes any other updater header fails to compile. An OBJECT library,
+# not an archive, so every object reaches the link: test_udsota_core_only links it alone, and a core call into the
+# updater fails that link. It runs the no-updater rows through udsota_core_init, a test-local service and the
+# ISO-TP adapter.
+set(UDSOTA_UPDATE_STATE_H ${ROOT}/components/udsota/update/include/udsota_update_state.h)
+set(CORE_ONLY_INC ${CMAKE_CURRENT_BINARY_DIR}/core_only_include)
+file(REMOVE_RECURSE ${CORE_ONLY_INC})
+configure_file(${UDSOTA_UPDATE_STATE_H} ${CORE_ONLY_INC}/udsota_update_state.h COPYONLY)   # the one updater header allowed
+add_library(udsota_server_only OBJECT ${UDSOTA_SERVER_SRCS})
+target_include_directories(udsota_server_only PUBLIC ${UDSOTA_SERVER_INCLUDE_DIRS} ${CORE_ONLY_INC})
+target_link_libraries(udsota_server_only PUBLIC isotp)
+target_compile_options(udsota_server_only PRIVATE -Wall -Wextra -Werror)
+add_executable(test_udsota_core_only test/core_only/test_udsota_core_only.c)
+target_include_directories(test_udsota_core_only PRIVATE ${TEST_DIR}/core_only)
+target_compile_options(test_udsota_core_only PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter)
+target_link_libraries(test_udsota_core_only PRIVATE udsota_server_only unity m)
+add_test(NAME test_udsota_core_only COMMAND test_udsota_core_only)
+
+# Its probes, each a known positive: the core-only include path can't reach an updater header, yet the state header
+# compiles alone on it; and server/'s objects don't define an updater function (udsota_pack_result), so a program
+# that calls one fails to link against them.
+set(CORE_ONLY_PROBE_INC ${UDSOTA_SERVER_INCLUDE_DIRS} ${CORE_ONLY_INC} ${ISOTP_INC})
+list(TRANSFORM CORE_ONLY_PROBE_INC PREPEND -I)
+add_test(NAME udsota_core_only_probe_updater
+         COMMAND ${CMAKE_C_COMPILER} -std=c11 -fsyntax-only ${CORE_ONLY_PROBE_INC} -DPROBE_UPDATER
+                 ${TEST_DIR}/fixtures/udsota_portable_probe.c)
+set_tests_properties(udsota_core_only_probe_updater PROPERTIES
+    PASS_REGULAR_EXPRESSION "error: (udsota_image\\.h: No such file|'udsota_image\\.h' file not found)")
+add_test(NAME udsota_core_only_probe_state
+         COMMAND ${CMAKE_C_COMPILER} -std=c11 -fsyntax-only -Wall -Wextra -Werror -I${CORE_ONLY_INC} -DPROBE_STATE
+                 ${TEST_DIR}/fixtures/udsota_portable_probe.c)
+add_test(NAME udsota_core_only_link_updater
+         COMMAND ${CMAKE_C_COMPILER} -DPROBE_LINK_UPDATER ${TEST_DIR}/fixtures/udsota_portable_probe.c
+                 $<TARGET_OBJECTS:udsota_server_only> $<TARGET_FILE:isotp>
+                 -o ${CMAKE_CURRENT_BINARY_DIR}/udsota_core_only_link_updater
+         COMMAND_EXPAND_LISTS)
+set_tests_properties(udsota_core_only_link_updater PROPERTIES
+    PASS_REGULAR_EXPRESSION "undefined reference to .?udsota_pack_result")
+
+# The seam's other direction: no server/ source, the port's included, touches the updater's member of the context.
+add_test(NAME udsota_seam_grep COMMAND sh ${ROOT}/tools/check_seam.sh)
+set_tests_properties(udsota_seam_grep PROPERTIES PASS_REGULAR_EXPRESSION "check_seam: PASS")
 
 # ---- UDS request-parser fuzz harness (on by default; -DUDSOTA_FUZZ=OFF skips it) ----
 # Replays built-in seeds and their mutants (and any corpus in UDSOTA_FUZZ_CORPUS) through the pure

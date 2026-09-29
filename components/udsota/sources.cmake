@@ -14,7 +14,8 @@ set(UDSOTA_SERVER_SRCS   ${_udsota_d}/server/udsota_server.c ${_udsota_d}/server
                          ${_udsota_d}/server/udsota_keys.c)
 set(UDSOTA_UPDATE_SRCS   ${_udsota_d}/update/udsota_update_codec.c ${_udsota_d}/update/udsota_image.c
                          ${_udsota_d}/update/udsota_isink.c ${_udsota_d}/update/udsota_zstream.c
-                         ${_udsota_d}/update/udsota_patch.c ${_udsota_d}/update/udsota_coded.c)
+                         ${_udsota_d}/update/udsota_patch.c ${_udsota_d}/update/udsota_coded.c
+                         ${_udsota_d}/update/udsota_update.c)
 set(UDSOTA_BOOTLOOP_SRCS ${_udsota_d}/bootloop/udsota_bootloop.c)
 set(UDSOTA_SRCS          ${UDSOTA_SERVER_SRCS} ${UDSOTA_UPDATE_SRCS} ${UDSOTA_BOOTLOOP_SRCS})
 
@@ -26,7 +27,7 @@ set(UDSOTA_INCLUDE_DIRS          ${_udsota_d}/include ${UDSOTA_SERVER_INCLUDE_DI
 set(UDSOTA_PRIV_INCLUDE_DIRS     "")
 
 set(UDSOTA_SERVICES_SRCS ${_udsota_d}/server/udsota_server.c ${_udsota_d}/server/udsota_codec.c
-                         ${_udsota_d}/update/udsota_update_codec.c)
+                         ${_udsota_d}/update/udsota_update.c ${_udsota_d}/update/udsota_update_codec.c)
 set(UDSOTA_CODEC_SRCS    ${_udsota_d}/server/udsota_codec.c ${_udsota_d}/update/udsota_update_codec.c)
 set(UDSOTA_RXWATCH_SRCS  ${_udsota_d}/server/udsota_rxwatch.c)
 set(UDSOTA_KEYS_SRCS     ${_udsota_d}/server/udsota_keys.c)

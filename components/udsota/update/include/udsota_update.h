@@ -11,8 +11,8 @@
 
 /* 1: the server serves coded downloads (DFI 0x10, 0x20, 0x30) when the engine sets zbegin, zwrite and zend and names
  * the format in zformats. 0: none of that is compiled in, and a 34 with any DFI but 00 answers 0x31 whatever the engine
- * sets; the structs keep their layout either way. Only udsota_server.c reads it, so define it for that file (the ESP32
- * port sets 0 while its compression is off). */
+ * sets; the structs keep their layout either way. Only update/udsota_update.c reads it, so define it for that file
+ * (the ESP32 port sets 0 while its compression is off). */
 #ifndef UDSOTA_COMPRESSION
 #define UDSOTA_COMPRESSION 1
 #endif
