@@ -266,4 +266,11 @@ void app_main(void)
     vTaskDelay(pdMS_TO_TICKS(HEALTHY_AFTER_MS));
     udsota_esp32_bootloop_mark_healthy();
     ESP_LOGI(TAG, "healthy%s", udsota_esp32_image_unconfirmed() ? "; image not yet confirmed, a reset rolls it back" : "");
+
+    /* What F1F0 reports, for a UI or a log. Built without the updater (sdkconfig.noupdater), both slots read
+     * UDSOTA_SLOT_NONE and the updater is never busy; only the flags remain. */
+    udsota_status_t st;
+    udsota_esp32_status(&st);
+    ESP_LOGI(TAG, "slots: running %u, boot %u, flags 0x%02X%s", (unsigned)st.running_slot, (unsigned)st.boot_slot,
+             (unsigned)st.flags, udsota_esp32_engine_busy() ? "; an update job is running" : "");
 }

@@ -1,0 +1,2 @@
+# A UDS server without the updater (no downloads): list this file after sdkconfig.defaults in SDKCONFIG_DEFAULTS (see README.md).
+# CONFIG_UDSOTA_ESP32_UPDATER is not set

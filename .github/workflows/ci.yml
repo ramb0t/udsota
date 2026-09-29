@@ -75,7 +75,7 @@ jobs:
     strategy:
       matrix:
         target: [esp32s3, esp32]
-        config: [default, compression, delta]
+        config: [default, compression, delta, noupdater]
     steps:
       - uses: actions/checkout@v4
       - name: Build the example for ${{ matrix.target }} (${{ matrix.config }})
@@ -99,3 +99,15 @@ jobs:
               components/udsota/update/udsota_image.c \
               -o /tmp/image_check
           /tmp/image_check "examples/esp32/build/${{ matrix.target }}/example.bin" "$chip"
+      - name: Check the updater is linked, or absent under sdkconfig.noupdater
+        shell: bash
+        run: |
+          . "$IDF_PATH/export.sh" > /dev/null
+          b="examples/esp32/build/${{ matrix.target }}"
+          xtensa-esp-elf-nm "$b/example.elf" > "$b/syms"   # a file, not a pipe: grep -q would make nm exit 141
+          if [ "${{ matrix.config }}" = noupdater ]; then
+            grep -qx '# CONFIG_UDSOTA_ESP32_UPDATER is not set' "$b/sdkconfig" || { echo "the option is still on"; exit 1; }
+            if grep -qw esp_ota_begin "$b/syms"; then echo "engine linked in noupdater"; exit 1; fi
+          else
+            grep -qw esp_ota_begin "$b/syms" || { echo "no esp_ota_begin: the check cannot see the engine"; exit 1; }
+          fi
