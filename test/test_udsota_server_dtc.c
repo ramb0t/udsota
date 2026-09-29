@@ -2,11 +2,23 @@
  * dtc_ext_data and dtc_clear: each hook gating its own part, the core's check order, the status mask and availability,
  * the room judged on resp_max, the index cap, SPRMIB, every session, a running job, and functional addressing. */
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 #include "unity.h"
 #include "udsota.h"
 #include "udsota_mock.h"
+
+/* The config fields come after 0.9.0's last field, so the change is not breaking. The hooks' place is pinned in
+ * fuzz_udsota.c. */
+_Static_assert(offsetof(udsota_config_t, dtc_availability_mask) ==
+                   offsetof(udsota_config_t, key_pubkey_len) + sizeof(size_t) &&
+               offsetof(udsota_config_t, dtc_format) == offsetof(udsota_config_t, dtc_availability_mask) + 1u,
+               "udsota_config_t: the dtc_ fields must follow key_pubkey_len, 0.9.0's last field");
+#if SIZE_MAX == UINT64_MAX && UINTPTR_MAX == UINT64_MAX
+_Static_assert(offsetof(udsota_config_t, key_pubkey_len) == 96u,
+               "udsota_config_t: a field before key_pubkey_len moved 0.9.0's layout (96 on a 64-bit host)");
+#endif
 
 #define T0         60000u   /* past the 10 s post-boot 0x27 delay */
 #define RESP_FULL  256u     /* UDSOTA_ISOTP_RESP_MAX: the transport's response buffer */
