@@ -1,5 +1,6 @@
-"""The udsota wire contract (components/udsota/include/udsota_wire.h): sessions, server-owned DIDs,
-routines, NRCs, the download format and the status, result and counter layouts. DECODE and describe_result are
+"""The udsota wire contract (components/udsota/include/udsota_wire.h, over the server's udsota_server_wire.h and
+the updater's udsota_update_wire.h): sessions, server-owned DIDs, routines, NRCs, the download format and the status,
+result and counter layouts. DECODE and describe_result are
 Python-only: how info and config render DID records."""
 import struct
 

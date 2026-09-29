@@ -13,7 +13,7 @@
  * iso14229's fuzz_server.cc idea (MIT, Nick James Kirkby & Co-Operators): a stream of requests with
  * fuzzed waits between them. No iso14229 code is copied.
  *
- * Built four times: fuzz_udsota with the app hooks NULL; fuzz_udsota_app_hooks (UDSOTA_FUZZ_APP_HOOKS=1) with
+ * Built four times, plus the no-update build below: fuzz_udsota with the app hooks NULL; fuzz_udsota_app_hooks (UDSOTA_FUZZ_APP_HOOKS=1) with
  * did_write, routine and routine_poll set, where it also checks that an app routine has exactly one owner;
  * fuzz_udsota_progress (UDSOTA_FUZZ_PROGRESS=1) with the progress hook set, where it also checks that done never
  * passes total nor shrinks within a download, and that the hook runs at most once per call and reports every
@@ -23,12 +23,17 @@
  * streams of random images, intact and mutated, sent as whole 34/36/37/FF01 sequences, and the progress checks
  * hold on the compressed path too.
  *
+ * A fifth build, fuzz_udsota_no_update (UDSOTA_FUZZ_NO_UPDATE=1 with UDSOTA_FUZZ_APP_HOOKS=1), gives udsota_init a
+ * NULL engine, so no update service is registered: it replays from the five states a download isn't needed for,
+ * 34, 36 and 37 count as unserved and must only ever get NRC 0x11 (0x21 while an app routine runs), and its
+ * coverage floor needs the reset and app hooks only.
+ *
  * The PASS line ends with digest=, an FNV-1a hash of every request fed to the server and every answer it gave
  * (empty ones too), so an answer that changes shows there even where the counts don't. It draws no rnd().
  *
  * libFuzzer, on a machine with clang:
  *   clang -g -O1 -fsanitize=fuzzer,address,undefined -DUDSOTA_LIBFUZZER <includes> fuzz_udsota.c
- *         udsota_server.c udsota_codec.c -o fuzz_udsota_lf && ./fuzz_udsota_lf -max_len=8192 <corpus>
+ *         <UDSOTA_SERVICES_SRCS> -o fuzz_udsota_lf && ./fuzz_udsota_lf -max_len=8192 <corpus>
  */
 #define _DEFAULT_SOURCE   /* MAP_ANONYMOUS, sigaction, fork, prctl under -std=c11 */
 #include <dirent.h>
@@ -61,6 +66,12 @@
 #ifndef UDSOTA_FUZZ_PROGRESS
 #define UDSOTA_FUZZ_PROGRESS 0    /* 1: FUZZ_HOOKS also sets progress */
 #endif
+#ifndef UDSOTA_FUZZ_NO_UPDATE
+#define UDSOTA_FUZZ_NO_UPDATE 0   /* 1: udsota_init gets a NULL engine, so no update service answers */
+#endif
+#if UDSOTA_FUZZ_NO_UPDATE && (!UDSOTA_FUZZ_APP_HOOKS || UDSOTA_FUZZ_PROGRESS || defined(UDSOTA_FUZZ_Z))
+#error "UDSOTA_FUZZ_NO_UPDATE needs UDSOTA_FUZZ_APP_HOOKS (0x31's positive answers) and no progress or z build"
+#endif
 
 /* Every engine and hook callback is mocked; these trip if the API structs gain a callback. */
 _Static_assert(offsetof(udsota_engine_t, slot_size) == 12u * sizeof(void (*)(void)),
@@ -91,6 +102,11 @@ typedef enum {                                 /* server states a replay starts 
     ST_DEFAULT, ST_EXTENDED, ST_PROG, ST_EXT_UNLOCKED, ST_PROG_UNLOCKED,
     ST_DOWNLOAD, ST_TRANSFER, ST_EXITED, ST_VERIFIED, ST_COUNT
 } state_t;
+#if UDSOTA_FUZZ_NO_UPDATE
+#define ST_FUZZED (ST_PROG_UNLOCKED + 1)       /* no download: the states from download-open on can't be reached */
+#else
+#define ST_FUZZED ST_COUNT                     /* the states a replay starts from */
+#endif
 static const char *const STATE_NAME[ST_COUNT] = {
     "default", "extended", "programming", "extended+01", "programming+03",
     "download-open", "mid-transfer", "transfer-exited", "image-verified",
@@ -148,6 +164,9 @@ typedef struct {                               /* counted outside the preamble o
     bool pos_sid[256], nrc_sid[256], nrc_code[256], reached[ST_COUNT];
 #if UDSOTA_FUZZ_APP_HOOKS
     bool app_orphaned;                         /* a fuzzed app routine reached the 90 s cap */
+#endif
+#if UDSOTA_FUZZ_NO_UPDATE
+    bool dl_nrc11[3], dl_nrc21;                /* 34, 36, 37 got 0x11 (each), and one of them 0x21 during a job */
 #endif
 #if UDSOTA_FUZZ_PROGRESS
     bool stage_seen[UDSOTA_STAGE_ACTIVATING + 1];   /* stages hooks.progress reported from fuzzed calls */
@@ -565,10 +584,12 @@ static int mock_routine(void *ctx, uint16_t rid, const uint8_t *in, size_t in_le
     if (M.app_outstanding) {
         fail("routine called while an app routine was outstanding", NULL, 0, NULL, 0);
     }
+#if !UDSOTA_FUZZ_NO_UPDATE   /* with no update service its RIDs are the app's, answered 0x31 below */
     if (rid == UDSOTA_RID_CHECK_PROG_DEPS || rid == UDSOTA_RID_GET_RESUME_POINT ||
         rid == UDSOTA_RID_ACTIVATE_IMAGE || rid == UDSOTA_RID_CONFIRM_IMAGE) {
         fail("routine handed a RID the core owns", NULL, 0, NULL, 0);
     }
+#endif
     touch(in, in_len);
     memset(out, 0xDD, out_max);
     switch (rid) {
@@ -778,9 +799,24 @@ static const udsota_hooks_t FUZZ_HOOKS = {
 #endif
 };
 
-/* True for the SIDs the server serves; every other SID must get NRC 0x11 or 0x7F. */
+#if UDSOTA_FUZZ_NO_UPDATE
+/* 0 for 34, 1 for 36, 2 for 37 (the update service's SIDs), -1 for any other SID. */
+static int dl_sid_index(uint8_t sid)
+{
+    return sid == UDSOTA_SID_REQUEST_DOWNLOAD ? 0 : sid == UDSOTA_SID_TRANSFER_DATA ? 1
+         : sid == UDSOTA_SID_TRANSFER_EXIT ? 2 : -1;
+}
+#endif
+
+/* True for the SIDs the server serves. check_request_answer fails a positive answer to any other SID, but takes any
+ * known NRC for it; only the digest pins which (check_no_update pins 34, 36 and 37 without the update service). */
 static bool sid_served(uint8_t sid)
 {
+#if UDSOTA_FUZZ_NO_UPDATE
+    if (dl_sid_index(sid) >= 0) {
+        return false;                          /* the update service's: none is registered */
+    }
+#endif
     switch (sid) {
     case UDSOTA_SID_SESSION: case UDSOTA_SID_RESET: case UDSOTA_SID_READ_DID: case UDSOTA_SID_SECURITY:
     case UDSOTA_SID_ROUTINE: case UDSOTA_SID_REQUEST_DOWNLOAD: case UDSOTA_SID_TRANSFER_DATA:
@@ -911,6 +947,11 @@ static void check_poll_answer(const uint8_t *r, size_t n, size_t resp_max)
     const bool ok = (r[0] & UDSOTA_POS_BIT) != 0 &&
                     ((sid == UDSOTA_SID_TRANSFER_DATA && n == 2) ||
                      (sid == UDSOTA_SID_ROUTINE && (n == 4 || n == 5) && r[1] == UDSOTA_RC_START));
+#if UDSOTA_FUZZ_NO_UPDATE
+    if (sid == UDSOTA_SID_TRANSFER_DATA) {
+        fail("a 36 answered from a poll with no update service", NULL, 0, r, n);
+    }
+#endif
     if (!ok) {
         fail("malformed positive poll response", NULL, 0, r, n);
     }
@@ -977,6 +1018,37 @@ static void check_orphan_held(bool orphan_before, uint8_t session_before, const 
 }
 #endif
 
+#if UDSOTA_FUZZ_NO_UPDATE
+/* With no update service, 34, 36 and 37 are no one's: exactly 7F sid 11, or 7F sid 21 when a job was running (the
+ * core's busy answer comes first), never a positive answer or another NRC; silent only when 3 bytes don't fit or a
+ * restart was armed or had fired. Also records which of those answers the fuzz reached, for the coverage floor. */
+static void check_no_update(bool job_before, bool restarting, const uint8_t *req, size_t rl, const uint8_t *r,
+                            size_t n, size_t resp_max)
+{
+    const int k = (rl != 0u) ? dl_sid_index(req[0]) : -1;
+    if (k < 0) {
+        return;
+    }
+    if (n == 0u) {
+        if (resp_max >= 3u && !restarting) {
+            fail("34, 36 or 37 went unanswered with no update service", req, rl, r, n);
+        }
+        return;
+    }
+    const uint8_t want = job_before ? UDSOTA_NRC_BUSY_REPEAT : UDSOTA_NRC_SERVICE_NOT_SUPPORTED;
+    if (n != 3u || r[0] != UDSOTA_NEG_RESPONSE || r[1] != req[0] || r[2] != want) {
+        fail("34, 36 or 37 answered other than 0x11 (0x21 during a job) with no update service", req, rl, r, n);
+    }
+    if (!g_in_preamble) {
+        if (job_before) {
+            g_stats.dl_nrc21 = true;
+        } else {
+            g_stats.dl_nrc11[k] = true;
+        }
+    }
+}
+#endif
+
 /* Returns the guarded response buffer for resp_max, with its canary armed. */
 static uint8_t *resp_buf(size_t resp_max)
 {
@@ -1011,9 +1083,16 @@ static size_t fuzz_request(const uint8_t *in, size_t len, layout_t lay, size_t r
     const bool orphan_before = S.app_orphan;
     const uint8_t session_before = S.session;
 #endif
+#if UDSOTA_FUZZ_NO_UPDATE
+    const bool job_before = S.job_running;
+    const bool restarting = udsota_restart_armed(&S) || M.resets != 0u;
+#endif
     const size_t n = udsota_on_request(&S, req, len, resp, resp_max, now);
     check_canary(resp, req, len);
     check_request_answer(req, len, resp, n, resp_max);
+#if UDSOTA_FUZZ_NO_UPDATE
+    check_no_update(job_before, restarting, req, len, resp, n, resp_max);
+#endif
     digest_fold('Q', req, len);
     digest_fold('A', resp, n);
     check_phase();
@@ -1193,7 +1272,12 @@ static uint32_t start_run(state_t st, unsigned variant, bool async)
     if ((g_stats.runs & 1u) != 0u) {
         engine.unverify = NULL;
     }
+#if UDSOTA_FUZZ_NO_UPDATE
+    (void)engine;
+    udsota_init(&S, &FUZZ_CFG, NULL, &FUZZ_SECURITY, &FUZZ_HOOKS);   /* the server alone: no update service */
+#else
     udsota_init(&S, &FUZZ_CFG, &engine, &FUZZ_SECURITY, &FUZZ_HOOKS);
+#endif
     udsota_set_tx_pending(&S, mock_tx_pending, NULL);
     uint32_t now = T0;
     g_in_preamble = true;
@@ -1273,7 +1357,7 @@ static void replay_input(const char *src, const uint8_t *in, size_t len, bool pr
     const size_t one = len > REQ_MAX ? REQ_MAX : len;
     const size_t seq = len > SEQ_MAX_BYTES ? SEQ_MAX_BYTES : len;
     const unsigned variant = pristine ? 0u : (unsigned)(idx % VARIANT_COUNT);
-    for (int st = 0; st < ST_COUNT; st++) {
+    for (int st = 0; st < ST_FUZZED; st++) {
         const size_t resp_max = pristine ? RESP_FULL : RESP_MAXES[(idx + (unsigned long)st) % RESP_MAX_COUNT];
         run_single(src, idx, in, one, (state_t)st, LAYOUT_END, variant, resp_max);
         run_single(src, idx, in, one, (state_t)st, LAYOUT_START, variant, resp_max);
@@ -1516,6 +1600,19 @@ static void replay_generated(void)
     n = rec(seq, n, 0, prog, sizeof prog);                     /* accepted */
     replay_input("seq-app-orphan", seq, n, true);
 #endif
+#if UDSOTA_FUZZ_NO_UPDATE
+    /* 34, 36 and 37 while an app routine runs (0x21, the core's busy answer), then after it finishes (0x11). */
+    const uint8_t pend[] = {UDSOTA_SID_ROUTINE, UDSOTA_RC_START, 0x12, 0x35};
+    const uint8_t r34[] = {UDSOTA_SID_REQUEST_DOWNLOAD, UDSOTA_DL_DFI, UDSOTA_DL_ALFID, 0, 0, 0, 0, 0, 0, 0, DL_SIZE};
+    const uint8_t r36[] = {UDSOTA_SID_TRANSFER_DATA, 0x01, 0xE9};
+    n = 0;
+    n = rec(seq, n, 0, pend, sizeof pend);
+    n = rec(seq, n, 0, r34, sizeof r34);
+    n = rec(seq, n, 0, r36, sizeof r36);
+    n = rec(seq, n, 0, exit_, sizeof exit_);
+    n = rec(seq, n, 4, r34, sizeof r34);                       /* 100 ms: the routine has finished */
+    replay_input("seq-no-update-busy", seq, n, true);
+#endif
 #ifdef UDSOTA_FUZZ_Z
     replay_z_streams();
 #endif
@@ -1652,6 +1749,11 @@ static void check_coverage(void)
         }
     }
     for (int op = 0; op < OP_COUNT; op++) {
+#if UDSOTA_FUZZ_NO_UPDATE
+        if (op != OP_RESET && op != OP_DID_WRITE && op != OP_ROUTINE && op != OP_ROUTINE_POLL) {
+            continue;                                /* the engine's ops: there is no engine */
+        }
+#endif
         if (g_stats.op_calls[op] == 0) {
             fprintf(stderr, "fuzz_udsota: COVERAGE: no fuzzed request reached %s\n", OP_NAME[op]);
             ok = false;
@@ -1660,6 +1762,20 @@ static void check_coverage(void)
 #if UDSOTA_FUZZ_APP_HOOKS
     if (!g_stats.app_orphaned) {
         fprintf(stderr, "fuzz_udsota: COVERAGE: no fuzzed app routine reached the 90 s cap\n");
+        ok = false;
+    }
+#endif
+#if UDSOTA_FUZZ_NO_UPDATE
+    for (int k = 0; k < 3; k++) {
+        if (!g_stats.dl_nrc11[k]) {
+            fprintf(stderr, "fuzz_udsota: COVERAGE: SID 0x%02X never drew 0x11 with no update service\n",
+                    (unsigned)(k == 0 ? UDSOTA_SID_REQUEST_DOWNLOAD : k == 1 ? UDSOTA_SID_TRANSFER_DATA
+                                                                              : UDSOTA_SID_TRANSFER_EXIT));
+            ok = false;
+        }
+    }
+    if (!g_stats.dl_nrc21) {
+        fprintf(stderr, "fuzz_udsota: COVERAGE: no 34, 36 or 37 arrived during a job (its 0x21)\n");
         ok = false;
     }
 #endif
@@ -1675,7 +1791,7 @@ static void check_coverage(void)
         ok = false;
     }
 #endif
-    for (int st = 0; st < ST_COUNT; st++) {
+    for (int st = 0; st < ST_FUZZED; st++) {
         ok = ok && g_stats.reached[st];
     }
     if (!ok) {
@@ -1870,13 +1986,13 @@ int main(int argc, char **argv)
         replay_path(argv[argi]);
     }
     int reached = 0;
-    for (int st = 0; st < ST_COUNT; st++) {
+    for (int st = 0; st < ST_FUZZED; st++) {
         reached += g_stats.reached[st] ? 1 : 0;
     }
     printf("fuzz_udsota: PASS %lu inputs, %lu runs, %lu requests (%lu positive, %lu NRC, %lu silent), "
            "%lu poll answers, %d/%d states reached, digest=%016" PRIx64 "\n",
            g_stats.inputs, g_stats.runs, g_stats.requests, g_stats.positive, g_stats.nrc, g_stats.silent,
-           g_stats.poll_answers, reached, (int)ST_COUNT, g_digest);
+           g_stats.poll_answers, reached, (int)ST_FUZZED, g_digest);
     return 0;
 }
 #endif

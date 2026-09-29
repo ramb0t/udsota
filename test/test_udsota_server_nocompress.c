@@ -113,15 +113,15 @@ static void send(const uint8_t *req, size_t len)
  * leaves F1F1, the download and the engine untouched. */
 static void test_coded_dfis_answer_0x31_with_the_ops_set(void)
 {
-    srv.last_dl.reason_code = UDSOTA_DL_VERIFY_FAILED;
+    srv.update.last_dl.reason_code = UDSOTA_DL_VERIFY_FAILED;
     const uint8_t dfis[] = {UDSOTA_DL_DFI_DEFLATE, UDSOTA_DL_DFI_DELTA, UDSOTA_DL_DFI_DELTA_DEFLATE};
     for (size_t i = 0; i < sizeof dfis; i++) {
         const uint8_t r34[] = {UDSOTA_SID_REQUEST_DOWNLOAD, dfis[i], UDSOTA_DL_ALFID, 0, 0, 0, 0, 0, 0, 4, 0};
         send(r34, sizeof r34);
         EXPECT(0x7F, 0x34, 0x31);
     }
-    TEST_ASSERT_FALSE(srv.download_active);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_VERIFY_FAILED, srv.last_dl.reason_code);
+    TEST_ASSERT_FALSE(srv.update.download_active);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_VERIFY_FAILED, srv.update.last_dl.reason_code);
     TEST_ASSERT_EQUAL_UINT(0u, g_z_calls);
 }
 

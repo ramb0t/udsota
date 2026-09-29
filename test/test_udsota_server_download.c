@@ -100,7 +100,7 @@ static int mock_check_first(void *ctx, const uint8_t *first, size_t len, udsota_
             .diag_request_id = EXAMPLE_REQ_ID, .diag_response_id = EXAMPLE_RESP_ID,
             .running_version = {0, 0, 0}, .running_is_release = false, .slot_size = UDSOTA_SLOT_SIZE_DEFAULT,
         };
-        *reason = udsota_image_check(first, len, srv.dl_announced, &ic, NULL);
+        *reason = udsota_image_check(first, len, srv.update.dl_announced, &ic, NULL);
         return *reason == UDSOTA_DL_OK ? 0 : 1;
     }
     *reason = m.check_reason;
@@ -172,17 +172,17 @@ static void request_download(uint32_t size)
 static void test_request_download_accepts(void)
 {
     enter_programming();
-    srv.slot_verified = true;
-    srv.last_dl.reason_code = UDSOTA_DL_SIG_FAILED;
+    srv.update.slot_verified = true;
+    srv.update.last_dl.reason_code = UDSOTA_DL_SIG_FAILED;
     request_download(TWO_BLOCKS);
-    TEST_ASSERT_TRUE(srv.download_active);
-    TEST_ASSERT_FALSE(srv.ota_open);
-    TEST_ASSERT_EQUAL_HEX8(0x01, srv.next_bsc);
-    TEST_ASSERT_EQUAL_UINT32(TWO_BLOCKS, srv.dl_announced);
-    TEST_ASSERT_EQUAL_UINT32(0, srv.dl_received);
-    TEST_ASSERT_FALSE(srv.slot_verified);
-    TEST_ASSERT_FALSE(srv.dl_complete);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_OK, srv.last_dl.reason_code);
+    TEST_ASSERT_TRUE(srv.update.download_active);
+    TEST_ASSERT_FALSE(srv.update.ota_open);
+    TEST_ASSERT_EQUAL_HEX8(0x01, srv.update.next_bsc);
+    TEST_ASSERT_EQUAL_UINT32(TWO_BLOCKS, srv.update.dl_announced);
+    TEST_ASSERT_EQUAL_UINT32(0, srv.update.dl_received);
+    TEST_ASSERT_FALSE(srv.update.slot_verified);
+    TEST_ASSERT_FALSE(srv.update.dl_complete);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_OK, srv.update.last_dl.reason_code);
     TEST_ASSERT_EQUAL_STRING("", m.log);
 }
 
@@ -199,7 +199,7 @@ static void test_request_download_bad_format(void)
     send(r, sizeof r); EXPECT(0x7F, 0x34, 0x31);
     build_34(r, UDSOTA_DL_DFI, UDSOTA_DL_ALFID, 0u, 4096u);
     send(r, UDSOTA_DL_REQ_LEN - 1u); EXPECT(0x7F, 0x34, 0x13);
-    TEST_ASSERT_FALSE(srv.download_active);
+    TEST_ASSERT_FALSE(srv.update.download_active);
     request_download(UDSOTA_SLOT_SIZE_DEFAULT);                        /* exactly the slot fits */
 }
 
@@ -214,7 +214,7 @@ static void test_download_needs_programming_and_key(void)
     const uint8_t sess[] = {UDSOTA_SID_SESSION, UDSOTA_SESSION_PROGRAMMING};
     send(sess, sizeof sess);
     send(r, sizeof r);  EXPECT(0x7F, 0x34, 0x33);
-    TEST_ASSERT_FALSE(srv.download_active);
+    TEST_ASSERT_FALSE(srv.update.download_active);
 }
 
 /* 34 is refused by a gate NRC (passed through), a PENDING_VERIFY image (0x22), or a download already open (0x22). */
@@ -247,7 +247,7 @@ static void test_refused_while_boot_slot_not_running(void)
     build_34(r, UDSOTA_DL_DFI, UDSOTA_DL_ALFID, 0u, 4096u);
     send(r, sizeof r);
     EXPECT(0x7F, 0x34, 0x22);
-    TEST_ASSERT_FALSE(srv.download_active);
+    TEST_ASSERT_FALSE(srv.update.download_active);
 }
 
 /* A full 4093-byte block at one CF per 10 ms (5.86 s, longer than S3) completes: S3 stops at the FF. */
@@ -262,7 +262,7 @@ static void test_full_block_at_10ms_per_cf_completes_without_fallback(void)
         TEST_ASSERT_EQUAL_UINT(0, udsota_poll(&srv, g_resp, sizeof g_resp, g_now));
     }
     TEST_ASSERT_EQUAL_INT(UDSOTA_SESSION_PROGRAMMING, srv.session);
-    TEST_ASSERT_TRUE(srv.download_active);
+    TEST_ASSERT_TRUE(srv.update.download_active);
     unsigned pending = 0;
     transfer(0x01, UDSOTA_DL_MAX_DATA, &pending);
     EXPECT(0x76, 0x01);
@@ -272,8 +272,8 @@ static void test_full_block_at_10ms_per_cf_completes_without_fallback(void)
     TEST_ASSERT_EQUAL_UINT(UDSOTA_DL_MAX_DATA, m.last_write_len);
     const uint8_t first[4] = {0x07, 0x08, 0x09, 0x0A};   /* the pattern for bsc 1 */
     TEST_ASSERT_EQUAL_HEX8_ARRAY(first, m.first_data, 4);
-    TEST_ASSERT_EQUAL_UINT32(UDSOTA_DL_MAX_DATA, srv.dl_received);
-    TEST_ASSERT_EQUAL_UINT32(UDSOTA_DL_MAX_DATA, srv.last_dl.bytes_received);
+    TEST_ASSERT_EQUAL_UINT32(UDSOTA_DL_MAX_DATA, srv.update.dl_received);
+    TEST_ASSERT_EQUAL_UINT32(UDSOTA_DL_MAX_DATA, srv.update.last_dl.bytes_received);
     TEST_ASSERT_EQUAL_INT(UDSOTA_SESSION_PROGRAMMING, srv.session);
     transfer(0x02, UDSOTA_DL_MAX_DATA, &pending);            /* page programs only: no 0x78 */
     EXPECT(0x76, 0x02);
@@ -290,7 +290,7 @@ static void test_first_block_checked_before_erase(void)
     transfer(0x01, UDSOTA_DL_MAX_DATA, NULL);
     EXPECT(0x76, 0x01);
     TEST_ASSERT_EQUAL_STRING("CBW", m.log);
-    TEST_ASSERT_TRUE(srv.ota_open);
+    TEST_ASSERT_TRUE(srv.update.ota_open);
     transfer(0x02, UDSOTA_DL_MAX_DATA, NULL);
     EXPECT(0x76, 0x02);
     TEST_ASSERT_EQUAL_STRING("CBWW", m.log);
@@ -306,10 +306,10 @@ static void test_first_block_reject(void)
     TEST_ASSERT_NOT_EQUAL(0, send_block(0x01, UDSOTA_DL_MAX_DATA));   /* answered at once: no job */
     EXPECT(0x7F, 0x36, 0x31);
     TEST_ASSERT_EQUAL_STRING("C", m.log);
-    TEST_ASSERT_FALSE(srv.download_active);
-    TEST_ASSERT_FALSE(srv.ota_open);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_BAD_BOARD, srv.last_dl.reason_code);
-    TEST_ASSERT_EQUAL_UINT32(0, srv.last_dl.bytes_received);
+    TEST_ASSERT_FALSE(srv.update.download_active);
+    TEST_ASSERT_FALSE(srv.update.ota_open);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_BAD_BOARD, srv.update.last_dl.reason_code);
+    TEST_ASSERT_EQUAL_UINT32(0, srv.update.last_dl.bytes_received);
     TEST_ASSERT_EQUAL_UINT16(1, srv.counters.aborts);
     send_block(0x01, 16);
     EXPECT(0x7F, 0x36, 0x24);
@@ -366,7 +366,7 @@ static void test_first_block_reject_without_reason(void)
     request_download(TWO_BLOCKS);
     send_block(0x01, UDSOTA_DL_MAX_DATA);
     EXPECT(0x7F, 0x36, 0x31);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_BAD_HEADER, srv.last_dl.reason_code);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_BAD_HEADER, srv.update.last_dl.reason_code);
 }
 
 /* A resend of the last accepted block (its 76 was lost) is answered 76 at once and not rewritten. */
@@ -379,9 +379,9 @@ static void test_repeat_of_last_block_positive_without_rewrite(void)
     TEST_ASSERT_NOT_EQUAL(0, send_block(0x01, UDSOTA_DL_MAX_DATA));
     EXPECT(0x76, 0x01);
     TEST_ASSERT_EQUAL_UINT(1, m.writes);
-    TEST_ASSERT_EQUAL_UINT32(UDSOTA_DL_MAX_DATA, srv.dl_received);
+    TEST_ASSERT_EQUAL_UINT32(UDSOTA_DL_MAX_DATA, srv.update.dl_received);
     TEST_ASSERT_EQUAL_UINT16(1, srv.counters.repeated_blocks);
-    TEST_ASSERT_EQUAL_HEX8(0x02, srv.next_bsc);
+    TEST_ASSERT_EQUAL_HEX8(0x02, srv.update.next_bsc);
     transfer(0x02, UDSOTA_DL_MAX_DATA, NULL);
     EXPECT(0x76, 0x02);
     TEST_ASSERT_EQUAL_UINT(2, m.writes);
@@ -394,11 +394,11 @@ static void test_repeat_of_final_block_is_not_overrun(void)
     request_download(UDSOTA_DL_MAX_DATA + 100u);
     transfer(0x01, UDSOTA_DL_MAX_DATA, NULL);  EXPECT(0x76, 0x01);
     transfer(0x02, 100u, NULL);             EXPECT(0x76, 0x02);
-    TEST_ASSERT_EQUAL_UINT32(srv.dl_announced, srv.dl_received);
+    TEST_ASSERT_EQUAL_UINT32(srv.update.dl_announced, srv.update.dl_received);
     TEST_ASSERT_NOT_EQUAL(0, send_block(0x02, 100u));
     EXPECT(0x76, 0x02);
     TEST_ASSERT_EQUAL_UINT(2, m.writes);
-    TEST_ASSERT_TRUE(srv.download_active);
+    TEST_ASSERT_TRUE(srv.update.download_active);
     send_37();
     EXPECT(0x77);
 }
@@ -412,7 +412,7 @@ static void test_bsc_zero_before_first_block_is_0x73(void)
     EXPECT(0x7F, 0x36, 0x73);
     TEST_ASSERT_EQUAL_UINT16(1, srv.counters.seq_errors);
     TEST_ASSERT_EQUAL_STRING("", m.log);
-    TEST_ASSERT_TRUE(srv.download_active);
+    TEST_ASSERT_TRUE(srv.update.download_active);
     transfer(0x01, 16, NULL);
     EXPECT(0x76, 0x01);
 }
@@ -425,7 +425,7 @@ static void test_wrong_bsc_0x73_transfer_stays_open(void)
     transfer(0x01, UDSOTA_DL_MAX_DATA, NULL);
     send_block(0x03, 16);
     EXPECT(0x7F, 0x36, 0x73);
-    TEST_ASSERT_TRUE(srv.download_active);
+    TEST_ASSERT_TRUE(srv.update.download_active);
     TEST_ASSERT_EQUAL_UINT(1, m.writes);
     TEST_ASSERT_EQUAL_UINT16(1, srv.counters.seq_errors);
     transfer(0x02, UDSOTA_DL_MAX_DATA, NULL);
@@ -443,7 +443,7 @@ static void test_bsc_wraps_ff_to_00(void)
         TEST_ASSERT_EQUAL_HEX8(0x76, g_resp[0]);
         TEST_ASSERT_EQUAL_HEX8((uint8_t)i, g_resp[1]);
     }
-    TEST_ASSERT_EQUAL_HEX8(0x00, srv.next_bsc);
+    TEST_ASSERT_EQUAL_HEX8(0x00, srv.update.next_bsc);
     send_block(0x01, 16);
     EXPECT(0x7F, 0x36, 0x73);
     transfer(0x00, 16, NULL);
@@ -451,7 +451,7 @@ static void test_bsc_wraps_ff_to_00(void)
     TEST_ASSERT_NOT_EQUAL(0, send_block(0x00, 16));
     EXPECT(0x76, 0x00);
     TEST_ASSERT_EQUAL_UINT(256, m.writes);
-    TEST_ASSERT_EQUAL_UINT32(256u * 16u, srv.dl_received);
+    TEST_ASSERT_EQUAL_UINT32(256u * 16u, srv.update.dl_received);
 }
 
 /* A block past the announced size gets 0x71 and ends the transfer; the open slot is aborted (kept for resume). */
@@ -463,10 +463,10 @@ static void test_overrun_0x71_ends_transfer(void)
     send_block(0x02, 11u);
     EXPECT(0x7F, 0x36, 0x71);
     TEST_ASSERT_EQUAL_STRING("CBWA", m.log);
-    TEST_ASSERT_FALSE(srv.download_active);
-    TEST_ASSERT_FALSE(srv.ota_open);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_ABORTED, srv.last_dl.reason_code);
-    TEST_ASSERT_EQUAL_UINT32(UDSOTA_DL_MAX_DATA, srv.last_dl.bytes_received);
+    TEST_ASSERT_FALSE(srv.update.download_active);
+    TEST_ASSERT_FALSE(srv.update.ota_open);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_ABORTED, srv.update.last_dl.reason_code);
+    TEST_ASSERT_EQUAL_UINT32(UDSOTA_DL_MAX_DATA, srv.update.last_dl.bytes_received);
     TEST_ASSERT_EQUAL_UINT16(1, srv.counters.aborts);
     send_block(0x02, 10u);
     EXPECT(0x7F, 0x36, 0x24);
@@ -480,7 +480,7 @@ static void test_first_block_overrun_touches_nothing(void)
     send_block(0x01, 101u);
     EXPECT(0x7F, 0x36, 0x71);
     TEST_ASSERT_EQUAL_STRING("", m.log);
-    TEST_ASSERT_FALSE(srv.download_active);
+    TEST_ASSERT_FALSE(srv.update.download_active);
 }
 
 /* 0x36 needs SID + BSC + 1..4093 data bytes (0x13 otherwise, transfer untouched); with no download open, 0x24. */
@@ -497,7 +497,7 @@ static void test_transfer_data_length_and_sequence(void)
     const uint8_t sid_only[] = {UDSOTA_SID_TRANSFER_DATA};
     send(sid_only, sizeof sid_only);
     EXPECT(0x7F, 0x36, 0x13);
-    TEST_ASSERT_TRUE(srv.download_active);
+    TEST_ASSERT_TRUE(srv.update.download_active);
     TEST_ASSERT_EQUAL_STRING("", m.log);
     transfer(0x01, UDSOTA_DL_MAX_DATA, NULL);
     EXPECT(0x76, 0x01);
@@ -511,16 +511,16 @@ static void test_transfer_exit_checks_byte_count(void)
     transfer(0x01, UDSOTA_DL_MAX_DATA, NULL);
     send_37();
     EXPECT(0x7F, 0x37, 0x24);
-    TEST_ASSERT_TRUE(srv.download_active);
+    TEST_ASSERT_TRUE(srv.update.download_active);
     transfer(0x02, 50u, NULL);
     EXPECT(0x76, 0x02);
     send_37();
     EXPECT(0x77);
-    TEST_ASSERT_FALSE(srv.download_active);
-    TEST_ASSERT_TRUE(srv.ota_open);                       /* FF01 closes the handle with engine.verify */
-    TEST_ASSERT_TRUE(srv.dl_complete);                    /* FF01's precondition, with ota_open */
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_OK, srv.last_dl.reason_code);
-    TEST_ASSERT_EQUAL_UINT32(UDSOTA_DL_MAX_DATA + 50u, srv.last_dl.bytes_received);
+    TEST_ASSERT_FALSE(srv.update.download_active);
+    TEST_ASSERT_TRUE(srv.update.ota_open);                       /* FF01 closes the handle with engine.verify */
+    TEST_ASSERT_TRUE(srv.update.dl_complete);                    /* FF01's precondition, with ota_open */
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_OK, srv.update.last_dl.reason_code);
+    TEST_ASSERT_EQUAL_UINT32(UDSOTA_DL_MAX_DATA + 50u, srv.update.last_dl.bytes_received);
     TEST_ASSERT_EQUAL_UINT(0, m.aborts);
     send_37();
     EXPECT(0x7F, 0x37, 0x24);                             /* nothing open any more */
@@ -535,7 +535,7 @@ static void test_transfer_exit_bad_length(void)
     const uint8_t r[] = {UDSOTA_SID_TRANSFER_EXIT, 0x00};
     send(r, sizeof r);
     EXPECT(0x7F, 0x37, 0x13);
-    TEST_ASSERT_TRUE(srv.download_active);
+    TEST_ASSERT_TRUE(srv.update.download_active);
 }
 
 /* A new 34 after a finished but unverified download releases the old handle before the next erase. */
@@ -546,10 +546,10 @@ static void test_new_download_releases_unverified_image(void)
     transfer(0x01, 16u, NULL);
     send_37();
     EXPECT(0x77);
-    TEST_ASSERT_TRUE(srv.ota_open);
+    TEST_ASSERT_TRUE(srv.update.ota_open);
     request_download(32u);
     TEST_ASSERT_EQUAL_UINT(1, m.aborts);
-    TEST_ASSERT_FALSE(srv.ota_open);
+    TEST_ASSERT_FALSE(srv.update.ota_open);
     transfer(0x01, 32u, NULL);                            /* checked and erased afresh */
     EXPECT(0x76, 0x01);
     TEST_ASSERT_EQUAL_STRING("CBWACBW", m.log);
@@ -585,15 +585,15 @@ static void test_gate_denial_mid_transfer_ends_it(void)
     g_mock.gate_nrc[UDSOTA_OP_CONTINUE_TRANSFER] = 0x22;
     send_block(0x02, UDSOTA_DL_MAX_DATA);
     EXPECT(0x7F, 0x36, 0x22);
-    TEST_ASSERT_FALSE(srv.download_active);
+    TEST_ASSERT_FALSE(srv.update.download_active);
     TEST_ASSERT_EQUAL_INT(UDSOTA_SESSION_DEFAULT, srv.session);
     TEST_ASSERT_EQUAL_UINT8(0, srv.security);
     TEST_ASSERT_EQUAL_UINT(1, m.aborts);
     TEST_ASSERT_EQUAL_UINT(1, m.writes);
     TEST_ASSERT_EQUAL_UINT16(1, srv.counters.aborts);
     TEST_ASSERT_EQUAL_UINT16(0, srv.counters.stmin_violations);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_ABORTED, srv.last_dl.reason_code);
-    TEST_ASSERT_EQUAL_UINT32(UDSOTA_DL_MAX_DATA, srv.last_dl.bytes_received);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_ABORTED, srv.update.last_dl.reason_code);
+    TEST_ASSERT_EQUAL_UINT32(UDSOTA_DL_MAX_DATA, srv.update.last_dl.bytes_received);
     uint8_t r[UDSOTA_DL_REQ_LEN];
     build_34(r, UDSOTA_DL_DFI, UDSOTA_DL_ALFID, 0u, 4096u);
     send(r, sizeof r);
@@ -610,13 +610,13 @@ static void test_second_tester_frame_ends_transfer(void)
     const uint8_t prog[] = {UDSOTA_SID_SESSION, UDSOTA_SESSION_PROGRAMMING};
     send(prog, sizeof prog);
     EXPECT(0x7F, 0x10, 0x22);
-    TEST_ASSERT_TRUE(srv.download_active);
+    TEST_ASSERT_TRUE(srv.update.download_active);
     TEST_ASSERT_EQUAL_UINT(0, m.aborts);
     const uint8_t ext[] = {UDSOTA_SID_SESSION, UDSOTA_SESSION_EXTENDED};
     send(ext, sizeof ext);
     TEST_ASSERT_EQUAL_HEX8(0x50, g_resp[0]);
     TEST_ASSERT_EQUAL_UINT(1, m.aborts);
-    TEST_ASSERT_FALSE(srv.download_active);
+    TEST_ASSERT_FALSE(srv.update.download_active);
     TEST_ASSERT_EQUAL_UINT8(0, srv.security);
     send_block(0x02, UDSOTA_DL_MAX_DATA);
     EXPECT(0x7F, 0x36, 0x7F);
@@ -633,7 +633,7 @@ static void test_gate_nrc_mid_transfer_passed_through(void)
     g_mock.gate_nrc[UDSOTA_OP_CONTINUE_TRANSFER] = 0x88;
     send_block(0x02, UDSOTA_DL_MAX_DATA);
     EXPECT(0x7F, 0x36, 0x88);
-    TEST_ASSERT_FALSE(srv.download_active);
+    TEST_ASSERT_FALSE(srv.update.download_active);
     TEST_ASSERT_EQUAL_INT(UDSOTA_SESSION_DEFAULT, srv.session);
 }
 
@@ -649,7 +649,7 @@ static void test_fc_check_withholds_on_stmin_violation(void)
     TEST_ASSERT_EQUAL_UINT16(1, srv.counters.withheld_fcs);
     TEST_ASSERT_EQUAL_UINT16(1, srv.counters.stmin_violations);
     TEST_ASSERT_EQUAL_UINT16(1, srv.counters.aborts);
-    TEST_ASSERT_FALSE(srv.download_active);
+    TEST_ASSERT_FALSE(srv.update.download_active);
     TEST_ASSERT_EQUAL_INT(UDSOTA_SESSION_DEFAULT, srv.session);
     TEST_ASSERT_EQUAL_UINT(1, m.aborts);
     TEST_ASSERT_TRUE(udsota_fc_check(&srv, 1599u, 2000u, g_now));   /* nothing open any more */
@@ -678,7 +678,7 @@ static void test_fc_check_ignored_during_job(void)
     TEST_ASSERT_TRUE(udsota_fc_check(&srv, 100u, 2000u, g_now));
     TEST_ASSERT_EQUAL_UINT(1, g_mock.gate_calls[UDSOTA_OP_CONTINUE_TRANSFER]);   /* the 36's own; none at the FC */
     TEST_ASSERT_EQUAL_UINT16(0, srv.counters.withheld_fcs);
-    TEST_ASSERT_TRUE(srv.download_active);
+    TEST_ASSERT_TRUE(srv.update.download_active);
 }
 
 /* The CF timing an FC point recorded is re-judged on the 0x36 that follows. */
@@ -688,7 +688,7 @@ static void test_fc_timing_rechecked_on_transfer_data(void)
     request_download(TWO_BLOCKS);
     transfer(0x01, UDSOTA_DL_MAX_DATA, NULL);
     TEST_ASSERT_TRUE(udsota_fc_check(&srv, 1700u, 2000u, g_now));
-    srv.cf_median_us = 1000u;                             /* as if the last window had come in fast */
+    srv.update.cf_median_us = 1000u;                             /* as if the last window had come in fast */
     send_block(0x02, UDSOTA_DL_MAX_DATA);
     EXPECT(0x7F, 0x36, 0x22);
     TEST_ASSERT_EQUAL_UINT16(1, srv.counters.stmin_violations);
@@ -705,10 +705,10 @@ static void test_worker_write_failure_0x72(void)
     transfer(0x02, UDSOTA_DL_MAX_DATA, NULL);
     EXPECT(0x7F, 0x36, 0x72);
     TEST_ASSERT_EQUAL_STRING("CBWWA", m.log);
-    TEST_ASSERT_FALSE(srv.download_active);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_FLASH_ERROR, srv.last_dl.reason_code);
-    TEST_ASSERT_EQUAL_UINT32(UDSOTA_DL_MAX_DATA, srv.last_dl.bytes_received);
-    TEST_ASSERT_EQUAL_UINT32(UDSOTA_DL_MAX_DATA, srv.dl_received);
+    TEST_ASSERT_FALSE(srv.update.download_active);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_FLASH_ERROR, srv.update.last_dl.reason_code);
+    TEST_ASSERT_EQUAL_UINT32(UDSOTA_DL_MAX_DATA, srv.update.last_dl.bytes_received);
+    TEST_ASSERT_EQUAL_UINT32(UDSOTA_DL_MAX_DATA, srv.update.dl_received);
     send_block(0x02, UDSOTA_DL_MAX_DATA);
     EXPECT(0x7F, 0x36, 0x24);
 }
@@ -722,10 +722,10 @@ static void test_worker_erase_failure_0x72(void)
     transfer(0x01, UDSOTA_DL_MAX_DATA, NULL);
     EXPECT(0x7F, 0x36, 0x72);
     TEST_ASSERT_EQUAL_STRING("CBWA", m.log);
-    TEST_ASSERT_EQUAL_UINT32(0, srv.dl_received);
-    TEST_ASSERT_FALSE(srv.download_active);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_FLASH_ERROR, srv.last_dl.reason_code);
-    TEST_ASSERT_EQUAL_UINT32(0, srv.last_dl.bytes_received);
+    TEST_ASSERT_EQUAL_UINT32(0, srv.update.dl_received);
+    TEST_ASSERT_FALSE(srv.update.download_active);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_FLASH_ERROR, srv.update.last_dl.reason_code);
+    TEST_ASSERT_EQUAL_UINT32(0, srv.update.last_dl.bytes_received);
 }
 
 /* An erase or a write the worker could not even queue answers 0x72 at once and records UDSOTA_DL_FLASH_ERROR. */
@@ -737,9 +737,9 @@ static void test_op_not_queued_0x72(void)
     TEST_ASSERT_NOT_EQUAL(0, send_block(0x01, UDSOTA_DL_MAX_DATA));
     EXPECT(0x7F, 0x36, 0x72);
     TEST_ASSERT_EQUAL_STRING("CB", m.log);                /* nothing opened, so nothing to abort */
-    TEST_ASSERT_FALSE(srv.download_active);
-    TEST_ASSERT_FALSE(srv.ota_open);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_FLASH_ERROR, srv.last_dl.reason_code);
+    TEST_ASSERT_FALSE(srv.update.download_active);
+    TEST_ASSERT_FALSE(srv.update.ota_open);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_FLASH_ERROR, srv.update.last_dl.reason_code);
 
     memset(&m, 0, sizeof m);
     m.write_ms = 15u;
@@ -748,21 +748,21 @@ static void test_op_not_queued_0x72(void)
     m.write_ret = SYNC_ERR;
     TEST_ASSERT_NOT_EQUAL(0, send_block(0x02, UDSOTA_DL_MAX_DATA));
     EXPECT(0x7F, 0x36, 0x72);
-    TEST_ASSERT_FALSE(srv.download_active);
+    TEST_ASSERT_FALSE(srv.update.download_active);
     TEST_ASSERT_EQUAL_UINT(1, m.aborts);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_FLASH_ERROR, srv.last_dl.reason_code);
-    TEST_ASSERT_EQUAL_UINT32(UDSOTA_DL_MAX_DATA, srv.last_dl.bytes_received);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_FLASH_ERROR, srv.update.last_dl.reason_code);
+    TEST_ASSERT_EQUAL_UINT32(UDSOTA_DL_MAX_DATA, srv.update.last_dl.bytes_received);
 }
 
 /* An accepted 34 un-verifies the other slot once, before anything is queued, even with FF01 passed. */
 static void test_accepted_download_unverifies_slot(void)
 {
     enter_programming();
-    srv.slot_verified = true;                             /* as if FF01 had passed on an earlier download */
+    srv.update.slot_verified = true;                             /* as if FF01 had passed on an earlier download */
     request_download(TWO_BLOCKS);
     TEST_ASSERT_EQUAL_UINT(1, m.unverifies);
     TEST_ASSERT_EQUAL_UINT(0, m.unverify_at);             /* no OTA op ran before it */
-    TEST_ASSERT_FALSE(srv.slot_verified);                 /* a following 31 01 F001 must get 0x24 */
+    TEST_ASSERT_FALSE(srv.update.slot_verified);                 /* a following 31 01 F001 must get 0x24 */
     transfer(0x01, UDSOTA_DL_MAX_DATA, NULL);
     EXPECT(0x76, 0x01);
     TEST_ASSERT_EQUAL_UINT(1, m.unverifies);              /* 0x36 does not call it again */
@@ -785,7 +785,7 @@ static void test_unverify_precedes_old_handle_abort(void)
 /* Every refused 34 (0x7F, 0x33, 0x13, 0x22, 0x31) leaves the verified state alone and never calls engine.unverify. */
 static void test_refused_download_does_not_unverify(void)
 {
-    srv.slot_verified = true;
+    srv.update.slot_verified = true;
     uint8_t r[UDSOTA_DL_REQ_LEN];
     build_34(r, UDSOTA_DL_DFI, UDSOTA_DL_ALFID, 0u, 4096u);
     send(r, sizeof r);  EXPECT(0x7F, 0x34, 0x7F);         /* default session */
@@ -800,7 +800,7 @@ static void test_refused_download_does_not_unverify(void)
     build_34(r, 0x11, UDSOTA_DL_ALFID, 0u, 4096u);
     send(r, sizeof r);  EXPECT(0x7F, 0x34, 0x31);
     TEST_ASSERT_EQUAL_UINT(0, m.unverifies);
-    TEST_ASSERT_TRUE(srv.slot_verified);
+    TEST_ASSERT_TRUE(srv.update.slot_verified);
     request_download(4096u);
     TEST_ASSERT_EQUAL_UINT(1, m.unverifies);
     build_34(r, UDSOTA_DL_DFI, UDSOTA_DL_ALFID, 0u, 4096u);
@@ -816,9 +816,9 @@ static void test_null_unverify_op_is_safe(void)
     no_unverify.unverify = NULL;
     boot(&no_unverify);
     enter_programming();
-    srv.slot_verified = true;
+    srv.update.slot_verified = true;
     request_download(16u);
-    TEST_ASSERT_FALSE(srv.slot_verified);
+    TEST_ASSERT_FALSE(srv.update.slot_verified);
     transfer(0x01, 16u, NULL);
     EXPECT(0x76, 0x01);
     send_37();
@@ -838,9 +838,9 @@ static void test_request_download_bounded_by_engine_slot_size(void)
     build_34(r, UDSOTA_DL_DFI, UDSOTA_DL_ALFID, 0u, 0x1001u);
     send(r, sizeof r);
     EXPECT(0x7F, 0x34, 0x31);
-    TEST_ASSERT_FALSE(srv.download_active);
+    TEST_ASSERT_FALSE(srv.update.download_active);
     request_download(0x1000u);                                /* asserts 74 20 0F FF */
-    TEST_ASSERT_EQUAL_UINT32(0x1000u, srv.dl_announced);
+    TEST_ASSERT_EQUAL_UINT32(0x1000u, srv.update.dl_announced);
 }
 
 /* Runs every download test. */

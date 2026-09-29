@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build and run the host tests (core, isotp, port logic, fuzz corpus)
+      - name: Build and run the host tests (core, isotp, port logic, seam checks, fuzz corpus)
         run: tools/run_tests.sh
 
   client:
@@ -92,7 +92,8 @@ jobs:
         shell: bash
         run: |
           case "${{ matrix.target }}" in esp32) chip=0x0000 ;; esp32s3) chip=0x0009 ;; esac
-          gcc -std=c11 -Wall -Wextra -Werror -Icomponents/udsota/include -Icomponents/udsota/update/include \
+          gcc -std=c11 -Wall -Wextra -Werror -Icomponents/udsota/include -Icomponents/udsota/server/include \
+              -Icomponents/udsota/update/include \
               -Icomponents/udsota_esp32/include -Icomponents/udsota_esp32/update/include \
               tools/image_check.c components/udsota_esp32/update/udsota_esp32_image.c \
               components/udsota/update/udsota_image.c \

@@ -330,7 +330,7 @@ static void test_gate_denial_at_transfer_ends_it(void)
     TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_DEFAULT, s.session);
     TEST_ASSERT_EQUAL_UINT8(0, s.security);
     TEST_ASSERT_EQUAL_UINT(1, e.aborts);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_ABORTED, s.last_dl.reason_code);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_ABORTED, s.update.last_dl.reason_code);
     TEST_ASSERT_EQUAL_UINT16(0, s.counters.stmin_violations);
 }
 
@@ -477,8 +477,8 @@ static void test_end_session_mid_transfer(void)
     TEST_ASSERT_EQUAL_UINT8(0, s.security);
     TEST_ASSERT_FALSE(udsota_download_active(&s));
     TEST_ASSERT_EQUAL_UINT(1, e.aborts);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_ABORTED, s.last_dl.reason_code);
-    TEST_ASSERT_EQUAL_UINT32(BLK, s.last_dl.bytes_received);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_ABORTED, s.update.last_dl.reason_code);
+    TEST_ASSERT_EQUAL_UINT32(BLK, s.update.last_dl.bytes_received);
     TEST_ASSERT_EQUAL_INT(UDSOTA_PHASE_IDLE, g_mock.phases[g_mock.phase_n - 1u]);
     block(2);
     EXPECT(0x7F, 0x36, 0x7F);
@@ -512,8 +512,8 @@ static void test_end_session_with_pending_write(void)
     TEST_ASSERT_FALSE(s.worker_orphan);
     TEST_ASSERT_FALSE(udsota_download_active(&s));
     TEST_ASSERT_EQUAL_UINT(1, e.aborts);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_ABORTED, s.last_dl.reason_code);
-    TEST_ASSERT_EQUAL_UINT32(BLK, s.last_dl.bytes_received);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_ABORTED, s.update.last_dl.reason_code);
+    TEST_ASSERT_EQUAL_UINT32(BLK, s.update.last_dl.bytes_received);
     TEST_ASSERT_EQUAL_INT(UDSOTA_PHASE_IDLE, udsota_phase(&s));
     block(2);
     EXPECT(0x7F, 0x36, 0x7F);
@@ -568,8 +568,8 @@ static void test_end_session_latch_applied_at_fc_point(void)
     TEST_ASSERT_EQUAL_UINT8(0, s.security);
     TEST_ASSERT_FALSE(udsota_download_active(&s));
     TEST_ASSERT_EQUAL_UINT(1, e.aborts);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_ABORTED, s.last_dl.reason_code);
-    TEST_ASSERT_EQUAL_UINT32(BLK, s.last_dl.bytes_received);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_ABORTED, s.update.last_dl.reason_code);
+    TEST_ASSERT_EQUAL_UINT32(BLK, s.update.last_dl.bytes_received);
     REQ(0x22, 0xF1, 0x86);
     EXPECT(0x62, 0xF1, 0x86, UDSOTA_SESSION_DEFAULT);
 }
@@ -636,12 +636,12 @@ static void test_end_session_during_pending_verify(void)
     now += 5u;
     rlen = udsota_poll(&s, resp, sizeof resp, now);
     EXPECT(0x71, 0x01, HI(UDSOTA_RID_CHECK_PROG_DEPS), LO(UDSOTA_RID_CHECK_PROG_DEPS), UDSOTA_DL_OK);
-    TEST_ASSERT_TRUE(s.slot_verified);
+    TEST_ASSERT_TRUE(s.update.slot_verified);
     now += 5u;
     udsota_poll(&s, resp, sizeof resp, now);
     TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_DEFAULT, s.session);
-    TEST_ASSERT_TRUE(s.slot_verified);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_OK, s.last_dl.reason_code);
+    TEST_ASSERT_TRUE(s.update.slot_verified);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_OK, s.update.last_dl.reason_code);
 }
 
 /* A worker orphan does not hold end_session back: after the 90 s cap, a new extended session ends at once. */
@@ -831,6 +831,57 @@ static void test_server_owned_dids_and_fallback(void)
     }
 }
 
+/* What eng_version_n and eng_sha_n return, whatever the room: SIZE_MAX or 0, neither a length they wrote. */
+static size_t g_engine_did_n;
+/* engine.version returning g_engine_did_n. */
+static size_t eng_version_n(void *ctx, char *out, size_t max) { return g_engine_did_n; }
+/* engine.running_sha returning g_engine_did_n. */
+static size_t eng_sha_n(void *ctx, uint8_t *out, size_t max) { return g_engine_did_n; }
+
+/* The app behind hooks.did_read serving F189 and F1F3 itself: AA BB. */
+static size_t app_updater_dids(uint16_t did, uint8_t *buf, size_t max)
+{
+    if ((did != UDSOTA_DID_SW_VERSION && did != UDSOTA_DID_RUNNING_SHA) || max < 2u) {
+        return 0;
+    }
+    buf[0] = 0xAA;
+    buf[1] = 0xBB;
+    return 2;
+}
+
+/* An engine source that answers SIZE_MAX (the service's "not mine" value) or 0 is 0x31: the engine owns F189 and
+ * F1F3 while it sets version and running_sha, so neither answer falls through to hooks.did_read, even with an app
+ * that serves both DIDs. */
+static void test_engine_did_size_max_or_zero_is_31(void)
+{
+    static udsota_engine_t eng;
+    eng = ENGINE;
+    eng.version = eng_version_n;
+    eng.running_sha = eng_sha_n;
+    g_mock.app_did = app_updater_dids;
+    udsota_init(&s, &g_cfg, &eng, udsota_mock_security(), &g_hooks);
+    static const size_t NS[] = {SIZE_MAX, 0u};
+    static const uint16_t DIDS[] = {UDSOTA_DID_SW_VERSION, UDSOTA_DID_RUNNING_SHA};
+    for (size_t i = 0; i < sizeof NS / sizeof NS[0]; i++) {
+        for (size_t d = 0; d < sizeof DIDS / sizeof DIDS[0]; d++) {
+            g_engine_did_n = NS[i];
+            g_mock.did_reads = 0;
+            const uint8_t rd[3] = {0x22, HI(DIDS[d]), LO(DIDS[d])};
+            txn(rd, sizeof rd);
+            EXPECT(0x7F, 0x22, 0x31);
+            TEST_ASSERT_EQUAL_UINT(0, g_mock.did_reads);
+        }
+    }
+    eng.version = NULL;                        /* the known positive: with the sources NULL the app serves both */
+    eng.running_sha = NULL;
+    udsota_init(&s, &g_cfg, &eng, udsota_mock_security(), &g_hooks);
+    for (size_t d = 0; d < sizeof DIDS / sizeof DIDS[0]; d++) {
+        const uint8_t rd[3] = {0x22, HI(DIDS[d]), LO(DIDS[d])};
+        txn(rd, sizeof rd);
+        EXPECT(0x62, HI(DIDS[d]), LO(DIDS[d]), 0xAA, 0xBB);
+    }
+}
+
 /* Without engine.status the core's slot conditions are not checked: 10 02 opens though the mock's status says
  * the boot slot moved, and ConfirmImage goes straight to the gate and the engine. */
 static void test_no_status_skips_slot_checks(void)
@@ -933,6 +984,7 @@ int main(void)
     RUN_TEST(test_config_defaults_and_overrides);
     RUN_TEST(test_max_block_len_clamped_to_4095);
     RUN_TEST(test_server_owned_dids_and_fallback);
+    RUN_TEST(test_engine_did_size_max_or_zero_is_31);
     RUN_TEST(test_no_status_skips_slot_checks);
     RUN_TEST(test_confirm_core_rule_per_state);
     RUN_TEST(test_restart_waits_without_tx_pending);

@@ -25,13 +25,14 @@ set(STUBS      ${TEST_DIR}/stubs)
 include(${ROOT}/components/udsota/sources.cmake)         # UDSOTA_*: the core's files and include dirs
 include(${ROOT}/components/udsota_esp32/sources.cmake)   # UDSOTA_ESP32_*: the port's
 set(CORE_INC   ${UDSOTA_INCLUDE_DIRS})
-set(CORE_PRIV  ${UDSOTA_PRIV_INCLUDE_DIRS})
 set(CORE_TEST  ${ROOT}/components/udsota/test)
 set(INFLATE_DIR ${ROOT}/components/udsota_inflate)
 set(DELTA_DIR  ${ROOT}/components/udsota_delta)
 
-# sources.cmake is what each component compiles, so a .c file it doesn't list would go unbuilt without a word:
-# stop on any difference between the files on disk and the list.
+# sources.cmake is what each component compiles, so a .c file it doesn't list would go unbuilt without a word, and
+# one listed under another directory's list would reach the wrong build (a server/ file under the update list escapes
+# the core-only build below): stop unless the component's .c files are exactly its whole list, and each directory's
+# exactly that directory's list.
 function(udsota_check_srcs dir listed)
     file(GLOB found CONFIGURE_DEPENDS ${dir}/*.c ${dir}/server/*.c ${dir}/update/*.c ${dir}/bootloop/*.c)
     list(SORT found)
@@ -40,9 +41,24 @@ function(udsota_check_srcs dir listed)
         message(FATAL_ERROR "${dir}/sources.cmake does not list exactly the .c files there:\n"
                             "  on disk: ${found}\n  listed:  ${listed}")
     endif()
+    foreach(pair IN LISTS ARGN)                      # <subdir>=<list variable>
+        string(REPLACE "=" ";" pair "${pair}")
+        list(GET pair 0 sub)
+        list(GET pair 1 var)
+        file(GLOB found CONFIGURE_DEPENDS ${dir}/${sub}/*.c)
+        set(own ${${var}})
+        list(SORT found)
+        list(SORT own)
+        if(NOT found STREQUAL own)
+            message(FATAL_ERROR "${dir}/sources.cmake's ${var} is not exactly the .c files in ${sub}/:\n"
+                                "  on disk: ${found}\n  listed:  ${own}")
+        endif()
+    endforeach()
 endfunction()
-udsota_check_srcs(${ROOT}/components/udsota "${UDSOTA_SRCS}")
-udsota_check_srcs(${ROOT}/components/udsota_esp32 "${UDSOTA_ESP32_SRCS}")
+udsota_check_srcs(${ROOT}/components/udsota "${UDSOTA_SRCS}"
+    server=UDSOTA_SERVER_SRCS update=UDSOTA_UPDATE_SRCS bootloop=UDSOTA_BOOTLOOP_SRCS)
+udsota_check_srcs(${ROOT}/components/udsota_esp32 "${UDSOTA_ESP32_SRCS}"
+    server=UDSOTA_ESP32_SERVER_SRCS update=UDSOTA_ESP32_UPDATE_SRCS bootloop=UDSOTA_ESP32_BOOTLOOP_SRCS)
 # ESP-IDF stops on an include dir that doesn't exist and a plain CMake build doesn't notice one: stop here too.
 foreach(d IN LISTS UDSOTA_INCLUDE_DIRS UDSOTA_PRIV_INCLUDE_DIRS UDSOTA_ESP32_INCLUDE_DIRS UDSOTA_ESP32_PRIV_INCLUDE_DIRS)
     if(NOT IS_DIRECTORY "${d}")
@@ -105,16 +121,18 @@ udsota_test(test_udsota_bootloop
     SOURCES  test/test_udsota_bootloop.c ${UDSOTA_BOOTLOOP_SRCS})
 
 # ---- Server, over SERVER_SRCS alone. _write: 0x2E through hooks.did_write, and the access state and session epoch
-# every app hook gets. _progress: udsota_progress() and hooks.progress after each step of a download.
+# every app hook gets. _progress: udsota_progress() and hooks.progress after each step of a download. _no_engine: the
+# server with no updater registered (udsota_init with a NULL engine).
 foreach(t IN ITEMS server server_security server_routines server_matrix server_hooks server_write
-                   server_functional server_progress)
-    udsota_test(test_udsota_${t} SOURCES test/test_udsota_${t}.c ${SERVER_SRCS} INCLUDES ${CORE_PRIV})
+                   server_functional server_progress server_no_engine)
+    udsota_test(test_udsota_${t} SOURCES test/test_udsota_${t}.c ${SERVER_SRCS})
 endforeach()
+target_include_directories(test_udsota_server_no_engine PRIVATE ${TEST_DIR}/core_only)   # the rows it shares
 
 # The download test also runs the real first-block rules behind engine.check_first.
 udsota_test(test_udsota_server_download
     SOURCES  test/test_udsota_server_download.c ${SERVER_SRCS} ${UDSOTA_IMAGE_SRCS}
-    INCLUDES ${CORE_PRIV} ${TEST_DIR})
+    INCLUDES ${TEST_DIR})
 
 # Compressed downloads: the stream and the real tinfl behind an engine's z ops, with the core image rules. The test
 # compiles its own miniz with deflate on, to make the streams it sends.
@@ -123,7 +141,7 @@ set(ZSTREAM_INC ${INFLATE_DIR}/include ${INFLATE_DIR})
 set(MINIZ_TEST_DEFS MINIZ_NO_STDIO MINIZ_NO_TIME MINIZ_NO_ARCHIVE_APIS MINIZ_NO_ZLIB_APIS)   # deflate on, for tdefl
 udsota_test(test_udsota_server_compress
     SOURCES  test/test_udsota_server_compress.c ${SERVER_SRCS} ${ZSTREAM_SRCS} ${UDSOTA_IMAGE_SRCS}
-    INCLUDES ${CORE_PRIV} ${TEST_DIR} ${ZSTREAM_INC})
+    INCLUDES ${TEST_DIR} ${ZSTREAM_INC})
 target_compile_definitions(test_udsota_server_compress PRIVATE ${MINIZ_TEST_DEFS})
 
 # Delta downloads (DFI 0x20 and 0x30): udsota_coded over the real detools and tinfl, with the core image rules, on the
@@ -132,21 +150,19 @@ target_compile_definitions(test_udsota_server_compress PRIVATE ${MINIZ_TEST_DEFS
 udsota_test(test_udsota_server_delta
     SOURCES  test/test_udsota_server_delta.c ${SERVER_SRCS} ${ZSTREAM_SRCS} ${UDSOTA_CODED_SRCS}
              ${UDSOTA_IMAGE_SRCS}
-    INCLUDES ${CORE_PRIV} ${TEST_DIR} ${ZSTREAM_INC} ${DELTA_DIR}/include
+    INCLUDES ${TEST_DIR} ${ZSTREAM_INC} ${DELTA_DIR}/include
     LIBS     udsota_delta)
 target_compile_definitions(test_udsota_server_delta PRIVATE ${MINIZ_TEST_DEFS})
 
 # The server with compressed downloads compiled out (UDSOTA_COMPRESSION=0): its own test, and the download and progress
 # tests again, which must pass unchanged.
 udsota_test(test_udsota_server_nocompress
-    SOURCES  test/test_udsota_server_nocompress.c ${SERVER_SRCS}
-    INCLUDES ${CORE_PRIV})
+    SOURCES  test/test_udsota_server_nocompress.c ${SERVER_SRCS})
 udsota_test(test_udsota_server_download_nocompress
     SOURCES  test/test_udsota_server_download.c ${SERVER_SRCS} ${UDSOTA_IMAGE_SRCS}
-    INCLUDES ${CORE_PRIV} ${TEST_DIR})
+    INCLUDES ${TEST_DIR})
 udsota_test(test_udsota_server_progress_nocompress
-    SOURCES  test/test_udsota_server_progress.c ${SERVER_SRCS}
-    INCLUDES ${CORE_PRIV})
+    SOURCES  test/test_udsota_server_progress.c ${SERVER_SRCS})
 foreach(t IN ITEMS test_udsota_server_nocompress test_udsota_server_download_nocompress
                    test_udsota_server_progress_nocompress)
     target_compile_definitions(${t} PRIVATE UDSOTA_COMPRESSION=0)
@@ -175,20 +191,20 @@ udsota_test(test_udsota_esp32_image
 # real stream and tinfl for a compressed download.
 udsota_test(test_udsota_esp32_ctl
     SOURCES  test/test_udsota_esp32_ctl.c ${UDSOTA_ESP32_CTL_SRCS} ${SERVER_SRCS} ${ZSTREAM_SRCS}
-    INCLUDES ${CORE_PRIV} ${UDSOTA_ESP32_PRIV_INCLUDE_DIRS} ${TEST_DIR} ${ZSTREAM_INC})
+    INCLUDES ${UDSOTA_ESP32_PRIV_INCLUDE_DIRS} ${TEST_DIR} ${ZSTREAM_INC})
 target_compile_definitions(test_udsota_esp32_ctl PRIVATE ${MINIZ_TEST_DEFS})
 
 # The device ID the port serves as F18C and the K_dev and keys over it, with the real server and key derivation.
 udsota_test(test_udsota_esp32_devid
     SOURCES  test/test_udsota_esp32_devid.c ${UDSOTA_ESP32_DEVID_SRCS} ${UDSOTA_KEYS_SRCS} ${SERVER_SRCS}
-    INCLUDES ${CORE_PRIV} ${UDSOTA_ESP32_INCLUDE_DIRS} ${UDSOTA_ESP32_PRIV_INCLUDE_DIRS})
+    INCLUDES ${UDSOTA_ESP32_INCLUDE_DIRS} ${UDSOTA_ESP32_PRIV_INCLUDE_DIRS})
 
 # The 0x27 mode the port's config selects and the ECDSA key check over the device ID, with the real server, key
 # messages and device ID, and a stand-in verify on the host SHA-256.
 udsota_test(test_udsota_esp32_sa
     SOURCES  test/test_udsota_esp32_sa.c ${UDSOTA_ESP32_SA_SRCS} ${UDSOTA_ESP32_DEVID_SRCS}
              ${UDSOTA_KEYS_SRCS} ${CORE_TEST}/sha256_host.c ${SERVER_SRCS}
-    INCLUDES ${CORE_PRIV} ${CORE_TEST} ${UDSOTA_ESP32_INCLUDE_DIRS} ${UDSOTA_ESP32_PRIV_INCLUDE_DIRS})
+    INCLUDES ${CORE_TEST} ${UDSOTA_ESP32_INCLUDE_DIRS} ${UDSOTA_ESP32_PRIV_INCLUDE_DIRS})
 
 # ---- Host fake of a two-slot OTA engine (file-backed, POSIX), the engine behind tools/linux_server's demo
 # server. Its test checks the fake and its SHA-256 against known answers.
@@ -218,6 +234,55 @@ add_test(NAME udsota_core_probe_freertos
 set_tests_properties(udsota_core_probe_freertos PROPERTIES
     PASS_REGULAR_EXPRESSION "error: (freertos/FreeRTOS\\.h: No such file|'freertos/FreeRTOS\\.h' file not found)")
 
+# ---- The server without the updater. udsota_server_only is server/ alone (UDSOTA_SERVER_SRCS), compiled with
+# server/include, isotp and a build-dir copy of udsota_update_state.h (the one updater header the server context may
+# name) on its include path: a core file that includes any other updater header through the include path fails to
+# compile, and tools/check_seam.sh catches one included by a relative path. An OBJECT library,
+# not an archive, so every object reaches the link: test_udsota_core_only links it alone, and a core call into the
+# updater fails that link. It runs the no-updater rows through udsota_core_init, a test-local service and the
+# ISO-TP adapter.
+set(UDSOTA_UPDATE_STATE_H ${ROOT}/components/udsota/update/include/udsota_update_state.h)
+set(CORE_ONLY_INC ${CMAKE_CURRENT_BINARY_DIR}/core_only_include)
+file(REMOVE_RECURSE ${CORE_ONLY_INC})
+configure_file(${UDSOTA_UPDATE_STATE_H} ${CORE_ONLY_INC}/udsota_update_state.h COPYONLY)   # the one updater header allowed
+add_library(udsota_server_only OBJECT ${UDSOTA_SERVER_SRCS})
+target_include_directories(udsota_server_only PUBLIC ${UDSOTA_SERVER_INCLUDE_DIRS} ${CORE_ONLY_INC})
+target_link_libraries(udsota_server_only PUBLIC isotp)
+target_compile_options(udsota_server_only PRIVATE -Wall -Wextra -Werror)
+add_executable(test_udsota_core_only test/core_only/test_udsota_core_only.c)
+target_include_directories(test_udsota_core_only PRIVATE ${TEST_DIR}/core_only)
+target_compile_options(test_udsota_core_only PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter)
+target_link_libraries(test_udsota_core_only PRIVATE udsota_server_only unity m)
+add_test(NAME test_udsota_core_only COMMAND test_udsota_core_only)
+
+# Its probes, each a known positive: the core-only include path can't reach an updater header, yet the state header
+# compiles alone on it; and server/'s objects don't define an updater function (udsota_pack_result), so a program
+# that calls one fails to link against them.
+set(CORE_ONLY_PROBE_INC ${UDSOTA_SERVER_INCLUDE_DIRS} ${CORE_ONLY_INC} ${ISOTP_INC})
+list(TRANSFORM CORE_ONLY_PROBE_INC PREPEND -I)
+add_test(NAME udsota_core_only_probe_updater
+         COMMAND ${CMAKE_C_COMPILER} -std=c11 -fsyntax-only ${CORE_ONLY_PROBE_INC} -DPROBE_UPDATER
+                 ${TEST_DIR}/fixtures/udsota_portable_probe.c)
+set_tests_properties(udsota_core_only_probe_updater PROPERTIES
+    PASS_REGULAR_EXPRESSION "error: (udsota_image\\.h: No such file|'udsota_image\\.h' file not found)")
+add_test(NAME udsota_core_only_probe_state
+         COMMAND ${CMAKE_C_COMPILER} -std=c11 -fsyntax-only -Wall -Wextra -Werror -I${CORE_ONLY_INC} -DPROBE_STATE
+                 ${TEST_DIR}/fixtures/udsota_portable_probe.c)
+add_test(NAME udsota_core_only_link_updater
+         COMMAND ${CMAKE_C_COMPILER} -DPROBE_LINK_UPDATER ${TEST_DIR}/fixtures/udsota_portable_probe.c
+                 $<TARGET_OBJECTS:udsota_server_only> $<TARGET_FILE:isotp>
+                 -o ${CMAKE_CURRENT_BINARY_DIR}/udsota_core_only_link_updater
+         COMMAND_EXPAND_LISTS)
+set_tests_properties(udsota_core_only_link_updater PROPERTIES
+    PASS_REGULAR_EXPRESSION   # GNU ld and gold; lld and mold; ld64, which names the symbol on the next line
+    "undefined reference to .?udsota_pack_result;undefined symbol: .?udsota_pack_result;Undefined symbols[^\n]*\n[^\n]*\"_udsota_pack_result\"")
+
+# The seam's other direction: no server/ source, the port's included, touches the updater's member of the context or
+# names an update/include header but udsota_update_state.h, by any path. The port's server/ still takes the updater
+# through the umbrella udsota.h; the core's can't, since the core-only build has no include/ on its path.
+add_test(NAME udsota_seam_grep COMMAND sh ${ROOT}/tools/check_seam.sh)
+set_tests_properties(udsota_seam_grep PROPERTIES PASS_REGULAR_EXPRESSION "check_seam: PASS")
+
 # ---- UDS request-parser fuzz harness (on by default; -DUDSOTA_FUZZ=OFF skips it) ----
 # Replays built-in seeds and their mutants (and any corpus in UDSOTA_FUZZ_CORPUS) through the pure
 # server, with guard pages in place of ASan and UBSan in trap mode (no runtime library needed).
@@ -245,7 +310,7 @@ if(UDSOTA_FUZZ AND UDSOTA_FUZZ_SAN_OK)
     function(udsota_fuzz name timeout)
         cmake_parse_arguments(F "" "DIGEST" "SOURCES;INCLUDES;DEFS" ${ARGN})
         udsota_test(${name} SOURCES ${CORE_TEST}/fuzz_udsota.c ${SERVER_SRCS} ${F_SOURCES}
-                            INCLUDES ${CORE_PRIV} ${F_INCLUDES})
+                            INCLUDES ${F_INCLUDES})
         target_compile_options(${name} PRIVATE ${FUZZ_SAN})
         target_link_options(${name} PRIVATE ${FUZZ_SAN})
         target_compile_definitions(${name} PRIVATE UDSOTA_FUZZ_UBSAN_TRAP=1 ${F_DEFS})
@@ -272,6 +337,10 @@ if(UDSOTA_FUZZ AND UDSOTA_FUZZ_SAN_OK)
     # hook set so that its checks hold on the compressed path too.
     udsota_fuzz(fuzz_udsota_z 600 DIGEST 2488a2952adadc9e SOURCES ${ZSTREAM_SRCS} INCLUDES ${ZSTREAM_INC}
                 DEFS UDSOTA_FUZZ_Z=1 UDSOTA_FUZZ_PROGRESS=1 ${MINIZ_TEST_DEFS})
+    # The same harness with no update service (udsota_init given a NULL engine), from the five states a download
+    # isn't needed for: 34, 36 and 37 get only 0x11 (0x21 while an app routine runs), and the app hooks give 0x31
+    # its positive answers.
+    udsota_fuzz(fuzz_udsota_no_update 300 DIGEST 7e2cee56a31e126f DEFS UDSOTA_FUZZ_NO_UPDATE=1 UDSOTA_FUZZ_APP_HOOKS=1)
     # The delta patch path on mutated patches (test/fuzz_udsota_patch.c): udsota_coded over the real detools and
     # tinfl, with AddressSanitizer where the toolchain has it, since the device parses these patches from the bus.
     set(FUZZ_PATCH_SAN ${FUZZ_SAN})

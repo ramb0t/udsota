@@ -6,7 +6,7 @@
 #include <string.h>
 #include "unity.h"
 #include "udsota.h"
-#include "udsota_priv.h"
+#include "udsota_service.h"
 #include "udsota_mock.h"
 
 #define T0        60000u   /* every test starts 60 s after boot, past SecurityAccess's 10 s boot delay */

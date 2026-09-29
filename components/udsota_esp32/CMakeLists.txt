@@ -14,8 +14,8 @@ idf_component_register(SRCS ${UDSOTA_ESP32_SRCS}
                        PRIV_REQUIRES isotp udsota_inflate udsota_delta app_update esp_partition esp_app_format esp_timer
                                      spi_flash bootloader_support mbedtls)
 
-# Without compressed downloads the core compiles none of the coded-download handling either (UDSOTA_COMPRESSION,
-# udsota.h).
+# Without compressed downloads the updater compiles none of the coded-download handling either (UDSOTA_COMPRESSION,
+# udsota_update.h).
 if(NOT CONFIG_UDSOTA_ESP32_COMPRESSION)
     idf_component_get_property(udsota_lib udsota COMPONENT_LIB)
     target_compile_definitions(${udsota_lib} PRIVATE UDSOTA_COMPRESSION=0)

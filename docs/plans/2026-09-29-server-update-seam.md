@@ -18,7 +18,7 @@ These settle where the planners differed or asked.
 - **Red-first tests.** The engine-NULL test crashes today (SIGSEGV at `udsota_server.c:227` and `:1099`), which CTest's `WILL_FAIL` does not invert. So the new tests land in the commit where they pass, and the PR records their failure against the step-1 tree (`gdb -batch` backtraces).
 - **Core-only check:** an OBJECT library of `server/` sources (a static archive would hide unreferenced updater calls), plus include and link probes on the existing `udsota_core_probe_*` pattern. It lands with the physical split, where it first passes.
 - **Grep check:** `tools/check_seam.sh` scans both `server/` directories (the port's `udsota_esp32.c` touches only `counters`, so it passes), with a fixture of known hits and near-misses and a live positive in `update/`, so an empty result is trusted.
-- **The context isn't regrouped.** The table pointer adds 4 B to `udsota_server_t` (364 B on Xtensa today); the PR states the measured figure, as the response allows, rather than reordering core fields to win it back.
+- **The context isn't regrouped.** The context grows 8 B on Xtensa, 364 to 372 (measured): the table pointer and 4 B of padding from nesting `udsota_update_t`. The CHANGELOG states it, as the response allows, rather than reordering core fields to win it back.
 - **Headers.** `udsota_update_state.h` is self-contained and holds the wire types the embedded engine needs (`udsota_reason_t`, `udsota_status_t`, `udsota_result_t`) plus the progress types `hooks.progress` names. `UDSOTA_DL_MAX_BLOCK_LEN` stays in the server wire header and joins the response's "mixes" list. New header basenames stay unique, since every include resolves by basename.
 - **A non-app job with no service registered** (only a test can make one) polls as `UDSOTA_NRC_GENERAL_REJECT`, as `app_poll` does without `routine_poll`.
 - **`withheld_fcs`** stays bumped in the core's `udsota_fc_check`, which is reachable only with a service.
@@ -60,7 +60,7 @@ Verify: the four fuzz digests equal 0.8.0's (the harness is deterministic), whic
 3. `examples/esp32/sdkconfig.noupdater` in the CI matrix, with a check that the option took effect and that `esp_ota_begin` is absent (and present in the default build, the known positive). The example's `main.c` gains calls to `udsota_esp32_engine_busy()` and `udsota_esp32_status()` so the link proves the stubs CANDash needs exist; today it calls only `udsota_esp32_image_unconfirmed()`.
 4. Docs: the port README's "Without the updater" section and a CHANGELOG entry with measured numbers. Additive, not Breaking.
 
-An engine-less build saves about 12.7 KB of internal heap (worker stack, block buffer, queue) and an estimated 10-20 KB of flash, to be measured. It still pays for the ISO-TP buffers (8,958 B). Detail: [port](2026-09-29-seam-step3-port.md).
+Measured, an engine-less build's image is about 23.4 KB smaller and its static internal RAM about 400 B smaller; by computation it saves about 12.5 KB of internal heap (worker stack, TCB, block buffer, queue), not yet measured on a board. It still pays for the ISO-TP buffers (8,958 B). Detail: [port](2026-09-29-seam-step3-port.md).
 
 ## CANDash's one change
 
