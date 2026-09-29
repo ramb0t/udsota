@@ -1,8 +1,9 @@
 /* udsota ESP32 port (ESP-IDF v6.1): the diag task that owns the ISO-TP link and the UDS server
  * (udsota_esp32_start), the update engine on esp_ota_* (flash worker and OTA state cache), 0x27 security
  * on PSA HMAC-SHA256 or PSA ECDSA and the hardware RNG, the PSA lock they share with the app, the boot-loop
- * counter in RTC memory and the image descriptor placement. Host code may include it: it needs only the core
- * headers and esp_err.h (test/stubs has one). */
+ * counter in RTC memory and the image descriptor placement. Without CONFIG_UDSOTA_ESP32_UPDATER the port is a UDS
+ * server alone: the engine's functions below are stubs, and the rest works as before. Host code may include it: it
+ * needs only the core headers and esp_err.h (test/stubs has one). */
 #pragma once
 #include <stdbool.h>
 #include <stddef.h>
@@ -14,7 +15,7 @@
 #define UDSOTA_ESP32_DEVICE_ID_LEN     6u           /* the base MAC: the device ID when cfg.device_id is NULL */
 #define UDSOTA_ESP32_PSA_WAIT_FOREVER  UINT32_MAX   /* udsota_esp32_psa_lock(): no time limit */
 
-/* ---- Engine (udsota_esp32_engine.c) ---- */
+/* ---- Engine (udsota_esp32_engine.c; without CONFIG_UDSOTA_ESP32_UPDATER, udsota_esp32_noupdater.c's stubs) ---- */
 
 /* The engine for udsota_init() or another front end. Its jobs run on the worker: the ops queue them and
  * return UDSOTA_PENDING, and poll() reports the result. One task (the server's) calls its ops. Before the
@@ -22,17 +23,20 @@
  * UDSOTA_DL_FLASH_ERROR, begin, write, verify and activate refuse with a negative error, as does confirm with
  * rollback on (without rollback confirm returns 0 as always), and abort does nothing. poll reads 0 (nothing queued),
  * status reads UDSOTA_SLOT_NONE and slot_size 0 (UDSOTA_SLOT_SIZE_DEFAULT). The core never calls confirm
- * then: it refuses ConfirmImage while the running slot reads UDSOTA_SLOT_NONE. */
+ * then: it refuses ConfirmImage while the running slot reads UDSOTA_SLOT_NONE. Without CONFIG_UDSOTA_ESP32_UPDATER
+ * it returns NULL, which udsota_init() takes as no updater. */
 const udsota_engine_t *udsota_esp32_engine(void);
 /* The status DID (0xF1F0) from the RAM cache, never otadata: slots and states, the other slot's version and
  * SHA prefix, flag 0x01 (IDF checks update signatures) and 0x02 (this boot ignored config). Any task, not
  * from an ISR, and safe before the engine starts: the slots read UDSOTA_SLOT_NONE until the boot read has
- * finished. With rollback off the running state is never PENDING_VERIFY. */
+ * finished. With rollback off the running state is never PENDING_VERIFY. Without CONFIG_UDSOTA_ESP32_UPDATER the
+ * slots always read UDSOTA_SLOT_NONE and only the flags are set, with the same meaning. */
 void udsota_esp32_status(udsota_status_t *out);
-/* True when the running image is PENDING_VERIFY and is the boot slot; from the cache, any task. */
+/* True when the running image is PENDING_VERIFY and is the boot slot; from the cache, any task. Always false
+ * without CONFIG_UDSOTA_ESP32_UPDATER. */
 bool udsota_esp32_image_unconfirmed(void);
 /* True while an engine job is queued or running, or the started worker's boot read has not finished; false when
- * the engine never started. Any task. */
+ * the engine never started, and always without CONFIG_UDSOTA_ESP32_UPDATER. Any task. */
 bool udsota_esp32_engine_busy(void);
 
 /* ---- Security (udsota_esp32_keys.c) ---- */
@@ -88,7 +92,9 @@ void udsota_esp32_bootloop_mark_healthy(void);
 
 /* ---- Image descriptor ---- */
 
-/* The running image's descriptor, which the app defines with UDSOTA_ESP32_IMAGE_DESC. */
+/* The running image's descriptor, which the app defines with UDSOTA_ESP32_IMAGE_DESC. The engine reads its release
+ * flag; without CONFIG_UDSOTA_ESP32_UPDATER nothing here reads it, and it still identifies the image to whatever
+ * updates it. */
 extern const udsota_image_desc_t udsota_image_desc;
 
 #ifndef UDSOTA_ESP32_IMG_RELEASE
@@ -126,7 +132,7 @@ typedef struct {
 
 /* Starts udsota once. It copies *cfg (the strings and arrays cfg points to must outlive the port), fixes
  * the device ID (a copy of cfg->device_id when set, else the base MAC) and serves it as F18C, turns security
- * on with keys over that same ID, starts the engine, and creates the buffers,
+ * on with keys over that same ID, starts the engine (with CONFIG_UDSOTA_ESP32_UPDATER), and creates the buffers,
  * the frame queue and the diag task (Kconfig UDSOTA_ESP32_*). Security is the ECDSA mode
  * (udsota_esp32_security_ecdsa) when cfg->key_pubkey is set, else the HMAC mode (udsota_esp32_security)
  * when cfg->key_label is set, else off; a key_master given with a key_pubkey is ignored, with a warning,
@@ -153,7 +159,8 @@ void udsota_esp32_end_session(void);
 udsota_phase_t udsota_esp32_phase(void);
 /* Any task, an app hook included: the download's progress as the server last reported it (udsota_progress_t),
  * copied under a spinlock, so a UI task can draw it without touching the server; IDLE before start. The port
- * keeps the snapshot by wrapping hooks.progress, and still calls the app's own with its ctx. */
+ * keeps the snapshot by wrapping hooks.progress, and still calls the app's own with its ctx. Always IDLE without
+ * CONFIG_UDSOTA_ESP32_UPDATER. */
 void udsota_esp32_progress(udsota_progress_t *out);
 
 #define UDSOTA_ESP32_VERSION_MAX 32u   /* esp_app_desc_t.version's size: up to 31 characters and a NUL */
@@ -161,7 +168,8 @@ void udsota_esp32_progress(udsota_progress_t *out);
 /* Any task, an app hook included: the version of the image being downloaded, copied into out (not NULL, with room
  * for UDSOTA_ESP32_VERSION_MAX bytes) with a NUL, from a snapshot under the progress snapshot's spinlock; returns
  * its length. "" before any download, from an accepted 34 until that download's first block passes the first-block
- * check, and after a compressed 34 refused for memory. This and udsota_esp32_progress() take the lock separately:
- * to pair the version with a progress (its last_reason, say), read the progress, then this, then the progress
- * again, and read all three again if the stage or last_reason changed. */
+ * check, and after a compressed 34 refused for memory; always "" without CONFIG_UDSOTA_ESP32_UPDATER. This and
+ * udsota_esp32_progress() take the lock separately: to pair the version with a progress (its last_reason, say),
+ * read the progress, then this, then the progress again, and read all three again if the stage or last_reason
+ * changed. */
 size_t udsota_esp32_incoming_version(char out[UDSOTA_ESP32_VERSION_MAX]);

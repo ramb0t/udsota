@@ -57,8 +57,10 @@ function(udsota_check_srcs dir listed)
 endfunction()
 udsota_check_srcs(${ROOT}/components/udsota "${UDSOTA_SRCS}"
     server=UDSOTA_SERVER_SRCS update=UDSOTA_UPDATE_SRCS bootloop=UDSOTA_BOOTLOOP_SRCS)
-udsota_check_srcs(${ROOT}/components/udsota_esp32 "${UDSOTA_ESP32_SRCS}"
-    server=UDSOTA_ESP32_SERVER_SRCS update=UDSOTA_ESP32_UPDATE_SRCS bootloop=UDSOTA_ESP32_BOOTLOOP_SRCS)
+# The port's update/ holds both halves of CONFIG_UDSOTA_ESP32_UPDATER: the updater and its no-updater stub.
+set(UDSOTA_ESP32_UPDATE_DIR_SRCS ${UDSOTA_ESP32_UPDATE_SRCS} ${UDSOTA_ESP32_NOUPDATER_SRCS})
+udsota_check_srcs(${ROOT}/components/udsota_esp32 "${UDSOTA_ESP32_SRCS};${UDSOTA_ESP32_NOUPDATER_SRCS}"
+    server=UDSOTA_ESP32_SERVER_SRCS update=UDSOTA_ESP32_UPDATE_DIR_SRCS bootloop=UDSOTA_ESP32_BOOTLOOP_SRCS)
 # ESP-IDF stops on an include dir that doesn't exist and a plain CMake build doesn't notice one: stop here too.
 foreach(d IN LISTS UDSOTA_INCLUDE_DIRS UDSOTA_PRIV_INCLUDE_DIRS UDSOTA_ESP32_INCLUDE_DIRS UDSOTA_ESP32_PRIV_INCLUDE_DIRS)
     if(NOT IS_DIRECTORY "${d}")
