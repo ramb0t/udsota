@@ -31,7 +31,8 @@ const udsota_engine_t *udsota_esp32_engine(void);
 void udsota_esp32_status(udsota_status_t *out);
 /* True when the running image is PENDING_VERIFY and is the boot slot; from the cache, any task. */
 bool udsota_esp32_image_unconfirmed(void);
-/* True while an engine job is queued or running, or the boot-time cache read has not finished. Any task. */
+/* True while an engine job is queued or running, or the started worker's boot read has not finished; false when
+ * the engine never started. Any task. */
 bool udsota_esp32_engine_busy(void);
 
 /* ---- Security (udsota_esp32_keys.c) ---- */

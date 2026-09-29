@@ -198,13 +198,12 @@ class DemoServer:
 
     # Close stdin (the server stops at EOF) and wait; kill it if it lingers. Returns its exit code.
     def stop(self):
-        if self.proc.poll() is None:
-            try:
-                self.proc.stdin.close()
-                self.proc.wait(timeout=5)
-            except (OSError, subprocess.TimeoutExpired):
-                self.proc.kill()
-                self.proc.wait()
+        try:
+            self.proc.stdin.close()
+            self.proc.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            self.proc.kill()
+            self.proc.wait()
         self._reader.join(timeout=2)
         self.proc.stdout.close()
         return self.proc.returncode

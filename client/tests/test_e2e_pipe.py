@@ -8,7 +8,7 @@ import time
 
 import pytest
 
-from udsota import profile, transport, update, wire
+from udsota import delta, profile, transport, update, wire
 from udsota.errors import NoResponse, Nrc
 
 from .demo_server import (EXAMPLE, LABEL, MASTER, PIPE_P2_S, SECURED, DemoServer, PipeTransport, binary_or_skip,
@@ -370,7 +370,7 @@ def test_flash_compressed_runs_the_whole_sequence(demo, tmp_path, capsys):
     sent = []
     s.tap = sent.append
     image = z_image()
-    zlen = len(update.deflate(image))
+    zlen = len(delta.deflate(image))
     assert zlen < 0.7 * len(image)
     assert flash(s, image_file(tmp_path, image), "--compress") == 0
     assert any(is_34(m, wire.DL_DFI_DEFLATE) for m in sent) and not any(is_34(m, wire.DL_DFI) for m in sent)
@@ -464,7 +464,7 @@ def send_stream(server, image, payload):
 def test_corrupt_stream_is_refused(demo):
     s = demo()
     image = z_image()
-    z = bytearray(update.deflate(image))
+    z = bytearray(delta.deflate(image))
     z[len(z) // 2:len(z) // 2 + 64] = random.Random(7).randbytes(64)
     t, uds, nrc = send_stream(s, image, z)
     with t:
@@ -480,7 +480,7 @@ def test_corrupt_stream_is_refused(demo):
 def test_truncated_stream_fails_transfer_exit(demo):
     s = demo()
     image = z_image()
-    t, uds, nrc = send_stream(s, image, update.deflate(image)[:-20])
+    t, uds, nrc = send_stream(s, image, delta.deflate(image)[:-20])
     with t:
         assert nrc is None
         with pytest.raises(Nrc) as e:
@@ -497,7 +497,7 @@ def test_truncated_stream_fails_transfer_exit(demo):
 def test_compressed_first_block_rules_refuse(demo):
     s = demo()
     image = z_image(product="widget")
-    t, uds, nrc = send_stream(s, image, update.deflate(image))
+    t, uds, nrc = send_stream(s, image, delta.deflate(image))
     with t:
         assert nrc is not None and nrc.code == wire.NRC_OUT_OF_RANGE
         assert wire.decode_result(uds.read_did(wire.DID_RESULT)) == ("DL_BAD_PROJECT", 0)

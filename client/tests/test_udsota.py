@@ -2027,8 +2027,8 @@ def test_example_config_comments_load():
 
 # Check u8 and u16 print as decimal, and a record of another length falls back to hex.
 def test_u8_u16_decoders():
-    assert (update.DECODE["u8"](b"\x2a"), update.DECODE["u16"](b"\x0b\xb8")) == ("42", "3000")
-    assert (update.DECODE["u8"](b"\x01\x02"), update.DECODE["u16"](b"\x05")) == ("01 02", "05")
+    assert (wire.DECODE["u8"](b"\x2a"), wire.DECODE["u16"](b"\x0b\xb8")) == ("42", "3000")
+    assert (wire.DECODE["u8"](b"\x01\x02"), wire.DECODE["u16"](b"\x05")) == ("01 02", "05")
 
 
 # Check info decodes CONF's u8 and u16 DIDs as decimal, a blob as hex, and reports the key the server lacks.
@@ -2444,6 +2444,15 @@ def test_compress_auto_does_not_fall_back_on_other_refusals():
         run_flash(d, compress="auto")
     assert (e.value.sid, e.value.code) == (0x34, 0x22)
     assert [x for x in d.log if x[0] == 0x34] == [(0x34, None)]
+
+
+# Check the 34's 0x22 is still what's reported when F1F1 then cannot be read (its read error must not hide it).
+def test_compressed_34_refusal_survives_an_unreadable_f1f1():
+    d = FakeServer(compress=True, nrc_once={(0x34, None): 0x22, (0x22, 0xF1F1): 0x31})
+    with pytest.raises(errors.Nrc) as e:
+        run_flash(d, compress="auto")
+    assert (e.value.sid, e.value.code) == (0x34, 0x22)
+    assert not [x for x in d.log if x[0] == 0x36]
 
 
 # Check a lost 76 mid-stream is resent once and the server takes the repeat without adding it to the stream.

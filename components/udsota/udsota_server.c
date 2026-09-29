@@ -877,15 +877,16 @@ bool udsota_fc_check(udsota_server_t *s, uint32_t median_cf_us, uint32_t stmin_u
     if (!s->download_active || s->job_running) {
         return true;
     }
-    if (!s->end_pending) {                        /* latched (answered, no poll yet): withhold without the gate */
+    if (!s->end_pending) {                        /* not latched: record the FC point's timing and ask the gate */
         s->cf_median_us = median_cf_us;
         s->cf_stmin_us = stmin_us;
         if (transfer_nrc(s) == 0u) {
             return true;
         }
     }
+    /* A latched end_session (answered, no poll yet) is withheld without the gate; enter_session fulfils it. */
     udsota_sat_inc16(&s->counters.withheld_fcs);
-    enter_session(s, UDSOTA_SESSION_DEFAULT);     /* also fulfils the latch */
+    enter_session(s, UDSOTA_SESSION_DEFAULT);
     phase_sync(s);
     progress_sync(s);
     return false;
