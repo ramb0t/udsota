@@ -15,7 +15,7 @@ udsota_esp32 is the ESP-IDF port of [udsota](../udsota/README.md). It runs the U
 | `udsota_esp32_image_unconfirmed()` | any task | true while the running image is pending verify and is the boot slot |
 | `udsota_esp32_status(out)` | any task | the cached F1F0 snapshot |
 | `udsota_esp32_engine()` | any task | the engine, for a front end other than UDS |
-| `bool udsota_esp32_engine_busy(void)` | any task | true while an engine job or the boot-time OTA read is queued or running |
+| `bool udsota_esp32_engine_busy(void)` | any task | true while an engine job is queued or running, or the boot-time OTA read has not finished |
 | `const udsota_security_t *udsota_esp32_security(const char *label, const uint8_t *master, size_t master_len, const uint8_t *id, size_t id_len)` | start code, before the diag task runs | builds the HMAC-mode 0x27 security that start installs (start calls it itself, with `cfg.device_id`) over `id`, or the base MAC when `id` is NULL; NULL label gives NULL, and no master or a bad `id_len` gives security with no key that matches |
 | `const udsota_security_t *udsota_esp32_security_ecdsa(const uint8_t *pubkey, size_t pubkey_len, const uint8_t *id, size_t id_len)` | start code, before the diag task runs | the same for the ECDSA mode: self-tests PSA ECDSA and imports `pubkey` once; NULL `pubkey` gives NULL, and a key that is not a 65-byte P-256 point, a failed self-test or a bad `id_len` gives security with no key that matches. The first call of either function fixes the mode |
 | `const uint8_t *udsota_esp32_device_id(size_t *len)` | any task | the device ID in use and its length: the ID start or `udsota_esp32_security()` fixed, else the 6-byte base MAC |
