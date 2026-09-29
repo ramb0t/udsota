@@ -29,14 +29,6 @@ static udsota_server_t S;
 static uint8_t      R[4095];
 static size_t       RL;
 
-/* The mock's stand-in for HMAC-SHA256: key[i] = seed[i] ^ level ^ 0xA5. */
-static void fake_key(const uint8_t seed[16], uint8_t level, uint8_t out[16])
-{
-    for (int i = 0; i < 16; i++) {
-        out[i] = (uint8_t)(seed[i] ^ level ^ 0xA5);
-    }
-}
-
 /* Mock rng16: fills base..base+15 (or zeros), then moves base on by 0x20 so seeds never repeat. */
 static bool mock_rng16(void *ctx, uint8_t out[16])
 {
@@ -52,7 +44,7 @@ static bool mock_rng16(void *ctx, uint8_t out[16])
     return true;
 }
 
-/* Mock security.key: records its arguments and returns fake_key(seed, level) when hmac_ok. */
+/* Mock security.key: records its arguments and returns udsota_mock_key_for(seed, level) when hmac_ok. */
 static bool mock_key(void *ctx, const uint8_t seed[16], uint8_t level, uint8_t out[16])
 {
     mock_t *m = ctx;
@@ -62,7 +54,7 @@ static bool mock_key(void *ctx, const uint8_t seed[16], uint8_t level, uint8_t o
     if (!m->hmac_ok) {
         return false;
     }
-    fake_key(seed, level, out);
+    udsota_mock_key_for(seed, level, out);
     return true;
 }
 
@@ -92,22 +84,7 @@ static int mock_verify(void *ctx, const uint8_t seed[16], uint8_t level, const u
 }
 
 static udsota_mock_t g_mock;
-
-/* Engine op that completes at once with success; no test here reaches the engine. */
-static int noop(void *ctx) { return 0; }
-/* Engine erase stub. */
-static int noop_begin(void *ctx, uint32_t size) { return 0; }
-/* Engine write stub. */
-static int noop_write(void *ctx, uint32_t off, const uint8_t *d, size_t n) { return 0; }
-/* Engine abort stub. */
-static void noop_abort(void *ctx) {}
-/* Engine first-block stub. */
-static int noop_check(void *ctx, const uint8_t *f, size_t n, udsota_reason_t *r) { *r = UDSOTA_DL_OK; return 0; }
-
-static const udsota_engine_t ENGINE = {
-    .check_first = noop_check, .begin = noop_begin, .write = noop_write, .verify = noop, .activate = noop,
-    .confirm = noop, .abort = noop_abort, .poll = noop, .status = udsota_mock_status, .ctx = &g_mock,
-};
+static udsota_engine_t g_eng;   /* udsota_mock_engine: no test here reaches the engine */
 static const udsota_security_t SECURITY = {.rng16 = mock_rng16, .key = mock_key, .ctx = &M};
 
 /* Rebuilds the server as a chip restart does, with the mock's config and hooks (the gate allows 10 02). */
@@ -115,7 +92,7 @@ static void fresh_server(void)
 {
     const udsota_config_t cfg = udsota_mock_cfg();
     const udsota_hooks_t hooks = udsota_mock_hooks(&g_mock);
-    udsota_init(&S, &cfg, &ENGINE, &SECURITY, &hooks);
+    udsota_init(&S, &cfg, &g_eng, &SECURITY, &hooks);
 }
 
 /* Unity hook: a healthy mock and a freshly booted server for every test. */
@@ -127,6 +104,7 @@ void setUp(void)
     M.seed_base = 0x10;
     memset(&S, 0, sizeof S);
     udsota_mock_clear(&g_mock);
+    g_eng = udsota_mock_engine(&g_mock);
     fresh_server();
 }
 
@@ -182,7 +160,7 @@ static void unlock(uint8_t level, uint32_t now)
 {
     uint8_t seed[16], key[16];
     request_seed(level, now, seed);
-    fake_key(seed, level, key);
+    udsota_mock_key_for(seed, level, key);
     send_key((uint8_t)(level + 1), key, now + 1);
     TEST_ASSERT_EQUAL_UINT(2, RL);
     TEST_ASSERT_EQUAL_HEX8(0x67, R[0]);
@@ -194,7 +172,7 @@ static void wrong_key(uint8_t level, uint32_t now)
 {
     uint8_t seed[16], key[16];
     request_seed(level, now, seed);
-    fake_key(seed, level, key);
+    udsota_mock_key_for(seed, level, key);
     key[15] ^= 0x01;
     send_key((uint8_t)(level + 1), key, now + 1);
 }
@@ -223,7 +201,7 @@ static void test_programming_seed_and_key_unlock_level_03(void)
     TEST_ASSERT_EQUAL_HEX8_ARRAY(want_seed, seed, 16);
     TEST_ASSERT_EQUAL_INT(1, M.rng_calls);
     TEST_ASSERT_EQUAL_HEX8(0x00, S.security);                       /* a seed alone unlocks nothing */
-    fake_key(seed, 0x03, key);
+    udsota_mock_key_for(seed, 0x03, key);
     send_key(0x04, key, T0 + 2);
     TEST_ASSERT_EQUAL_UINT(2, RL);
     TEST_ASSERT_EQUAL_HEX8(0x67, R[0]);
@@ -334,7 +312,7 @@ static void test_seed_is_single_use(void)
     uint8_t seed[16], key[16], bad[16];
     enter(UDSOTA_SESSION_EXTENDED, T0);
     request_seed(0x01, T0 + 1, seed);
-    fake_key(seed, 0x01, key);
+    udsota_mock_key_for(seed, 0x01, key);
     memcpy(bad, key, 16);
     bad[0] ^= 0xFF;
     send_key(0x02, bad, T0 + 2);  assert_nrc(0x35);
@@ -349,7 +327,7 @@ static void test_seed_expires_after_30s(void)
     enter(UDSOTA_SESSION_EXTENDED, T0);
     const uint32_t t1 = T0 + 1;
     request_seed(0x01, t1, seed);
-    fake_key(seed, 0x01, key);
+    udsota_mock_key_for(seed, 0x01, key);
     keep_alive(t1, t1 + 29999u);
     send_key(0x02, key, t1 + 29999u);
     TEST_ASSERT_EQUAL_UINT(2, RL);
@@ -358,7 +336,7 @@ static void test_seed_expires_after_30s(void)
     const uint32_t t2 = t1 + 30010u;
     enter(UDSOTA_SESSION_EXTENDED, t2);                                /* relock */
     request_seed(0x01, t2 + 1, seed);
-    fake_key(seed, 0x01, key);
+    udsota_mock_key_for(seed, 0x01, key);
     keep_alive(t2 + 1, t2 + 1 + 30000u);
     send_key(0x02, key, t2 + 1 + 30000u);  assert_nrc(0x24);
     TEST_ASSERT_EQUAL_INT(1, M.hmac_calls);                         /* the expired seed reached no HMAC */
@@ -374,10 +352,10 @@ static void test_new_seed_replaces_outstanding_one(void)
     request_seed(0x01, T0 + 2, b);
     TEST_ASSERT_EQUAL_INT(2, M.rng_calls);
     TEST_ASSERT_NOT_EQUAL(0, memcmp(a, b, 16));
-    fake_key(a, 0x01, ka);
+    udsota_mock_key_for(a, 0x01, ka);
     send_key(0x02, ka, T0 + 3);  assert_nrc(0x35);
     request_seed(0x01, T0 + 4, b);
-    fake_key(b, 0x01, kb);
+    udsota_mock_key_for(b, 0x01, kb);
     send_key(0x02, kb, T0 + 5);
     TEST_ASSERT_EQUAL_HEX8(0x67, R[0]);
 }
@@ -402,7 +380,7 @@ static void test_hmac_failure_refused_and_not_counted(void)
     enter(UDSOTA_SESSION_EXTENDED, T0);
     M.hmac_ok = false;
     request_seed(0x01, T0 + 1, seed);
-    fake_key(seed, 0x01, key);
+    udsota_mock_key_for(seed, 0x01, key);
     send_key(0x02, key, T0 + 2);  assert_nrc(0x22);
     M.hmac_ok = true;
     send_key(0x02, key, T0 + 3);  assert_nrc(0x24);                 /* seed consumed */
@@ -466,7 +444,7 @@ static void test_every_key_byte_compared(void)
         fresh_server();                                             /* no lockout carried between positions */
         enter(UDSOTA_SESSION_EXTENDED, T0);
         request_seed(0x01, T0 + 1, seed);
-        fake_key(seed, 0x01, key);
+        udsota_mock_key_for(seed, 0x01, key);
         key[pos] ^= 0x80;
         send_key(0x02, key, T0 + 2);
         assert_nrc(0x35);
@@ -480,11 +458,11 @@ static void test_suppress_bit_on_send_key(void)
     uint8_t seed[16], key[16];
     enter(UDSOTA_SESSION_EXTENDED, T0);
     request_seed(0x01, T0 + 1, seed);
-    fake_key(seed, 0x01, key);
+    udsota_mock_key_for(seed, 0x01, key);
     key[3] ^= 0x10;
     send_key(0x82, key, T0 + 2);  assert_nrc(0x35);
     request_seed(0x01, T0 + 3, seed);
-    fake_key(seed, 0x01, key);
+    udsota_mock_key_for(seed, 0x01, key);
     send_key(0x82, key, T0 + 4);
     TEST_ASSERT_EQUAL_UINT(0, RL);
     TEST_ASSERT_EQUAL_HEX8(UDSOTA_SA_SEED_EXTENDED, S.security);
@@ -500,7 +478,7 @@ static void test_relock_on_session_change(void)
     TEST_ASSERT_EQUAL_HEX8(0x00, S.security);
     request_seed(0x01, T0 + 11, seed);                              /* locked: a real seed, not zeros */
     TEST_ASSERT_NOT_EQUAL(0, memcmp(seed, ZERO16, 16));
-    fake_key(seed, 0x01, key);
+    udsota_mock_key_for(seed, 0x01, key);
     enter(UDSOTA_SESSION_EXTENDED, T0 + 12);                           /* drops that outstanding seed */
     send_key(0x02, key, T0 + 13);  assert_nrc(0x24);
 
@@ -529,7 +507,7 @@ static void test_relock_on_s3_timeout(void)
     const uint32_t t = T0 + 9000u;
     enter(UDSOTA_SESSION_EXTENDED, t);
     request_seed(0x01, t + 1, seed);                                /* outstanding across the fallback */
-    fake_key(seed, 0x01, key);
+    udsota_mock_key_for(seed, 0x01, key);
     udsota_poll(&S, R, sizeof R, t + 1 + 6000u);
     TEST_ASSERT_EQUAL_INT(UDSOTA_SESSION_DEFAULT, S.session);
     enter(UDSOTA_SESSION_EXTENDED, t + 8000u);
@@ -559,7 +537,7 @@ static void boot_verifier(uint16_t key_len)
     const udsota_hooks_t hooks = udsota_mock_hooks(&g_mock);
     const udsota_security_t sec = {.rng16 = mock_rng16, .key = mock_key, .ctx = &M,
                                    .verify = mock_verify, .key_len = key_len};
-    udsota_init(&S, &cfg, &ENGINE, &sec, &hooks);
+    udsota_init(&S, &cfg, &g_eng, &sec, &hooks);
 }
 
 /* Sends 27 <sub> with n key bytes (a sendKey). */
@@ -633,7 +611,7 @@ static void test_key_len_defaults_and_is_ignored_without_verifier(void)
     const udsota_config_t cfg = udsota_mock_cfg();
     const udsota_hooks_t hooks = udsota_mock_hooks(&g_mock);
     const udsota_security_t sec = {.rng16 = mock_rng16, .key = mock_key, .ctx = &M, .key_len = SIG_LEN};
-    udsota_init(&S, &cfg, &ENGINE, &sec, &hooks);
+    udsota_init(&S, &cfg, &g_eng, &sec, &hooks);
     enter(UDSOTA_SESSION_EXTENDED, T0);
     unlock(0x01, T0 + 1);                                           /* 18-byte sendKey, HMAC compare */
     TEST_ASSERT_EQUAL_INT(1, M.verify_calls);                       /* only the first server's */
@@ -697,7 +675,7 @@ static void test_init_refuses_security_without_key_or_verify(void)
     const udsota_config_t cfg = udsota_mock_cfg();
     const udsota_hooks_t hooks = udsota_mock_hooks(&g_mock);
     const udsota_security_t none = {.rng16 = mock_rng16, .ctx = &M};
-    TEST_ASSERT_FALSE(udsota_init(&S, &cfg, &ENGINE, &none, &hooks));
+    TEST_ASSERT_FALSE(udsota_init(&S, &cfg, &g_eng, &none, &hooks));
     TEST_ASSERT_TRUE(S.secured);
     uint8_t seed[16], key[16];
     memset(key, 0, sizeof key);
@@ -715,8 +693,8 @@ static void test_init_refuses_security_without_key_or_verify(void)
     TEST_ASSERT_EQUAL_HEX8(0x7F, R[0]);
     TEST_ASSERT_EQUAL_HEX8(0x34, R[1]);
     TEST_ASSERT_EQUAL_HEX8(0x33, R[2]);
-    TEST_ASSERT_TRUE(udsota_init(&S, &cfg, &ENGINE, &SECURITY, &hooks));
-    TEST_ASSERT_TRUE(udsota_init(&S, &cfg, &ENGINE, NULL, &hooks));
+    TEST_ASSERT_TRUE(udsota_init(&S, &cfg, &g_eng, &SECURITY, &hooks));
+    TEST_ASSERT_TRUE(udsota_init(&S, &cfg, &g_eng, NULL, &hooks));
 }
 
 /* init refuses a security without rng16 (false), with key or verify set or not, yet keeps security on: every
@@ -727,8 +705,8 @@ static void test_init_refuses_security_without_rng16(void)
     const udsota_hooks_t hooks = udsota_mock_hooks(&g_mock);
     const udsota_security_t no_rng = {.key = mock_key, .ctx = &M};
     const udsota_security_t nothing = {.ctx = &M};
-    TEST_ASSERT_FALSE(udsota_init(&S, &cfg, &ENGINE, &nothing, &hooks));
-    TEST_ASSERT_FALSE(udsota_init(&S, &cfg, &ENGINE, &no_rng, &hooks));
+    TEST_ASSERT_FALSE(udsota_init(&S, &cfg, &g_eng, &nothing, &hooks));
+    TEST_ASSERT_FALSE(udsota_init(&S, &cfg, &g_eng, &no_rng, &hooks));
     TEST_ASSERT_TRUE(S.secured);
     uint8_t key[16];
     memset(key, 0, sizeof key);

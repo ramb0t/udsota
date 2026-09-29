@@ -101,7 +101,7 @@ typedef enum {
 /* ---- RequestDownload / TransferData ---- */
 #define UDSOTA_DL_DFI            0x00       /* dataFormatIdentifier: no compression or encryption */
 #define UDSOTA_DL_DFI_DEFLATE    0x10       /* dataFormatIdentifier: raw DEFLATE (RFC 1951, no zlib or gzip header), no
-                                               encryption; served only when the engine has zbegin */
+                                               encryption; served only when the engine's zformats has it */
 #define UDSOTA_DL_DFI_DELTA      0x20       /* dataFormatIdentifier: a delta patch (udsota_patch.h) from the running
                                                image; served only when the engine's zformats has it */
 #define UDSOTA_DL_DFI_DELTA_DEFLATE 0x30    /* dataFormatIdentifier: a delta patch, all of it raw DEFLATE; served only

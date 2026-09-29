@@ -4,15 +4,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>
-#include "sha256_host.h"
 #include "udsota_esp32_image.h"
-#include "udsota_image_desc.h"
 
-#define SEG0_OFS     32u    /* segment 0 data: esp_image_header_t 24 + esp_image_segment_header_t 8 */
-#define PROJECT_OFS  80u    /* esp_app_desc_t.project_name (32 B) */
-#define HASH_LEN     32u
-#define SEED_CAP     (SEG0_OFS + DEMO_SEED_PAYLOAD + 16u + HASH_LEN)
+#define SEED_CAP (32u + DEMO_SEED_PAYLOAD + 16u + 32u)   /* headers, segment 0, checksum padding, SHA-256 */
 
 /* Monotonic milliseconds, for the emulated worker jobs. */
 static uint64_t mono_ms(void)
@@ -20,13 +14,6 @@ static uint64_t mono_ms(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
-}
-
-/* Writes a little-endian u16. */
-static void put_le16(uint8_t *p, uint16_t v)
-{
-    p[0] = (uint8_t)v;
-    p[1] = (uint8_t)(v >> 8);
 }
 
 /* Re-reads the version rule's inputs from the running slot: its version and whether it is a clean release. */
@@ -78,18 +65,31 @@ static int eng_check_first(void *ctx, const uint8_t *first, size_t len, udsota_r
     return r == UDSOTA_DL_OK ? 0 : 1;
 }
 
+/* The coded download's erase: fake_ota_begin, synchronous (the job wraps the whole zwrite). */
+static int z_begin(void *ctx, uint32_t size)
+{
+    demo_engine_t *e = ctx;
+    return fake_ota_begin(&e->ota, size);
+}
+
+/* The coded download's write, at the image offset where the last one ended. */
+static int z_write(void *ctx, uint32_t off, const uint8_t *d, size_t n)
+{
+    demo_engine_t *e = ctx;
+    return (off == e->ota.written) ? fake_ota_write(&e->ota, d, n) : -1;
+}
+
 /* engine.begin: erases the inactive slot's image extent. */
 static int eng_begin(void *ctx, uint32_t size)
 {
-    demo_engine_t *e = ctx;
-    return job(e, fake_ota_begin(&e->ota, size));
+    return job(ctx, z_begin(ctx, size));
 }
 
 /* engine.write: appends at off, which must be where the last write ended; joins a running job (the erase). */
 static int eng_write(void *ctx, uint32_t off, const uint8_t *d, size_t n)
 {
     demo_engine_t *e = ctx;
-    const int rc = (off == e->ota.written) ? fake_ota_write(&e->ota, d, n) : -1;
+    const int rc = z_write(ctx, off, d, n);
     if (e->job_open) {
         return job(e, rc);
     }
@@ -104,8 +104,7 @@ static int eng_verify(void *ctx)
     int r = fake_ota_end(&e->ota);
     if (r == UDSOTA_DL_OK) {
         uint8_t first[UDSOTA_IMAGE_MIN_LEN];
-        const int fd = e->ota.fd[fake_ota_other(&e->ota)];
-        const bool got = pread(fd, first, sizeof first, 0) == (ssize_t)sizeof first;
+        const bool got = fake_ota_slot_read(&e->ota, fake_ota_other(&e->ota), 0, first, sizeof first) == 0;
         r = got ? (int)first_block_rules(e, first, sizeof first) : (int)UDSOTA_DL_VERIFY_FAILED;
         e->ota.verified = (r == UDSOTA_DL_OK);
     }
@@ -132,20 +131,6 @@ static void eng_abort(void *ctx)
     demo_engine_t *e = ctx;
     udsota_coded_close(&e->cd);
     (void)fake_ota_abort(&e->ota);
-}
-
-/* The coded download's erase: fake_ota_begin, synchronous (the job wraps the whole zwrite). */
-static int z_begin(void *ctx, uint32_t size)
-{
-    demo_engine_t *e = ctx;
-    return fake_ota_begin(&e->ota, size);
-}
-
-/* The coded download's write, at the image offset where the last one ended. */
-static int z_write(void *ctx, uint32_t off, const uint8_t *d, size_t n)
-{
-    demo_engine_t *e = ctx;
-    return (off == e->ota.written) ? fake_ota_write(&e->ota, d, n) : -1;
 }
 
 /* A delta download's base: n bytes of the running slot at off; a read past the slot is refused. */
@@ -292,7 +277,7 @@ bool demo_engine_open(demo_engine_t *e, const char *dir, uint32_t slot_size, boo
     uint8_t sha[32];
     if (!fake_ota_slot_desc(&e->ota, e->ota.running_slot, v, sha)) {
         uint8_t img[SEED_CAP];
-        const size_t n = demo_image_build(img, sizeof img, seed_version, cfg, DEMO_SEED_PAYLOAD);
+        const size_t n = fake_ota_build_image(img, sizeof img, seed_version, &e->rules, DEMO_SEED_PAYLOAD);
         if (n == 0u || fake_ota_load_slot(&e->ota, e->ota.running_slot, img, n) != 0) {
             fake_ota_close(&e->ota);
             return false;
@@ -337,29 +322,12 @@ udsota_engine_t demo_engine_ops(demo_engine_t *e)
     };
 }
 
-/* fake_ota_build_image's image, restamped for cfg and resealed; see demo_engine.h. */
+/* fake_ota_build_image's image with cfg's identity; see demo_engine.h. */
 size_t demo_image_build(uint8_t *out, size_t cap, const char *version, const udsota_config_t *cfg,
                         uint32_t payload_len)
 {
-    const char *product = (cfg->product != NULL) ? cfg->product : FAKE_OTA_PROJECT;
-    if (strlen(product) > 31u) {
-        return 0;
-    }
-    const size_t total = fake_ota_build_image(out, cap, version, cfg->hw_id, payload_len);
-    if (total == 0u) {
-        return 0;
-    }
-    memset(&out[PROJECT_OFS], 0, 32);
-    memcpy(&out[PROJECT_OFS], product, strlen(product));
-    uint8_t *d = &out[UDSOTA_IMG_DESC_OFFSET];
-    d[offsetof(udsota_image_desc_t, partition_layout_id)] = cfg->layout_id;
-    put_le16(&d[offsetof(udsota_image_desc_t, diag_request_id)], cfg->req_id);
-    put_le16(&d[offsetof(udsota_image_desc_t, diag_response_id)], cfg->resp_id);
-    const size_t padded = total - HASH_LEN;         /* segment 0, then the checksum byte ending a 16-byte block */
-    uint8_t x = 0xEF;                               /* ESP_ROM_CHECKSUM_INITIAL */
-    for (size_t i = SEG0_OFS; i < SEG0_OFS + payload_len; i++) {
-        x ^= out[i];
-    }
-    out[padded - 1u] = x;
-    return sha256_host(out, padded, &out[padded]) ? total : 0u;
+    const udsota_image_ctx_t id = {.hw_id = cfg->hw_id, .partition_layout_id = cfg->layout_id,
+                                   .diag_request_id = cfg->req_id, .diag_response_id = cfg->resp_id,
+                                   .product = cfg->product};
+    return fake_ota_build_image(out, cap, version, &id, payload_len);
 }

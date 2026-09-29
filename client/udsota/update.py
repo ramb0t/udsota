@@ -2,17 +2,16 @@
 the keyed reset. Every product-specific step comes from the profile."""
 import contextlib
 import time
-import zlib
 
-from .delta import build as build_delta, validation_hash
+from .delta import build as build_delta, deflate, validation_hash
 from .errors import NoResponse, Nrc, Refused, SendFailed, UpdateFailed
 from .image import parse_image
 from .keys import DeviceKeys, SigningKeys
 from .wire import (DID_COUNTERS, DID_DEVICE_ID, DID_RESULT, DID_RUNNING_SHA, DID_SESSION, DID_STATUS, DID_VERSION,
                    DL_DFI, DL_DFI_DEFLATE, DL_DFI_DELTA, DL_DFI_DELTA_DEFLATE, IMG_PENDING_VERIFY, IMG_STATES,
                    NRC_CONDITIONS, NRC_OUT_OF_RANGE, NRC_PROGRAMMING_FAILURE, NRC_SEQUENCE, OTHER_VERIFIED,
-                   RID_ACTIVATE, RID_CHECK_DEPS, RID_CONFIRM, SESSION_EXTENDED, SESSION_PROGRAMMING, cstr,
-                   decode_counters, decode_result, decode_status, describe_status, reason_name)
+                   RID_ACTIVATE, RID_CHECK_DEPS, RID_CONFIRM, SESSION_EXTENDED, SESSION_PROGRAMMING, DECODE, cstr,
+                   decode_counters, decode_result, decode_status, describe_result, describe_status, reason_name)
 
 REBOOT_WAIT_S = 3.0
 BOOT_TIMEOUT_S = 60.0
@@ -27,36 +26,35 @@ DETOOLS_HINT = ('delta downloads need detools: pip install "./client[diff]" from
                 "from source, so it needs a C and C++ compiler)")
 
 # The server-owned DIDs `info` reads first, with their labels and renderers.
-CORE_DIDS = ((DID_SESSION, "active session", lambda d: d.hex(" ")),
+CORE_DIDS = ((DID_SESSION, "active session", DECODE["hex"]),
              (DID_VERSION, "version", cstr),
              (DID_DEVICE_ID, "device ID", lambda d: ":".join("%02x" % b for b in d)),
-             (DID_RUNNING_SHA, "running app_elf_sha256", lambda d: d.hex(" ")),
+             (DID_RUNNING_SHA, "running app_elf_sha256", DECODE["hex"]),
              (DID_STATUS, "update status", lambda d: describe_status(decode_status(d))),
-             (DID_RESULT, "last download", lambda d: describe_result(d)),
+             (DID_RESULT, "last download", describe_result),
              (DID_COUNTERS, "ISO-TP/UDS counters",
               lambda d: " ".join("%s=%d" % kv for kv in decode_counters(d).items())))
-DECODE = {"hex": lambda d: d.hex(" "), "ascii": cstr,
-          "version3": lambda d: "%d.%d.%d" % tuple(d) if len(d) == 3 else d.hex(" "),
-          "u8": lambda d: "%d" % d[0] if len(d) == 1 else d.hex(" "),
-          "u16": lambda d: "%d" % int.from_bytes(d, "big") if len(d) == 2 else d.hex(" ")}
+
+
+# One DID's record, or None when the server answers 0x31 (it does not serve that DID).
+def read_record(uds, did):
+    try:
+        return uds.read_did(did)
+    except Nrc as e:
+        if e.code != NRC_OUT_OF_RANGE:
+            raise
+        return None
 
 
 # `info`: the server-owned DIDs, then the profile's [dids] in file order; a range stops at its first absent DID.
 def info(uds, profile, log=print):
     for did, name, render in CORE_DIDS:
-        try:
-            log("%04X %s: %s" % (did, name, render(uds.read_did(did))))
-        except Nrc as e:
-            if e.code != NRC_OUT_OF_RANGE:
-                raise
-            log("%04X %s: not supported" % (did, name))
+        d = read_record(uds, did)
+        log("%04X %s: %s" % (did, name, "not supported" if d is None else render(d)))
     for entry in profile.dids:
         for did in range(entry.first, entry.last + 1):
-            try:
-                d = uds.read_did(did)
-            except Nrc as e:
-                if e.code != NRC_OUT_OF_RANGE:
-                    raise
+            d = read_record(uds, did)
+            if d is None:
                 if entry.first == entry.last:
                     log("%04X %s: not supported" % (did, entry.name))
                 break
@@ -70,11 +68,6 @@ def send_block(uds, bsc, chunk):
         uds.transfer(bsc, chunk)
     except NoResponse:
         uds.transfer(bsc, chunk)
-
-
-# F1F1's value d as `info` and the errors show it: "DL_ABORTED, 0 bytes received".
-def describe_result(d):
-    return "%s, %d bytes received" % decode_result(d)
 
 
 # F1F1 as an error quotes it, or that it could not be read, so a failed read never hides the error being reported.
@@ -102,21 +95,16 @@ def block_failed(uds, n, e):
     return type(e)("block %d: %s" % (n, e))
 
 
-# The image as a raw DEFLATE stream (RFC 1951, no zlib header), level 9: what a 34 with DFI 0x10 announces.
-def deflate(image):
-    c = zlib.compressobj(9, zlib.DEFLATED, -15)
-    return c.compress(image) + c.flush()
-
-
 # Why the server refused a compressed RequestDownload with nrc: (reason, the error a "deflate" run raises). 0x31 is a
 # server without compressed downloads, or an image larger than its slot, which the same check refuses; 0x22 with F1F1
-# DL_NO_MEMORY is one without memory for the inflater now. None for any other refusal, which is not about compression.
+# DL_NO_MEMORY is one without memory for the inflater now. None for any other refusal, which is not about compression,
+# or when F1F1 cannot be read: the caller then raises the 34's own NRC, not the F1F1 read's.
 def compressed_refusal(uds, nrc):
     if nrc.code == NRC_OUT_OF_RANGE:
         why = "the server has no compressed downloads, or the image is larger than its slot"
         return why, Refused("%s (RequestDownload with DFI 0x10 answered 0x31); flash without --compress, or with "
                             "--compress-auto" % why)
-    if nrc.code == NRC_CONDITIONS and decode_result(uds.read_did(DID_RESULT))[0] == "DL_NO_MEMORY":
+    if nrc.code == NRC_CONDITIONS and last_reason(uds) == "DL_NO_MEMORY":
         why = "the server has no memory for a compressed download now"
         return why, UpdateFailed("%s (RequestDownload with DFI 0x10 answered 0x22, F1F1 DL_NO_MEMORY); a plain flash, "
                                  "without --compress, may work" % why)
@@ -378,16 +366,6 @@ def device_keys(uds, profile, secret):
     return make_keys(profile, secret, read_device_id(uds, profile))
 
 
-# The precheck's F1F0 read; NRC 0x31 means the device does not serve udsota's status DID, so it is no udsota server.
-def read_status_precheck(uds):
-    try:
-        return uds.read_did(DID_STATUS)
-    except Nrc as e:
-        if e.code != NRC_OUT_OF_RANGE:
-            raise
-        raise Refused("the device does not serve the udsota status DID F1F0; is it running a udsota server?") from e
-
-
 # `flash`: precheck, programming session (and unlock), download, FF01, ActivateImage, the restart and
 # ConfirmImage. Returns 0 or raises ToolError. secret is the master or private key (make_keys), unused when the
 # profile has no [security]. quiet() is entered once an update is needed and held until the end (the transport's
@@ -406,7 +384,10 @@ def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep
     img = parse_image(profile, image)
     board_of = profile.board_names.get(img.hw_id, "hw_id %d" % img.hw_id)
     log("image %s for %s, %d bytes, app_elf_sha256 %s" % (img.version, board_of, img.size, img.elf_sha[:8].hex()))
-    state = decode_status(read_status_precheck(uds))
+    status = read_record(uds, DID_STATUS)
+    if status is None:                        # 0x31: no udsota status DID, so no udsota server
+        raise Refused("the device does not serve the udsota status DID F1F0; is it running a udsota server?")
+    state = decode_status(status)
     running_sha = uds.read_did(DID_RUNNING_SHA)
     board = None if profile.board_did is None else cstr(uds.read_did(profile.board_did))
     device_id = read_device_id(uds, profile)   # read in the precheck, used only once an update is needed
@@ -434,7 +415,7 @@ def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep
             if need_download:
                 download(uds, image, drop_76=drop_76, log=log, compress=compress, clock=clock, deltas=deltas)
                 check_image(uds, log=log)
-                drop_76 = None                    # the fault injection applies to the first download only
+                need_download, drop_76 = False, None   # the fault injection applies to the first download only
             try:
                 uds.routine(RID_ACTIVATE)
                 break
@@ -443,8 +424,7 @@ def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep
                     break
                 if resent:
                     raise
-                resent, need_download = True, False   # the request itself was lost: send it once more
-                continue
+                resent = True                     # the request itself was lost: send it once more
             except Nrc as e:
                 if e.code == NRC_CONDITIONS:
                     raise UpdateFailed("ActivateImage refused (0x22): the server's conditions are not met. The image "
@@ -454,9 +434,8 @@ def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep
                     break
                 if recovered or e.code != NRC_SEQUENCE:
                     raise
-                recovered = True                  # one re-download per run
-            log("ActivateImage answered 0x24 (the slot is not verified): downloading again")
-            need_download = True
+                log("ActivateImage answered 0x24 (the slot is not verified): downloading again")
+                recovered = need_download = True   # one re-download per run
         log("activated; waiting for the server to restart")
         wait_for_image(uds, img.elf_sha, preroll, sleep=sleep, clock=clock)
         log("the server runs %s; confirming" % img.version)

@@ -5,17 +5,15 @@ import random
 import subprocess
 import threading
 import time
-import tomllib
 
 import pytest
 
-from udsota import cli, profile, transport, update, wire
+from udsota import delta, profile, transport, update, wire
 from udsota.errors import NoResponse, Nrc
 
-from .demo_server import (LABEL, MASTER, PIPE_P2_S, DemoServer, PipeTransport, binary_or_skip, build_image,
-                          delta_pair, elf_sha, reseal)
+from .demo_server import (EXAMPLE, LABEL, MASTER, PIPE_P2_S, SECURED, DemoServer, PipeTransport, binary_or_skip,
+                          build_image, delta_pair, elf_sha, image_file, read_state, reseal, run_cli)
 
-EXAMPLE = profile.load("example")
 OLD = "v0.1.0"                     # the demo's seeded running image
 VALID, PENDING, ROLLED_BACK = 3, wire.IMG_PENDING_VERIFY, 4   # F1F0 running_state VALID, other_slot_state INVALID
 FAST = ["--stmin-us", "200", "--boot-ms", "300"]   # frames 200 us apart; a 0.3 s restart
@@ -38,31 +36,16 @@ def demo(tmp_path, monkeypatch):
         s.stop()
 
 
-# A profile from TOML text, and its file under tmp_path for --profile.
+# A profile's TOML text written under tmp_path; its path for --profile.
 def write_profile(tmp_path, text, name="e2e"):
     p = tmp_path / ("%s.toml" % name)
     p.write_text(text)
-    return profile.from_dict(name, tomllib.loads(text)), str(p)
-
-
-# cli.main with argv, its transport the pipe to server with client P2 p2_s.
-def run_cli(server, argv, p2_s=PIPE_P2_S):
-    return cli.main(argv, transport=lambda prof, interface: PipeTransport(prof, server, p2_s=p2_s))
-
-
-# An image file under tmp_path.
-def image_file(tmp_path, data, name="image.bin"):
-    p = tmp_path / name
-    p.write_bytes(data)
     return str(p)
 
 
-# Reads status, running SHA and version from server over a fresh transport.
-def read_state(server, prof=EXAMPLE):
-    with PipeTransport(prof, server) as t:
-        uds = t.uds()
-        return (wire.decode_status(uds.read_did(wire.DID_STATUS)), uds.read_did(wire.DID_RUNNING_SHA),
-                wire.cstr(uds.read_did(wire.DID_VERSION)))
+# cli.main `flash path *args` with the example profile, over the pipe to server.
+def flash(server, path, *args, p2_s=PIPE_P2_S):
+    return run_cli(server, ["--profile", "example", "--interface", "pipe", "flash", path, *args], p2_s)
 
 
 # True for a single-frame negative response to sid with nrc.
@@ -107,36 +90,14 @@ def test_flash_runs_the_whole_sequence(demo, tmp_path, capsys):
     s = demo()
     image = build_image("v0.2.0")
     path = image_file(tmp_path, image)
-    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash", path]) == 0
+    assert flash(s, path) == 0
     status, sha, version = read_state(s)
     assert (status["running_slot"], status["running_state"], status["boot_slot"]) == (1, VALID, 1)
     assert sha == elf_sha(image) and version == "v0.2.0"
     assert "boot 2: slot 1 runs v0.2.0 (pending verify)" in s.log()
     assert "confirmed" in capsys.readouterr().out
-    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash", path]) == 0
+    assert flash(s, path) == 0
     assert "already runs this image" in capsys.readouterr().out
-
-
-# The example profile's [can], [image] and [board] with [security] on: the demo's label and a master file.
-SECURED = """
-[can]
-req_id = 0x710
-resp_id = 0x718
-
-[security]
-label = "%s"
-master_file = "%s"
-
-[image]
-product = "example"
-hw_ids = [1]
-layout_id = 1
-slot_size = 0x1E0000
-
-[board]
-did = 0xF191
-names = { 1 = "devkit" }
-"""
 
 
 # Check `flash` with security on: the programming unlock uses the key udsota_keys.c derives on the server
@@ -146,7 +107,7 @@ def test_flash_with_security(demo, tmp_path, capsys):
     good.write_bytes(MASTER)
     bad.write_bytes(bytes(32))
     s = demo("--label", LABEL, "--master", str(good), "--skip-boot-delay")
-    _, path = write_profile(tmp_path, SECURED % (LABEL, good))
+    path = write_profile(tmp_path, SECURED % (LABEL, good))
     image = image_file(tmp_path, build_image("v0.2.0"))
     assert run_cli(s, ["--profile", path, "--interface", "pipe", "--master", str(bad), "flash", image]) == 1
     assert "0x35" in capsys.readouterr().err
@@ -203,7 +164,7 @@ def test_first_block_rules_refuse(demo, image, reason):
 # the client exits 1 naming 0x31, and F1F1 reads DL_BAD_PROJECT.
 def test_flash_of_a_wrong_product_is_refused_by_the_server(demo, tmp_path, capsys):
     s = demo()
-    _, path = write_profile(tmp_path, "[can]\nreq_id = 0x710\nresp_id = 0x718\n")
+    path = write_profile(tmp_path, "[can]\nreq_id = 0x710\nresp_id = 0x718\n")
     image = image_file(tmp_path, build_image("v0.2.0", product="widget"))
     assert run_cli(s, ["--profile", path, "--interface", "pipe", "flash", image]) == 1
     assert "0x31" in capsys.readouterr().err
@@ -217,7 +178,7 @@ def test_corrupt_image_fails_ff01(demo, tmp_path, capsys):
     s = demo()
     image = bytearray(build_image("v0.2.0"))
     image[5000] ^= 0x01
-    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash", image_file(tmp_path, image)]) == 1
+    assert flash(s, image_file(tmp_path, image)) == 1
     assert "DL_VERIFY_FAILED" in capsys.readouterr().err
     status, _, version = read_state(s)
     assert (status["running_slot"], version) == (0, OLD)
@@ -257,8 +218,7 @@ def test_unconfirmed_image_rolls_back(demo):
 # retries every 2 s until it passes.
 def test_confirm_retries_through_the_soak(demo, tmp_path):
     s = demo("--soak-ms", "3000")
-    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash",
-                       image_file(tmp_path, build_image("v0.2.0"))]) == 0
+    assert flash(s, image_file(tmp_path, build_image("v0.2.0"))) == 0
     assert any(is_nrc(m, 0x31, wire.NRC_CONDITIONS) for m in s.sent)
     assert read_state(s)[0]["running_state"] == VALID
 
@@ -267,8 +227,7 @@ def test_confirm_retries_through_the_soak(demo, tmp_path):
 # first and the client waits for the final answer.
 def test_slow_jobs_answer_response_pending(demo, tmp_path):
     s = demo("--job-ms", "300")
-    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash",
-                       image_file(tmp_path, build_image("v0.2.0"))]) == 0
+    assert flash(s, image_file(tmp_path, build_image("v0.2.0"))) == 0
     assert {m.data[2] for m in s.sent if m.data[1] == 0x7F and m.data[3] == 0x78} == {0x36, 0x31}
     assert read_state(s)[2] == "v0.2.0"
 
@@ -277,8 +236,7 @@ def test_slow_jobs_answer_response_pending(demo, tmp_path):
 # update completes. F1F2's repeated_blocks is RAM, so the restart clears it; the answers show the repeat.
 def test_drop_76_resends_one_block(demo, tmp_path):
     s = demo()
-    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash",
-                       image_file(tmp_path, build_image("v0.2.0")), "--drop-76", "2"]) == 0
+    assert flash(s, image_file(tmp_path, build_image("v0.2.0")), "--drop-76", "2") == 0
     answers = [bytes(m.data[:3]) for m in s.sent if m.data[1] == 0x76]
     assert answers.count(b"\x02\x76\x02") == 2
     assert read_state(s)[2] == "v0.2.0"
@@ -290,8 +248,7 @@ def test_drop_76_resends_one_block(demo, tmp_path):
 def test_withheld_flow_control_exits_1_with_the_servers_reason(demo, tmp_path, capsys):
     s = demo("--withhold-fc-after", "64")
     t0 = time.monotonic()
-    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash",
-                       image_file(tmp_path, build_image("v0.2.0"))]) == 1
+    assert flash(s, image_file(tmp_path, build_image("v0.2.0"))) == 1
     assert time.monotonic() - t0 < 15.0
     err = capsys.readouterr().err
     assert "block 1:" in err and "F1F1 reads DL_ABORTED" in err, err
@@ -302,17 +259,15 @@ def test_withheld_flow_control_exits_1_with_the_servers_reason(demo, tmp_path, c
 # from a new FF, the server takes it in place of the message it was still receiving, and the update completes.
 def test_lost_flow_control_is_resent_and_the_update_completes(demo, tmp_path):
     s = demo("--drop-fc-after", "64")
-    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash",
-                       image_file(tmp_path, build_image("v0.2.0"))]) == 0
-    assert "--drop-fc-after: losing the FC" in s.log_path.read_text()
+    assert flash(s, image_file(tmp_path, build_image("v0.2.0"))) == 0
+    assert "--drop-fc-after: losing the FC" in s.log()
     assert read_state(s)[2] == "v0.2.0"
 
 
 # Check a platform without rollback: the activated image boots UNDEFINED, and ConfirmImage answers positive at once.
 def test_flash_without_rollback(demo, tmp_path):
     s = demo("--no-rollback")
-    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash",
-                       image_file(tmp_path, build_image("v0.2.0"))]) == 0
+    assert flash(s, image_file(tmp_path, build_image("v0.2.0"))) == 0
     status, _, version = read_state(s)
     assert (status["running_slot"], status["running_state"], version) == (1, 0, "v0.2.0")
 
@@ -330,7 +285,7 @@ def test_lost_activate_answer_still_confirms(demo, tmp_path):
     s = demo()
     s.drop = lambda m: is_activate_answer(m) and not s.dropped
     image = build_image("v0.2.0")
-    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash", image_file(tmp_path, image)]) == 0
+    assert flash(s, image_file(tmp_path, image)) == 0
     assert len(s.dropped) == 1
     status, _, version = read_state(s)
     assert (status["running_slot"], status["running_state"], version) == (1, VALID, "v0.2.0")
@@ -353,8 +308,7 @@ def is_block_request(msg, bsc):
 def test_busy_resends_outlast_a_short_job(demo, tmp_path):
     s = demo("--job-ms", "1000")
     s.drop = lambda m: (is_nrc(m, 0x36, 0x78) or is_block_answer(m, 1)) and len(s.dropped) < 2
-    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash",
-                       image_file(tmp_path, build_image("v0.2.0"))], p2_s=transport.P2_S) == 0
+    assert flash(s, image_file(tmp_path, build_image("v0.2.0")), p2_s=transport.P2_S) == 0
     assert any(is_nrc(m, 0x36, wire.NRC_BUSY) for m in s.sent)
     assert len(s.dropped) == 2 and is_block_answer(s.dropped[1], 1)
 
@@ -384,8 +338,7 @@ def test_late_answer_is_not_the_next_blocks(demo, tmp_path):
                     s.release(held.pop(0))
 
     s.drop, s.tap = drop, tap
-    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash",
-                       image_file(tmp_path, build_image("v0.2.0"))]) == 0
+    assert flash(s, image_file(tmp_path, build_image("v0.2.0"))) == 0
 
 
 # Suspected in the client audit, confirmed here, and fixed: when the first 0x78 of a job longer than the 0x21
@@ -395,13 +348,12 @@ def test_late_answer_is_not_the_next_blocks(demo, tmp_path):
 def test_lost_response_pending_on_a_long_job(demo, tmp_path):
     s = demo("--job-ms", "8000")
     s.drop = lambda m: is_nrc(m, 0x36, 0x78) and not s.dropped
-    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash",
-                       image_file(tmp_path, build_image("v0.2.0"))]) == 0
+    assert flash(s, image_file(tmp_path, build_image("v0.2.0"))) == 0
 
 
 # ---- compressed downloads (DFI 0x10) ----
 
-# The demo's arguments and an image that compresses about as a real app does, 48 KB of segment 0.
+# An image that compresses about as a real app does: 48 KB of build_image's noise in segment 0.
 def z_image(version="v0.2.0", **kw):
     return build_image(version, payload=48 * 1024, noise=True, **kw)
 
@@ -418,10 +370,9 @@ def test_flash_compressed_runs_the_whole_sequence(demo, tmp_path, capsys):
     sent = []
     s.tap = sent.append
     image = z_image()
-    zlen = len(update.deflate(image))
+    zlen = len(delta.deflate(image))
     assert zlen < 0.7 * len(image)
-    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash", image_file(tmp_path, image),
-                       "--compress"]) == 0
+    assert flash(s, image_file(tmp_path, image), "--compress") == 0
     assert any(is_34(m, wire.DL_DFI_DEFLATE) for m in sent) and not any(is_34(m, wire.DL_DFI) for m in sent)
     out = capsys.readouterr().out
     assert "compressed with raw DEFLATE: %d -> %d bytes" % (len(image), zlen) in out and "s saved" in out
@@ -435,10 +386,10 @@ def test_flash_compressed_runs_the_whole_sequence(demo, tmp_path, capsys):
 def test_compress_on_a_server_without_it(demo, tmp_path, capsys):
     s = demo("--no-compress")
     path = image_file(tmp_path, z_image())
-    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash", path, "--compress"]) == 2
+    assert flash(s, path, "--compress") == 2
     assert "the server has no compressed downloads" in capsys.readouterr().err
     assert read_state(s)[0]["other_state"] == 0
-    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash", path, "--compress-auto"]) == 0
+    assert flash(s, path, "--compress-auto") == 0
     assert "sending the image uncompressed" in capsys.readouterr().out
     assert read_state(s)[2] == "v0.2.0"
 
@@ -447,7 +398,7 @@ def test_compress_on_a_server_without_it(demo, tmp_path, capsys):
 def test_profile_compression(demo, tmp_path):
     s = demo()
     text = (profile.PROFILE_DIR / "example.toml").read_text().replace("[image]\n", '[image]\ncompression = "deflate"\n')
-    _, path = write_profile(tmp_path, text)
+    path = write_profile(tmp_path, text)
     sent = []
     s.tap = sent.append
     assert run_cli(s, ["--profile", path, "--interface", "pipe", "flash", image_file(tmp_path, z_image())]) == 0
@@ -458,8 +409,7 @@ def test_profile_compression(demo, tmp_path):
 # without inflating it twice, and the image still verifies.
 def test_compressed_drop_76_mid_stream(demo, tmp_path):
     s = demo()
-    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash", image_file(tmp_path, z_image()),
-                       "--compress", "--drop-76", "3"]) == 0
+    assert flash(s, image_file(tmp_path, z_image()), "--compress", "--drop-76", "3") == 0
     assert [bytes(m.data[:3]) for m in s.sent].count(b"\x02\x76\x03") == 2
     assert read_state(s)[2] == "v0.2.0"
 
@@ -477,8 +427,7 @@ def test_compressed_lost_frame_mid_stream(demo, tmp_path):
         return state["in_block_4"] and m.data[0] >> 4 == 2 and not s.dropped_tx and m.data[0] & 0x0F == 5
 
     s.drop_tx = drop_tx
-    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash", image_file(tmp_path, z_image()),
-                       "--compress"]) == 0
+    assert flash(s, image_file(tmp_path, z_image()), "--compress") == 0
     assert len(s.dropped_tx) == 1
     assert read_state(s)[2] == "v0.2.0"
 
@@ -489,8 +438,7 @@ def test_compressed_lost_answers_on_a_slow_job(demo, tmp_path):
     s = demo("--job-ms", "1000")
     s.drop = lambda m: (is_nrc(m, 0x36, 0x78) or is_block_answer(m, 2)) and len(s.dropped) < 2 and \
         any(is_block_answer(x, 1) for x in s.sent)
-    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash", image_file(tmp_path, z_image()),
-                       "--compress"], p2_s=transport.P2_S) == 0
+    assert flash(s, image_file(tmp_path, z_image()), "--compress", p2_s=transport.P2_S) == 0
     assert len(s.dropped) == 2
     assert read_state(s)[2] == "v0.2.0"
 
@@ -516,7 +464,7 @@ def send_stream(server, image, payload):
 def test_corrupt_stream_is_refused(demo):
     s = demo()
     image = z_image()
-    z = bytearray(update.deflate(image))
+    z = bytearray(delta.deflate(image))
     z[len(z) // 2:len(z) // 2 + 64] = random.Random(7).randbytes(64)
     t, uds, nrc = send_stream(s, image, z)
     with t:
@@ -532,7 +480,7 @@ def test_corrupt_stream_is_refused(demo):
 def test_truncated_stream_fails_transfer_exit(demo):
     s = demo()
     image = z_image()
-    t, uds, nrc = send_stream(s, image, update.deflate(image)[:-20])
+    t, uds, nrc = send_stream(s, image, delta.deflate(image)[:-20])
     with t:
         assert nrc is None
         with pytest.raises(Nrc) as e:
@@ -549,7 +497,7 @@ def test_truncated_stream_fails_transfer_exit(demo):
 def test_compressed_first_block_rules_refuse(demo):
     s = demo()
     image = z_image(product="widget")
-    t, uds, nrc = send_stream(s, image, update.deflate(image))
+    t, uds, nrc = send_stream(s, image, delta.deflate(image))
     with t:
         assert nrc is not None and nrc.code == wire.NRC_OUT_OF_RANGE
         assert wire.decode_result(uds.read_did(wire.DID_RESULT)) == ("DL_BAD_PROJECT", 0)
@@ -563,8 +511,7 @@ def test_compressed_first_block_rules_refuse(demo):
 def running_base(server, tmp_path):
     pytest.importorskip("detools")
     base, new = delta_pair(payload=48 * 1024)
-    assert run_cli(server, ["--profile", "example", "--interface", "pipe", "flash", image_file(tmp_path, base, "base.bin"),
-                            "--compress"]) == 0
+    assert flash(server, image_file(tmp_path, base, "base.bin"), "--compress") == 0
     return base, new, str(tmp_path / "base.bin"), image_file(tmp_path, new, "new.bin")
 
 
@@ -579,8 +526,7 @@ def test_flash_delta_runs_the_whole_sequence(demo, tmp_path, capsys, args, dfi):
     capsys.readouterr()
     sent = []
     s.tap = sent.append
-    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash", new_path, "--diff-from", base_path,
-                       *args]) == 0
+    assert flash(s, new_path, "--diff-from", base_path, *args) == 0
     assert any(is_34(m, dfi) for m in sent)
     assert not any(is_34(m, d) for m in sent for d in (wire.DL_DFI, wire.DL_DFI_DEFLATE))
     out = capsys.readouterr().out
@@ -600,7 +546,7 @@ def test_flash_delta_from_a_wrong_base_falls_back(demo, tmp_path, capsys):
     capsys.readouterr()
     sent = []
     s.tap = sent.append
-    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash", new_path, "--diff-from", wrong]) == 0
+    assert flash(s, new_path, "--diff-from", wrong) == 0
     assert any(is_34(m, wire.DL_DFI_DELTA_DEFLATE) for m in sent) and any(is_34(m, wire.DL_DFI) for m in sent)
     assert not any(is_34(m, wire.DL_DFI_DELTA) for m in sent)          # the base is wrong for every delta mode
     assert "not running the base this patch was made from" in capsys.readouterr().out
@@ -613,7 +559,7 @@ def test_flash_delta_on_a_server_without_it(demo, tmp_path, capsys):
     s = demo("--no-delta")
     base, new, base_path, new_path = running_base(s, tmp_path)
     capsys.readouterr()
-    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash", new_path, "--diff-from", base_path]) == 0
+    assert flash(s, new_path, "--diff-from", base_path) == 0
     out = capsys.readouterr().out
     assert "no delta downloads for DFI 0x30" in out and "no delta downloads for DFI 0x20" in out
     assert read_state(s)[2] == "v0.3.0"
@@ -625,6 +571,6 @@ def test_flash_delta_on_slow_jobs(demo, tmp_path):
     s = demo("--job-ms", "300")
     base, new, base_path, new_path = running_base(s, tmp_path)
     s.sent.clear()
-    assert run_cli(s, ["--profile", "example", "--interface", "pipe", "flash", new_path, "--diff-from", base_path]) == 0
+    assert flash(s, new_path, "--diff-from", base_path) == 0
     assert 0x37 in {m.data[2] for m in s.sent if m.data[1] == 0x7F and m.data[3] == 0x78}
     assert read_state(s)[2] == "v0.3.0"

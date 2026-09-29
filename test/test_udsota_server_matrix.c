@@ -27,27 +27,6 @@ static udsota_server_t s;
 static uint8_t      resp[64];
 static uint32_t     now;
 
-/* Mock seed source: always 10 11 .. 1F (non-zero, so SecurityAccess accepts it). */
-static bool mock_rng16(void *ctx, uint8_t out[16])
-{
-    for (int i = 0; i < 16; i++) {
-        out[i] = (uint8_t)(0x10 + i);
-    }
-    return true;
-}
-/* Stand-in for HMAC-SHA256, as in test_udsota_server_security.c: key[i] = seed[i] ^ level ^ 0xA5. */
-static void fake_key(const uint8_t *seed, uint8_t level, uint8_t out[16])
-{
-    for (int i = 0; i < 16; i++) {
-        out[i] = (uint8_t)(seed[i] ^ level ^ 0xA5);
-    }
-}
-/* Mock security.key: the expected key for seed and level. */
-static bool mock_key(void *ctx, const uint8_t seed[16], uint8_t level, uint8_t out[16])
-{
-    fake_key(seed, level, out);
-    return true;
-}
 /* Counts an erase; completes at once (a synchronous fake). */
 static int mock_ota_begin(void *ctx, uint32_t size) { m.n_begin++; return 0; }
 /* Counts a write; completes at once. */
@@ -79,7 +58,6 @@ static const udsota_engine_t ENGINE = {
     .activate = mock_ota_ok, .confirm = mock_ota_ok, .abort = mock_ota_abort, .poll = mock_job_poll,
     .status = udsota_mock_status, .ctx = &g_mock,
 };
-static const udsota_security_t SECURITY = {.rng16 = mock_rng16, .key = mock_key};
 
 /* A freshly booted server at T0: the mock's config (F18C) and hooks, but this file's reset hook, which records
  * the server's state at the restart; the gate allows everything. */
@@ -92,7 +70,7 @@ static void fresh(void)
     const udsota_config_t cfg = udsota_mock_cfg();
     udsota_hooks_t hooks = udsota_mock_hooks(&g_mock);
     hooks.reset = mock_reset;
-    udsota_init(&s, &cfg, &ENGINE, &SECURITY, &hooks);
+    udsota_init(&s, &cfg, &ENGINE, udsota_mock_security(), &hooks);
     udsota_set_tx_pending(&s, mock_tx_pending, NULL);
 }
 
@@ -131,10 +109,8 @@ static void unlock(uint8_t level)
 {
     uint8_t req[2 + UDSOTA_KEY_LEN] = {UDSOTA_SID_SECURITY, level};
     TEST_ASSERT_EQUAL_UINT(2 + UDSOTA_SEED_LEN, send_req(req, 2));
-    uint8_t seed[UDSOTA_SEED_LEN];
-    memcpy(seed, &resp[2], sizeof seed);
     req[1] = (uint8_t)(level + 1u);
-    fake_key(seed, level, &req[2]);
+    udsota_mock_key_for(&resp[2], level, &req[2]);
     EXPECT(send_req(req, sizeof req), 0x67, level + 1u);
 }
 

@@ -96,31 +96,12 @@ static size_t app_dids(uint16_t did, uint8_t *buf, size_t max)
     return 6;
 }
 
-/* security.rng16: 10..1F, never zero. */
-static bool sec_rng16(void *ctx, uint8_t out[16])
-{
-    for (int i = 0; i < 16; i++) {
-        out[i] = (uint8_t)(0x10 + i);
-    }
-    return true;
-}
-
-/* security.key: seed ^ level ^ 0xA5 per byte, as the other server suites. */
-static bool sec_key(void *ctx, const uint8_t seed[16], uint8_t level, uint8_t out[16])
-{
-    for (int i = 0; i < 16; i++) {
-        out[i] = (uint8_t)(seed[i] ^ level ^ 0xA5u);
-    }
-    return true;
-}
-
 static const udsota_engine_t ENGINE = {
     .check_first = eng_check_first, .begin = eng_begin, .write = eng_write, .verify = eng_verify,
     .activate = eng_activate, .confirm = eng_confirm, .abort = eng_abort, .unverify = NULL, .poll = eng_poll,
     .status = udsota_mock_status, .running_sha = eng_sha, .version = eng_version, .slot_size = 0u,
     .ctx = &g_mock,
 };
-static const udsota_security_t SECURITY = {.rng16 = sec_rng16, .key = sec_key, .ctx = NULL};
 
 /* Boots a server on g_cfg with sec and hooks (NULL = none) and installs tx_pending; the clock restarts at T0. */
 static void boot(const udsota_security_t *sec, const udsota_hooks_t *hooks)
@@ -138,7 +119,7 @@ void setUp(void)
     g_mock.app_did = app_dids;
     g_cfg = udsota_mock_cfg();
     g_hooks = udsota_mock_hooks(&g_mock);
-    boot(&SECURITY, &g_hooks);
+    boot(udsota_mock_security(), &g_hooks);
 }
 
 /* Unity hook: nothing to undo. */
@@ -174,9 +155,7 @@ static void unlock(uint8_t level)
     uint8_t req[2u + UDSOTA_KEY_LEN] = {0x27, level};
     TEST_ASSERT_EQUAL_UINT(2u + UDSOTA_SEED_LEN, txn(req, 2));
     req[1] = (uint8_t)(level + 1u);
-    for (size_t i = 0; i < UDSOTA_KEY_LEN; i++) {
-        req[2u + i] = (uint8_t)(resp[2u + i] ^ level ^ 0xA5u);
-    }
+    udsota_mock_key_for(&resp[2], level, &req[2]);
     txn(req, sizeof req);
     EXPECT(0x67, (uint8_t)(level + 1u));
 }
@@ -390,7 +369,7 @@ static void test_stmin_violation_counted_only_when_gate_allows(void)
 static void test_stmin_monitor_off(void)
 {
     g_cfg.stmin_monitor = false;
-    boot(&SECURITY, &g_hooks);
+    boot(udsota_mock_security(), &g_hooks);
     transfer_open();
     TEST_ASSERT_TRUE(udsota_fc_check(&s, 100u, 2000u, now));
     TEST_ASSERT_EQUAL_UINT16(0, s.counters.stmin_violations);
@@ -401,7 +380,7 @@ static void test_stmin_monitor_off(void)
  * positive without arming a restart, and 11 01 is 0x11. */
 static void test_null_hooks_allow(void)
 {
-    boot(&SECURITY, NULL);
+    boot(udsota_mock_security(), NULL);
     verified();
     REQ(0x22, 0xF1, 0x91);
     EXPECT(0x7F, 0x22, 0x31);
@@ -615,7 +594,7 @@ static uint8_t gate_records_phase(void *ctx, udsota_op_t op)
 static void test_latched_end_reports_idle_before_dispatch(void)
 {
     g_hooks.gate = gate_records_phase;
-    boot(&SECURITY, &g_hooks);
+    boot(udsota_mock_security(), &g_hooks);
     transfer_open();
     uint8_t b[2u + BLK] = {0x36, 0x01};
     memset(&b[2], 0xE9, BLK);
@@ -744,7 +723,7 @@ static void test_no_security(void)
 static void test_reset_hook_null(void)
 {
     g_hooks.reset = NULL;
-    boot(&SECURITY, &g_hooks);
+    boot(udsota_mock_security(), &g_hooks);
     REQ(0x11, 0x01);
     EXPECT(0x7F, 0x11, 0x11);                                 /* default: 0x11 before 0x7F */
     ext_unlocked();
@@ -772,7 +751,7 @@ static void test_config_defaults_and_overrides(void)
     g_cfg.max_block_len = 1026u;
     g_cfg.level_extended = 0x11u;
     g_cfg.level_programming = 0x05u;
-    boot(&SECURITY, &g_hooks);
+    boot(udsota_mock_security(), &g_hooks);
     REQ(0x10, 0x03);
     EXPECT(0x50, 0x03, 0x00, 0x19, 0x00, 0xC8);
     REQ(0x27, 0x01);
@@ -806,7 +785,7 @@ static void test_config_defaults_and_overrides(void)
 static void test_max_block_len_clamped_to_4095(void)
 {
     g_cfg.max_block_len = 8000u;
-    boot(&SECURITY, &g_hooks);
+    boot(udsota_mock_security(), &g_hooks);
     TEST_ASSERT_EQUAL_UINT16(UDSOTA_DL_MAX_BLOCK_LEN, s.cfg.max_block_len);
     transfer_open();                                          /* asserts 74 20 0F FF */
 }
@@ -839,7 +818,7 @@ static void test_server_owned_dids_and_fallback(void)
     bare.version = NULL;
     g_cfg.device_id = NULL;
     g_cfg.device_id_len = 0u;
-    udsota_init(&s, &g_cfg, &bare, &SECURITY, &g_hooks);
+    udsota_init(&s, &g_cfg, &bare, udsota_mock_security(), &g_hooks);
     static const uint16_t DIDS[] = {UDSOTA_DID_SW_VERSION, UDSOTA_DID_SERIAL, UDSOTA_DID_STATUS,
                                     UDSOTA_DID_RUNNING_SHA};
     for (size_t i = 0; i < sizeof DIDS / sizeof DIDS[0]; i++) {
@@ -860,7 +839,7 @@ static void test_no_status_skips_slot_checks(void)
     bare = ENGINE;
     bare.status = NULL;
     g_mock.status.boot_slot = UDSOTA_SLOT_OTA1;
-    udsota_init(&s, &g_cfg, &bare, &SECURITY, &g_hooks);
+    udsota_init(&s, &g_cfg, &bare, udsota_mock_security(), &g_hooks);
     prog_locked();
     ext_locked();
     REQ(CONF);
@@ -912,7 +891,7 @@ static void test_confirm_core_rule_per_state(void)
 /* With no tx_pending source installed a restart waits the full UDSOTA_RESET_TX_WAIT_MS. */
 static void test_restart_waits_without_tx_pending(void)
 {
-    udsota_init(&s, &g_cfg, &ENGINE, &SECURITY, &g_hooks);
+    udsota_init(&s, &g_cfg, &ENGINE, udsota_mock_security(), &g_hooks);
     now = T0;
     ext_unlocked();
     REQ(0x11, 0x01);

@@ -22,7 +22,7 @@ from .config import config_set, config_show, parse_writes, writable_keys
 from .image import parse_image
 from .keys import keygen, load_master, load_private_key
 from .transport import Transport
-from .update import DETOOLS_HINT, confirm_cmd, flash, info, reset
+from .update import DETOOLS_HINT, DIFF_DFIS, confirm_cmd, flash, info, reset
 
 
 # Command-line arguments; every command but keygen needs --profile.
@@ -51,7 +51,7 @@ def parse_args(argv):
     f.add_argument("--diff-from", type=pathlib.Path, metavar="PATH",
                    help="offer a delta download from the image the server runs: PATH is that .bin, or a directory "
                         "of .bin files to find it in (needs detools: pip install \"./client[diff]\")")
-    f.add_argument("--diff-format", choices=("auto", "heatshrink", "deflate"),
+    f.add_argument("--diff-format", choices=tuple(DIFF_DFIS),
                    help="with --diff-from, the delta modes to try: heatshrink (DFI 0x20), deflate (DFI 0x30) or "
                         "both (default auto)")
     sub.add_parser("confirm", help="ConfirmImage for a PENDING_VERIFY image")

@@ -1617,16 +1617,11 @@ static const char *const OP_NAME[OP_COUNT] = {   /* op_id_t names for the covera
  * a call, so accepted 0x34s and written 0x36 blocks were reached, not just refusals. */
 static void check_coverage(void)
 {
-#if UDSOTA_FUZZ_APP_HOOKS
-    static const uint8_t SERVED[] = {0x10, 0x11, 0x22, 0x27, 0x2E, 0x31, 0x34, 0x36, 0x37, 0x3E};
-#else
-    static const uint8_t SERVED[] = {0x10, 0x11, 0x22, 0x27, 0x31, 0x34, 0x36, 0x37, 0x3E};
-#endif
     bool ok = g_stats.nrc_code[UDSOTA_NRC_INCORRECT_LENGTH] && g_stats.nrc_code[UDSOTA_NRC_INVALID_KEY];
-    for (size_t i = 0; i < sizeof SERVED; i++) {
-        if (!g_stats.pos_sid[SERVED[i]] || !g_stats.nrc_sid[SERVED[i]]) {
-            fprintf(stderr, "fuzz_udsota: COVERAGE: SID 0x%02X positive=%d NRC=%d\n", SERVED[i],
-                    g_stats.pos_sid[SERVED[i]], g_stats.nrc_sid[SERVED[i]]);
+    for (unsigned sid = 0; sid < 256u; sid++) {   /* sid_served() is the one list: a hand copy here drifted */
+        if (sid_served((uint8_t)sid) && (!g_stats.pos_sid[sid] || !g_stats.nrc_sid[sid])) {
+            fprintf(stderr, "fuzz_udsota: COVERAGE: SID 0x%02X positive=%d NRC=%d\n", sid, g_stats.pos_sid[sid],
+                    g_stats.nrc_sid[sid]);
             ok = false;
         }
     }

@@ -1,5 +1,6 @@
 """The udsota wire contract (components/udsota/include/udsota_wire.h): sessions, server-owned DIDs,
-routines, NRCs, the download format and the status, result and counter layouts."""
+routines, NRCs, the download format and the status, result and counter layouts. DECODE and describe_result are
+Python-only: how info and config render DID records."""
 import struct
 
 from .errors import UpdateFailed
@@ -9,7 +10,7 @@ DID_SESSION, DID_VERSION, DID_DEVICE_ID = 0xF186, 0xF189, 0xF18C
 DID_STATUS, DID_RESULT, DID_COUNTERS, DID_RUNNING_SHA = 0xF1F0, 0xF1F1, 0xF1F2, 0xF1F3
 RID_CHECK_DEPS, RID_ACTIVATE, RID_CONFIRM = 0xFF01, 0xF001, 0xF002
 NRC_NOT_SUPPORTED, NRC_BUSY, NRC_CONDITIONS, NRC_SEQUENCE = 0x11, 0x21, 0x22, 0x24   # 0x11: e.g. 0x2E, no config writes
-NRC_OUT_OF_RANGE, NRC_TIME_DELAY = 0x31, 0x37
+NRC_OUT_OF_RANGE, NRC_TIME_DELAY, NRC_PENDING = 0x31, 0x37, 0x78
 NRC_PROGRAMMING_FAILURE = 0x72   # generalProgrammingFailure: a flash job failed or passed the 90 s cap
 DL_DFI, DL_ALFID, DL_MAX_DATA = 0x00, 0x44, 4093
 DL_DFI_DEFLATE = 0x10            # dataFormatIdentifier: raw DEFLATE (RFC 1951), memorySize still the image's size
@@ -62,6 +63,18 @@ def decode_result(d):
     if len(d) < 5:
         raise UpdateFailed("last-result DID F1F1 is %d bytes, expected 5" % len(d))
     return reason_name(d[0]), int.from_bytes(d[1:5], "big")
+
+
+# F1F1's value d as `info` and the errors show it: "DL_ABORTED, 0 bytes received".
+def describe_result(d):
+    return "%s, %d bytes received" % decode_result(d)
+
+
+# A [dids] entry's decode, by the name the profile gives it, as its renderer.
+DECODE = {"hex": lambda d: d.hex(" "), "ascii": cstr,
+          "version3": lambda d: "%d.%d.%d" % tuple(d) if len(d) == 3 else d.hex(" "),
+          "u8": lambda d: "%d" % d[0] if len(d) == 1 else d.hex(" "),
+          "u16": lambda d: "%d" % int.from_bytes(d, "big") if len(d) == 2 else d.hex(" ")}
 
 
 # The counters DID (udsota_counters_t) as {counter name: value}.

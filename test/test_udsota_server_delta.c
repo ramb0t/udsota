@@ -10,7 +10,7 @@
 #include <string.h>
 #include "unity.h"
 #include "udsota.h"
-#include "udsota_mock.h"
+#include "udsota_dl_harness.h"
 #include "udsota_image.h"
 #include "udsota_coded.h"
 #include "udsota_detools.h"
@@ -54,14 +54,9 @@ typedef struct {
 } eng_t;
 
 static eng_t e;
-static uint32_t g_now;
-static udsota_server_t srv;
-static uint8_t g_resp[64];
-static size_t g_resp_len;
 static uint8_t g_req[UDSOTA_DL_MAX_BLOCK_LEN];
 static uint8_t g_p[PATCH_CAP];         /* the payload the 36s carry */
 static size_t g_p_len;
-static udsota_mock_t g_mock;
 
 /* ---- the decoders' memory ---- */
 
@@ -195,18 +190,6 @@ static int eng_verify(void *ctx)
     return memcmp(e.flash, DELTA_NEW, IMG_LEN) == 0 ? 0 : (int)UDSOTA_DL_VERIFY_FAILED;
 }
 
-/* engine.check_first of the raw path: the core image rules, as the sink's. */
-static int eng_raw_check(void *ctx, const uint8_t *first, size_t len, udsota_reason_t *why)
-{
-    return s_check(ctx, first, len, why);
-}
-
-/* engine.begin of the raw path: the sink's erase. */
-static int eng_raw_begin(void *ctx, uint32_t size) { return s_begin(ctx, size); }
-
-/* engine.write of the raw path: the sink's write. */
-static int eng_raw_write(void *ctx, uint32_t off, const uint8_t *d, size_t n) { return s_write(ctx, off, d, n); }
-
 /* engine.activate and engine.confirm: done at once. */
 static int eng_ok(void *ctx) { return 0; }
 
@@ -221,38 +204,15 @@ static int eng_poll(void *ctx)
 #define ALL_FORMATS (UDSOTA_DL_FMT(UDSOTA_DL_DFI_DEFLATE) | UDSOTA_DL_FMT(UDSOTA_DL_DFI_DELTA) | \
                      UDSOTA_DL_FMT(UDSOTA_DL_DFI_DELTA_DEFLATE))
 
+/* The raw path's check_first, begin and write are the sink's: udsota_zsink_t has the engine ops' signatures. */
 static const udsota_engine_t ENGINE = {
-    .check_first = eng_raw_check, .begin = eng_raw_begin, .write = eng_raw_write, .verify = eng_verify,
+    .check_first = s_check, .begin = s_begin, .write = s_write, .verify = eng_verify,
     .activate = eng_ok, .confirm = eng_ok, .abort = eng_abort, .poll = eng_poll, .status = udsota_mock_status,
     .ctx = &g_mock, .zbegin = eng_zbegin, .zwrite = eng_zwrite, .zend = eng_zend, .zwritten = eng_zwritten,
     .zformats = ALL_FORMATS,
 };
 
 /* ---- the server ---- */
-
-/* Fixed non-zero seed pattern 01..10. */
-static bool mock_rng16(void *ctx, uint8_t out[16])
-{
-    for (int i = 0; i < 16; i++) out[i] = (uint8_t)(i + 1);
-    return true;
-}
-
-/* security.key stand-in: expected key = seed XOR 0x5A. */
-static bool mock_key(void *ctx, const uint8_t seed[16], uint8_t level, uint8_t out[16])
-{
-    for (int i = 0; i < 16; i++) out[i] = (uint8_t)(seed[i] ^ 0x5A);
-    return true;
-}
-
-static const udsota_security_t SECURITY = {.rng16 = mock_rng16, .key = mock_key};
-
-/* Boots the server on engine with the mock's config and hooks. */
-static void boot(const udsota_engine_t *engine)
-{
-    const udsota_config_t cfg = udsota_mock_cfg();
-    const udsota_hooks_t hooks = udsota_mock_hooks(&g_mock);
-    udsota_init(&srv, &cfg, engine, &SECURITY, &hooks);
-}
 
 /* Copies n bytes of p into g_p. */
 static void set_payload(const uint8_t *p, size_t n)
@@ -287,44 +247,6 @@ void tearDown(void)
     udsota_coded_close(&e.cd);
 }
 
-/* Asserts the last response is exactly the bytes listed. */
-#define EXPECT(...) do {                                                       \
-        const uint8_t e_[] = {__VA_ARGS__};                                    \
-        TEST_ASSERT_EQUAL_UINT(sizeof e_, g_resp_len);                         \
-        TEST_ASSERT_EQUAL_HEX8_ARRAY(e_, g_resp, sizeof e_);                   \
-    } while (0)
-
-/* Sends one request at g_now; keeps the immediate response in g_resp. */
-static size_t send(const uint8_t *req, size_t len)
-{
-    g_resp_len = udsota_on_request(&srv, req, len, g_resp, sizeof g_resp, g_now);
-    return g_resp_len;
-}
-
-/* 10 02 and the level-03 unlock. */
-static void enter_programming(void)
-{
-    const uint8_t sess[] = {UDSOTA_SID_SESSION, UDSOTA_SESSION_PROGRAMMING};
-    send(sess, sizeof sess);
-    TEST_ASSERT_EQUAL_HEX8(0x50, g_resp[0]);
-    const uint8_t seed_req[] = {UDSOTA_SID_SECURITY, UDSOTA_SA_SEED_PROGRAMMING};
-    send(seed_req, sizeof seed_req);
-    uint8_t key[2u + UDSOTA_KEY_LEN] = {UDSOTA_SID_SECURITY, UDSOTA_SA_KEY_PROGRAMMING};
-    for (size_t i = 0; i < UDSOTA_KEY_LEN; i++) key[2u + i] = (uint8_t)(g_resp[2u + i] ^ 0x5A);
-    send(key, sizeof key);
-    EXPECT(0x67, 0x04);
-}
-
-/* Sends 34 <dfi> 44 <address 0> <size>. */
-static size_t send_34(uint8_t dfi, uint32_t size)
-{
-    const uint8_t r[UDSOTA_DL_REQ_LEN] = {
-        UDSOTA_SID_REQUEST_DOWNLOAD, dfi, UDSOTA_DL_ALFID, 0, 0, 0, 0,
-        (uint8_t)(size >> 24), (uint8_t)(size >> 16), (uint8_t)(size >> 8), (uint8_t)size,
-    };
-    return send(r, sizeof r);
-}
-
 /* Sends 36 <bsc> with n bytes of data. */
 static size_t send_36_data(uint8_t bsc, const uint8_t *data, size_t n)
 {
@@ -344,32 +266,6 @@ static uint8_t send_payload(size_t chunk)
         EXPECT(0x76, bsc);
     }
     return bsc;
-}
-
-/* Polls every 10 ms until a final response, counting 0x78s; fails after 100 s. */
-static size_t finish_job(unsigned *pending)
-{
-    for (uint32_t waited = 0; waited < 100000u; waited += 10u) {
-        g_now += 10u;
-        const size_t n = udsota_poll(&srv, g_resp, sizeof g_resp, g_now);
-        if (n == 3u && g_resp[0] == UDSOTA_NEG_RESPONSE && g_resp[2] == UDSOTA_NRC_RESPONSE_PENDING) {
-            (*pending)++;
-            continue;
-        }
-        if (n > 0u) {
-            g_resp_len = n;
-            return n;
-        }
-    }
-    TEST_FAIL_MESSAGE("the job never finished");
-    return 0;
-}
-
-/* Sends 37. */
-static size_t send_37(void)
-{
-    const uint8_t r[] = {UDSOTA_SID_TRANSFER_EXIT};
-    return send(r, sizeof r);
 }
 
 /* Sends 31 01 <rid>. */
@@ -778,7 +674,7 @@ static void test_37_as_a_worker_job(void)
     send_payload(BLOCK);
     TEST_ASSERT_EQUAL_UINT(0u, send_37());
     unsigned pending = 0;
-    finish_job(&pending);
+    finish_job(&pending, 0);
     EXPECT(0x77);
     TEST_ASSERT_TRUE(pending >= 1u);
     expect_reason(UDSOTA_DL_OK);
@@ -793,7 +689,7 @@ static void test_37_as_a_worker_job(void)
     send_payload(BLOCK);
     TEST_ASSERT_EQUAL_UINT(0u, send_37());
     pending = 0;
-    finish_job(&pending);
+    finish_job(&pending, 0);
     EXPECT(0x7F, 0x37, 0x72);
     expect_reason(UDSOTA_DL_BAD_STREAM);
     TEST_ASSERT_EQUAL_UINT(e.allocs, e.frees);
@@ -823,7 +719,7 @@ static void test_requests_during_the_37_job(void)
     send(tp, sizeof tp);
     EXPECT(0x7E, 0x00);
     unsigned pending = 0;
-    finish_job(&pending);
+    finish_job(&pending, 0);
     EXPECT(0x77);
     TEST_ASSERT_EQUAL_UINT(1u, e.zends);
     send_routine(UDSOTA_RID_CHECK_PROG_DEPS);
@@ -841,7 +737,7 @@ static void test_37_job_cap_and_a_latched_end(void)
     send_payload(BLOCK);
     TEST_ASSERT_EQUAL_UINT(0u, send_37());
     unsigned pending = 0;
-    finish_job(&pending);
+    finish_job(&pending, 0);
     EXPECT(0x7F, 0x37, 0x72);
     expect_reason(UDSOTA_DL_WORKER_TIMEOUT);
     TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_DEFAULT, srv.session);
@@ -855,7 +751,7 @@ static void test_37_job_cap_and_a_latched_end(void)
     udsota_end_session(&srv, g_now + 10u);
     TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_PROGRAMMING, srv.session);   /* latched while the job runs */
     pending = 0;
-    finish_job(&pending);
+    finish_job(&pending, 0);
     EXPECT(0x77);
     g_now += 10u;
     (void)udsota_poll(&srv, g_resp, sizeof g_resp, g_now);

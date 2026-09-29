@@ -4,7 +4,6 @@
  * the patch's length up front for an uncompressed patch. */
 #include "udsota_detools.h"
 #include <limits.h>
-#include <stdbool.h>
 #include <stdlib.h>
 #include "detools.h"
 

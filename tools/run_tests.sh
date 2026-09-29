@@ -7,4 +7,4 @@ build=${1:-"$root/build"}
 [ $# -gt 0 ] && shift
 cmake -S "$root" -B "$build" "$@"
 cmake --build "$build" -j
-ctest --test-dir "$build" --output-on-failure
+ctest --test-dir "$build" --output-on-failure -j "$(getconf _NPROCESSORS_ONLN)"

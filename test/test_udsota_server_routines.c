@@ -36,24 +36,6 @@ static int mock_queue(int j)
     return UDSOTA_PENDING;
 }
 
-/* Fixed, non-zero seed so the key below is predictable. */
-static bool mock_rng16(void *ctx, uint8_t out[16])
-{
-    for (int i = 0; i < 16; i++) {
-        out[i] = (uint8_t)(0xA0 + i);
-    }
-    return true;
-}
-
-/* Expected key = seed ^ level ^ 0x5A per byte; unlock_programming() computes the same. */
-static bool mock_key(void *ctx, const uint8_t seed[16], uint8_t level, uint8_t out[16])
-{
-    for (int i = 0; i < 16; i++) {
-        out[i] = (uint8_t)(seed[i] ^ level ^ 0x5A);
-    }
-    return true;
-}
-
 /* Erase-and-begin, queued. */
 static int mock_ota_begin(void *ctx, uint32_t size) { return mock_queue(JOB_FLASH); }
 /* Block write, queued. */
@@ -103,14 +85,13 @@ static const udsota_engine_t ENGINE = {
     .activate = mock_ota_activate, .confirm = mock_ota_confirm, .abort = mock_ota_abort,
     .unverify = mock_ota_unverify, .poll = mock_job_poll, .status = udsota_mock_status, .ctx = &g_mock,
 };
-static const udsota_security_t SECURITY = {.rng16 = mock_rng16, .key = mock_key};
 
 /* A newly booted server: the mock's config and hooks (restarts counted in g_mock.resets) and the TX source. */
 static void boot(void)
 {
     const udsota_config_t cfg = udsota_mock_cfg();
     const udsota_hooks_t hooks = udsota_mock_hooks(&g_mock);
-    udsota_init(&srv, &cfg, &ENGINE, &SECURITY, &hooks);
+    udsota_init(&srv, &cfg, &ENGINE, udsota_mock_security(), &hooks);
     udsota_set_tx_pending(&srv, mock_tx_pending, NULL);
 }
 
@@ -158,14 +139,15 @@ static size_t send(const uint8_t *req, size_t len)
 #define REQ(...)     send((const uint8_t[]){__VA_ARGS__}, sizeof((const uint8_t[]){__VA_ARGS__}))
 #define REQ_RAW(...) send_raw((const uint8_t[]){__VA_ARGS__}, sizeof((const uint8_t[]){__VA_ARGS__}))
 
-/* Asserts the answer is exactly 7F 31 <nrc>. */
-static void expect_nrc(size_t n, uint8_t nrc)
+/* Asserts the answer is exactly 7F <sid> <nrc>; expect_nrc for 0x31's. */
+static void expect_nrc_sid(size_t n, uint8_t sid, uint8_t nrc)
 {
     TEST_ASSERT_EQUAL_UINT(3, n);
     TEST_ASSERT_EQUAL_HEX8(0x7F, resp[0]);
-    TEST_ASSERT_EQUAL_HEX8(0x31, resp[1]);
+    TEST_ASSERT_EQUAL_HEX8(sid, resp[1]);
     TEST_ASSERT_EQUAL_HEX8(nrc, resp[2]);
 }
+#define expect_nrc(n, nrc) expect_nrc_sid((n), 0x31, (nrc))
 
 /* Asserts 71 01 <rid>, plus one status byte when status >= 0 (no status record when it is -1). */
 static void expect_pos(size_t n, uint16_t rid, int status)
@@ -179,30 +161,28 @@ static void expect_pos(size_t n, uint16_t rid, int status)
     }
 }
 
-/* 27 03 then 27 04 with the mock's key; the server must already be in the programming session. */
-static void unlock_programming(void)
+/* 27 <level> then 27 <level+1> with the mock's key; the server must already be in that level's session. */
+static void unlock(uint8_t level)
 {
-    size_t n = REQ(0x27, 0x03);
+    size_t n = REQ(0x27, level);
     TEST_ASSERT_EQUAL_UINT(2 + UDSOTA_SEED_LEN, n);
     TEST_ASSERT_EQUAL_HEX8(0x67, resp[0]);
-    uint8_t key[2 + UDSOTA_KEY_LEN] = {0x27, 0x04};
-    for (size_t i = 0; i < UDSOTA_KEY_LEN; i++) {
-        key[2 + i] = (uint8_t)(resp[2 + i] ^ 0x03 ^ 0x5A);
-    }
+    uint8_t key[2 + UDSOTA_KEY_LEN] = {0x27, (uint8_t)(level + 1u)};
+    udsota_mock_key_for(&resp[2], level, &key[2]);
     n = send(key, sizeof key);
     TEST_ASSERT_EQUAL_UINT(2, n);
     TEST_ASSERT_EQUAL_HEX8(0x67, resp[0]);
-    TEST_ASSERT_EQUAL_HEX8(0x04, resp[1]);
+    TEST_ASSERT_EQUAL_HEX8(level + 1u, resp[1]);
 }
 
-/* 10 02, then level 03 when unlock is set. */
-static void enter_programming(bool unlock)
+/* 10 02, then level 03 when unlocked is set. */
+static void enter_programming(bool unlocked)
 {
     size_t n = REQ(0x10, 0x02);
     TEST_ASSERT_EQUAL_UINT(6, n);
     TEST_ASSERT_EQUAL_HEX8(0x50, resp[0]);
-    if (unlock) {
-        unlock_programming();
+    if (unlocked) {
+        unlock(UDSOTA_SA_SEED_PROGRAMMING);
     }
 }
 
@@ -320,32 +300,8 @@ static void boot_app(bool with_poll)
     udsota_hooks_t hooks = udsota_mock_hooks(&g_mock);
     hooks.routine = app_routine;
     hooks.routine_poll = with_poll ? app_routine_poll : NULL;
-    udsota_init(&srv, &cfg, &ENGINE, &SECURITY, &hooks);
+    udsota_init(&srv, &cfg, &ENGINE, udsota_mock_security(), &hooks);
     udsota_set_tx_pending(&srv, mock_tx_pending, NULL);
-}
-
-/* 27 01 then 27 02 with the mock's key; the server must already be in the extended session. */
-static void unlock_extended(void)
-{
-    size_t n = REQ(0x27, 0x01);
-    TEST_ASSERT_EQUAL_UINT(2 + UDSOTA_SEED_LEN, n);
-    uint8_t key[2 + UDSOTA_KEY_LEN] = {0x27, 0x02};
-    for (size_t i = 0; i < UDSOTA_KEY_LEN; i++) {
-        key[2 + i] = (uint8_t)(resp[2 + i] ^ 0x01 ^ 0x5A);
-    }
-    n = send(key, sizeof key);
-    TEST_ASSERT_EQUAL_UINT(2, n);
-    TEST_ASSERT_EQUAL_HEX8(0x67, resp[0]);
-    TEST_ASSERT_EQUAL_HEX8(0x02, resp[1]);
-}
-
-/* Asserts the answer is exactly 7F <sid> <nrc>. */
-static void expect_nrc_sid(size_t n, uint8_t sid, uint8_t nrc)
-{
-    TEST_ASSERT_EQUAL_UINT(3, n);
-    TEST_ASSERT_EQUAL_HEX8(0x7F, resp[0]);
-    TEST_ASSERT_EQUAL_HEX8(sid, resp[1]);
-    TEST_ASSERT_EQUAL_HEX8(nrc, resp[2]);
 }
 
 /* Polls every 10 ms from a job started at t0, accepting only silence or 0x78, then once at the 90 s cap;
@@ -544,12 +500,7 @@ static void test_ff01_cap_records_worker_timeout(void)
     mark_transfer_exited();
     m.hold = true;
     TEST_ASSERT_EQUAL_UINT(0, REQ_RAW(0x31, 0x01, 0xFF, 0x01));
-    const uint32_t t0 = now;
-    while (now + 10u < t0 + UDSOTA_JOB_CAP_MS) {
-        size_t n = poll_after(10);
-        TEST_ASSERT_TRUE(n == 0 || is_pending(n));
-    }
-    expect_nrc(poll_after(t0 + UDSOTA_JOB_CAP_MS - now), UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE);
+    expect_nrc(poll_to_cap(now), UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE);
     TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_WORKER_TIMEOUT, srv.last_dl.reason_code);
     TEST_ASSERT_FALSE(srv.slot_verified);
 }
@@ -887,7 +838,7 @@ static void test_app_routine_access_follows_session(void)
 {
     boot_app(true);
     enter_extended();
-    unlock_extended();
+    unlock(UDSOTA_SA_SEED_EXTENDED);
     expect_pos(REQ(0x31, 0x01, 0x12, 0x34), APP_RID, -1);
     TEST_ASSERT_EQUAL_UINT8(0x01, app.access.unlocked_level);
     const uint32_t e0 = app.access.epoch;
@@ -915,7 +866,7 @@ static void test_core_checks_come_before_the_app(void)
     enter_programming(false);
     mark_transfer_exited();
     expect_nrc(REQ(0x31, 0x01, 0xFF, 0x01), UDSOTA_NRC_SECURITY_ACCESS_DENIED);
-    unlock_programming();
+    unlock(UDSOTA_SA_SEED_PROGRAMMING);
     expect_nrc(REQ(0x31, 0x01, 0xFF, 0x01, 0x00), UDSOTA_NRC_INCORRECT_LENGTH);
     TEST_ASSERT_EQUAL_UINT(0, app.n_routine);
     TEST_ASSERT_EQUAL_UINT(0, m.n_end);
@@ -1014,7 +965,7 @@ static void test_app_cap_orphans_until_routine_poll(void)
     TEST_ASSERT_TRUE(srv.app_orphan);
     expect_nrc_sid(REQ(0x10, 0x02), 0x10, UDSOTA_NRC_CONDITIONS_NOT_CORRECT);
     enter_extended();
-    unlock_extended();
+    unlock(UDSOTA_SA_SEED_EXTENDED);
     expect_nrc_sid(REQ(0x11, 0x01), 0x11, UDSOTA_NRC_CONDITIONS_NOT_CORRECT);
     TEST_ASSERT_EQUAL_UINT(0, g_mock.resets);
     expect_nrc(REQ(0x31, 0x01, 0x12, 0x34), UDSOTA_NRC_CONDITIONS_NOT_CORRECT);

@@ -2,6 +2,7 @@
 guard and pre-roll, the TX-ID hard limit, profiles, and a run with a minimal profile. No kernel ISO-TP socket
 and no vcan: the UDS layer runs over a stub udsoncan connection, the pre-flight over python-can virtual buses.
 Most tests run with FULL (P), a profile that turns every optional feature on."""
+import argparse
 import errno
 import hashlib
 import io
@@ -19,6 +20,7 @@ import zlib
 from collections import deque
 
 import can
+import isotp
 import pytest
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
@@ -30,9 +32,9 @@ from udsoncan.exceptions import TimeoutException
 
 from udsota import cli, config, delta, errors, keys, profile, transport, update, wire
 from udsota.image import parse_image
-from udsota.uds import BUSY_BACKOFF_S, KEEPALIVE_S, SA_DELAY_S, Uds
+from udsota.uds import KEEPALIVE_S, SA_DELAY_S, Uds
 
-from .demo_server import build_image, delta_pair, elf_sha, reseal
+from .demo_server import MASTER, build_image, delta_pair, elf_sha, reseal
 
 # Every optional table on, with the example IDs, label, product and board; a deny list and three boards so
 # the deny-list and board checks have something to refuse.
@@ -90,7 +92,6 @@ def chatter(channel, msg, stop):
     tx.shutdown()
 
 
-MASTER = bytes(range(32))                      # master 0..31: the udsota-example vectors below and udsota_keys.c's KAT
 MAC = bytes.fromhex("020000000001")
 SEED = bytes(range(0x10, 0x20))
 KEYS = {0x01: bytes.fromhex("5de67156ccb30a17846a4cac31c9db8f"),
@@ -321,8 +322,9 @@ class FakeServer:
         self.unlocked = sub - 1
         return [bytes([0x67, sub])]
 
-    # 0x34 RequestDownload: DFI 00 (or 10 with compress), ALFID 44, address 0; answers 74 20 <max_block> and starts
-    # a fresh download, which also ends any earlier FF01 pass.
+    # 0x34 RequestDownload: DFI 00, 10 with compress, or one in delta; ALFID 44, address 0. A DFI in no_memory (or 10
+    # with z_nomem) answers 0x22 with F1F1 DL_NO_MEMORY; otherwise 74 20 <max_block> starts a fresh download, which
+    # also ends any earlier FF01 pass.
     def s34(self, req, _):
         self.dfis.append(req[1])
         if (req[1] not in ((0x00, 0x10) if self.compress else (0x00,)) + self.delta or req[2] != 0x44
@@ -371,31 +373,31 @@ class FakeServer:
     def patch(self):
         return bytes(self.zin) if self.dfi == 0x20 else zlib.decompressobj(-15).decompress(bytes(self.zin))
 
-    # The image the patch rebuilds from base, or b"" when it does not apply.
+    # The image the patch rebuilds from base, or None when it does not apply.
     def apply_patch(self):
         import detools
         out = io.BytesIO()
         try:
             detools.apply_patch(io.BytesIO(self.base), io.BytesIO(self.patch()[delta.HEADER_LEN:]), out)
         except (detools.Error, zlib.error):
-            return b""
+            return None
         return out.getvalue()
 
-    # 0x37 RequestTransferExit: an open transfer holding every announced byte closes (77), else 0x24.
+    # The DFI 0x10 blocks inflated, or None unless they are exactly one complete raw DEFLATE stream.
+    def inflate(self):
+        z = zlib.decompressobj(-15)
+        try:
+            out = z.decompress(bytes(self.zin))
+        except zlib.error:
+            return None
+        return out if z.eof and not z.unused_data else None
+
+    # 0x37 RequestTransferExit: an inflated or patched stream that is not the announced image answers 0x72
+    # (DL_BAD_STREAM); an open transfer holding every announced byte closes (77), else 0x24.
     def s37(self, req, _):
-        if self.dl_open and self.dfi in (0x20, 0x30):
-            out = self.apply_patch()
-            if len(out) != self.announced:
-                self.dl_open, self.last_dl = False, (13, len(self.zin))    # DL_BAD_STREAM
-                return self.nrc(0x37, 0x72)
-            self.written = bytearray(out)
-        if self.dl_open and self.dfi == 0x10:
-            z = zlib.decompressobj(-15)
-            try:
-                out = z.decompress(bytes(self.zin))
-            except zlib.error:
-                out = b""
-            if not z.eof or z.unused_data or len(out) != self.announced:
+        if self.dl_open and self.dfi:
+            out = self.apply_patch() if self.dfi in (0x20, 0x30) else self.inflate()
+            if out is None or len(out) != self.announced:
                 self.dl_open, self.last_dl = False, (13, len(self.zin))    # DL_BAD_STREAM
                 return self.nrc(0x37, 0x72)
             self.written = bytearray(out)
@@ -511,17 +513,11 @@ def uds_for(server, ft, monitor=None):
 
 
 # Run flash against server with fake time; returns (rc, fake time, pre-roll count).
-def run_flash(server, image=None, prof=P, master=MASTER, **kw):
+def run_flash(server, image=None, prof=P, master=MASTER, log=lambda *a: None, **kw):
     ft, prerolls = FakeTime(), []
     rc = update.flash(uds_for(server, ft), prof, make_image() if image is None else image, master,
-                  preroll=lambda: prerolls.append(1), sleep=ft.sleep, clock=ft.clock, log=lambda *a: None, **kw)
+                      preroll=lambda: prerolls.append(1), sleep=ft.sleep, clock=ft.clock, log=log, **kw)
     return rc, ft, len(prerolls)
-
-
-PRECHECK = [(0x22, 0xF1F0), (0x22, 0xF1F3), (0x22, 0xF191), (0x22, 0xF18C)]
-UNLOCK_PROG = [(0x10, 2), (0x27, 3), (0x27, 4)]
-DOWNLOAD_TAIL = [(0x37, None), (0x31, 0xFF01), (0x31, 0xF001)]
-AFTER_ACTIVATE = [(0x22, 0xF1F3)] * 3 + [(0x10, 3)] + [(0x31, 0xF002)] * 3 + [(0x22, 0xF1F0)]
 
 
 # Expected 0x36 log for a 4800-byte image in 16-byte blocks: 300 blocks, counter wrapping 0xFF -> 0x00.
@@ -532,6 +528,15 @@ def blocks(repeat=None):
         if n == repeat:
             out.append((0x36, n & 0xFF))
     return out
+
+
+PRECHECK = [(0x22, 0xF1F0), (0x22, 0xF1F3), (0x22, 0xF191), (0x22, 0xF18C)]
+UNLOCK_PROG = [(0x10, 2), (0x27, 3), (0x27, 4)]
+UNLOCK_EXT = [(0x22, 0xF18C), (0x10, 3), (0x27, 1), (0x27, 2)]
+RESET = UNLOCK_EXT + [(0x11, 1)]
+DOWNLOAD_TAIL = [(0x37, None), (0x31, 0xFF01), (0x31, 0xF001)]
+DOWNLOAD = [(0x34, None)] + blocks() + DOWNLOAD_TAIL
+AFTER_ACTIVATE = [(0x22, 0xF1F3)] * 3 + [(0x10, 3)] + [(0x31, 0xF002)] * 3 + [(0x22, 0xF1F0)]
 
 
 # ---- keys: the udsota-example vectors and the core's KAT ----
@@ -791,7 +796,6 @@ def test_quiet_bus_cleans_up_on_send_errors():
 
 # Check a key flag for the other 0x27 mode is refused, not silently ignored.
 def test_key_flag_for_the_other_mode_is_refused():
-    import argparse
     hmac_args = argparse.Namespace(master=None, private_key="k.pem")
     with pytest.raises(errors.Refused, match="--private-key is for mode ecdsa"):
         cli.load_secret(P, hmac_args)
@@ -828,7 +832,6 @@ def test_isotp_address_refuses_deny_tx_ids():
 
 # Check the kernel socket is blocking, WAIT_TX_DONE, padded 0xAA and never forces STmin (no real socket).
 def test_isotp_connection_socket_options(monkeypatch):
-    import isotp
     made = []
 
     # Records the constructor timeout and the options; never opens an AF_CAN socket.
@@ -888,7 +891,6 @@ class EcommSocket:
 
 # Open cls (a udsoncan ISO-TP socket connection) over an EcommSocket and send payload from the peer.
 def open_over_ecomm(cls, payload, errors=1, stolen=False):
-    import isotp
     sock = EcommSocket(errors=errors, stolen=stolen)
     conn = cls("vcan0", isotp.Address(isotp.AddressingMode.Normal_11bits, txid=0x710, rxid=0x718), tpsock=sock)
     conn.open()
@@ -1162,9 +1164,7 @@ def test_flash_runs_the_update_sequence_in_order():
     d = FakeServer()
     rc, ft, prerolls = run_flash(d)
     assert rc == 0
-    assert d.log == (PRECHECK + UNLOCK_PROG + [(0x34, None)] + blocks()
-                     + [(0x37, None), (0x31, 0xFF01), (0x31, 0xF001)]
-                     + [(0x22, 0xF1F3)] * 3 + [(0x10, 3)] + [(0x31, 0xF002)] * 3 + [(0x22, 0xF1F0)])
+    assert d.log == PRECHECK + UNLOCK_PROG + DOWNLOAD + AFTER_ACTIVATE
     assert bytes(d.written) == make_image() and d.writes == 300
     assert prerolls == 3
     assert ft.sleeps[0] == update.REBOOT_WAIT_S and ft.sleeps.count(update.CONFIRM_RETRY_S) == 2
@@ -1473,9 +1473,8 @@ def test_lost_ff01_failure_names_the_result_reason():
 def test_activate_sequence_error_downloads_again():
     d = FakeServer(activate_nrcs=[0x24])
     assert run_flash(d, drop_76=2)[0] == 0
-    once = [(0x34, None)] + blocks() + DOWNLOAD_TAIL
     assert d.log == (PRECHECK + UNLOCK_PROG + [(0x34, None)] + blocks(repeat=2) + DOWNLOAD_TAIL
-                     + once + AFTER_ACTIVATE)
+                     + DOWNLOAD + AFTER_ACTIVATE)
     assert d.writes == 600 and d.sha == NEW_SHA
 
 
@@ -1483,8 +1482,7 @@ def test_activate_sequence_error_downloads_again():
 def test_activate_sequence_error_on_the_skip_path_downloads():
     d = FakeServer(other_state=3, other_sha=NEW_SHA, activate_nrcs=[0x24])
     assert run_flash(d)[0] == 0
-    assert d.log == (PRECHECK + UNLOCK_PROG + [(0x31, 0xF001), (0x34, None)] + blocks() + DOWNLOAD_TAIL
-                     + AFTER_ACTIVATE)
+    assert d.log == PRECHECK + UNLOCK_PROG + [(0x31, 0xF001)] + DOWNLOAD + AFTER_ACTIVATE
 
 
 # Check a second 0x24 to ActivateImage stops: the tool recovers once per run.
@@ -1501,8 +1499,8 @@ def test_activate_failure_with_set_boot_landed_resets_and_confirms():
     d = FakeServer(activate_fail="set_boot")
     rc, _, prerolls = run_flash(d)
     assert rc == 0
-    assert d.log == (PRECHECK + UNLOCK_PROG + [(0x34, None)] + blocks() + DOWNLOAD_TAIL
-                     + [(0x22, 0xF1F0), (0x10, 3), (0x27, 1), (0x27, 2), (0x11, 1)] + AFTER_ACTIVATE)
+    assert d.log == (PRECHECK + UNLOCK_PROG + DOWNLOAD + [(0x22, 0xF1F0), (0x10, 3), (0x27, 1), (0x27, 2), (0x11, 1)]
+                     + AFTER_ACTIVATE)
     assert d.sha == NEW_SHA and d.running_state == 3 and prerolls == 3
 
 
@@ -1511,7 +1509,7 @@ def test_activate_failure_not_landed_stops():
     d = FakeServer(activate_fail="clean")
     with pytest.raises(errors.UpdateFailed, match="did not land"):
         run_flash(d)
-    assert d.log == PRECHECK + UNLOCK_PROG + [(0x34, None)] + blocks() + DOWNLOAD_TAIL + [(0x22, 0xF1F0)]
+    assert d.log == PRECHECK + UNLOCK_PROG + DOWNLOAD + [(0x22, 0xF1F0)]
     assert d.sha == OLD_SHA
 
 
@@ -1547,7 +1545,7 @@ def test_confirm_gives_up_after_timeout():
 def test_reset_is_keyed():
     ft, d = FakeTime(), FakeServer()
     assert update.reset(uds_for(d, ft), P, MASTER, log=lambda *a: None) == 0
-    assert d.log == [(0x22, 0xF18C), (0x10, 3), (0x27, 1), (0x27, 2), (0x11, 1)]
+    assert d.log == RESET
 
 
 # Check reset just after a boot waits out the server's 10 s 0x27 delay (NRC 0x37) instead of failing.
@@ -1563,7 +1561,7 @@ def test_reset_waits_out_the_post_boot_delay():
 def test_reset_ecdsa_is_keyed():
     ft, d = FakeTime(), FakeServer(pubkey=TESTER_PUB)
     assert update.reset(uds_for(d, ft), PE, TESTER_KEY, log=lambda *a: None) == 0
-    assert d.log == [(0x22, 0xF18C), (0x10, 3), (0x27, 1), (0x27, 2), (0x11, 1)]
+    assert d.log == RESET
 
 
 # Check info reads the identity DIDs and config DIDs up to the first absent one, without a session change.
@@ -1584,6 +1582,11 @@ class FakeTransport:
     # Remember the server and interface.
     def __init__(self, server, interface):
         self.server, self.interface = server, interface
+
+    # A cli.main transport factory that opens this class on server.
+    @classmethod
+    def on(cls, server):
+        return lambda prof, interface: cls(server, interface)
 
     # Enter the with-block.
     def __enter__(self):
@@ -1636,19 +1639,18 @@ def test_main_refuses_before_opening_the_bus(tmp_path, full_path):
 # Check `info` runs end to end through main with the built-in example profile and exits 0.
 def test_main_info_end_to_end(capsys):
     d = FakeServer(security=False)
-    assert cli.main(["--profile", "example", "--interface", "vcan0", "info"],
-                    transport=lambda p, i: FakeTransport(d, i)) == 0
+    assert cli.main(["--profile", "example", "--interface", "vcan0", "info"], transport=FakeTransport.on(d)) == 0
     assert "F191 board: devkit" in capsys.readouterr().out
 
 
 # Check a short DID record or an answer for another service ends in exit 1 with a message, not a traceback.
 def test_main_maps_malformed_answers_to_exit_1(capsys):
     d = FakeServer(config={0xF1F0: b"\x01"})     # F1F0 too short for its 16-byte layout
-    assert cli.main(["--profile", "example", "info"], transport=lambda p, i: FakeTransport(d, i)) == 1
+    assert cli.main(["--profile", "example", "info"], transport=FakeTransport.on(d)) == 1
     assert "F1F0 is 1 bytes" in capsys.readouterr().err
     d = FakeServer()
     d.s22 = lambda req, did: [b"\x51\x01"]        # an ECUReset answer to a ReadDataByIdentifier
-    assert cli.main(["--profile", "example", "info"], transport=lambda p, i: FakeTransport(d, i)) == 1
+    assert cli.main(["--profile", "example", "info"], transport=FakeTransport.on(d)) == 1
     assert "unexpected answer" in capsys.readouterr().err
 
 
@@ -1801,9 +1803,8 @@ def test_main_ecdsa_reset(tmp_path):
     p.write_text(FULL_ECDSA)
     private, _ = keys.keygen(tmp_path / "keys")
     d = FakeServer(pubkey=keys.public_point(keys.load_private_key(private)))
-    assert cli.main(["--profile", str(p), "--private-key", str(private), "reset"],
-                    transport=lambda prof, i: FakeTransport(d, i)) == 0
-    assert d.log == [(0x22, 0xF18C), (0x10, 3), (0x27, 1), (0x27, 2), (0x11, 1)]
+    assert cli.main(["--profile", str(p), "--private-key", str(private), "reset"], transport=FakeTransport.on(d)) == 0
+    assert d.log == RESET
     assert cli.main(["--profile", str(p), "--private-key", str(tmp_path / "absent.pem"), "reset"],
                     transport=no_transport) == 2
 
@@ -1889,9 +1890,7 @@ def test_generic_flash_has_no_security(generic):
     d = FakeServer(security=False)
     rc, _, prerolls = run_flash(d, image=widget_image(), prof=generic, master=None)
     assert rc == 0
-    assert d.log == ([(0x22, 0xF1F0), (0x22, 0xF1F3), (0x10, 2), (0x34, None)] + blocks()
-                     + [(0x37, None), (0x31, 0xFF01), (0x31, 0xF001)]
-                     + [(0x22, 0xF1F3)] * 3 + [(0x10, 3)] + [(0x31, 0xF002)] * 3 + [(0x22, 0xF1F0)])
+    assert d.log == [(0x22, 0xF1F0), (0x22, 0xF1F3), (0x10, 2)] + DOWNLOAD + AFTER_ACTIVATE
     assert bytes(d.written) == widget_image() and d.sha == NEW_SHA and d.running_state == 3
 
 
@@ -1962,14 +1961,14 @@ C = profile.from_dict("conf", tomllib.loads(CONF))
 KEY = '[dids]\n"0x0200" = { name = "mode", decode = "u8", '
 
 
-# Check CONF's typed entries (an absent min or max stays None), the overlapping range, and its [config]; FULL has
+# Check CONF's typed entries (an absent min or max is the type's bound), the overlapping range, and its [config]; FULL has
 # no config and no typed DID.
 def test_config_profile_values():
     assert [(e.first, e.last, e.name, e.decode, e.type, e.writable, e.min, e.max) for e in C.dids] == [
-        (0x0200, 0x0200, "mode", "u8", "u8", True, None, 2),
+        (0x0200, 0x0200, "mode", "u8", "u8", True, 0, 2),
         (0x0201, 0x0201, "timeout_ms", "u16", "u16", True, 1000, 5000),
         (0x0202, 0x0202, "tag", "hex", "blob", True, None, None),
-        (0x0203, 0x0203, "spare", "u8", "u8", True, None, None),
+        (0x0203, 0x0203, "spare", "u8", "u8", True, 0, 255),
         (0x0205, 0x0205, "limit", "u8", None, False, None, None),
         (0x0200, 0x020F, "settings", "hex", None, False, None, None)]
     assert C.config == profile.ConfigSpec(0x1234, 0xF1B2, profile.HashSpec(0xF1B0, 0x0200, 0x020F, 1))
@@ -2019,7 +2018,7 @@ def test_example_config_comments_load():
     text = (profile.PROFILE_DIR / "example.toml").read_text()
     live = re.sub(r'(?m)^# (?=(?:"0x020[01]" |\[config\]$|commit_rid |status_did |hash ))', "", text)
     e = profile.from_dict("example", tomllib.loads(live))
-    assert [(d.name, d.type, d.min, d.max) for d in e.dids if d.writable] == [("mode", "u8", None, 2),
+    assert [(d.name, d.type, d.min, d.max) for d in e.dids if d.writable] == [("mode", "u8", 0, 2),
                                                                             ("timeout_ms", "u16", 1000, 5000)]
     assert e.config == profile.ConfigSpec(0x1234, 0xF1B2, profile.HashSpec(0xF1B0, 0x0200, 0x02FF, 1))
 
@@ -2028,8 +2027,8 @@ def test_example_config_comments_load():
 
 # Check u8 and u16 print as decimal, and a record of another length falls back to hex.
 def test_u8_u16_decoders():
-    assert (update.DECODE["u8"](b"\x2a"), update.DECODE["u16"](b"\x0b\xb8")) == ("42", "3000")
-    assert (update.DECODE["u8"](b"\x01\x02"), update.DECODE["u16"](b"\x05")) == ("01 02", "05")
+    assert (wire.DECODE["u8"](b"\x2a"), wire.DECODE["u16"](b"\x0b\xb8")) == ("42", "3000")
+    assert (wire.DECODE["u8"](b"\x01\x02"), wire.DECODE["u16"](b"\x05")) == ("01 02", "05")
 
 
 # Check info decodes CONF's u8 and u16 DIDs as decimal, a blob as hex, and reports the key the server lacks.
@@ -2043,7 +2042,6 @@ def test_info_decodes_u8_and_u16():
 
 # ---- config writes: set and show ----
 
-UNLOCK_EXT = [(0x22, 0xF18C), (0x10, 3), (0x27, 1), (0x27, 2)]
 HASH_READS = [(0x22, did) for did in range(0x0200, 0x0210)] + [(0x22, CFG_HASH_DID)]
 
 
@@ -2249,7 +2247,7 @@ def test_main_config_set_exit_codes(conf_path, capsys, server_kw, args, rc, text
     d = FakeServer(**server_kw)
     master = str(pathlib.Path(conf_path).parent / "master.bin")
     assert cli.main(["--profile", conf_path, "--master", master, "config", "set"] + args,
-                    transport=lambda p, i: FakeTransport(d, i)) == rc
+                    transport=FakeTransport.on(d)) == rc
     assert re.search(text, capsys.readouterr().err) and d.log[-1] == last
     assert d.nvs is None or d.nvs == CFG_VALUES
 
@@ -2257,7 +2255,7 @@ def test_main_config_set_exit_codes(conf_path, capsys, server_kw, args, rc, text
 # Check config show runs end to end through main without any master file and exits 0.
 def test_main_config_show_end_to_end(conf_path, capsys):
     d = FakeServer(cfg_keys=CFG_VALUES)
-    assert cli.main(["--profile", conf_path, "config", "show"], transport=lambda p, i: FakeTransport(d, i)) == 0
+    assert cli.main(["--profile", conf_path, "config", "show"], transport=FakeTransport.on(d)) == 0
     assert "0201 timeout_ms: 2000 (1000..5000)" in capsys.readouterr().out
 
 
@@ -2276,7 +2274,7 @@ def test_main_ecdsa_config_set(tmp_path, capsys):
     private, _ = keys.keygen(tmp_path / "keys")
     d = FakeServer(pubkey=keys.public_point(keys.load_private_key(private)), cfg_keys=CFG_VALUES)
     assert cli.main(["--profile", str(p), "--private-key", str(private), "config", "set", "mode=2", "--commit"],
-                    transport=lambda prof, i: FakeTransport(d, i)) == 0
+                    transport=FakeTransport.on(d)) == 0
     assert d.nvs[0x0200] == b"\x02" and d.log[:4] == UNLOCK_EXT
     master = tmp_path / "master.bin"
     master.write_bytes(MASTER)
@@ -2290,7 +2288,7 @@ def test_main_ecdsa_config_set(tmp_path, capsys):
 # the keys, not from a failed hash or status read.
 def test_main_config_show_without_config_writes(conf_path, capsys):
     d = FakeServer()
-    assert cli.main(["--profile", conf_path, "config", "show"], transport=lambda p, i: FakeTransport(d, i)) == 2
+    assert cli.main(["--profile", conf_path, "config", "show"], transport=FakeTransport.on(d)) == 2
     assert "this firmware has no config writes" in capsys.readouterr().err
     assert d.log == [(0x22, did) for did in (0x0200, 0x0201, 0x0202, 0x0203)]
 
@@ -2328,7 +2326,7 @@ def test_main_config_set_prerolls_the_restart(conf_path, monkeypatch):
 
     master = str(pathlib.Path(conf_path).parent / "master.bin")
     assert cli.main(["--profile", conf_path, "--master", master, "config", "set", "mode=2", "--commit", "--reset"],
-                    transport=lambda p, i: Counting(d, i)) == 0
+                    transport=Counting.on(d)) == 0
     assert len(prerolls) == 3 and d.cfg_keys[0x0200] == b"\x02"
 
 
@@ -2372,9 +2370,7 @@ def deflate9(image):
 # stream in fewer blocks, counting progress in compressed bytes, and the server's slot ends up holding the image.
 def test_flash_compressed_sends_a_deflate_stream():
     d, lines = FakeServer(compress=True), []
-    ft = FakeTime()
-    rc = update.flash(uds_for(d, ft), P, make_image(), MASTER, sleep=ft.sleep, clock=ft.clock, log=lines.append,
-                      compress="deflate")
+    rc = run_flash(d, compress="deflate", log=lines.append)[0]
     z = deflate9(make_image())
     assert rc == 0 and d.dfi == 0x10 and d.announced == 4800
     assert bytes(d.zin) == z
@@ -2419,9 +2415,7 @@ def test_compress_on_a_server_without_it_is_refused():
 # prints no ratio for a stream it never sent.
 def test_compress_auto_falls_back_to_uncompressed():
     d, lines = FakeServer(), []
-    ft = FakeTime()
-    assert update.flash(uds_for(d, ft), P, make_image(), MASTER, sleep=ft.sleep, clock=ft.clock, log=lines.append,
-                        compress="auto") == 0
+    assert run_flash(d, compress="auto", log=lines.append)[0] == 0
     assert [e for e in d.log if e[0] == 0x34] == [(0x34, None)] * 2
     assert bytes(d.written) == make_image() and d.writes == 300
     assert ("the server has no compressed downloads, or the image is larger than its slot: sending the image "
@@ -2437,9 +2431,7 @@ def test_compressed_34_without_memory():
         run_flash(d, compress="deflate")
     assert not any(e[0] == 0x36 for e in d.log)
     d, lines = FakeServer(compress=True, z_nomem=True), []
-    ft = FakeTime()
-    assert update.flash(uds_for(d, ft), P, make_image(), MASTER, sleep=ft.sleep, clock=ft.clock, log=lines.append,
-                        compress="auto") == 0
+    assert run_flash(d, compress="auto", log=lines.append)[0] == 0
     assert d.dfi == 0x00 and bytes(d.written) == make_image()
     assert "the server has no memory for a compressed download now: sending the image uncompressed" in lines
 
@@ -2452,6 +2444,15 @@ def test_compress_auto_does_not_fall_back_on_other_refusals():
         run_flash(d, compress="auto")
     assert (e.value.sid, e.value.code) == (0x34, 0x22)
     assert [x for x in d.log if x[0] == 0x34] == [(0x34, None)]
+
+
+# Check the 34's 0x22 is still what's reported when F1F1 then cannot be read (its read error must not hide it).
+def test_compressed_34_refusal_survives_an_unreadable_f1f1():
+    d = FakeServer(compress=True, nrc_once={(0x34, None): 0x22, (0x22, 0xF1F1): 0x31})
+    with pytest.raises(errors.Nrc) as e:
+        run_flash(d, compress="auto")
+    assert (e.value.sid, e.value.code) == (0x34, 0x22)
+    assert not [x for x in d.log if x[0] == 0x36]
 
 
 # Check a lost 76 mid-stream is resent once and the server takes the repeat without adding it to the stream.
@@ -2518,7 +2519,7 @@ def test_main_compress_on_a_server_without_it_exits_2(tmp_path, full_path, capsy
     master.write_bytes(MASTER)
     d = FakeServer()
     rc = cli.main(["--profile", full_path, "--master", str(master), "flash", "--compress", str(img)],
-                  transport=lambda prof, interface: FakeTransport(d, interface))
+                  transport=FakeTransport.on(d))
     assert rc == 2 and "the server has no compressed downloads" in capsys.readouterr().err
 
 
@@ -2538,10 +2539,8 @@ def resigned(base):
 # Run flash from DELTA_BASE (what server runs) to DELTA_NEW with bases; returns (rc, the log lines). Needs detools.
 def run_delta(server, bases, **kw):
     pytest.importorskip("detools")
-    ft, lines = FakeTime(), []
-    rc = update.flash(uds_for(server, ft), P, DELTA_NEW, MASTER, sleep=ft.sleep, clock=ft.clock, log=lines.append,
-                      bases=bases, **kw)
-    return rc, lines
+    lines = []
+    return run_flash(server, DELTA_NEW, bases=bases, log=lines.append, **kw)[0], lines
 
 
 # A server running DELTA_BASE that serves the delta DFIs in delta, and compressed downloads.
@@ -2643,20 +2642,11 @@ def test_flash_delta_profile_none_still_tries_0x30():
     assert rc == 0 and d.dfis == [0x30, 0x20, 0x00] and bytes(d.written) == DELTA_NEW
 
 
-# Check a lost 7F 36 31 for a patch from another base still falls back: the resent block finds the download ended
-# (0x24), F1F1 reads DL_BAD_BASE, and the full download goes.
-def test_flash_delta_wrong_base_with_the_answer_lost():
-    d = delta_server(base=resigned(DELTA_BASE), lose_bad_base=True)
-    rc, lines = run_delta(d, [("a.bin", DELTA_BASE)], compress="auto")
-    assert rc == 0 and d.dfis == [0x30, 0x10] and bytes(d.written) == DELTA_NEW
-    assert any(ln.startswith("the device is not running the base this patch was made from") for ln in lines)
-
-
 # Check flash() itself refuses --drop-76 with bases, before any request, for a library caller as for the CLI.
 def test_flash_drop_76_with_bases_is_refused():
     d = delta_server()
     with pytest.raises(errors.Refused, match="--drop-76 is for full and compressed downloads"):
-        update.flash(uds_for(d, FakeTime()), P, DELTA_NEW, MASTER, bases=[("a.bin", DELTA_BASE)], drop_76=2)
+        run_flash(d, DELTA_NEW, bases=[("a.bin", DELTA_BASE)], drop_76=2)
     assert d.dfis == []
 
 
@@ -2671,7 +2661,7 @@ def test_flash_delta_patch_build_failures(monkeypatch, raised, error, text):
     monkeypatch.setattr(update, "build_delta", boom)
     d = delta_server()
     with pytest.raises(error, match=re.escape(text)):
-        update.flash(uds_for(d, FakeTime()), P, DELTA_NEW, MASTER, bases=[("a.bin", DELTA_BASE)])
+        run_flash(d, DELTA_NEW, bases=[("a.bin", DELTA_BASE)])
 
 
 # Check --diff-format without --diff-from, and a --diff-from directory with no .bin files, are refused (exit 2).
@@ -2680,7 +2670,7 @@ def test_main_diff_flag_misuse(tmp_path, full_path, capsys):
     img.write_bytes(DELTA_NEW)
     (tmp_path / "empty").mkdir()
     d = delta_server()
-    tr = lambda prof, interface: FakeTransport(d, interface)   # noqa: E731
+    tr = FakeTransport.on(d)
     assert cli.main(["--profile", full_path, "flash", str(img), "--diff-format", "deflate"], transport=tr) == 2
     assert "--diff-format needs --diff-from" in capsys.readouterr().err
     pytest.importorskip("detools")                              # load_bases checks for it before the directory
@@ -2706,7 +2696,7 @@ def test_main_drop_76_with_diff_from(tmp_path, full_path, capsys):
     base.write_bytes(DELTA_BASE)
     d = delta_server()
     rc = cli.main(["--profile", full_path, "flash", str(img), "--diff-from", str(base), "--drop-76", "2"],
-                  transport=lambda prof, interface: FakeTransport(d, interface))
+                  transport=FakeTransport.on(d))
     assert rc == 2 and d.dfis == []
     assert "--drop-76 is for full and compressed downloads" in capsys.readouterr().err
 
@@ -2722,13 +2712,15 @@ def test_flash_delta_falls_back_on_0x31_at_the_34(served, dfis):
 
 
 # Check a 36 refused with 0x31 and F1F1 DL_BAD_BASE (the server runs a re-signed build: same app_elf_sha256, other
-# image) skips every other delta mode and sends the full download with a new 34.
-def test_flash_delta_wrong_base_falls_back_to_a_full_download():
-    d = delta_server(base=resigned(DELTA_BASE))
+# image) skips every other delta mode and sends the full download with a new 34; or, with the 7F 36 31 lost, the
+# resent block finds the download ended (0x24) and F1F1 reads DL_BAD_BASE, and the same fallback follows.
+@pytest.mark.parametrize("lost", [False, True], ids=["refused", "answer_lost"])
+def test_flash_delta_wrong_base_falls_back_to_a_full_download(lost):
+    d = delta_server(base=resigned(DELTA_BASE), lose_bad_base=lost)
     rc, lines = run_delta(d, [("a.bin", DELTA_BASE)], compress="auto")
     assert rc == 0 and d.dfis == [0x30, 0x10] and bytes(d.written) == DELTA_NEW
     assert any(ln.startswith("the device is not running the base this patch was made from") for ln in lines)
-    d = delta_server(base=resigned(DELTA_BASE))
+    d = delta_server(base=resigned(DELTA_BASE), lose_bad_base=lost)
     assert run_delta(d, [("a.bin", DELTA_BASE)], compress="none")[0] == 0 and d.dfis == [0x20, 0x00]
 
 
@@ -2784,7 +2776,7 @@ def test_main_diff_from_a_directory(tmp_path, full_path, capsys, monkeypatch):
     (bases / "resigned.img").write_bytes(resigned(DELTA_BASE))
     d = delta_server(boot_silence=0, confirm_refusals=0)
     rc = cli.main(["--profile", full_path, "--master", str(master), "flash", str(img), "--diff-from", str(bases),
-                   "--compress-auto"], transport=lambda prof, interface: FakeTransport(d, interface))
+                   "--compress-auto"], transport=FakeTransport.on(d))
     assert rc == 0 and d.dfis == [0x30] and bytes(d.written) == DELTA_NEW
     assert "delta base: %s" % (bases / "v0.2.0.bin") in capsys.readouterr().out
     assert cli.main(["--profile", full_path, "--master", str(master), "flash", str(img), "--diff-from",

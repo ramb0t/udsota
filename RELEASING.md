@@ -1,5 +1,7 @@
 # Releasing udsota
 
+How udsota is versioned and released. After a user-visible merge, run **Actions → cut release** with minor or patch; the rest explains what that does and the by-hand paths.
+
 ## Version numbers
 
 udsota uses [semantic versioning](https://semver.org). While it is 0.x:
@@ -17,13 +19,13 @@ The example's `PROJECT_VER` in `examples/esp32/CMakeLists.txt` is something else
 
 ## Every pull request
 
-Add a line to `## [Unreleased]` in `CHANGELOG.md` for anything a user would notice, and say whether it is breaking.
+Add a line to `## [Unreleased]` in `CHANGELOG.md` for anything a user would notice, and say whether it is breaking. The [pull request template](.github/pull_request_template.md) asks for it, with the bump from the table above and where the change ran.
 
 ## Making a release
 
 **Right after merging, run Actions → cut release → Run workflow** on `main`, with **minor** or **patch** from the table above. It takes the next version from the latest tag, moves `[Unreleased]`'s entries under `## [X.Y.Z] - today` with a new empty `[Unreleased]` above them, sets `__version__`, commits that to `main` as "Release X.Y.Z", and pushes an annotated tag. It refuses when `[Unreleased]` is empty or `main`'s CI hasn't passed on the commit. Release after each user-visible merge, or after several.
 
-It then runs the [release workflow](.github/workflows/release.yml) on the tag. That checks the tag, builds the client's wheel and sdist and the example's app image for esp32 and esp32s3 at the tag, and publishes a GitHub Release. The notes are the version's CHANGELOG section, with its links made absolute at the tag. Releases are not marked as pre-releases, even at 0.x, so the newest one is GitHub's Latest and `/releases/latest` finds it.
+It then runs the [release workflow](.github/workflows/release.yml) on the tag. That checks the tag, builds the client's wheel and sdist and the example's app image for esp32 and esp32s3 at the tag, and publishes a GitHub Release. The notes are the version's section of `main`'s CHANGELOG, with its links made absolute at the tag. Releases are not marked as pre-releases, even at 0.x, so the newest one is GitHub's Latest and `/releases/latest` finds it.
 
 The cut pushes to `main` directly. That works while `main` has no branch protection; with protection on, it needs a bypass, or a release PR instead.
 
@@ -32,11 +34,10 @@ To release by hand instead, merge a PR that makes the same two edits (`python to
 ## Rules
 
 - Tag only commits on `main` whose CI is green. The cut's own commit changes only the CHANGELOG and `__version__`, on top of one whose CI passed.
-- Tags are annotated and named `vX.Y.Z`.
 - Never move or delete a published tag, or replace a published Release's files. Fix a bad release with a new patch release.
 
 ## Releasing an older tag
 
-For a version tagged before the workflow existed, run the workflow by hand: **Actions → release → Run workflow**, with the tag and, for an older commit whose CHANGELOG may still say "unreleased", **backfill** on. Backfill skips the version check and takes the notes from `main`'s CHANGELOG. The tag must already exist on `main` and be annotated; the workflow never creates one.
+For a version tagged before the workflow existed, run the workflow by hand: **Actions → release → Run workflow**, with the tag and, for an older commit whose CHANGELOG may still say "unreleased", **backfill** on. Backfill skips the version check. The tag must already exist on `main` and be annotated; the workflow never creates one.
 
 A Release attaches the client only when the tagged client's `__version__` is the Release's version, which is why `v0.2.0`'s has none.

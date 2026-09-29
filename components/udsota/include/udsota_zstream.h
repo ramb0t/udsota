@@ -1,9 +1,8 @@
 /* Compressed downloads (DFI 0x10, and the outer layer of 0x30): the decompressor interface and the stream that turns
  * a download's compressed 0x36 payloads into an image (through udsota_isink.h: the first-block check, erase and writes
  * at image offsets) or into the next stage's input (the delta patch of DFI 0x30, udsota_patch.h). Pure C: the core
- * never includes a compression library. An engine that serves DFI 0x10 runs a udsota_zstream_t behind its zbegin,
- * zwrite and zend (udsota.h) wherever it does its flash work; components/udsota_inflate supplies a udsota_inflate_t
- * on miniz's tinfl. */
+ * never includes a compression library. An engine reaches it through udsota_coded.h, which chains it for DFI 0x10
+ * and 0x30; components/udsota_inflate supplies a udsota_inflate_t on miniz's tinfl. */
 #pragma once
 #include <stdbool.h>
 #include <stddef.h>

@@ -3,7 +3,7 @@
  * block; FF01 is fake_ota_end (segment walk and a real SHA-256 over the image), then the same first-block
  * rules again on the bytes in the slot, as the port does. A simulated reset (demo_engine_boot) runs the
  * boot slot: an activated image boots PENDING_VERIFY, and one rebooted before ConfirmImage rolls back.
- * With job_ms set, begin, verify, activate and confirm (and the writes queued behind an erase) answer
+ * With job_ms set, begin, verify, activate, confirm, zwrite and zend (and the writes queued behind an erase) answer
  * UDSOTA_PENDING and finish job_ms later, like the port's flash worker, so the server sends 0x78. With compress set it
  * also serves compressed downloads (DFI 0x10), and with delta set too delta ones (0x20, 0x30) rebuilt from the
  * running slot: zbegin, zwrite and zend run udsota_coded over the vendored tinfl and detools into the same
@@ -60,7 +60,7 @@ udsota_engine_t demo_engine_ops(demo_engine_t *e);
 void demo_engine_version(const demo_engine_t *e, char out[33]);
 
 /* Builds an image that passes the demo's first-block rules and FF01: fake_ota_build_image's one-segment image
- * (hw_id, version, payload_len bytes of segment 0), restamped with cfg's product, layout and IDs and resealed
- * (checksum byte and appended SHA-256). Returns its length, or 0 on a bad argument or a short out. */
+ * (version, payload_len bytes of segment 0) carrying cfg's product, hw_id, layout and IDs. Returns its length, or 0
+ * on a bad argument or a short out. */
 size_t demo_image_build(uint8_t *out, size_t cap, const char *version, const udsota_config_t *cfg,
                         uint32_t payload_len);

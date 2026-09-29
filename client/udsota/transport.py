@@ -13,7 +13,8 @@ from udsoncan.client import Client
 from udsoncan.connections import BaseConnection, IsoTPSocketConnection
 
 from .errors import Busy, Refused, SecondTester
-from .uds import Uds
+from .uds import P2_STAR_S, Uds
+from .wire import NRC_PENDING
 
 PAD = 0xAA               # ISO-TP padding byte; every frame goes out at DLC 8, which some servers require
 LISTEN_S = 2.0
@@ -26,7 +27,6 @@ QUIET_START = (b"\x10\x83", b"\x85\x82", b"\x28\x83\x03")
 # And back: messages on, DTC setting on, default session (which alone would undo the other two).
 QUIET_END = (b"\x28\x80\x03", b"\x85\x81", b"\x10\x81")
 P2_S = 0.15              # client P2
-P2_STAR_S = 5.5          # client P2*; the server repeats 0x78 every 1.5 s
 REQUEST_TIMEOUT_S = 100.0   # overall per request: above the server's 90 s flash-job cap
 GRACE_S = 0.25           # a response frame this soon after our last response is its tail, not a second tester
 RX_ERROR_PAUSE_S = 0.02  # the receive thread's pause after a socket error, before it listens again
@@ -246,7 +246,7 @@ class GuardedConnection(BaseConnection):
         except BaseException:
             self.monitor.end(grace_s=P2_STAR_S)
             raise
-        if frame is None or not (len(frame) >= 3 and frame[0] == 0x7F and frame[2] == 0x78):
+        if frame is None or not (len(frame) >= 3 and frame[0] == 0x7F and frame[2] == NRC_PENDING):
             self.monitor.end()
         return frame
 

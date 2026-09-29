@@ -26,13 +26,9 @@ typedef struct {
     bool     in_msg;                    /* a multi-frame message is being reassembled */
     uint32_t msg_len;                   /* FF_DL */
     uint32_t msg_got;                   /* bytes received so far, FF included */
-    uint32_t cf_count;                  /* CFs received in this message */
-    uint8_t  next_sn;                   /* expected CF sequence number */
-    bool     have_last;                 /* last_cf_us is valid */
+    uint32_t cf_count;                  /* CFs received in this message; the next SN and ring slot follow from it */
     uint32_t last_cf_us;                /* timestamp of this message's previous CF */
-    uint32_t iv[UDSOTA_RXW_INTERVALS];    /* ring of CF-to-CF intervals, microseconds */
-    uint8_t  iv_head;                   /* next ring slot to write */
-    uint8_t  iv_n;                      /* valid ring entries, up to UDSOTA_RXW_INTERVALS */
+    uint32_t iv[UDSOTA_RXW_INTERVALS];    /* ring of CF-to-CF intervals (us), slot (cf_count - 2) % UDSOTA_RXW_INTERVALS */
 } udsota_rxwatch_t;
 
 /* Forgets any message in progress and its interval window. */

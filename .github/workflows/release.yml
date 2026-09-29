@@ -1,8 +1,8 @@
 # Publishes a GitHub Release (see RELEASING.md). Pushing a vX.Y.Z tag on main checks that the tag, the dated
 # CHANGELOG section and the client's __version__ agree, builds the client and the example's app images at the
-# tag, and publishes them with the CHANGELOG section as the notes. Run it by hand (workflow_dispatch) to release
-# an existing tag that has no Release yet; with backfill set it skips the version check and takes the notes from
-# main's CHANGELOG. cut-release.yml calls it (workflow_call) for the tag it pushes, since a tag pushed with a
+# tag, and publishes them with that version's section of main's CHANGELOG as the notes. Run it by hand
+# (workflow_dispatch) to release an existing tag that has no Release yet; with backfill set it skips the version
+# check. cut-release.yml calls it (workflow_call) for the tag it pushes, since a tag pushed with a
 # workflow's token starts no workflow. It never creates or moves a tag. Actions are pinned by commit, since this
 # job publishes.
 name: release
@@ -16,7 +16,7 @@ on:
         description: "Existing tag to release, vX.Y.Z"
         required: true
       backfill:
-        description: "An older version: skip the version check and take the notes from main's CHANGELOG"
+        description: "An older version: skip the version check"
         type: boolean
         default: false
   workflow_call:
@@ -115,8 +115,7 @@ jobs:
         run: |
           . "$IDF_PATH/export.sh"
           b="$PWD/examples/esp32/build/${{ matrix.target }}"
-          idf.py -C examples/esp32 -B "$b" -D SDKCONFIG="$b/sdkconfig" set-target ${{ matrix.target }}
-          idf.py -C examples/esp32 -B "$b" -D SDKCONFIG="$b/sdkconfig" build
+          idf.py -C examples/esp32 -B "$b" -D SDKCONFIG="$b/sdkconfig" set-target ${{ matrix.target }} build
           mkdir -p out && cp "$b/example.bin" "out/example-${{ matrix.target }}.bin"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
