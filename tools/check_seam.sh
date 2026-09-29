@@ -1,7 +1,8 @@
 #!/bin/sh
-# Fails when a server-core source reaches into the updater: it mentions the updater's member of udsota_server_t
+# Fails when a server/ source, the core's or the port's, reaches into the updater: it mentions the updater's member of udsota_server_t
 # (->update or .update), or includes an updater header other than udsota_update_state.h, by a path through '../' or
-# 'update/' or by the name of a header in components/udsota/update/include.
+# 'update/' or by the name of a header in components/udsota/update/include. The port's server/ may still include the
+# umbrella udsota.h, which is in include/; the core-only build keeps the core's server/ from doing so.
 set -eu
 root=$(cd "$(dirname "$0")/.." && pwd)
 member='(->|\.)[[:space:]]*update([^[:alnum:]_]|$)'

@@ -278,7 +278,8 @@ set_tests_properties(udsota_core_only_link_updater PROPERTIES
     "undefined reference to .?udsota_pack_result;undefined symbol: .?udsota_pack_result;Undefined symbols[^\n]*\n[^\n]*\"_udsota_pack_result\"")
 
 # The seam's other direction: no server/ source, the port's included, touches the updater's member of the context or
-# includes an updater header but udsota_update_state.h, by any path.
+# names an update/include header but udsota_update_state.h, by any path. The port's server/ still takes the updater
+# through the umbrella udsota.h; the core's can't, since the core-only build has no include/ on its path.
 add_test(NAME udsota_seam_grep COMMAND sh ${ROOT}/tools/check_seam.sh)
 set_tests_properties(udsota_seam_grep PROPERTIES PASS_REGULAR_EXPRESSION "check_seam: PASS")
 
