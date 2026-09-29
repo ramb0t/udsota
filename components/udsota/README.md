@@ -412,6 +412,16 @@ The FF01 status byte and F1F1 byte 0.
 | 12 | `flags` | bit 0: release build; other bits 0 |
 | 13 | `reserved` | 19 zero bytes |
 
+### Flashing without the client
+
+A flasher that is not the client, such as an edge device that fetches updates from a server, sends the payloads `udsota pack` writes (client README) in this sequence, with every value it needs in their manifest. The 0x27 key is not in the manifest: the flasher needs the master key or per-device keys, and how it holds them is the product's choice. The client's `update.flash` is the reference implementation, and `flash_packed` in `client/tests/test_e2e_pipe.py` is a minimal one.
+
+First the precheck, in the default session. If F1F3 already reads the manifest's `image_elf_sha256`, there is nothing to send, or only ConfirmImage when F1F0 says the running image is pending verify. Any other pending-verify image must be confirmed or rolled back first. The board DID (`board_did`) must read `board`. If F1F0's other slot is verified and its SHA prefix is the first 8 bytes of `image_elf_sha256`, skip straight to ActivateImage.
+
+Then 10 02 and the programming unlock, and the payloads in manifest order until one is taken, skipping a delta whose `base_elf_sha256` is not F1F3. Each goes as a 34 with the entry's `dfi`, ALFID 44, address 0 and `memory_size`, then 36 blocks of the 74's maxNumberOfBlockLength less 2 bytes, counter from 01 wrapping FF to 00, then a 37. A 34 answered 0x31, or 0x22 with F1F1 reason 14 (`DL_NO_MEMORY`), means the device cannot take that mode now: try the next entry. A 36 answered 0x31 with F1F1 reason 15 (`DL_BAD_BASE`) has ended the download before any erase: go on to the full entries. A 36 or 37 that gets no answer may be sent once more unchanged. Any other refusal stops the update, and F1F1 names why.
+
+Then FF01, which must answer status 00, and ActivateImage (F001). The device restarts, so poll F1F3 until it reads `image_elf_sha256`. A device still on its old image has rolled back or never switched. Finally 10 03 and ConfirmImage (F002), repeating a 0x22 answer every 2 s while the product's own checks run; the client allows 120 s.
+
 ## Third-party code
 
 Vendored libraries, their versions and licences are in [THIRD_PARTY.md](../../THIRD_PARTY.md). The UDS server is udsota's own: driftregion's iso14229 (MIT) was the model for the fuzz harness and the 0x78 cadence, but none of its code is copied. udsota itself is MIT-licensed; see the repository's `LICENSE`.

@@ -4,6 +4,10 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ## [Unreleased]
 
+`udsota pack`, for updates that a flasher other than the client sends, and a README that walks through using udsota and managing its keys.
+- Client: `udsota pack FILE --out DIR [--dfi XX]... [--diff-from BASE]` writes the payloads `flash` would send (DFI 0x00, 0x10, and 0x20 and 0x30 from a base) and a JSON manifest, for a flasher that is not this client, such as an edge device that gets its updates from a server. Each manifest entry gives the DFI, memorySize, the payload's size and SHA-256, the new image's app_elf_sha256, version, hw_id and board, and for a delta the base's app_elf_sha256 and validation hash; entries are in the order `flash` tries them, and a delta no smaller than the 0x10 payload is kept but flagged. `flash` and `pack` build payloads with the same code. It needs no bus, so it runs on any platform. The core README's new "Flashing without the client" gives the sequence and fallbacks; the 0x27 key stays the product's to hold.
+- Docs: the README gains a how-to-use walk-through (integrate, profile, build, flash, pack), a step-by-step account of an update, and a key-management section covering both keys, remote unlocking without the private key, and rotation.
+
 ## [0.7.0] - 2026-09-29
 
 A cleanup pass over the whole tree: two smaller adapter structs, a few fixes in the client and the demo server, and a wider CI build. Nothing changes on the wire.
