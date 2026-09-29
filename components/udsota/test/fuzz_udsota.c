@@ -35,9 +35,9 @@
  * FUZZ_DTC_N DTCs with junk top bytes, so 19 and 14 are served: 19 02 FF and 19 0A outgrow the response buffer
  * (0x14, which the oracle takes from a 19 in this build alone) while 19 02 01 and 02 08 fit, the mocks fail on an
  * unknown DTC, a top byte or record 00 handed to dtc_ext_data, or an access state that is not the server's, and the
- * positive shapes check every status sent is a subset of the availability mask. Every walk ends at FUZZ_DTC_N, so
- * the index cap is test_index_cap's to pin, not this build's. The other five builds leave the DTC hooks NULL and
- * answer as they did without it.
+ * positive shapes check every status sent is a subset of the availability mask and 59 01's count against the
+ * table. Every walk ends at FUZZ_DTC_N, so the index cap is test_index_cap's to pin, not this build's. The other five
+ * builds leave the DTC hooks NULL and answer as they did without it.
  *
  * The PASS line ends with digest=, an FNV-1a hash of every request fed to the server and every answer it gave
  * (empty ones too), so an answer that changes shows there even where the counts don't. It draws no rnd().
@@ -95,6 +95,13 @@ _Static_assert(offsetof(udsota_engine_t, zformats) == offsetof(udsota_engine_t, 
                "udsota_engine_t gained a member after zformats: mock it in FUZZ_ENGINE and move this check");
 _Static_assert(offsetof(udsota_hooks_t, ctx) == 7u * sizeof(void (*)(void)),
                "udsota_hooks_t gained a callback: mock it in FUZZ_HOOKS and update this count");
+#define HOOK_AFTER(m, prev) (offsetof(udsota_hooks_t, m) == offsetof(udsota_hooks_t, prev) + sizeof(void (*)(void)))
+_Static_assert(HOOK_AFTER(did_write, ctx) && HOOK_AFTER(routine, did_write) && HOOK_AFTER(routine_poll, routine) &&
+               HOOK_AFTER(progress, routine_poll) && HOOK_AFTER(dtc_get, progress) &&
+               HOOK_AFTER(dtc_ext_data, dtc_get) && HOOK_AFTER(dtc_clear, dtc_ext_data),
+               "udsota_hooks_t gained or moved a member between ctx and dtc_clear: add it after dtc_clear instead, "
+               "so every earlier field keeps its offset, then mock it in FUZZ_HOOKS and extend this chain");
+#undef HOOK_AFTER
 _Static_assert(offsetof(udsota_hooks_t, dtc_clear) + sizeof(void (*)(void)) == sizeof(udsota_hooks_t),
                "udsota_hooks_t gained a member after dtc_clear: mock it in FUZZ_HOOKS and move this check");
 
@@ -668,12 +675,19 @@ static uint32_t fuzz_dtc24(size_t i)
     return 0xC00000u | ((uint32_t)i << 8) | ((i % 3u == 0u) ? 0u : (uint32_t)i);
 }
 
-/* hooks.dtc_get: FUZZ_DTC_N DTCs with a junk top byte, statuses cycling through 00, 01, 2F, 08, 40, 09, FF and 28.
- * An index at the cap is a defect, but the core's walks stop at FUZZ_DTC_N first, so only a walk that skipped ahead
- * would reach it; test_index_cap pins the cap itself. */
-static bool mock_dtc_get(void *ctx, size_t i, udsota_dtc_t *out)
+/* The i-th DTC's status, cycling through 00, 01, 2F, 08, 40, 09, FF and 28. Nothing changes it during a run (the
+ * mock dtc_clear clears nothing), so dtc_count's expectation holds at every 19 01. */
+static uint8_t fuzz_dtc_status(size_t i)
 {
     static const uint8_t STATUS[8] = {0x00, 0x01, 0x2F, 0x08, 0x40, 0x09, 0xFF, 0x28};
+    return STATUS[i % 8u];
+}
+
+/* hooks.dtc_get: FUZZ_DTC_N DTCs with a junk top byte and fuzz_dtc_status's statuses. An index at the cap is a
+ * defect, but the core's walks stop at FUZZ_DTC_N first, so only a walk that skipped ahead would reach it;
+ * test_index_cap pins the cap itself. */
+static bool mock_dtc_get(void *ctx, size_t i, udsota_dtc_t *out)
+{
     count_op(OP_DTC_GET);
     if (i >= UDSOTA_DTC_INDEX_MAX) {
         fail("dtc_get asked for an index at UDSOTA_DTC_INDEX_MAX or past it", NULL, 0, NULL, 0);
@@ -682,7 +696,7 @@ static bool mock_dtc_get(void *ctx, size_t i, udsota_dtc_t *out)
         return false;
     }
     out->dtc = ((uint32_t)(uint8_t)(0x5Bu + 7u * i) << 24) | fuzz_dtc24(i);
-    out->status = STATUS[i % 8u];
+    out->status = fuzz_dtc_status(i);
     return true;
 }
 
@@ -992,8 +1006,18 @@ static bool dtc_list_ok(uint8_t sub, uint8_t mask, const uint8_t *r, size_t n)
     return true;
 }
 
-/* 59 xx for a 19 request: 01's count with the availability and format 00, 02 and 0A's lists, 06's DTC echo and a
- * masked status. */
+/* 59 01's count for a status mask: the table's DTCs whose status & mask & availability is non-zero. */
+static uint16_t dtc_count(uint8_t mask)
+{
+    uint16_t c = 0u;
+    for (size_t i = 0; i < FUZZ_DTC_N; i++) {
+        c += (fuzz_dtc_status(i) & mask & FUZZ_DTC_AVAIL) != 0u;
+    }
+    return c;
+}
+
+/* 59 xx for a 19 request: 01's availability, format 00 and count, 02 and 0A's lists, 06's DTC echo and a masked
+ * status. */
 static bool dtc_shape_ok(const uint8_t *req, size_t rl, uint8_t sub, const uint8_t *r, size_t n)
 {
     if (n < 2u || r[1] != sub) {
@@ -1001,7 +1025,8 @@ static bool dtc_shape_ok(const uint8_t *req, size_t rl, uint8_t sub, const uint8
     }
     switch (sub) {
     case UDSOTA_RDTC_COUNT_BY_MASK:
-        return n == 6u && rl == 3u && r[2] == FUZZ_DTC_AVAIL && r[3] == 0x00u;
+        return n == 6u && rl == 3u && r[2] == FUZZ_DTC_AVAIL && r[3] == 0x00u &&
+               udsota_get_u16be(&r[4]) == dtc_count(req[2]);
     case UDSOTA_RDTC_BY_MASK:
         return rl == 3u && dtc_list_ok(sub, req[2], r, n);
     case UDSOTA_RDTC_SUPPORTED:

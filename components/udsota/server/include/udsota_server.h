@@ -133,12 +133,14 @@ typedef struct {   /* all optional */
                                                    /* 0x19: the i-th supported DTC and its status now; false past the
                                                       last. i names the same DTC for as long as the server runs, and
                                                       only its status may change. Asked from 0 up for each 19 01, 02,
-                                                      0A and 06, never for i at UDSOTA_DTC_INDEX_MAX or past it. The
-                                                      walk ends at false, at the DTC a 19 06 asks for, or at the first
-                                                      DTC that would overflow a 19 02 or 0A (0x14), so a hook must not
-                                                      rely on being asked until false. NULL: 19 answers 0x11, as
-                                                      before. It answers at once, may read udsota_phase() but must not
-                                                      call other udsota functions */
+                                                      0A and 06 that passes the core's own checks first, never for i
+                                                      at UDSOTA_DTC_INDEX_MAX or past it. The walk ends at false, at
+                                                      the DTC a 19 06 asks for, or at the first DTC that would
+                                                      overflow a 19 02 or 0A (0x14), so a hook must not rely on being
+                                                      asked until false. A DTC reported at two indexes is counted and
+                                                      listed twice, and 19 06 answers with the first one's status.
+                                                      NULL: 19 answers 0x11, as before. It answers at once, may read
+                                                      udsota_phase() but must not call other udsota functions */
     uint8_t  (*dtc_ext_data)(void *ctx, uint32_t dtc, uint8_t record, uint8_t *buf, size_t max, size_t *len);
                                                    /* 19 06, for a DTC dtc_get reports (the core answers 0x31 for any
                                                       other, and for record 00, without a call); dtc is the request's
