@@ -1,6 +1,7 @@
 """Tests for the udsota client: key vectors, the update sequence against a scripted server, the pre-flight
-guard and pre-roll, the TX-ID hard limit, profiles, and a run with a minimal profile. No kernel ISO-TP socket
-and no vcan: the UDS layer runs over a stub udsoncan connection, the pre-flight over python-can virtual buses.
+guard and pre-roll, the TX-ID hard limit, profiles, the config and dtc commands, and a run with a minimal profile.
+No kernel ISO-TP socket and no vcan: the UDS layer runs over a stub udsoncan connection, the pre-flight over
+python-can virtual buses.
 Most tests run with FULL (P), a profile that turns every optional feature on."""
 import argparse
 import dataclasses
@@ -33,7 +34,7 @@ from udsoncan.connections import BaseConnection, IsoTPSocketConnection
 from udsoncan.exceptions import TimeoutException
 
 import udsota
-from udsota import cli, config, delta, errors, keys, pack, profile, transport, update, wire
+from udsota import cli, config, delta, dtc, errors, keys, pack, profile, transport, update, wire
 from udsota.image import parse_image
 from udsota.uds import KEEPALIVE_S, SA_DELAY_S, Uds
 
@@ -173,6 +174,8 @@ class FakeTime:
 # With delta (DFIs 0x20 and/or 0x30) it serves delta downloads from base, its running image: the 36 that completes
 # the patch header answers 0x31 with F1F1 DL_BAD_BASE when the header names another base, and the 37 applies the
 # patch with detools.
+# With dtcs, [(dtc, status)] in the order dtc_get reports them, it serves 0x19 and 0x14 with the core's rules and the
+# demo server's clear hook; without, both answer 0x11.
 class FakeServer:
     # Knobs select the faults and states each test needs.
     def __init__(self, max_block=18, boot_silence=2, confirm_refusals=2, running_state=3, sha=OLD_SHA,
@@ -180,7 +183,7 @@ class FakeServer:
                  nrc_once=None, activate_refusals=0, ff01_status=0, config=None, lose_77_once=False,
                  lose_ff01_once=False, activate_nrcs=None, activate_fail=None, no_fc=None, security=True,
                  pubkey=None, cfg_keys=None, commit_status=0, compress=False, z_nomem=False, delta=(), base=None,
-                 no_memory=(), lose_bad_base=False):
+                 no_memory=(), lose_bad_base=False, dtcs=None, dtc_ext=None, dtc_avail=0x2F, dtc_format=0x00):
         self.max_block, self.boot_silence, self.confirm_refusals = max_block, boot_silence, confirm_refusals
         self.running_state, self.sha, self.board = running_state, sha, board
         self.other_state, self.other_sha = other_state, other_sha
@@ -210,6 +213,9 @@ class FakeServer:
         self.dl_open, self.dl_complete, self.verified = False, False, other_state == 3
         self.last_dl = (0, 0)                   # F1F1: (reason, bytes received)
         self.boot_pending = None                # the sha set_boot selected, until the restart
+        self.dtcs = None if dtcs is None else list(dtcs)   # [(dtc, status)]; None: no DTC hooks
+        self.dtc_ext = dtc_ext                  # {dtc: its records for record FF}; None: no dtc_ext_data (19 06: 0x12)
+        self.dtc_avail, self.dtc_format = dtc_avail, dtc_format   # cfg.dtc_availability_mask and cfg.dtc_format
 
     # Answer one request payload with a list of response payloads ([] = no answer).
     def handle(self, req):
@@ -217,7 +223,8 @@ class FakeServer:
         arg = {0x10: lambda: req[1], 0x11: lambda: req[1], 0x27: lambda: req[1], 0x36: lambda: req[1],
                0x3E: lambda: req[1], 0x22: lambda: int.from_bytes(req[1:3], "big"),
                0x2E: lambda: int.from_bytes(req[1:3], "big"),
-               0x31: lambda: int.from_bytes(req[2:4], "big")}.get(sid, lambda: None)()
+               0x31: lambda: int.from_bytes(req[2:4], "big"), 0x19: lambda: req[1],
+               0x14: lambda: int.from_bytes(req[1:4], "big")}.get(sid, lambda: None)()
         if self.no_fc.get((sid, arg)):
             self.no_fc[(sid, arg)] -= 1         # FF seen, FC dropped: the request never arrives
             raise OSError(errno.ECOMM, os.strerror(errno.ECOMM))
@@ -460,6 +467,49 @@ class FakeServer:
             self.staged, self.last_commit = {}, 1
             return [bytes([0x7F, 0x31, 0x78]), echo + b"\x00"]   # the write runs under 0x78
         return self.nrc(0x31, 0x31)
+
+    # 0x19 ReadDTCInformation with the core's check order (handle_read_dtc): 0x11 without dtcs; a length under 2
+    # 0x13; a sub-function but 01, 02, 06 and 0A, or 06 without dtc_ext, 0x12; the wrong length 0x13. Every status
+    # sent is status & dtc_avail, and a list past the 256-byte response buffer answers 0x14. 19 06 answers 0x31 for
+    # record 00 or a DTC not in dtcs, else the DTC, its status and dtc_ext's records (none when it holds none).
+    def s19(self, req, _):
+        if self.dtcs is None:
+            return self.nrc(0x19, 0x11)
+        if len(req) < 2:
+            return self.nrc(0x19, 0x13)
+        sub, avail = req[1] & 0x7F, self.dtc_avail
+        if sub not in (0x01, 0x02, 0x06, 0x0A) or (sub == 0x06 and self.dtc_ext is None):
+            return self.nrc(0x19, 0x12)
+        if len(req) != {0x01: 3, 0x02: 3, 0x06: 6, 0x0A: 2}[sub]:
+            return self.nrc(0x19, 0x13)
+        if sub == 0x06:
+            dtc = int.from_bytes(req[2:5], "big")
+            status = dict(self.dtcs).get(dtc)
+            if req[5] == 0 or status is None:
+                return self.nrc(0x19, 0x31)
+            return [b"\x59\x06" + req[2:5] + bytes([status & avail]) + self.dtc_ext.get(dtc, b"")]
+        match = [(d, st & avail) for d, st in self.dtcs if sub == 0x0A or st & req[2] & avail]
+        if sub == 0x01:
+            return [bytes([0x59, 0x01, avail, self.dtc_format]) + len(match).to_bytes(2, "big")]
+        answer = bytes([0x59, sub, avail]) + b"".join(d.to_bytes(3, "big") + bytes([st]) for d, st in match)
+        return self.nrc(0x19, 0x14) if len(answer) > 256 else [answer]
+
+    # 0x14 ClearDiagnosticInformation: 0x11 without dtcs and 0x13 for any length but 4 (the core), then the demo
+    # server's hook: 0x7F outside the extended session, 0x33 without the level-1 unlock, 0x31 for a group but FFFFFF.
+    # Zeroes every status and answers 54.
+    def s14(self, req, group):
+        if self.dtcs is None:
+            return self.nrc(0x14, 0x11)
+        if len(req) != 4:
+            return self.nrc(0x14, 0x13)
+        if self.session != 3:
+            return self.nrc(0x14, 0x7F)
+        if self.security and self.unlocked != 1:
+            return self.nrc(0x14, 0x33)
+        if group != 0xFFFFFF:
+            return self.nrc(0x14, 0x31)
+        self.dtcs = [(d, 0) for d, _ in self.dtcs]
+        return [b"\x54"]
 
     # 0x11 ECUReset: keyed (either level unlocked), then the restart.
     def s11(self, req, sub):
@@ -1127,7 +1177,12 @@ WIRE_DEFINES = {"UDSOTA_DID_ACTIVE_SESSION": "DID_SESSION", "UDSOTA_DID_SW_VERSI
                 "UDSOTA_NRC_REQUEST_SEQUENCE_ERROR": "NRC_SEQUENCE",
                 "UDSOTA_NRC_REQUEST_OUT_OF_RANGE": "NRC_OUT_OF_RANGE",
                 "UDSOTA_NRC_TIME_DELAY_NOT_EXPIRED": "NRC_TIME_DELAY",
-                "UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE": "NRC_PROGRAMMING_FAILURE"}
+                "UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE": "NRC_PROGRAMMING_FAILURE",
+                "UDSOTA_NRC_SUBFUNC_NOT_SUPPORTED": "NRC_SUBFUNCTION_NOT_SUPPORTED",
+                "UDSOTA_NRC_RESPONSE_TOO_LONG": "NRC_RESPONSE_TOO_LONG",
+                "UDSOTA_RDTC_COUNT_BY_MASK": "RDTC_COUNT_BY_MASK", "UDSOTA_RDTC_BY_MASK": "RDTC_BY_MASK",
+                "UDSOTA_RDTC_EXT_DATA": "RDTC_EXT_DATA", "UDSOTA_RDTC_SUPPORTED": "RDTC_SUPPORTED",
+                "UDSOTA_DTC_RECORD_ALL": "DTC_RECORD_ALL", "UDSOTA_DTC_GROUP_ALL": "DTC_GROUP_ALL"}
 
 
 # Where udsota_wire.h's own #includes resolve: it is an umbrella over the server's and the updater's wire headers.
@@ -1168,7 +1223,8 @@ def test_reason_names_match_udsota_wire():
     assert wire.reason_name(len(wire.DL_REASONS)) == "reason 0x%02X" % len(wire.DL_REASONS)
 
 
-# Check the DIDs, RIDs, NRCs, download format and status flags wire.py mirrors match udsota_wire.h's #defines.
+# Check the DIDs, RIDs, NRCs, download format, DTC numbers and status flags wire.py mirrors match udsota_wire.h's
+# #defines.
 def test_wire_numbers_match_udsota_wire():
     defines = {m[1]: int(m[2], 0) for m in re.finditer(r"#define\s+(UDSOTA_\w+)\s+(0x[0-9A-Fa-f]+|\d+)u?\b",
                                                       wire_header())}
@@ -2378,6 +2434,220 @@ def test_config_set_commit_sequence_error():
                                                   r"changed\); run config set again") as e:
         run_config_set(d, ["mode=2"])
     assert e.value.exit_code == 1 and d.nvs == CFG_VALUES
+
+# ---- DTCs: dtc show and dtc clear ----
+
+# The demo server's three DTCs (tools/linux_server) and U0155 with failure-type bytes 1C and 02, as (dtc, status);
+# U0073's extended data records for record FF, as the demo holds them.
+DTCS = [(0xC07300, 0x2F), (0x056200, 0x68), (0x923400, 0x00), (0xC1551C, 0x09), (0xC15502, 0x01)]
+DTC_EXT = {0xC07300: bytes.fromhex("0103100000007800000e10")}
+# A [dtcs] table: U0073 for every failure-type byte, and U0155-1C's own text beside U0155's.
+DTC_TABLE = ('\n[dtcs]\n"U0073" = "Lost communication with ECM/PCM \\"A\\""\n"U0155" = "any FTB"\n'
+             '"u0155-1c" = "FTB 1C"\n')
+PD = profile.from_dict("full-dtcs", tomllib.loads(FULL + DTC_TABLE))
+U0073_LINE = ("U0073  status 0x2F (testFailed, testFailedThisOperationCycle, pendingDTC, confirmedDTC, "
+              "testFailedSinceLastClear)  Lost communication with ECM/PCM \"A\"")
+
+
+# Run fn(uds, prof, *args, log=...) against server with fake time; returns (rc, log lines).
+def run_dtc(server, fn, *args, prof=PD):
+    lines = []
+    return fn(uds_for(server, FakeTime()), prof, *args, log=lines.append), lines
+
+
+# Check a code parses in each form and either case, U0073 naming FTB 00 on the wire and every FTB in [dtcs], and that
+# anything else is not a code.
+def test_dtc_codes_parse():
+    assert [dtc.parse_code(t) for t in ("U0073", "u0073-1c", "0xc07300", "P0562", "B1234", "C3FFF-FF", "0x5")] == [
+        (0xC07300, True), (0xC0731C, False), (0xC07300, False), (0x056200, True), (0x923400, True),
+        (0x7FFFFF, False), (0x000005, False)]
+    for text in ("U4073", "X0073", "U007", "U00731", "U0073-1", "U0073-", "C07300", "0x", "0x1000000", " U0073", ""):
+        assert dtc.parse_code(text) is None, text
+
+
+# Check codes print in the SAE formats (0x00, 0x04) with -XX only for a non-zero failure-type byte, in any other
+# format as 0x and 6 hex digits; and a status names its bits from bit 0.
+def test_dtc_codes_and_status_render():
+    assert [dtc.code_name(d, f) for d, f in ((0xC07300, 0x00), (0xC0731C, 0x04), (0x923400, 0x00),
+                                             (0x7FFFFF, 0x00), (0xC07300, 0x01))] == [
+        "U0073", "U0073-1C", "B1234", "C3FFF-FF", "0xC07300"]
+    assert dtc.describe_dtc_status(0x28) == "0x28 (confirmedDTC, testFailedSinceLastClear)"
+    assert dtc.describe_dtc_status(0xD0) == ("0xD0 (testNotCompletedSinceLastClear, "
+                                             "testNotCompletedThisOperationCycle, warningIndicatorRequested)")
+    assert dtc.describe_dtc_status(0x00) == "0x00 (none)"
+    assert len(wire.DTC_STATUS_BITS) == 8
+
+
+# Check dtc show sends 19 01 FF then 19 02 FF in the default session, and prints the count, each code with its status
+# (ANDed with availability 0x2F on the device) and bits, and the profile's text: a key with the DTC's own
+# failure-type byte wins over the code's, and a DTC [dtcs] lacks prints none. B1234 (status 00) doesn't match.
+def test_dtc_show():
+    d = FakeServer(dtcs=DTCS)
+    rc, lines = run_dtc(d, dtc.dtc_show)
+    assert rc == 0 and d.log == [(0x19, 0x01), (0x19, 0x02)] and d.session == 1
+    assert lines == ["4 DTCs (availability 0x2F, format 0x00)", U0073_LINE,
+                     "P0562  status 0x28 (confirmedDTC, testFailedSinceLastClear)",
+                     "U0155-1C  status 0x09 (testFailed, confirmedDTC)  FTB 1C",
+                     "U0155-02  status 0x01 (testFailed)  any FTB"]
+
+
+# Check a device in format 0x01 gets 6 hex digits, the descriptions still apply, one DTC is "1 DTC", and a device
+# with no DTC matching says so with its availability.
+def test_dtc_show_other_format_and_empty():
+    rc, lines = run_dtc(FakeServer(dtcs=DTCS[:1], dtc_format=0x01), dtc.dtc_show)
+    assert rc == 0 and lines == ["1 DTC (availability 0x2F, format 0x01)", "0xC07300" + U0073_LINE[5:]]
+    rc, lines = run_dtc(FakeServer(dtcs=[(0xC07300, 0x40)], dtc_avail=0x3F), dtc.dtc_show, prof=P)
+    assert rc == 0 and lines == ["no DTCs match (availability 0x3F)"]
+
+
+# Check a list past the device's answer buffer (0x14: 64 DTCs don't fit 256 bytes, 63 do) fails with exit 1 saying
+# so, and a malformed answer fails with exit 1.
+def test_dtc_show_too_many_and_malformed():
+    rc, lines = run_dtc(FakeServer(dtcs=[(i << 8, 0x01) for i in range(63)]), dtc.dtc_show)
+    assert rc == 0 and lines[0] == "63 DTCs (availability 0x2F, format 0x00)"
+    with pytest.raises(errors.UpdateFailed, match=r"^more DTCs than the device can send in one answer \(19 02 "
+                                                  r"answered NRC 0x14\)$") as e:
+        run_dtc(FakeServer(dtcs=[(i << 8, 0x01) for i in range(64)]), dtc.dtc_show)
+    assert e.value.exit_code == 1
+    d = FakeServer(dtcs=DTCS)
+    d.s19 = lambda req, sub: [bytes([0x59, sub, 0x2F, 0xC0, 0x73])]
+    with pytest.raises(errors.UpdateFailed, match="19 01 answered 2f c0 73, not <availability> <format> <count>"):
+        run_dtc(d, dtc.dtc_show)
+    d.s19 = lambda req, sub: [bytes([0x59, sub, 0x2F, 0x00, 0x00, 0x01]) if sub == 1 else b"\x59\x02\x2f\xc0\x73"]
+    with pytest.raises(errors.UpdateFailed, match="19 02 answered 2f c0 73, not <availability> and 4 bytes per DTC"):
+        run_dtc(d, dtc.dtc_show)
+    d.s19 = lambda req, sub: [b"\x59\x02\x2f\x00\x00\x01"]
+    with pytest.raises(errors.UpdateFailed, match="19 01 answered with sub-function 02"):
+        run_dtc(d, dtc.dtc_show)
+
+
+# Check --ext sends 19 01 FF then 19 06 <DTC> FF and prints the DTC's line and its records as hex, unsplit; a DTC
+# holding none says so; a DTC the device doesn't report (0x31) fails with exit 1 naming the code as given.
+def test_dtc_show_ext():
+    d = FakeServer(dtcs=DTCS, dtc_ext=DTC_EXT)
+    rc, lines = run_dtc(d, dtc.dtc_ext, 0xC07300, "U0073")
+    assert rc == 0 and d.log == [(0x19, 0x01), (0x19, 0x06)]
+    assert lines == [U0073_LINE, "extended data: 01 03 10 00 00 00 78 00 00 0e 10"]
+    rc, lines = run_dtc(FakeServer(dtcs=DTCS, dtc_ext=DTC_EXT), dtc.dtc_ext, 0x056200, "p0562")
+    assert rc == 0 and lines == ["P0562  status 0x28 (confirmedDTC, testFailedSinceLastClear)",
+                                 "no extended data stored"]
+    with pytest.raises(errors.UpdateFailed, match=r"^u0074 is not a DTC the device supports \(19 06 answered NRC "
+                                                  r"0x31\)$") as e:
+        run_dtc(FakeServer(dtcs=DTCS, dtc_ext=DTC_EXT), dtc.dtc_ext, 0xC07400, "u0074")
+    assert e.value.exit_code == 1
+
+
+# Check --ext on firmware without dtc_ext_data (19 06 answers 0x12) is refused (exit 2), records past the answer
+# buffer (0x14) fail (exit 1), and an answer for another DTC fails (exit 1).
+def test_dtc_show_ext_refusals():
+    with pytest.raises(errors.Refused, match=r"this firmware has no DTC extended data \(19 06 answered NRC 0x12\)"):
+        run_dtc(FakeServer(dtcs=DTCS), dtc.dtc_ext, 0xC07300, "U0073")
+    d = FakeServer(dtcs=DTCS, dtc_ext=DTC_EXT, nrc_once={(0x19, 0x06): 0x14})
+    with pytest.raises(errors.UpdateFailed, match=r"U0073's extended data is more than the device can send in one "
+                                                  r"answer \(19 06 answered NRC 0x14\)"):
+        run_dtc(d, dtc.dtc_ext, 0xC07300, "U0073")
+    d = FakeServer(dtcs=DTCS, dtc_ext=DTC_EXT)
+    d.s19 = lambda req, sub: [b"\x59\x01\x2f\x00\x00\x01" if sub == 1 else b"\x59\x06\x05\x62\x00\x28"]
+    with pytest.raises(errors.UpdateFailed, match="19 06 answered 05 62 00 28, not DTC C07300 and its status"):
+        run_dtc(d, dtc.dtc_ext, 0xC07300, "U0073")
+
+
+# Check dtc clear reads the device ID, opens the extended session and unlocks at level 1, then sends 14 FF FF FF,
+# which zeroes every status; without [security], 10 03 and the 14 alone.
+def test_dtc_clear():
+    d = FakeServer(dtcs=DTCS)
+    rc, lines = run_dtc(d, dtc.dtc_clear, MASTER)
+    assert rc == 0 and lines == ["cleared every DTC"]
+    assert d.log == UNLOCK_EXT + [(0x14, 0xFFFFFF)] and not any(st for _, st in d.dtcs)
+    d = FakeServer(dtcs=DTCS, security=False)
+    rc, _ = run_dtc(d, dtc.dtc_clear, None, prof=profile.from_dict("nosec", tomllib.loads(CAN + DTC_TABLE)))
+    assert rc == 0 and d.log == [(0x10, 3), (0x14, 0xFFFFFF)] and not any(st for _, st in d.dtcs)
+
+
+# Check a clear the device refuses fails with exit 1 naming the NRC, nothing cleared, and firmware without DTC
+# services (0x11) is refused with exit 2.
+def test_dtc_clear_refusals():
+    d = FakeServer(dtcs=DTCS, nrc_once={(0x14, 0xFFFFFF): 0x22})
+    with pytest.raises(errors.UpdateFailed, match=r"clearing every DTC \(14 FF FF FF\) answered NRC 0x22") as e:
+        run_dtc(d, dtc.dtc_clear, MASTER)
+    assert e.value.exit_code == 1 and d.dtcs == DTCS
+    with pytest.raises(errors.Refused, match=r"this firmware has no DTC services \(14 FF FF FF answered NRC 0x11\)"):
+        run_dtc(FakeServer(), dtc.dtc_clear, MASTER)
+
+
+# Check [dtcs] loads keyed by (DTC, any FTB), and a profile without it has none.
+def test_dtc_profile_values():
+    assert PD.dtcs == {(0xC07300, True): "Lost communication with ECM/PCM \"A\"", (0xC15500, True): "any FTB",
+                       (0xC1551C, False): "FTB 1C"}
+    assert P.dtcs == {} and profile.load("example").dtcs == {}
+
+
+# Check a broken [dtcs] is refused with its reason: a key that is no code, a value that is no non-empty string, and
+# two keys naming the same DTC.
+@pytest.mark.parametrize("table,why", [
+    ('"U4073" = "x"', r"\[dtcs\] key 'U4073' is not a DTC code \(U0073, U0073-1C or 0xC07300\)"),
+    ('"0xF186" = { name = "x" }', r"\[dtcs\] 0xF186 must be a non-empty string"),
+    ('"U0073" = 3', r"\[dtcs\] U0073 must be a non-empty string"),
+    ('"U0073" = ""', r"\[dtcs\] U0073 must be a non-empty string"),
+    ('"U0073" = "a"\n"u0073" = "b"', r"\[dtcs\] u0073 names the same DTC as an earlier key"),
+    ('"U0073-00" = "a"\n"0xC07300" = "b"', r"\[dtcs\] 0xC07300 names the same DTC as an earlier key"),
+])
+def test_bad_dtc_profiles_are_refused(table, why):
+    with pytest.raises(errors.Refused, match=why):
+        profile.from_dict("bad", tomllib.loads(CAN + "[dtcs]\n" + table + "\n"))
+
+
+# Check the example's commented [dtcs] loads once uncommented, so the syntax it documents is valid.
+def test_example_dtc_comments_load():
+    text = (profile.PROFILE_DIR / "example.toml").read_text()
+    live = re.sub(r'(?m)^# (?=\[dtcs\]$|"[UP]0)', "", text)
+    assert profile.from_dict("example", tomllib.loads(live)).dtcs == {
+        (0xC07300, True): "Lost communication with ECM/PCM \"A\"", (0x056200, True): "System voltage low"}
+
+
+# FULL with DTC_TABLE and the master key in tmp_path, for the tests that pass --profile to main; returns its path.
+@pytest.fixture
+def dtc_path(tmp_path):
+    (tmp_path / "master.bin").write_bytes(MASTER)
+    p = tmp_path / "dtcs.toml"
+    p.write_text(FULL.replace('"master.bin"', '"%s"' % (tmp_path / "master.bin")) + DTC_TABLE)
+    return str(p)
+
+
+# Check dtc show, show --ext and clear run end to end through main: show needs no master, clear unlocks with it.
+def test_main_dtc_end_to_end(dtc_path, capsys):
+    d = FakeServer(dtcs=DTCS, dtc_ext=DTC_EXT)
+    assert cli.main(["--profile", dtc_path, "dtc", "show"], transport=FakeTransport.on(d)) == 0
+    assert U0073_LINE in capsys.readouterr().out.splitlines()
+    assert cli.main(["--profile", dtc_path, "dtc", "show", "--ext", "0xC07300"], transport=FakeTransport.on(d)) == 0
+    assert "extended data: 01 03 10 00 00 00 78 00 00 0e 10" in capsys.readouterr().out
+    assert cli.main(["--profile", dtc_path, "dtc", "clear"], transport=FakeTransport.on(d)) == 0
+    assert capsys.readouterr().out == "cleared every DTC\n" and d.log[-5:] == UNLOCK_EXT + [(0x14, 0xFFFFFF)]
+
+
+# Check a bad --ext code and a clear without its master key are refused (exit 2) before any bus opens.
+def test_main_dtc_refuses_before_opening_the_bus(dtc_path, tmp_path, capsys):
+    assert cli.main(["--profile", dtc_path, "dtc", "show", "--ext", "U4073"], transport=no_transport) == 2
+    assert "--ext 'U4073' is not a DTC: give U0073, U0073-1C or 0xC07300" in capsys.readouterr().err
+    assert cli.main(["--profile", dtc_path, "--master", str(tmp_path / "absent"), "dtc", "clear"],
+                    transport=no_transport) == 2
+    assert "cannot read the master key" in capsys.readouterr().err
+
+
+# Check main's exit code for the dtc commands: firmware without DTC services, or without extended data for --ext, is
+# refused (exit 2); a DTC the device lacks and a refused clear fail (exit 1).
+@pytest.mark.parametrize("server_kw,args,rc,text", [
+    ({}, ["show"], 2, r"no DTC services \(19 01 answered NRC 0x11\)"),
+    ({}, ["show", "--ext", "U0073"], 2, r"no DTC services \(19 01 answered NRC 0x11\)"),
+    ({}, ["clear"], 2, r"no DTC services \(14 FF FF FF answered NRC 0x11\)"),
+    ({"dtcs": DTCS}, ["show", "--ext", "U0073"], 2, r"no DTC extended data \(19 06 answered NRC 0x12\)"),
+    ({"dtcs": DTCS, "dtc_ext": DTC_EXT}, ["show", "--ext", "U0074-01"], 1, "U0074-01 is not a DTC the device"),
+    ({"dtcs": DTCS, "nrc_once": {(0x14, 0xFFFFFF): 0x31}}, ["clear"], 1, r"\(14 FF FF FF\) answered NRC 0x31"),
+])
+def test_main_dtc_exit_codes(dtc_path, capsys, server_kw, args, rc, text):
+    assert cli.main(["--profile", dtc_path, "dtc"] + args, transport=FakeTransport.on(FakeServer(**server_kw))) == rc
+    assert re.search(text, capsys.readouterr().err)
+
 
 # ---- compressed downloads (DFI 0x10) ----
 

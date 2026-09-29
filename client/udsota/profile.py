@@ -1,10 +1,12 @@
 """Client profiles: everything product-specific (CAN IDs, deny list, key derivation, image identity,
-busy detector, pre-roll, extra DIDs, writable config DIDs and their commit), read from a TOML file."""
+busy detector, pre-roll, extra DIDs, writable config DIDs and their commit, DTC descriptions), read from a TOML
+file."""
 import pathlib
 import re
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+from .dtc import CODE_FORMS, parse_code
 from .errors import Refused
 from .wire import DECODE
 
@@ -21,7 +23,8 @@ KEYS = {"can": {"interface", "req_id", "resp_id", "deny_tx"},
         "preroll": {"tester_present_frames"},
         "functional": {"id", "quiet_bus"},
         "dids": None,
-        "config": {"commit_rid", "status_did", "hash"}}
+        "config": {"commit_rid", "status_did", "hash"},
+        "dtcs": None}
 DID_KEYS = {"name", "decode", "type", "writable", "min", "max"}
 HASH_KEYS = {"did", "first", "last", "schema"}
 
@@ -106,6 +109,7 @@ class Profile:
     quiet_bus: bool = False         # [functional] quiet_bus: silence the bus's other nodes while flashing
     config: ConfigSpec | None = None   # [config]: config set's commit routine, status DID and hash check
     compression: str = "none"       # [image] compression: "none", "deflate" or "auto", as flash's compress
+    dtcs: dict = field(default_factory=dict)   # [dtcs]: {(dtc, any_ftb): description} (dtc.parse_code)
 
 
 # Raise Refused naming the profile and the problem.
@@ -229,6 +233,23 @@ def _config(name, t):
     return ConfigSpec(_int(name, t, "commit_rid", 0, 0xFFFF, required=True), status_did, spec)
 
 
+# [dtcs] as {(dtc, any_ftb): description}: each key a code dtc.parse_code reads, each value a non-empty string, and no
+# two keys naming the same DTC (U0073 and u0073, or U0073-00 and 0xC07300). A key without a failure-type byte names
+# every FTB of its code, and `dtc show` prefers the key with the DTC's own.
+def _dtcs(name, t):
+    out = {}
+    for key, text in t.items():
+        dtc = parse_code(key)
+        if dtc is None:
+            _bad(name, "[dtcs] key %r is not a DTC code (%s)" % (key, CODE_FORMS))
+        if not isinstance(text, str) or not text:
+            _bad(name, "[dtcs] %s must be a non-empty string" % key)
+        if dtc in out:
+            _bad(name, "[dtcs] %s names the same DTC as an earlier key" % key)
+        out[dtc] = text
+    return out
+
+
 # Build a Profile from parsed TOML; every problem raises Refused (exit 2, nothing sent).
 def from_dict(name, d):
     for table, value in d.items():
@@ -297,7 +318,7 @@ def from_dict(name, d):
                    preroll_frames=_int(name, d.get("preroll", {}), "tester_present_frames", 0, 64, default=0),
                    dids=dids, func_id=func_id, compression=compression,
                    quiet_bus=func_t is not None and _bool(name, func_t, "quiet_bus", False),
-                   config=_config(name, d.get("config")))
+                   config=_config(name, d.get("config")), dtcs=_dtcs(name, d.get("dtcs", {})))
 
 
 # Load a profile by name (a file in udsota/profiles) or by path (anything with a / or ending .toml).

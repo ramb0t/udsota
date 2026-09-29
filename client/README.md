@@ -1,6 +1,6 @@
 # udsota client
 
-`udsota` is the PC client for a [udsota](../components/udsota/README.md) server. It reads a device's identity and update state and installs firmware over UDS on ISO-TP. Everything product-specific lives in a TOML profile, so one tool serves every product that embeds udsota.
+`udsota` is the PC client for a [udsota](../components/udsota/README.md) server. It reads a device's identity, update state and fault codes and installs firmware over UDS on ISO-TP. Everything product-specific lives in a TOML profile, so one tool serves every product that embeds udsota.
 
 It runs on Linux with SocketCAN and the kernel's ISO-TP module, on Python 3.11 or newer. `pip install ./client` installs the `udsota` command, pins python-can, can-isotp and udsoncan, and installs cryptography 42 or newer for the ecdsa mode. The unit tests run on virtual buses and open no CAN interface: `python -m pytest client/tests`. The end-to-end tests drive the [Linux demo server](../tools/linux_server/README.md) once it is built: over a frame pipe, and over vcan0 with the kernel's ISO-TP module when both are there. Otherwise they skip.
 
@@ -15,6 +15,8 @@ udsota --profile example confirm                 # ConfirmImage for an image lef
 udsota --profile example reset                   # 11 01; an unconfirmed image rolls back
 udsota --profile example config show             # the writable DIDs, the config status and hash
 udsota --profile example config set timeout_ms=3000 --commit --reset   # write, commit, restart, check
+udsota --profile example dtc show [--ext U0073]  # the DTCs with a status bit set, or one DTC's extended data
+udsota --profile example dtc clear               # 14 FF FF FF, unlocked as config set is
 udsota keygen --out keys                         # a new ecdsa-mode key pair; no profile, no bus
 udsota --profile example pack build/example.bin --out dist --diff-from releases/v1.bin   # payloads for another flasher; no bus
 ```
@@ -26,6 +28,8 @@ udsota --profile example pack build/example.bin --out dist --diff-from releases/
 `flash` checks the image against the profile before it opens the bus, and reads the device before it writes anything. It does nothing when the device already runs the image, confirms it if an earlier run stopped short of that, and refuses while a different image is still unconfirmed. After ActivateImage it waits for the restart and retries ConfirmImage for up to 120 s, so the application's own post-update checks can pass.
 
 `config set NAME=VALUE ...` writes the profile's writable DIDs (the example's are commented out). It checks every value against the profile before it opens the bus. Then it opens the extended session, unlocks at `level_extended`, and stages each value with WriteDataByIdentifier (0x2E). `--commit` runs the profile's commit routine, which must answer status 00. `--reset` needs `--commit`. It sends the keyed 11 01, waits for the restart as `flash` does, reads back every key it wrote, and checks the device's config hash when the profile has one. Staged values that are never committed are dropped when the session ends. Firmware that answers 0x2E with NRC 0x11, or the commit routine with 0x31, has no config writes, and the tool stops with exit code 2. `config show` reads the keys, the status DID and the hash check without changing session, and stops the same way when the device serves none of the keys.
+
+`dtc show` reads the device's fault codes with ReadDTCInformation (0x19), in the default session and with no key. It sends 19 01 FF for the DTC format, then 19 02 FF, and prints each DTC whose status has a bit set: its code, its status with the bits named, and its description when the profile's `[dtcs]` has one. In DTC formats 0x00 and 0x04 a code prints in SAE J2012 form, `U0073`, with `-1C` when its failure-type byte isn't 00; in any other format it prints as `0xC07300`. `--ext CODE` sends 19 06 CODE FF instead and prints that DTC's line and its extended data records as hex, which the tool doesn't split because their layout is the product's. CODE is written as the codes print, in either case, and one that isn't a code is refused before the bus opens. `dtc clear` sends 14 FF FF FF in the extended session, unlocked at `level_extended` as `config set` is; the device's own rules decide whether it clears. Firmware that answers 0x19 or 0x14 with NRC 0x11 has no DTC services, and one that answers 19 06 with 0x12 has no extended data: the tool stops with exit code 2. Any other refusal exits 1 and names the NRC, 0x31 to `--ext` being a DTC the device doesn't report and 0x14 an answer longer than the device can send.
 
 `flash --compress` sends the image as a raw DEFLATE stream (Python's `zlib`, level 9, no header), which usually takes an update to 50–65 % of its time on the bus. The RequestDownload still announces the image's own size, and the device writes the same bytes. Once the device takes the compressed download, the tool prints the ratio, and after it the time saved. A device answers 0x31 when it has no compressed downloads, or when the image is larger than its slot, and 0x22 with F1F1 reading `DL_NO_MEMORY` when it has no memory for the inflater now. `--compress` then stops before anything is written: exit code 2 for the first, 1 for the second, whose message says a plain flash may work. `--compress-auto` sends the image uncompressed in both cases instead. `[image] compression` in the profile sets the default, `"deflate"`, `"auto"` or `"none"`, which `--compress`, `--compress-auto` and `--no-compress` override. No download resumes, compressed or not: a new run starts from the first byte.
 
@@ -52,7 +56,7 @@ The exit code says why it stopped:
 |---|---|
 | 0 | done |
 | 1 | the device refused or failed a step |
-| 2 | refused with nothing written: a bad profile, image, key file or `config set` value, a precheck stop (an image for another board, a running image still unconfirmed, a device that does not serve the udsota status DID F1F0), firmware without config writes, `flash --compress` on a server without compressed downloads, or `--diff-from` without detools installed |
+| 2 | refused with nothing written: a bad profile, image, key file, `config set` value or `dtc show --ext` code, a precheck stop (an image for another board, a running image still unconfirmed, a device that does not serve the udsota status DID F1F0), firmware without config writes or DTC services, `flash --compress` on a server without compressed downloads, or `--diff-from` without detools installed |
 | 3 | another tester holds a session |
 | 4 | a second tester is on the bus |
 
@@ -71,6 +75,7 @@ Start from [`example.toml`](udsota/profiles/example.toml), which comments every 
 | `[functional]` | `id`, `quiet_bus` (false) | the functional ID (0x7DF on most buses), the only ID besides `req_id` the tool may send on. With `quiet_bus`, `flash` first sends 10 83, 85 82 and 28 83 03 to every node, holds them there with 3E 80 every 2 s, and afterwards sends 28 80 03, 85 81 and 10 81, whether or not the update succeeded. Turn it on only on a bus where every node may stop its normal messages while you flash, never on a vehicle that is in use |
 | `[dids]` | `"0xNNNN"` or `"0xNNNN-0xNNNN"` = `{ name, decode, type, writable, min, max }` | extra DIDs `info` reads after the server's own, decoded as `hex`, `ascii`, `version3`, `u8` or `u16` (decimal); a range stops at its first absent DID. `writable = true` makes one DID a key for `config set`, with a `type` (`u8`, `u16` or `blob`), a `name` of letters, digits and `_`, and for u8 and u16 a write range `min`..`max` (default the whole type) |
 | `[config]` | `commit_rid`, `status_did`, `hash = { did, first, last, schema }` | the routine `config set --commit` runs; a DID shown as hex by `config show` and after a failed commit; and the hash check: SHA-256 of `schema`, then DID (big-endian), length and value for every DID from `first` to `last` the device answers, compared with DID `did`. `did` and `status_did` must lie outside `first`..`last` |
+| `[dtcs]` | `"U0073"`, `"U0073-1C"` or `"0xC07300"` = `"text"` | the description `dtc show` prints for each DTC. A code without a failure-type byte covers all of that code's, and a key with the DTC's own failure-type byte wins over it. Two keys for the same DTC are refused |
 
 ## Limits
 

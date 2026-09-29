@@ -1,6 +1,6 @@
 """The udsota wire contract (components/udsota/include/udsota_wire.h, over the server's udsota_server_wire.h and
-the updater's udsota_update_wire.h): sessions, server-owned DIDs, routines, NRCs, the download format and the status,
-result and counter layouts. DECODE and describe_result are
+the updater's udsota_update_wire.h): sessions, server-owned DIDs, routines, NRCs, the download format, the DTC
+services' numbers and the status, result, counter and DTC status layouts. DECODE and describe_result are
 Python-only: how info and config render DID records."""
 import struct
 
@@ -13,10 +13,18 @@ RID_CHECK_DEPS, RID_ACTIVATE, RID_CONFIRM = 0xFF01, 0xF001, 0xF002
 NRC_NOT_SUPPORTED, NRC_BUSY, NRC_CONDITIONS, NRC_SEQUENCE = 0x11, 0x21, 0x22, 0x24   # 0x11: e.g. 0x2E, no config writes
 NRC_OUT_OF_RANGE, NRC_TIME_DELAY, NRC_PENDING = 0x31, 0x37, 0x78
 NRC_PROGRAMMING_FAILURE = 0x72   # generalProgrammingFailure: a flash job failed or passed the 90 s cap
+NRC_SUBFUNCTION_NOT_SUPPORTED = 0x12   # e.g. 19 06 on firmware without DTC extended data
+NRC_RESPONSE_TOO_LONG = 0x14     # responseTooLong: a 19 answer past the server's response buffer
 DL_DFI, DL_ALFID, DL_MAX_DATA = 0x00, 0x44, 4093
 DL_DFI_DEFLATE = 0x10            # dataFormatIdentifier: raw DEFLATE (RFC 1951), memorySize still the image's size
 DL_DFI_DELTA = 0x20              # a delta patch from the running image (delta.py), heatshrink inside
 DL_DFI_DELTA_DEFLATE = 0x30      # the same with its patch uncompressed, all of it raw DEFLATE
+RDTC_COUNT_BY_MASK = 0x01        # 19 01 <mask>: 59 01 <avail> <format> <count u16>
+RDTC_BY_MASK = 0x02              # 19 02 <mask>: 59 02 <avail>, then <DTC 3 B> <status> for each match
+RDTC_EXT_DATA = 0x06             # 19 06 <DTC 3 B> <record>: 59 06 <DTC> <status>, then <record> <data>...
+RDTC_SUPPORTED = 0x0A            # 19 0A: 59 0A <avail>, then every DTC and its status
+DTC_RECORD_ALL = 0xFF            # 19 06: every extended data record
+DTC_GROUP_ALL = 0xFFFFFF         # 14's groupOfDTC for every DTC
 
 IMG_STATES = {0: "UNDEFINED", 1: "NEW", 2: "PENDING_VERIFY", 3: "VALID", 4: "INVALID", 5: "ABORTED"}
 OTHER_STATES = {0: "EMPTY", 1: "UNVERIFIED", 2: "WRITING", 3: "VERIFIED", 4: "INVALID"}
@@ -30,6 +38,10 @@ DL_REASONS = ("DL_OK", "DL_BAD_HEADER", "DL_BAD_PROJECT", "DL_BAD_BOARD", "DL_BA
 # signature failure, so FF01 reports both as 8 (DL_VERIFY_FAILED).
 COUNTER_NAMES = ("seq_errors", "ncr_timeouts", "repeated_blocks", "aborts", "withheld_fcs",
                  "stmin_violations", "resp_pending_caps", "resp_frames_dropped")
+# ISO 14229-1's statusOfDTC bits, from bit 0.
+DTC_STATUS_BITS = ("testFailed", "testFailedThisOperationCycle", "pendingDTC", "confirmedDTC",
+                   "testNotCompletedSinceLastClear", "testFailedSinceLastClear", "testNotCompletedThisOperationCycle",
+                   "warningIndicatorRequested")
 
 
 # NUL-terminated ASCII field to str.

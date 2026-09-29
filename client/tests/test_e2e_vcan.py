@@ -1,5 +1,5 @@
 """End-to-end over a virtual CAN bus: tools/linux_server's udsota_demo_server runs on vcan0 (or $UDSOTA_VCAN)
-through its SocketCAN backend, and the client flashes it two ways:
+through its SocketCAN backend, and the client flashes it, and reads and clears its DTCs, two ways:
 - over can-isotp's Python ISO-TP stack on a python-can SocketCAN bus, which needs only the vcan module (CI's e2e
   job runs these on GitHub's hosted runners, whose kernel has no ISO-TP module);
 - as the real `udsota` command over the kernel's ISO-TP socket, which also needs can-isotp (a local Linux box).
@@ -199,3 +199,37 @@ def test_cli_flash_resends_after_a_lost_flow_control(vcan_demo, tmp_path):
     r = udsota("--profile", "example", "--interface", IFACE, "flash", image, timeout_s=60)
     assert r.returncode == 0, r.stdout + r.stderr + demo.log.read_text()
     assert "--drop-fc-after: losing the FC" in demo.log.read_text()
+
+
+# Check dtc show, show --ext and clear over vcan with the Python ISO-TP stack: the demo's multi-frame 59 02 and 59 06
+# answers through its SocketCAN backend, and a clear in the extended session that leaves nothing to show.
+def test_dtc_over_vcan_with_python_isotp(vcan_demo, link, capsys):
+    demo = vcan_demo()
+    argv = ["--profile", "example", "--interface", IFACE, "dtc"]
+    assert run_cli(link, argv + ["show"]) == 0, demo.log.read_text()
+    out = capsys.readouterr().out
+    assert out.startswith("2 DTCs (availability 0x2F, format 0x00)\nU0073  status 0x2F (")
+    assert "\nP0562  status 0x28 (" in out
+    assert run_cli(link, argv + ["show", "--ext", "U0073"]) == 0
+    assert capsys.readouterr().out.endswith("\nextended data: 01 03 10 00 00 00 78 00 00 0e 10\n")
+    assert run_cli(link, argv + ["clear"]) == 0
+    assert run_cli(link, argv + ["show"]) == 0
+    assert capsys.readouterr().out == "cleared every DTC\nno DTCs match (availability 0x2F)\n"
+
+
+# Check `udsota dtc show` and a keyed `udsota dtc clear` over the kernel's ISO-TP socket: the client's key for the
+# demo's label, master and device ID unlocks the clear.
+def test_cli_dtc_over_vcan(vcan_demo, tmp_path):
+    kernel_isotp_or_skip()
+    master = tmp_path / "master.bin"
+    master.write_bytes(MASTER)
+    demo = vcan_demo("--label", LABEL, "--master", str(master), "--skip-boot-delay")
+    prof = tmp_path / "secured.toml"
+    prof.write_text(SECURED % (LABEL, master))
+    argv = ["--profile", str(prof), "--interface", IFACE, "dtc"]
+    r = udsota(*argv, "show")
+    assert r.returncode == 0 and r.stdout.startswith("2 DTCs"), r.stdout + r.stderr + demo.log.read_text()
+    r = udsota(*argv, "clear")
+    assert r.returncode == 0 and r.stdout == "cleared every DTC\n", r.stdout + r.stderr + demo.log.read_text()
+    r = udsota(*argv, "show")
+    assert r.returncode == 0 and r.stdout == "no DTCs match (availability 0x2F)\n", r.stdout + r.stderr
