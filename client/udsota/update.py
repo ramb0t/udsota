@@ -3,11 +3,11 @@ the keyed reset. Every product-specific step comes from the profile."""
 import contextlib
 import time
 
-from .delta import DETOOLS_HINT, validation_hash
+from .delta import validation_hash
 from .errors import NoResponse, Nrc, Refused, SendFailed, UpdateFailed
 from .image import parse_image
 from .keys import DeviceKeys, SigningKeys
-from .pack import encode
+from .pack import build_patch, encode, rank_deltas
 from .wire import (DID_COUNTERS, DID_DEVICE_ID, DID_RESULT, DID_RUNNING_SHA, DID_SESSION, DID_STATUS, DID_VERSION,
                    DL_DFI, DL_DFI_DEFLATE, DL_DFI_DELTA, DL_DFI_DELTA_DEFLATE, IMG_PENDING_VERIFY, IMG_STATES,
                    NRC_CONDITIONS, NRC_OUT_OF_RANGE, NRC_PROGRAMMING_FAILURE, NRC_SEQUENCE, OTHER_VERIFIED,
@@ -166,7 +166,8 @@ def download(uds, image, drop_76=None, log=print, compress="none", clock=time.mo
 
 # The 0x36 blocks and the 0x37 of an open download of image carrying payload: the image itself (kind None), or it
 # coded as kind ("compressed" or "delta"), which ends with the time the coding saved. True when done; False when
-# a delta's 36 was refused (0x31) with F1F1 DL_BAD_BASE, which ends the download on the server.
+# a delta's 36 was refused with F1F1 DL_BAD_BASE, which ends the download on the server: 0x31, or, when that answer
+# was lost, 0x24 to the resent block, or for a block over 256 bytes a resend the ended download's ISO-TP refuses.
 def send_payload(uds, image, payload, max_data, kind, drop_76=None, log=print, clock=time.monotonic):
     total = (len(payload) + max_data - 1) // max_data
     if drop_76 is not None and drop_76 > total:
@@ -181,6 +182,8 @@ def send_payload(uds, image, payload, max_data, kind, drop_76=None, log=print, c
                     log("--drop-76: resending block %d as if its 76 were lost" % n)
                     send_block(uds, n & 0xFF, chunk)
             except (NoResponse, SendFailed) as e:
+                if kind == "delta" and isinstance(e, SendFailed) and last_reason(uds) == "DL_BAD_BASE":
+                    return False
                 raise block_failed(uds, n, e) from e
             if n % 32 == 0 or n == total:
                 log("sent %d of %d bytes" % (min(n * max_data, len(payload)), len(payload)))
@@ -241,20 +244,12 @@ def plan_deltas(bases, image, running_sha, compress, diff_format, log=print, def
         log("no delta: DFI 0x30 is raw DEFLATE, which --no-compress rules out")
         return []
     full = len(encode(image, DL_DFI if compress == "none" else DL_DFI_DEFLATE))
-    out = []
-    for dfi in dfis:
-        try:
-            payload = encode(image, dfi, base)
-        except ImportError:
-            raise Refused(DETOOLS_HINT) from None
-        except Exception as e:                  # detools' own errors, which have no common base worth importing
-            raise UpdateFailed("building the DFI 0x%02X patch failed: %s" % (dfi, e)) from e
-        if len(payload) < full:
-            out.append((dfi, payload))
-        else:
-            log("no delta over DFI 0x%02X: its %d bytes are no fewer than the full download's %d"
-                % (dfi, len(payload), full))
-    return sorted(out, key=lambda d: len(d[1]))
+    payloads = {dfi: build_patch(image, dfi, base) for dfi in dfis}
+    worth, rest = rank_deltas({d: len(p) for d, p in payloads.items()}, full)
+    for dfi in rest:
+        log("no delta over DFI 0x%02X: its %d bytes are no fewer than the full download's %d"
+            % (dfi, len(payloads[dfi]), full))
+    return [(dfi, payloads[dfi]) for dfi in worth]
 
 
 # RequestTransferExit, resent once after a plain timeout. A resend refused with 0x24 means the first 0x37

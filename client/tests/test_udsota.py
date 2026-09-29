@@ -2897,7 +2897,7 @@ def test_pack_refuses(tmp_path, capsys, args, base, why):
 # Check a base for another of the profile's boards is refused: no device of the image's board runs it.
 def test_pack_refuses_a_base_for_another_board(tmp_path):
     prof = dataclasses.replace(profile.load("example"), hw_ids=(1, 2))
-    with pytest.raises(errors.Refused, match="the base is for hw_id 2, the image for 1"):
+    with pytest.raises(errors.Refused, match="the base is example for hw_id 2, the image example for hw_id 1"):
         pack.pack(prof, DELTA_NEW, "new", tmp_path / "out", base=other_base(hw_id=2))
     assert not (tmp_path / "out").exists()
 
@@ -2910,10 +2910,72 @@ def test_pack_refuses_a_bad_image_or_file(tmp_path, capsys):
     assert cli.main(["--profile", "example", "pack", str(tmp_path / "missing.bin"), "--out", str(tmp_path)]) == 2
     assert "cannot read" in capsys.readouterr().err
     (tmp_path / "out").write_text("a file, not a directory")
-    assert run_pack(tmp_path, make_image())[0] == 2 and "cannot write in" in capsys.readouterr().err
+    assert run_pack(tmp_path, make_image())[0] == 2 and "is not a directory" in capsys.readouterr().err
     (tmp_path / "out").unlink()
     assert run_pack(tmp_path, make_image())[0] == 0
     before = {p.name: p.read_bytes() for p in (tmp_path / "out").iterdir()}
     assert run_pack(tmp_path, make_image(size=5000))[0] == 2
     assert "already holds new.dfi00.bin, new.dfi10.bin, new.manifest.json" in capsys.readouterr().err
     assert {p.name: p.read_bytes() for p in (tmp_path / "out").iterdir()} == before
+
+
+# Check the no-overwrite rule reads names literally and without case: a stem with glob characters, and a file whose
+# name differs only in case (one file on macOS or Windows), both block a second run.
+@pytest.mark.parametrize("stem, other", [("fw[rc1]", "fw[rc1].dfi10.bin"), ("new", "NEW.DFI10.BIN")])
+def test_pack_never_overwrites_by_name(tmp_path, stem, other):
+    (tmp_path / "out").mkdir()
+    (tmp_path / "out" / other).write_bytes(b"earlier")
+    with pytest.raises(errors.Refused, match="already holds"):
+        pack.pack(profile.load("example"), make_image(), stem, tmp_path / "out")
+    assert [p.name for p in (tmp_path / "out").iterdir()] == [other]
+
+
+# Check a base for another product is refused even when the profile names no product to check either against.
+def test_pack_refuses_a_base_for_another_product_without_a_profile_product(tmp_path):
+    prof = dataclasses.replace(profile.load("example"), product=None)
+    with pytest.raises(errors.Refused, match="the base is widget for hw_id 1, the image example"):
+        pack.pack(prof, DELTA_NEW, "new", tmp_path / "out", base=other_base(project=b"widget"))
+
+
+# Check a write that fails part-way leaves nothing in --out, so the run can simply be repeated.
+def test_pack_leaves_nothing_after_a_failed_write(tmp_path, monkeypatch):
+    real, calls = pathlib.Path.write_bytes, []
+
+    def flaky(self, data):
+        calls.append(self.name)
+        if len(calls) == 2:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real(self, data)
+
+    monkeypatch.setattr(pathlib.Path, "write_bytes", flaky)
+    with pytest.raises(errors.Refused, match="cannot write in .*No space left"):
+        pack.pack(profile.load("example"), make_image(), "new", tmp_path / "out")
+    assert list((tmp_path / "out").iterdir()) == []
+    monkeypatch.setattr(pathlib.Path, "write_bytes", real)
+    assert [e["dfi"] for e in pack.pack(profile.load("example"), make_image(), "new", tmp_path / "out")["payloads"]] \
+        == [0x10, 0x00]
+
+
+# Check --diff-from with a directory, which flash takes, is refused with the reason: pack has no device to choose by.
+def test_pack_refuses_a_base_directory(tmp_path, capsys):
+    (tmp_path / "releases").mkdir()
+    (tmp_path / "new.bin").write_bytes(make_image())
+    assert cli.main(["--profile", "example", "pack", str(tmp_path / "new.bin"), "--out", str(tmp_path / "out"),
+                     "--diff-from", str(tmp_path / "releases")]) == 2
+    assert "takes one base file" in capsys.readouterr().err
+
+
+# Check --dfi 0x00 alone never deflates the image: without a delta there is nothing to rank against 0x10.
+def test_pack_plain_mode_does_not_deflate(tmp_path, monkeypatch):
+    monkeypatch.setattr(pack, "deflate", lambda data: pytest.fail("deflated"))
+    assert run_pack(tmp_path, make_image(), "--dfi", "0x00")[0] == 0
+
+
+# Check pack lists the deltas flash --compress-auto would send, in the order it would send them: both rank with
+# rank_deltas against the 0x10 payload.
+def test_pack_orders_deltas_as_flash_does(tmp_path):
+    pytest.importorskip("detools")
+    _, m = run_pack(tmp_path, DELTA_NEW, base=DELTA_BASE)
+    planned = update.plan_deltas([("base", DELTA_BASE)], DELTA_NEW, DELTA_BASE[176:208], "auto", "auto",
+                                 log=lambda *a: None)
+    assert [e["dfi"] for e in m["payloads"] if e.get("smaller_than_dfi_10")] == [d for d, _ in planned]

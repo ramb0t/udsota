@@ -134,6 +134,9 @@ def keygen_cmd(out):
 
 # `pack`: reads FILE and the --diff-from base, and writes the payloads and manifest (pack.pack).
 def pack_cmd(prof, args):
+    if args.diff_from is not None and args.diff_from.is_dir():
+        raise Refused("pack --diff-from takes one base file, the image the devices run: with no device to ask, it "
+                      "cannot choose from a directory as flash does")
     try:
         image = args.file.read_bytes()
         base = None if args.diff_from is None else args.diff_from.read_bytes()
