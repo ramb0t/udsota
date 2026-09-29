@@ -19,7 +19,7 @@ The example's `PROJECT_VER` in `examples/esp32/CMakeLists.txt` is something else
 
 ## Every pull request
 
-Add a line to `## [Unreleased]` in `CHANGELOG.md` for anything a user would notice, and say whether it is breaking.
+Add a line to `## [Unreleased]` in `CHANGELOG.md` for anything a user would notice, and say whether it is breaking. The [pull request template](.github/pull_request_template.md) asks for it, with the bump from the table above and where the change ran.
 
 ## Making a release
 
