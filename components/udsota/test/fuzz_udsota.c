@@ -1554,6 +1554,23 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 }
 #else  /* the ctest program: self-tests, seeds, mutants, corpus replay */
 
+/* Built with AddressSanitizer (-DUDSOTA_SANITIZE=ON), a guard-page fault must stay a plain SIGSEGV, as the self-test
+ * and on_fatal expect: ASan's own SEGV handler would report it and exit 1. ASan still checks what it instruments. */
+#if defined(__SANITIZE_ADDRESS__)
+#define FUZZ_ASAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define FUZZ_ASAN 1
+#endif
+#endif
+#ifdef FUZZ_ASAN
+const char *__asan_default_options(void);
+const char *__asan_default_options(void)
+{
+    return "handle_segv=0:handle_sigbus=0";
+}
+#endif
+
 /* Writes s to stderr from a signal handler (async-signal-safe). */
 static void say(const char *s)
 {

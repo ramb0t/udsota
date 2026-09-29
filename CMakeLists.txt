@@ -11,6 +11,15 @@ set(CMAKE_C_EXTENSIONS OFF)
 
 enable_testing()
 
+# -DUDSOTA_SANITIZE=ON builds every host target, Unity and the fuzz harnesses included, with AddressSanitizer and
+# UBSan, and the first report ends the program. CI's sanitize job runs the whole suite so, with clang.
+option(UDSOTA_SANITIZE "Build every host target with ASan and UBSan, stopping at the first report" OFF)
+if(UDSOTA_SANITIZE)
+    set(UDSOTA_SAN_FLAGS -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer)
+    add_compile_options(${UDSOTA_SAN_FLAGS})
+    add_link_options(${UDSOTA_SAN_FLAGS})
+endif()
+
 include(FetchContent)
 FetchContent_Declare(unity
     GIT_REPOSITORY https://github.com/ThrowTheSwitch/Unity.git
@@ -271,7 +280,8 @@ add_test(NAME udsota_core_only_probe_state
          COMMAND ${CMAKE_C_COMPILER} -std=c11 -fsyntax-only -Wall -Wextra -Werror -I${CORE_ONLY_INC} -DPROBE_STATE
                  ${TEST_DIR}/fixtures/udsota_portable_probe.c)
 add_test(NAME udsota_core_only_link_updater
-         COMMAND ${CMAKE_C_COMPILER} -DPROBE_LINK_UPDATER ${TEST_DIR}/fixtures/udsota_portable_probe.c
+         COMMAND ${CMAKE_C_COMPILER} ${UDSOTA_SAN_FLAGS} -DPROBE_LINK_UPDATER
+                 ${TEST_DIR}/fixtures/udsota_portable_probe.c
                  $<TARGET_OBJECTS:udsota_server_only> $<TARGET_FILE:isotp>
                  -o ${CMAKE_CURRENT_BINARY_DIR}/udsota_core_only_link_updater
          COMMAND_EXPAND_LISTS)

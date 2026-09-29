@@ -1,5 +1,5 @@
-# Host unit tests, the Python client's tests, the end-to-end tests against the Linux demo server and the ESP-IDF
-# example build, on every push and pull request.
+# Host unit tests (also under clang's ASan and UBSan), the Python client's tests, the end-to-end tests against the
+# Linux demo server and the ESP-IDF example build, on every push and pull request.
 name: ci
 
 on:
@@ -16,6 +16,15 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build and run the host tests (core, isotp, port logic, seam checks, fuzz corpus)
         run: tools/run_tests.sh
+
+  sanitize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: The same host tests under clang with AddressSanitizer and UBSan, where any report fails its test
+        env:
+          CC: clang
+        run: tools/run_tests.sh build -DUDSOTA_SANITIZE=ON
 
   client:
     runs-on: ubuntu-latest

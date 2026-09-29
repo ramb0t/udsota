@@ -5,7 +5,7 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 ## [Unreleased]
 
 - Host builds: `sources.cmake` gains `UDSOTA_SERVER_CORE_SRCS`, the server with neither the updater nor the transport (`udsota_server.c`, `udsota_codec.c` and `udsota_keys.c`), for a host build that brings its own isotp-c and so can't link `udsota_isotp.c`, which defines isotp-c's `isotp_user_*` callbacks. The existing lists are unchanged.
-- Internal: `fuzz_udsota_no_update` builds from `UDSOTA_SERVER_CORE_SRCS` and starts the server with `udsota_core_init`, so it links no updater; its digest is unchanged.
+- Internal: a new CI job, `sanitize`, runs the whole host suite under clang with AddressSanitizer and UBSan, where any report fails its test: `-DUDSOTA_SANITIZE=ON`, off by default, builds every host target so (`tools/run_tests.sh build -DUDSOTA_SANITIZE=ON`). The fuzz harness's pinned digests are the same under it, and its guard pages still catch what they did, since it leaves SIGSEGV to them (ASan's `handle_segv=0`). `fuzz_udsota_no_update` builds from `UDSOTA_SERVER_CORE_SRCS` and starts the server with `udsota_core_init`, so it links no updater; its digest is unchanged.
 
 ## [0.10.0] - 2026-09-29
 
