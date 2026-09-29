@@ -1,7 +1,7 @@
 /* Host tests for the server with no updater: udsota_init with a NULL engine registers no service, so 34, 36 and 37
  * answer 0x11, the updater's RIDs and DIDs go to the app's hooks, 10 02 and 11 01 ask only the core's worker rule and
- * the gate, and nothing reaches a NULL engine op. Groups A to G are the rows test_udsota_core_only also runs, through
- * udsota_core_init (test/core_only/udsota_core_rows.h); here udsota_init runs them, and udsota_progress, the
+ * the gate, and nothing reaches a NULL engine op. Groups A to G and I are the rows test_udsota_core_only also runs,
+ * through udsota_core_init (test/core_only/udsota_core_rows.h); here udsota_init runs them, and udsota_progress, the
  * updater's, is read too. Group H compares udsota_init with udsota_core_init. Pass a test's name to run it alone. */
 #include <stdbool.h>
 #include <stdint.h>

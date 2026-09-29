@@ -28,6 +28,12 @@
  * 34, 36 and 37 count as unserved and must only ever get NRC 0x11 (0x21 while an app routine runs), and its
  * coverage floor needs the reset and app hooks only.
  *
+ * A sixth build, fuzz_udsota_dtc (UDSOTA_FUZZ_DTC=1), sets dtc_get, dtc_ext_data and dtc_clear over a table of
+ * FUZZ_DTC_N DTCs with junk top bytes, so 19 and 14 are served: 19 02 FF and 19 0A outgrow the response buffer
+ * (0x14) while 19 02 01 and 02 08 fit, the mocks fail on an index at the cap, an unknown DTC, a top byte or record 00
+ * handed to dtc_ext_data, or an access state that is not the server's, and the positive shapes check every status
+ * sent is a subset of the availability mask. The other five builds compile to what they were without it.
+ *
  * The PASS line ends with digest=, an FNV-1a hash of every request fed to the server and every answer it gave
  * (empty ones too), so an answer that changes shows there even where the counts don't. It draws no rnd().
  *
@@ -69,6 +75,9 @@
 #ifndef UDSOTA_FUZZ_NO_UPDATE
 #define UDSOTA_FUZZ_NO_UPDATE 0   /* 1: udsota_init gets a NULL engine, so no update service answers */
 #endif
+#ifndef UDSOTA_FUZZ_DTC
+#define UDSOTA_FUZZ_DTC 0         /* 1: FUZZ_HOOKS also sets dtc_get, dtc_ext_data and dtc_clear */
+#endif
 #if UDSOTA_FUZZ_NO_UPDATE && (!UDSOTA_FUZZ_APP_HOOKS || UDSOTA_FUZZ_PROGRESS || defined(UDSOTA_FUZZ_Z))
 #error "UDSOTA_FUZZ_NO_UPDATE needs UDSOTA_FUZZ_APP_HOOKS (0x31's positive answers) and no progress or z build"
 #endif
@@ -81,8 +90,8 @@ _Static_assert(offsetof(udsota_engine_t, zformats) == offsetof(udsota_engine_t, 
                "udsota_engine_t gained a member after zformats: mock it in FUZZ_ENGINE and move this check");
 _Static_assert(offsetof(udsota_hooks_t, ctx) == 7u * sizeof(void (*)(void)),
                "udsota_hooks_t gained a callback: mock it in FUZZ_HOOKS and update this count");
-_Static_assert(offsetof(udsota_hooks_t, progress) + sizeof(void (*)(void)) == sizeof(udsota_hooks_t),
-               "udsota_hooks_t gained a member after progress: mock it in FUZZ_HOOKS and move this check");
+_Static_assert(offsetof(udsota_hooks_t, dtc_clear) + sizeof(void (*)(void)) == sizeof(udsota_hooks_t),
+               "udsota_hooks_t gained a member after dtc_clear: mock it in FUZZ_HOOKS and move this check");
 
 #define REQ_MAX          UDSOTA_DL_MAX_BLOCK_LEN  /* the ISO-TP link never delivers a longer request */
 #define RESP_FULL        256u                  /* UDSOTA_ISOTP_RESP_MAX: the transport's response buffer */
@@ -154,6 +163,9 @@ typedef enum {                                 /* platform ops whose fuzz-phase 
 #endif
 #ifdef UDSOTA_FUZZ_Z
     OP_ZBEGIN, OP_ZWRITE, OP_ZEND,
+#endif
+#if UDSOTA_FUZZ_DTC
+    OP_DTC_GET, OP_DTC_EXT_DATA, OP_DTC_CLEAR,
 #endif
     OP_COUNT
 } op_id_t;
@@ -641,6 +653,84 @@ static void mock_dtc_setting(void *ctx, bool on)
     (void)on;
 }
 
+#if UDSOTA_FUZZ_DTC
+#define FUZZ_DTC_N      90u    /* 19 0A and 19 02 FF outgrow 256 B; 19 02 01 and 02 08 fit */
+#define FUZZ_DTC_AVAIL  0x2Fu  /* FUZZ_CFG's availability mask */
+
+/* The i-th DTC's 24 bits: U0000 up by code, the failure-type byte i on every third, else 00; all distinct. */
+static uint32_t fuzz_dtc24(size_t i)
+{
+    return 0xC00000u | ((uint32_t)i << 8) | ((i % 3u == 0u) ? 0u : (uint32_t)i);
+}
+
+/* hooks.dtc_get: FUZZ_DTC_N DTCs with a junk top byte, statuses cycling through 00, 01, 2F, 08, 40, 09, FF and 28;
+ * an index at the cap is a defect. */
+static bool mock_dtc_get(void *ctx, size_t i, udsota_dtc_t *out)
+{
+    static const uint8_t STATUS[8] = {0x00, 0x01, 0x2F, 0x08, 0x40, 0x09, 0xFF, 0x28};
+    count_op(OP_DTC_GET);
+    if (i >= UDSOTA_DTC_INDEX_MAX) {
+        fail("dtc_get asked for an index at UDSOTA_DTC_INDEX_MAX or past it", NULL, 0, NULL, 0);
+    }
+    if (i >= FUZZ_DTC_N) {
+        return false;
+    }
+    out->dtc = ((uint32_t)(uint8_t)(0x5Bu + 7u * i) << 24) | fuzz_dtc24(i);
+    out->status = STATUS[i % 8u];
+    return true;
+}
+
+/* hooks.dtc_ext_data: first writes all of max (an oversized one faults on the guard page), then record 01 is 01 AB,
+ * 02 is held with no data, FF is every record with data (01 AB) or 0x14, 7E sets *len to max + 1 (the core's 0x10)
+ * and any other is 0x31. A DTC dtc_get doesn't report, a top byte or record 00 is a defect. */
+static uint8_t mock_dtc_ext_data(void *ctx, uint32_t dtc, uint8_t record, uint8_t *buf, size_t max, size_t *len)
+{
+    count_op(OP_DTC_EXT_DATA);
+    bool known = false;
+    for (size_t i = 0; i < FUZZ_DTC_N && !known; i++) {
+        known = (fuzz_dtc24(i) & 0xFFFFFFu) == dtc;
+    }
+    if (!known || record == 0x00u) {
+        fail("dtc_ext_data handed a DTC dtc_get doesn't report, a top byte, or record 00", NULL, 0, NULL, 0);
+    }
+    memset(buf, 0xDD, max);
+    switch (record) {
+    case 0x01:
+    case UDSOTA_DTC_RECORD_ALL:
+        if (max < 2u) {
+            return UDSOTA_NRC_RESPONSE_TOO_LONG;
+        }
+        buf[0] = 0x01;
+        buf[1] = 0xAB;
+        *len = 2u;
+        return 0u;
+    case 0x02:
+        *len = 0u;
+        return 0u;
+    case 0x7E:
+        *len = max + 1u;
+        return 0u;
+    default:
+        return UDSOTA_NRC_REQUEST_OUT_OF_RANGE;
+    }
+}
+
+/* hooks.dtc_clear: the access state must be the server's own; clears group FFFFFF (0x22 in variant 1, a second
+ * device on the IDs), and any other group is 0x31. */
+static uint8_t mock_dtc_clear(void *ctx, uint32_t group, udsota_access_t access)
+{
+    count_op(OP_DTC_CLEAR);
+    if (access.session != S.session || access.unlocked_level != S.security || access.epoch != S.session_epoch ||
+        group > 0xFFFFFFu) {
+        fail("dtc_clear handed an access state that is not the server's, or a group past 24 bits", NULL, 0, NULL, 0);
+    }
+    if (group != UDSOTA_DTC_GROUP_ALL) {
+        return UDSOTA_NRC_REQUEST_OUT_OF_RANGE;
+    }
+    return (M.live && M.variant == 1u) ? UDSOTA_NRC_CONDITIONS_NOT_CORRECT : 0u;
+}
+#endif
+
 #ifdef UDSOTA_FUZZ_Z
 /* ---- Compressed downloads: udsota_zstream over the real tinfl, into the mock flash ops ---- */
 
@@ -776,6 +866,9 @@ static int mock_zend(void *ctx)
 static const uint8_t FUZZ_SERIAL[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
 static const udsota_config_t FUZZ_CFG = {
     .stmin_monitor = true, .device_id = FUZZ_SERIAL, .device_id_len = sizeof FUZZ_SERIAL,
+#if UDSOTA_FUZZ_DTC
+    .dtc_availability_mask = FUZZ_DTC_AVAIL, .dtc_format = 0x00u,
+#endif
 };
 static const udsota_engine_t FUZZ_ENGINE = {
     .check_first = mock_image_check, .begin = mock_ota_begin, .write = mock_ota_write, .verify = mock_ota_end,
@@ -796,6 +889,9 @@ static const udsota_hooks_t FUZZ_HOOKS = {
 #endif
 #if UDSOTA_FUZZ_PROGRESS
     .progress = mock_progress,
+#endif
+#if UDSOTA_FUZZ_DTC
+    .dtc_get = mock_dtc_get, .dtc_ext_data = mock_dtc_ext_data, .dtc_clear = mock_dtc_clear,
 #endif
 };
 
@@ -825,18 +921,22 @@ static bool sid_served(uint8_t sid)
 #if UDSOTA_FUZZ_APP_HOOKS
     case UDSOTA_SID_WRITE_DID:
 #endif
+#if UDSOTA_FUZZ_DTC
+    case UDSOTA_SID_READ_DTC: case UDSOTA_SID_CLEAR_DTC:
+#endif
         return true;
     default:
         return false;
     }
 }
 
-/* True for the 19 NRCs udsota.h defines; anything else on the wire is a server defect. */
+/* True for the 20 NRCs udsota.h defines; anything else on the wire is a server defect. */
 static bool nrc_known(uint8_t nrc)
 {
     switch (nrc) {
     case UDSOTA_NRC_GENERAL_REJECT: case UDSOTA_NRC_SERVICE_NOT_SUPPORTED: case UDSOTA_NRC_SUBFUNC_NOT_SUPPORTED:
-    case UDSOTA_NRC_INCORRECT_LENGTH: case UDSOTA_NRC_BUSY_REPEAT: case UDSOTA_NRC_CONDITIONS_NOT_CORRECT:
+    case UDSOTA_NRC_INCORRECT_LENGTH: case UDSOTA_NRC_RESPONSE_TOO_LONG: case UDSOTA_NRC_BUSY_REPEAT:
+    case UDSOTA_NRC_CONDITIONS_NOT_CORRECT:
     case UDSOTA_NRC_REQUEST_SEQUENCE_ERROR: case UDSOTA_NRC_REQUEST_OUT_OF_RANGE:
     case UDSOTA_NRC_SECURITY_ACCESS_DENIED: case UDSOTA_NRC_INVALID_KEY: case UDSOTA_NRC_EXCEEDED_ATTEMPTS:
     case UDSOTA_NRC_TIME_DELAY_NOT_EXPIRED: case UDSOTA_NRC_UPLOAD_DOWNLOAD_NOT_ACCEPTED:
@@ -854,6 +954,46 @@ static bool nrc_ok(uint8_t nrc)
 {
     return nrc_known(nrc) || (M.live && M.variant == 2u && nrc == FUZZ_GATE_NRC);
 }
+
+#if UDSOTA_FUZZ_DTC
+/* 59 02 and 59 0A after the echo: whole <DTC> <status> entries, each status a subset of the availability mask and,
+ * for 02, sharing a bit with the request's mask (status & mask & availability != 0, as status is already masked). */
+static bool dtc_list_ok(uint8_t sub, uint8_t mask, const uint8_t *r, size_t n)
+{
+    if (n < 3u || (n - 3u) % 4u != 0u || r[2] != FUZZ_DTC_AVAIL) {
+        return false;
+    }
+    for (size_t k = 3u; k < n; k += 4u) {
+        const uint8_t st = r[k + 3u];
+        if ((st & (uint8_t)~FUZZ_DTC_AVAIL) != 0u || (sub == UDSOTA_RDTC_BY_MASK && (st & mask) == 0u)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* 59 xx for a 19 request: 01's count with the availability and format 00, 02 and 0A's lists, 06's DTC echo and a
+ * masked status. */
+static bool dtc_shape_ok(const uint8_t *req, size_t rl, uint8_t sub, const uint8_t *r, size_t n)
+{
+    if (n < 2u || r[1] != sub) {
+        return false;
+    }
+    switch (sub) {
+    case UDSOTA_RDTC_COUNT_BY_MASK:
+        return n == 6u && rl == 3u && r[2] == FUZZ_DTC_AVAIL && r[3] == 0x00u;
+    case UDSOTA_RDTC_BY_MASK:
+        return rl == 3u && dtc_list_ok(sub, req[2], r, n);
+    case UDSOTA_RDTC_SUPPORTED:
+        return rl == 2u && dtc_list_ok(sub, 0u, r, n);
+    case UDSOTA_RDTC_EXT_DATA:
+        return n >= 6u && rl == 6u && r[2] == req[2] && r[3] == req[3] && r[4] == req[4] &&
+               (r[5] & (uint8_t)~FUZZ_DTC_AVAIL) == 0u;
+    default:
+        return false;
+    }
+}
+#endif
 
 /* True when a positive answer r[0..n) to req has the shape the server tests pin for its SID. */
 static bool positive_shape_ok(const uint8_t *req, size_t rl, const uint8_t *r, size_t n)
@@ -885,6 +1025,12 @@ static bool positive_shape_ok(const uint8_t *req, size_t rl, const uint8_t *r, s
 #if UDSOTA_FUZZ_APP_HOOKS
     case UDSOTA_SID_WRITE_DID:          /* 6E did-hi did-lo */
         return n == 3 && rl >= 4 && r[1] == req[1] && r[2] == req[2];
+#endif
+#if UDSOTA_FUZZ_DTC
+    case UDSOTA_SID_READ_DTC:           /* 59 sub ... */
+        return dtc_shape_ok(req, rl, sub, r, n);
+    case UDSOTA_SID_CLEAR_DTC:          /* 54, for exactly 14 and a 3-byte group */
+        return n == 1 && rl == UDSOTA_CLEAR_DTC_LEN;
 #endif
     default:
         return false;
@@ -1493,6 +1639,21 @@ static const seed_t SEEDS[] = {
     SEED(0x36, 0x02, 0x01, 0x20, 0x00, 0xDF, 0xFF, 0x11, 0x22),
     SEED(0x36, 0x01, 0x07, 0x00), SEED(0x36, 0x01, 0x03, 0x00), SEED(0x36, 0x02, 0x73, 0x75, 0x03, 0x00),
 #endif
+#if UDSOTA_FUZZ_DTC
+    SEED(0x19, 0x01, 0xFF), SEED(0x19, 0x01, 0x08), SEED(0x19, 0x01, 0x40), SEED(0x19, 0x01),
+    SEED(0x19, 0x01, 0xFF, 0x00), SEED(0x19, 0x81, 0xFF), SEED(0x19, 0x02, 0x01), SEED(0x19, 0x02, 0x08),
+    SEED(0x19, 0x02, 0x40), SEED(0x19, 0x02), SEED(0x19, 0x02, 0x01, 0x00), SEED(0x19, 0x82, 0x01),
+    SEED(0x19, 0x82, 0xFF), SEED(0x19, 0x0A), SEED(0x19, 0x0A, 0x00), SEED(0x19, 0x8A),
+    SEED(0x19, 0x06, 0xC0, 0x01, 0x01, 0x01), SEED(0x19, 0x06, 0xC0, 0x02, 0x02, 0x02),
+    SEED(0x19, 0x06, 0xC0, 0x03, 0x00, 0xFF), SEED(0x19, 0x06, 0xC0, 0x04, 0x04, 0x7E),
+    SEED(0x19, 0x06, 0xC0, 0x05, 0x05, 0x00), SEED(0x19, 0x06, 0xC0, 0x05, 0x05, 0x03),
+    SEED(0x19, 0x06, 0xC0, 0x05, 0x05, 0xFE), SEED(0x19, 0x06, 0x12, 0x34, 0x56, 0x01),
+    SEED(0x19, 0x86, 0xC0, 0x01, 0x01, 0x01), SEED(0x19, 0x06, 0xC0, 0x01, 0x01),
+    SEED(0x19, 0x06, 0xC0, 0x01, 0x01, 0x01, 0x00), SEED(0x19, 0x06), SEED(0x19, 0x04, 0xC0, 0x01, 0x01, 0x01),
+    SEED(0x19, 0x03), SEED(0x19, 0x14), SEED(0x19),
+    SEED(0x14, 0xFF, 0xFF, 0xFF), SEED(0x14, 0xC0, 0x01, 0x01), SEED(0x14, 0x00, 0x00, 0x00), SEED(0x14, 0xFF, 0xFF),
+    SEED(0x14, 0xFF, 0xFF, 0xFF, 0x00), SEED(0x14),
+#endif
 };
 #define SEED_COUNT (sizeof SEEDS / sizeof SEEDS[0])
 
@@ -1683,7 +1844,11 @@ static void replay_z_streams(void)
 static size_t mutate(const uint8_t *seed, size_t len, uint8_t *out)
 {
     static const uint8_t INTERESTING[] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x7F, 0x80, 0x81, 0xFE, 0xFF};
+#if UDSOTA_FUZZ_DTC
+    static const uint8_t SIDS[] = {0x10, 0x11, 0x14, 0x19, 0x22, 0x27, 0x2E, 0x31, 0x34, 0x36, 0x37, 0x3E};
+#else
     static const uint8_t SIDS[] = {0x10, 0x11, 0x22, 0x27, 0x2E, 0x31, 0x34, 0x36, 0x37, 0x3E};
+#endif
     size_t n = len;
     memcpy(out, seed, len);
     const unsigned edits = 1u + rnd() % 4u;
@@ -1733,6 +1898,9 @@ static const char *const OP_NAME[OP_COUNT] = {   /* op_id_t names for the covera
 #ifdef UDSOTA_FUZZ_Z
     "zbegin", "zwrite", "zend",
 #endif
+#if UDSOTA_FUZZ_DTC
+    "dtc_get", "dtc_ext_data", "dtc_clear",
+#endif
 };
 
 /* The replay's own positive control, from fuzzed requests only (preamble answers never count): every
@@ -1741,6 +1909,12 @@ static const char *const OP_NAME[OP_COUNT] = {   /* op_id_t names for the covera
 static void check_coverage(void)
 {
     bool ok = g_stats.nrc_code[UDSOTA_NRC_INCORRECT_LENGTH] && g_stats.nrc_code[UDSOTA_NRC_INVALID_KEY];
+#if UDSOTA_FUZZ_DTC
+    if (!g_stats.nrc_code[UDSOTA_NRC_RESPONSE_TOO_LONG]) {
+        fprintf(stderr, "fuzz_udsota: COVERAGE: no fuzzed 19 answered 0x14 (responseTooLong)\n");
+        ok = false;
+    }
+#endif
     for (unsigned sid = 0; sid < 256u; sid++) {   /* sid_served() is the one list: a hand copy here drifted */
         if (sid_served((uint8_t)sid) && (!g_stats.pos_sid[sid] || !g_stats.nrc_sid[sid])) {
             fprintf(stderr, "fuzz_udsota: COVERAGE: SID 0x%02X positive=%d NRC=%d\n", sid, g_stats.pos_sid[sid],

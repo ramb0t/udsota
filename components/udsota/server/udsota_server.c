@@ -1,6 +1,6 @@
-/* Pure UDS server core: sessions, S3, SecurityAccess, routines, reset, 0x2E through the app's hook, and the
- * worker-job wait, behind the security and hooks the integrator passes to udsota_core_init; SIDs, RIDs and DIDs the
- * core doesn't own go to the one registered service (udsota_service.h), such as the firmware updater
+/* Pure UDS server core: sessions, S3, SecurityAccess, routines, reset, 0x2E, 0x19 and 0x14 through the app's hooks,
+ * and the worker-job wait, behind the security and hooks the integrator passes to udsota_core_init; SIDs, RIDs and
+ * DIDs the core doesn't own go to the one registered service (udsota_service.h), such as the firmware updater
  * (update/udsota_update.c). The core never names a service. No ESP-IDF: the transport feeds it reassembled requests,
  * reception events and now_ms, and sends whatever it returns. */
 #include <string.h>
@@ -768,6 +768,163 @@ static size_t handle_dtc_setting(udsota_server_t *s, const uint8_t *req, size_t 
     return 2;
 }
 
+/* ---- 0x19 ReadDTCInformation and 0x14 ClearDiagnosticInformation: the app's DTCs through hooks.dtc_get,
+ * dtc_ext_data and dtc_clear; the core owns the lengths, sub-functions, mask filter, framing and size cap ---- */
+
+#define DTC_BITS  0xFFFFFFu   /* a DTC's three bytes: udsota_dtc_t.dtc's top byte is ignored */
+
+/* Writes the low 24 bits of v big-endian into p[0..2]. */
+static void put_u24be(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)(v >> 16);
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)v;
+}
+
+/* Reads a big-endian 24-bit value from p[0..2]. */
+static uint32_t get_u24be(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
+}
+
+/* hooks.dtc_get for the i-th DTC, never asked at UDSOTA_DTC_INDEX_MAX or past it; false there or past the last. */
+static bool dtc_at(const udsota_server_t *s, size_t i, udsota_dtc_t *out)
+{
+    return i < UDSOTA_DTC_INDEX_MAX && s->hooks.dtc_get(s->hooks.ctx, i, out);
+}
+
+/* 19 01, 02 and 0A after the length checks: walks dtc_get from 0 and counts (01) or lists (02) each DTC whose
+ * status & mask & availability is non-zero, or lists every DTC (0A), each status sent as status & availability.
+ * Room is judged on resp_max: 0x14 when 59 01's six bytes or 59 xx <avail> don't fit, or at the first listed DTC
+ * that would pass resp_max, which ends the walk. */
+static size_t rdtc_list(udsota_server_t *s, uint8_t sub, uint8_t mask, uint8_t *resp, size_t resp_max)
+{
+    const uint8_t sid = UDSOTA_SID_READ_DTC;
+    const uint8_t avail = s->cfg.dtc_availability_mask;
+    const bool count = (sub == UDSOTA_RDTC_COUNT_BY_MASK);
+    if (resp_max < (count ? 6u : 3u)) {
+        return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_RESPONSE_TOO_LONG);
+    }
+    size_t n = 3u;
+    uint16_t matches = 0u;                          /* at most UDSOTA_DTC_INDEX_MAX: dtc_at stops below it */
+    udsota_dtc_t d = {0};
+    for (size_t i = 0; dtc_at(s, i, &d); i++) {
+        const uint8_t status = d.status & avail;
+        if (sub != UDSOTA_RDTC_SUPPORTED && (status & mask) == 0u) {
+            continue;
+        }
+        if (count) {
+            matches++;
+            continue;
+        }
+        if (resp_max - n < 4u) {
+            return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_RESPONSE_TOO_LONG);
+        }
+        put_u24be(&resp[n], d.dtc);
+        resp[n + 3u] = status;
+        n += 4u;
+    }
+    resp[0] = UDSOTA_POS(sid);
+    resp[1] = sub;
+    resp[2] = avail;
+    if (count) {
+        resp[3] = s->cfg.dtc_format;
+        udsota_put_u16be(&resp[4], matches);
+        return 6u;
+    }
+    return n;
+}
+
+/* 19 06 <DTC> <record> after the length checks: record 00 is 0x31; the first DTC dtc_get reports with the request's
+ * 24 bits gives the status, and none is 0x31; 0x14 when 59 06 <DTC> <status> doesn't fit; then dtc_ext_data writes
+ * the records after it, and its NRC is sent as given, or 0x10 for a *len over its room. */
+static size_t rdtc_ext_data(udsota_server_t *s, const uint8_t *req, uint8_t *resp, size_t resp_max)
+{
+    const uint8_t sid = UDSOTA_SID_READ_DTC;
+    const uint32_t dtc = get_u24be(&req[2]);
+    const uint8_t record = req[5];
+    if (record == 0u) {
+        return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_REQUEST_OUT_OF_RANGE);
+    }
+    udsota_dtc_t d = {0};
+    bool found = false;
+    for (size_t i = 0; !found && dtc_at(s, i, &d); i++) {
+        found = (d.dtc & DTC_BITS) == dtc;
+    }
+    if (!found) {
+        return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_REQUEST_OUT_OF_RANGE);
+    }
+    if (resp_max < 6u) {
+        return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_RESPONSE_TOO_LONG);
+    }
+    const size_t room = resp_max - 6u;
+    size_t len = 0u;
+    const uint8_t nrc = s->hooks.dtc_ext_data(s->hooks.ctx, dtc, record, &resp[6], room, &len);
+    if (nrc != 0u) {
+        return udsota_nrc(resp, resp_max, sid, nrc);
+    }
+    if (len > room) {
+        return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_GENERAL_REJECT);
+    }
+    resp[0] = UDSOTA_POS(sid);
+    resp[1] = UDSOTA_RDTC_EXT_DATA;
+    put_u24be(&resp[2], dtc);
+    resp[5] = d.status & s->cfg.dtc_availability_mask;
+    return 6u + len;
+}
+
+/* 0x19 ReadDTCInformation (only with hooks.dtc_get), in every session and with no key. Check order: length 13,
+ * sub-function 12 (01, 02, 06 and 0A; 06 only with hooks.dtc_ext_data), exact length 13, then rdtc_list's room 14,
+ * or rdtc_ext_data's record and DTC 31, room 14 and the hook's NRC. SPRMIB drops only a positive answer: every NRC,
+ * 0x14 included, is sent as without it. */
+static size_t handle_read_dtc(udsota_server_t *s, const uint8_t *req, size_t len, uint8_t *resp, size_t resp_max)
+{
+    const uint8_t sid = UDSOTA_SID_READ_DTC;
+    if (len < 2u) {
+        return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_INCORRECT_LENGTH);
+    }
+    const uint8_t sub = req[1] & (uint8_t)~UDSOTA_SPRMIB;
+    const bool spr = (req[1] & UDSOTA_SPRMIB) != 0;
+    size_t want = 0u;                               /* the sub-function's exact length; 0 = not served */
+    if (sub == UDSOTA_RDTC_COUNT_BY_MASK || sub == UDSOTA_RDTC_BY_MASK) {
+        want = 3u;
+    } else if (sub == UDSOTA_RDTC_SUPPORTED) {
+        want = 2u;
+    } else if (sub == UDSOTA_RDTC_EXT_DATA && s->hooks.dtc_ext_data != NULL) {
+        want = 6u;
+    }
+    if (want == 0u) {
+        return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_SUBFUNC_NOT_SUPPORTED);
+    }
+    if (len != want) {
+        return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_INCORRECT_LENGTH);
+    }
+    const size_t n = (sub == UDSOTA_RDTC_EXT_DATA) ? rdtc_ext_data(s, req, resp, resp_max)
+                     : rdtc_list(s, sub, (sub == UDSOTA_RDTC_SUPPORTED) ? 0u : req[2], resp, resp_max);
+    return (spr && is_positive(resp, n)) ? 0 : n;
+}
+
+/* 0x14 ClearDiagnosticInformation (only with hooks.dtc_clear), physical only, in any session: the session and key
+ * rules are the hook's. Check order: exact length 13 (14 and a 3-byte groupOfDTC, so the 2020 edition's
+ * memorySelection byte is 0x13 too), then the hook's NRC, which it checks in ISO order (7F, 33, 31); 0 answers 54.
+ * The hook is not asked when resp has no room at all. */
+static size_t handle_clear_dtc(udsota_server_t *s, const uint8_t *req, size_t len, uint8_t *resp, size_t resp_max)
+{
+    const uint8_t sid = UDSOTA_SID_CLEAR_DTC;
+    if (len != UDSOTA_CLEAR_DTC_LEN) {
+        return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_INCORRECT_LENGTH);
+    }
+    if (resp_max < 1u) {
+        return 0;
+    }
+    const uint8_t nrc = s->hooks.dtc_clear(s->hooks.ctx, get_u24be(&req[1]), access_of(s));
+    if (nrc != 0u) {
+        return udsota_nrc(resp, resp_max, sid, nrc);
+    }
+    resp[0] = UDSOTA_POS(sid);
+    return 1;
+}
+
 /* Routes one request (no job running) to its service handler; a SID the core doesn't own goes to the service, and
  * one it passes, or every one with no service, gets NRC 0x11. */
 static size_t dispatch(udsota_server_t *s, const uint8_t *req, size_t len, uint8_t *resp, size_t resp_max,
@@ -798,6 +955,12 @@ static size_t dispatch(udsota_server_t *s, const uint8_t *req, size_t len, uint8
         return s->hooks.did_write != NULL ? handle_write_did(s, req, len, resp, resp_max)
                                           : udsota_nrc(resp, resp_max, UDSOTA_SID_WRITE_DID,
                                                        UDSOTA_NRC_SERVICE_NOT_SUPPORTED);
+    case UDSOTA_SID_READ_DTC:            /* no dtc_get hook: 0x11 before anything else */
+        return s->hooks.dtc_get != NULL ? handle_read_dtc(s, req, len, resp, resp_max)
+                                        : udsota_nrc(resp, resp_max, req[0], UDSOTA_NRC_SERVICE_NOT_SUPPORTED);
+    case UDSOTA_SID_CLEAR_DTC:           /* no dtc_clear hook: 0x11 before anything else */
+        return s->hooks.dtc_clear != NULL ? handle_clear_dtc(s, req, len, resp, resp_max)
+                                          : udsota_nrc(resp, resp_max, req[0], UDSOTA_NRC_SERVICE_NOT_SUPPORTED);
     default:
         if (s->svc != NULL) {
             const size_t n = s->svc->request(s, req, len, resp, resp_max, now_ms);
@@ -828,6 +991,7 @@ static udsota_config_t cfg_resolve(const udsota_config_t *in)
     if (c.block_size == 0u) c.block_size = UDSOTA_BLOCK_SIZE_DEFAULT;
     if (c.level_extended == 0u) c.level_extended = UDSOTA_SA_SEED_EXTENDED;
     if (c.level_programming == 0u) c.level_programming = UDSOTA_SA_SEED_PROGRAMMING;
+    if (c.dtc_availability_mask == 0u) c.dtc_availability_mask = 0xFFu;
     return c;
 }
 
@@ -937,8 +1101,9 @@ size_t udsota_on_request(udsota_server_t *s, const uint8_t *req, size_t req_len,
     return n;
 }
 
-/* True for a request udsota serves functionally: 10 01, 10 03, 3E, 22, 28 and 85 (a 10 02 is sent physically, to the
- * one device being programmed). */
+/* True for a request udsota serves functionally: 10 01, 10 03, 3E, 19 (every sub-function), 22, 28 and 85; 14 stays
+ * physical, since clearing needs a per-node unlock (and a 10 02 is sent physically, to the one device being
+ * programmed). */
 static bool functional_served(const uint8_t *req, size_t len)
 {
     switch (req[0]) {
@@ -947,6 +1112,7 @@ static bool functional_served(const uint8_t *req, size_t len)
         return sub == UDSOTA_SESSION_DEFAULT || sub == UDSOTA_SESSION_EXTENDED;
     }
     case UDSOTA_SID_TESTER_PRESENT:
+    case UDSOTA_SID_READ_DTC:
     case UDSOTA_SID_READ_DID:
     case UDSOTA_SID_COMM_CONTROL:
     case UDSOTA_SID_DTC_SETTING:
