@@ -1,6 +1,7 @@
 """Helpers for the end-to-end tests against tools/linux_server's udsota_demo_server: finding the binary,
-building images as its engine (fake_engine) does, running it in pipe mode, and a client transport over that
-pipe that stands in for transport.Transport (can-isotp's Python ISO-TP stack instead of the kernel's)."""
+building images as its engine (fake_engine) does, running it in pipe mode, a client transport over that pipe that
+stands in for transport.Transport (can-isotp's Python ISO-TP stack instead of the kernel's), and the profile,
+cli.main and state helpers both e2e modules share."""
 import errno
 import hashlib
 import os
@@ -19,13 +20,14 @@ import pytest
 from udsoncan.client import Client
 from udsoncan.connections import PythonIsoTpConnection
 
-from udsota import transport
+from udsota import cli, profile, transport, wire
 from udsota.uds import Uds
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 BINARY_NAME = "udsota_demo_server"
-MASTER = bytes(range(32))                # the master the key tests use (udsota_keys.c's KAT master)
+MASTER = bytes(range(32))                # the key tests' master: the udsota-example vectors and udsota_keys.c's KAT
 LABEL = "udsota-example"
+EXAMPLE = profile.load("example")
 
 # can-isotp parameters matching the kernel socket transport.isotp_connection() opens: 0xAA padding to DLC 8,
 # the server's STmin and BS, and a send that returns once the last CF is out (so P2 starts after it).
@@ -49,12 +51,16 @@ def find_binary():
     return shutil.which(BINARY_NAME)
 
 
+# The skip (or, with $UDSOTA_VCAN set, failure) text when the demo is not built.
+BUILD_HINT = ("%s is not built: cmake -S . -B build && cmake --build build --target %s (or set UDSOTA_DEMO_SERVER)"
+              % (BINARY_NAME, BINARY_NAME))
+
+
 # The binary, or a pytest skip naming how to build it.
 def binary_or_skip():
     path = find_binary()
     if path is None:
-        pytest.skip("%s is not built: cmake -S . -B build && cmake --build build --target %s "
-                    "(or set UDSOTA_DEMO_SERVER)" % (BINARY_NAME, BINARY_NAME))
+        pytest.skip(BUILD_HINT)
     return path
 
 
@@ -92,12 +98,7 @@ def build_image(version="v0.2.0", product="example", hw_id=1, layout=1, ids=(0x7
             img[i:i + n], i = img[src:src + n], i + n
         else:
             img[i], i = rnd.randrange(256), i + 1
-    x = 0xEF
-    for b in img[32:unpadded]:
-        x ^= b
-    img[padded - 1] = x
-    img[padded:] = hashlib.sha256(img[:padded]).digest()
-    return bytes(img)
+    return reseal(img)
 
 
 # The app_elf_sha256 an image carries (what F1F3 answers once it runs).
@@ -143,9 +144,9 @@ class DemoServer:
     # Start binary with args; the log goes to log_path.
     def __init__(self, binary, args, log_path):
         self.log_path = pathlib.Path(log_path)
-        self._log = open(self.log_path, "wb")
-        self.proc = subprocess.Popen([binary, *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=self._log, bufsize=0)
+        with open(self.log_path, "wb") as err:            # the child keeps its own descriptor
+            self.proc = subprocess.Popen([binary, *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                         stderr=err, bufsize=0)
         self.rx = queue.Queue()
         self.sent, self.dropped, self.drop, self.tap = [], [], None, None
         self.dropped_tx, self.drop_tx = [], None
@@ -193,7 +194,6 @@ class DemoServer:
 
     # The server's log so far.
     def log(self):
-        self._log.flush()
         return self.log_path.read_text(errors="replace")
 
     # Close stdin (the server stops at EOF) and wait; kill it if it lingers. Returns its exit code.
@@ -206,7 +206,7 @@ class DemoServer:
                 self.proc.kill()
                 self.proc.wait()
         self._reader.join(timeout=2)
-        self._log.close()
+        self.proc.stdout.close()
         return self.proc.returncode
 
 
@@ -291,3 +291,45 @@ class PipeTransport:
     def __exit__(self, *exc):
         if self.client is not None:
             self.client.close()
+
+
+# The example profile's [can], [image] and [board] with [security] on: % (label, master file path).
+SECURED = """
+[can]
+req_id = 0x710
+resp_id = 0x718
+
+[security]
+label = "%s"
+master_file = "%s"
+
+[image]
+product = "example"
+hw_ids = [1]
+layout_id = 1
+slot_size = 0x1E0000
+
+[board]
+did = 0xF191
+names = { 1 = "devkit" }
+"""
+
+
+# cli.main with argv, its transport a PipeTransport on server (a DemoServer or a vcan link) with client P2 p2_s.
+def run_cli(server, argv, p2_s=PIPE_P2_S):
+    return cli.main(argv, transport=lambda prof, interface: PipeTransport(prof, server, p2_s=p2_s))
+
+
+# Reads status, running SHA and version from server over a fresh transport.
+def read_state(server):
+    with PipeTransport(EXAMPLE, server) as t:
+        uds = t.uds()
+        return (wire.decode_status(uds.read_did(wire.DID_STATUS)), uds.read_did(wire.DID_RUNNING_SHA),
+                wire.cstr(uds.read_did(wire.DID_VERSION)))
+
+
+# An image file under tmp_path.
+def image_file(tmp_path, data, name="image.bin"):
+    p = tmp_path / name
+    p.write_bytes(data)
+    return str(p)
