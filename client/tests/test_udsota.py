@@ -161,7 +161,7 @@ class FakeTime:
         self.t += s
 
 
-# UDS-payload stand-in for a udsota server (components/udsota/udsota_server.c):
+# UDS-payload stand-in for a udsota server (components/udsota/server/udsota_server.c):
 # answers the update sequence and logs (sid, sub-function / DID / RID / block counter) per request. It
 # models S3 (5 s without a request drops to the default session and relocks), refuses the keyed
 # services outside their sessions, and keeps the server's download state: 0x37 closes the transfer,

@@ -1,6 +1,6 @@
 # ISO-TP transport: the pinned SimonCahill isotp-c v1.9.3 (commit 1fc19e2, unpatched) plus a port
 # that gives each link its own block size and STmin (include/isotp_port.h). The platform hooks
-# isotp_user_send_can / isotp_user_get_us / isotp_user_debug are defined by components/udsota/udsota_isotp.c;
+# isotp_user_send_can / isotp_user_get_us / isotp_user_debug are defined by components/udsota/server/udsota_isotp.c;
 # test_isotp_loopback defines its own and never links it.
 # Under ESP-IDF this is the component `isotp`; in a plain CMake build it is the static library `isotp`.
 if(ESP_PLATFORM)

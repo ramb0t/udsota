@@ -1,6 +1,7 @@
-/* Host tests for the ESP32 port's 0x27 mode choice and ECDSA key check (components/udsota_esp32/udsota_esp32_sa.c)
- * with the real server, key messages and device ID: which mode a config selects, the public-key form, and a
- * signature a client makes over F18C's bytes unlocking, while one for another device, level or seed does not.
+/* Host tests for the ESP32 port's 0x27 mode choice and ECDSA key check
+ * (components/udsota_esp32/server/udsota_esp32_sa.c) with the real server, key messages and device ID: which mode a
+ * config selects, the public-key form, and a signature a client makes over F18C's bytes unlocking, while one for
+ * another device, level or seed does not.
  * The verify is a stand-in: the "signature" of a message is its SHA-256 twice, the second copy inverted, so it
  * depends on every message byte as a real one does. */
 #include <stdatomic.h>

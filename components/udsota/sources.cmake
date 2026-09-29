@@ -8,25 +8,28 @@
 # (udsota_detools.c).
 set(_udsota_d ${CMAKE_CURRENT_LIST_DIR})
 
-set(UDSOTA_SERVER_SRCS   ${_udsota_d}/udsota_server.c ${_udsota_d}/udsota_codec.c ${_udsota_d}/udsota_isotp.c
-                         ${_udsota_d}/udsota_rxwatch.c ${_udsota_d}/udsota_keys.c)
-set(UDSOTA_UPDATE_SRCS   ${_udsota_d}/udsota_image.c ${_udsota_d}/udsota_isink.c ${_udsota_d}/udsota_zstream.c
-                         ${_udsota_d}/udsota_patch.c ${_udsota_d}/udsota_coded.c)
-set(UDSOTA_BOOTLOOP_SRCS ${_udsota_d}/udsota_bootloop.c)
+set(UDSOTA_SERVER_SRCS   ${_udsota_d}/server/udsota_server.c ${_udsota_d}/server/udsota_codec.c
+                         ${_udsota_d}/server/udsota_isotp.c ${_udsota_d}/server/udsota_rxwatch.c
+                         ${_udsota_d}/server/udsota_keys.c)
+set(UDSOTA_UPDATE_SRCS   ${_udsota_d}/update/udsota_image.c ${_udsota_d}/update/udsota_isink.c
+                         ${_udsota_d}/update/udsota_zstream.c ${_udsota_d}/update/udsota_patch.c
+                         ${_udsota_d}/update/udsota_coded.c)
+set(UDSOTA_BOOTLOOP_SRCS ${_udsota_d}/bootloop/udsota_bootloop.c)
 set(UDSOTA_SRCS          ${UDSOTA_SERVER_SRCS} ${UDSOTA_UPDATE_SRCS} ${UDSOTA_BOOTLOOP_SRCS})
 
-set(UDSOTA_SERVER_INCLUDE_DIRS   ${_udsota_d}/include)
-set(UDSOTA_UPDATE_INCLUDE_DIRS   ${_udsota_d}/include)
-set(UDSOTA_BOOTLOOP_INCLUDE_DIRS ${_udsota_d}/include)
-set(UDSOTA_INCLUDE_DIRS          ${_udsota_d}/include)
-set(UDSOTA_PRIV_INCLUDE_DIRS     ${_udsota_d}/priv)
+set(UDSOTA_SERVER_INCLUDE_DIRS   ${_udsota_d}/server/include)
+set(UDSOTA_UPDATE_INCLUDE_DIRS   ${_udsota_d}/update/include)
+set(UDSOTA_BOOTLOOP_INCLUDE_DIRS ${_udsota_d}/bootloop/include)
+set(UDSOTA_INCLUDE_DIRS          ${_udsota_d}/include ${UDSOTA_SERVER_INCLUDE_DIRS} ${UDSOTA_UPDATE_INCLUDE_DIRS}
+                                 ${UDSOTA_BOOTLOOP_INCLUDE_DIRS})
+set(UDSOTA_PRIV_INCLUDE_DIRS     ${_udsota_d}/server/priv)
 
-set(UDSOTA_SERVICES_SRCS ${_udsota_d}/udsota_server.c ${_udsota_d}/udsota_codec.c)
-set(UDSOTA_CODEC_SRCS    ${_udsota_d}/udsota_codec.c)
-set(UDSOTA_RXWATCH_SRCS  ${_udsota_d}/udsota_rxwatch.c)
-set(UDSOTA_KEYS_SRCS     ${_udsota_d}/udsota_keys.c)
-set(UDSOTA_IMAGE_SRCS    ${_udsota_d}/udsota_image.c)
-set(UDSOTA_ZSTREAM_SRCS  ${_udsota_d}/udsota_isink.c ${_udsota_d}/udsota_zstream.c)
-set(UDSOTA_CODED_SRCS    ${_udsota_d}/udsota_patch.c ${_udsota_d}/udsota_coded.c)
+set(UDSOTA_SERVICES_SRCS ${_udsota_d}/server/udsota_server.c ${_udsota_d}/server/udsota_codec.c)
+set(UDSOTA_CODEC_SRCS    ${_udsota_d}/server/udsota_codec.c)
+set(UDSOTA_RXWATCH_SRCS  ${_udsota_d}/server/udsota_rxwatch.c)
+set(UDSOTA_KEYS_SRCS     ${_udsota_d}/server/udsota_keys.c)
+set(UDSOTA_IMAGE_SRCS    ${_udsota_d}/update/udsota_image.c)
+set(UDSOTA_ZSTREAM_SRCS  ${_udsota_d}/update/udsota_isink.c ${_udsota_d}/update/udsota_zstream.c)
+set(UDSOTA_CODED_SRCS    ${_udsota_d}/update/udsota_patch.c ${_udsota_d}/update/udsota_coded.c)
 
 unset(_udsota_d)
