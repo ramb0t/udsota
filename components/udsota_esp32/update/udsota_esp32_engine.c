@@ -100,7 +100,7 @@ static bool s_buf_busy;             /* s_buf holds a block the worker has not wr
 static bool s_verified;             /* FF01 passed on s_target since the last BEGIN, eng_unverify or boot */
 static uint32_t s_unverify_gen;     /* bumped by every eng_unverify: a verify that spans one never marks the slot */
 
-/* Set once by udsota_esp32_engine_start() before the worker runs; read-only afterwards. */
+/* Set once by engine_start() before the worker runs; read-only afterwards. */
 static QueueHandle_t s_q;
 static uint8_t *s_buf;                      /* BLOCK_BUF bytes, internal RAM */
 static const esp_partition_t *s_target;     /* the inactive slot; NULL refuses every download */
@@ -691,11 +691,12 @@ static void finish(int result)
     taskEXIT_CRITICAL(&s_mux);
 }
 
-/* Set once by udsota_esp32_engine_set_wake() before the worker exists: called after every finished job. */
+/* Set once by engine_set_wake() before the worker exists: called after every finished job. */
 static void (*s_wake)(void);
 
-/* See udsota_esp32_priv.h. */
-void udsota_esp32_engine_set_wake(void (*wake)(void))
+/* Installs the function the flash worker calls after each finished job, from the worker's task, so the diag task
+ * answers at once instead of at its next poll. Called before engine_start(); NULL = none. */
+static void engine_set_wake(void (*wake)(void))
 {
     s_wake = wake;
 }
@@ -1060,7 +1061,7 @@ static udsota_engine_t s_engine = {
     .check_first = eng_check_first, .begin = eng_begin, .write = eng_write, .verify = eng_verify,
     .activate = eng_activate, .confirm = eng_confirm, .abort = eng_abort, .unverify = eng_unverify,
     .poll = eng_poll, .status = eng_status, .running_sha = eng_running_sha, .version = eng_version,
-    .slot_size = 0u,                    /* set by udsota_esp32_engine_start(); 0 = UDSOTA_SLOT_SIZE_DEFAULT */
+    .slot_size = 0u,                    /* set by engine_start(); 0 = UDSOTA_SLOT_SIZE_DEFAULT */
     .ctx = NULL,
 #if CONFIG_UDSOTA_ESP32_COMPRESSION
     .zbegin = eng_zbegin, .zwrite = eng_zwrite, .zend = eng_zend, .zwritten = eng_zwritten,
@@ -1079,9 +1080,14 @@ const udsota_engine_t *udsota_esp32_engine(void)
     return &s_engine;
 }
 
-/* Creates the worker, its buffer and queue in internal RAM, and fills the image rules from cfg and the running
- * image; the worker reads the OTA state before its first job. See udsota_esp32_priv.h. */
-void udsota_esp32_engine_start(const udsota_config_t *cfg)
+/* Starts the engine once, before anything uses it. Creates the flash worker (Kconfig core, priority and stack;
+ * internal RAM; off the task watchdog), its 4 KB block buffer and job queue. Takes the image identity from cfg
+ * (product, hw_id, layout_id, req_id, resp_id; the product string must stay valid), the running version from
+ * esp_app_desc and the release flag from udsota_image_desc, and puts the inactive slot's size in
+ * udsota_esp32_engine()->slot_size. The worker reads the OTA state before its first job. Idempotent. A failed
+ * allocation or a missing inactive slot is logged, and every download is then refused. Links against
+ * udsota_image_desc, so the app places one with UDSOTA_ESP32_IMAGE_DESC. */
+static void engine_start(const udsota_config_t *cfg)
 {
     if (s_q != NULL || cfg == NULL) {
         return;
@@ -1131,4 +1137,13 @@ void udsota_esp32_engine_start(const udsota_config_t *cfg)
              (s_target != NULL) ? s_target->label : "none", s_ctx.slot_size, s_ctx.running_version[0],
              s_ctx.running_version[1], s_ctx.running_version[2], s_ctx.running_is_release ? "release" : "dev",
              s_ctx.hw_id);
+}
+
+/* See udsota_esp32_priv.h: the one call the diag task's start makes into the updater. */
+bool udsota_esp32_server_init(udsota_server_t *srv, const udsota_config_t *cfg, const udsota_security_t *sec,
+                              const udsota_hooks_t *hooks, void (*wake)(void))
+{
+    engine_set_wake(wake);
+    engine_start(cfg);                          /* logs its own failures; the engine then refuses downloads */
+    return udsota_init(srv, cfg, udsota_esp32_engine(), sec, hooks);
 }
