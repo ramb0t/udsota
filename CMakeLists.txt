@@ -22,12 +22,27 @@ target_compile_definitions(unity PUBLIC UNITY_INCLUDE_DOUBLE)
 set(ROOT       ${CMAKE_CURRENT_LIST_DIR})
 set(TEST_DIR   ${ROOT}/test)
 set(STUBS      ${TEST_DIR}/stubs)
-set(CORE_DIR   ${ROOT}/components/udsota)
-set(CORE_INC   ${CORE_DIR}/include)
-set(CORE_PRIV  ${CORE_DIR}/priv)
-set(ESP32_DIR  ${ROOT}/components/udsota_esp32)
+include(${ROOT}/components/udsota/sources.cmake)         # UDSOTA_*: the core's files and include dirs
+include(${ROOT}/components/udsota_esp32/sources.cmake)   # UDSOTA_ESP32_*: the port's
+set(CORE_INC   ${UDSOTA_INCLUDE_DIRS})
+set(CORE_PRIV  ${UDSOTA_PRIV_INCLUDE_DIRS})
+set(CORE_TEST  ${ROOT}/components/udsota/test)
 set(INFLATE_DIR ${ROOT}/components/udsota_inflate)
 set(DELTA_DIR  ${ROOT}/components/udsota_delta)
+
+# sources.cmake is what each component compiles, so a .c file it doesn't list would go unbuilt without a word:
+# stop on any difference between the files on disk and the list.
+function(udsota_check_srcs dir listed)
+    file(GLOB found CONFIGURE_DEPENDS ${dir}/*.c ${dir}/server/*.c ${dir}/update/*.c ${dir}/bootloop/*.c)
+    list(SORT found)
+    list(SORT listed)
+    if(NOT found STREQUAL listed)
+        message(FATAL_ERROR "${dir}/sources.cmake does not list exactly the .c files there:\n"
+                            "  on disk: ${found}\n  listed:  ${listed}")
+    endif()
+endfunction()
+udsota_check_srcs(${ROOT}/components/udsota "${UDSOTA_SRCS}")
+udsota_check_srcs(${ROOT}/components/udsota_esp32 "${UDSOTA_ESP32_SRCS}")
 
 # ---- Libraries: isotp (vendored isotp-c v1.9.3, unpatched, plus the per-link BS/STmin port) and
 # udsota_core, the portability target. udsota_core is every core .c, compiled with nothing on its
@@ -52,7 +67,7 @@ function(udsota_test name)
     add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
-set(SERVER_SRCS ${CORE_DIR}/udsota_server.c ${CORE_DIR}/udsota_codec.c)
+set(SERVER_SRCS ${UDSOTA_SERVICES_SRCS})
 
 # ---- ISO-TP ----
 udsota_test(test_isotp_loopback
@@ -66,22 +81,22 @@ udsota_test(test_udsota_isotp
 
 # ---- Core, pure parts ----
 udsota_test(test_udsota_codec
-    SOURCES  test/test_udsota_codec.c ${CORE_DIR}/udsota_codec.c)
+    SOURCES  test/test_udsota_codec.c ${UDSOTA_CODEC_SRCS})
 
 udsota_test(test_udsota_image
-    SOURCES  test/test_udsota_image.c ${CORE_DIR}/udsota_image.c
+    SOURCES  test/test_udsota_image.c ${UDSOTA_IMAGE_SRCS}
     INCLUDES ${TEST_DIR})
 
 # With the host SHA-256, for the digest of the ECDSA mode's known-answer message.
 udsota_test(test_udsota_keys
-    SOURCES  test/test_udsota_keys.c ${CORE_DIR}/udsota_keys.c ${CORE_DIR}/test/sha256_host.c
-    INCLUDES ${CORE_DIR}/test)
+    SOURCES  test/test_udsota_keys.c ${UDSOTA_KEYS_SRCS} ${CORE_TEST}/sha256_host.c
+    INCLUDES ${CORE_TEST})
 
 udsota_test(test_udsota_rxwatch
-    SOURCES  test/test_udsota_rxwatch.c ${CORE_DIR}/udsota_rxwatch.c)
+    SOURCES  test/test_udsota_rxwatch.c ${UDSOTA_RXWATCH_SRCS})
 
 udsota_test(test_udsota_bootloop
-    SOURCES  test/test_udsota_bootloop.c ${CORE_DIR}/udsota_bootloop.c)
+    SOURCES  test/test_udsota_bootloop.c ${UDSOTA_BOOTLOOP_SRCS})
 
 # ---- Server, over SERVER_SRCS alone. _write: 0x2E through hooks.did_write, and the access state and session epoch
 # every app hook gets. _progress: udsota_progress() and hooks.progress after each step of a download.
@@ -92,17 +107,16 @@ endforeach()
 
 # The download test also runs the real first-block rules behind engine.check_first.
 udsota_test(test_udsota_server_download
-    SOURCES  test/test_udsota_server_download.c ${SERVER_SRCS} ${CORE_DIR}/udsota_image.c
+    SOURCES  test/test_udsota_server_download.c ${SERVER_SRCS} ${UDSOTA_IMAGE_SRCS}
     INCLUDES ${CORE_PRIV} ${TEST_DIR})
 
 # Compressed downloads: the stream and the real tinfl behind an engine's z ops, with the core image rules. The test
 # compiles its own miniz with deflate on, to make the streams it sends.
-set(ZSTREAM_SRCS ${CORE_DIR}/udsota_isink.c ${CORE_DIR}/udsota_zstream.c ${INFLATE_DIR}/udsota_tinfl.c
-                 ${INFLATE_DIR}/miniz/miniz.c)
+set(ZSTREAM_SRCS ${UDSOTA_ZSTREAM_SRCS} ${INFLATE_DIR}/udsota_tinfl.c ${INFLATE_DIR}/miniz/miniz.c)
 set(ZSTREAM_INC ${INFLATE_DIR}/include ${INFLATE_DIR})
 set(MINIZ_TEST_DEFS MINIZ_NO_STDIO MINIZ_NO_TIME MINIZ_NO_ARCHIVE_APIS MINIZ_NO_ZLIB_APIS)   # deflate on, for tdefl
 udsota_test(test_udsota_server_compress
-    SOURCES  test/test_udsota_server_compress.c ${SERVER_SRCS} ${ZSTREAM_SRCS} ${CORE_DIR}/udsota_image.c
+    SOURCES  test/test_udsota_server_compress.c ${SERVER_SRCS} ${ZSTREAM_SRCS} ${UDSOTA_IMAGE_SRCS}
     INCLUDES ${CORE_PRIV} ${TEST_DIR} ${ZSTREAM_INC})
 target_compile_definitions(test_udsota_server_compress PRIVATE ${MINIZ_TEST_DEFS})
 
@@ -110,8 +124,8 @@ target_compile_definitions(test_udsota_server_compress PRIVATE ${MINIZ_TEST_DEFS
 # fixtures tools/make_delta_fixtures.py generates; and the image sink on its own. miniz is built with deflate on, to
 # wrap a patch in DEFLATE.
 udsota_test(test_udsota_server_delta
-    SOURCES  test/test_udsota_server_delta.c ${SERVER_SRCS} ${ZSTREAM_SRCS} ${CORE_DIR}/udsota_patch.c
-             ${CORE_DIR}/udsota_coded.c ${CORE_DIR}/udsota_image.c
+    SOURCES  test/test_udsota_server_delta.c ${SERVER_SRCS} ${ZSTREAM_SRCS} ${UDSOTA_CODED_SRCS}
+             ${UDSOTA_IMAGE_SRCS}
     INCLUDES ${CORE_PRIV} ${TEST_DIR} ${ZSTREAM_INC} ${DELTA_DIR}/include
     LIBS     udsota_delta)
 target_compile_definitions(test_udsota_server_delta PRIVATE ${MINIZ_TEST_DEFS})
@@ -122,7 +136,7 @@ udsota_test(test_udsota_server_nocompress
     SOURCES  test/test_udsota_server_nocompress.c ${SERVER_SRCS}
     INCLUDES ${CORE_PRIV})
 udsota_test(test_udsota_server_download_nocompress
-    SOURCES  test/test_udsota_server_download.c ${SERVER_SRCS} ${CORE_DIR}/udsota_image.c
+    SOURCES  test/test_udsota_server_download.c ${SERVER_SRCS} ${UDSOTA_IMAGE_SRCS}
     INCLUDES ${CORE_PRIV} ${TEST_DIR})
 udsota_test(test_udsota_server_progress_nocompress
     SOURCES  test/test_udsota_server_progress.c ${SERVER_SRCS}
@@ -138,7 +152,7 @@ endforeach()
 foreach(name IN ITEMS test_udsota_image_desc test_udsota_image_desc_board3 test_udsota_image_desc_release)
     udsota_test(${name}
         SOURCES  test/test_udsota_image_desc.c
-        INCLUDES ${ESP32_DIR}/include)
+        INCLUDES ${UDSOTA_ESP32_INCLUDE_DIRS})
 endforeach()
 target_compile_definitions(test_udsota_image_desc         PRIVATE UDSOTA_TEST_HW_ID=1 UDSOTA_ESP32_IMG_RELEASE=0)
 target_compile_definitions(test_udsota_image_desc_board3  PRIVATE UDSOTA_TEST_HW_ID=3 UDSOTA_ESP32_IMG_RELEASE=0)
@@ -148,35 +162,35 @@ target_compile_definitions(test_udsota_image_desc_release PRIVATE UDSOTA_TEST_HW
 # ---- ESP32 port, pure parts ----
 # The ESP-IDF first-block header check in front of the core rules.
 udsota_test(test_udsota_esp32_image
-    SOURCES  test/test_udsota_esp32_image.c ${ESP32_DIR}/udsota_esp32_image.c ${CORE_DIR}/udsota_image.c
-    INCLUDES ${ESP32_DIR}/include ${TEST_DIR})
+    SOURCES  test/test_udsota_esp32_image.c ${UDSOTA_ESP32_IMAGE_SRCS} ${UDSOTA_IMAGE_SRCS}
+    INCLUDES ${UDSOTA_ESP32_INCLUDE_DIRS} ${TEST_DIR})
 
 # The port's control block (phase, end-session, hook wrappers, incoming version) with the real server, and the
 # real stream and tinfl for a compressed download.
 udsota_test(test_udsota_esp32_ctl
-    SOURCES  test/test_udsota_esp32_ctl.c ${ESP32_DIR}/udsota_esp32_ctl.c ${SERVER_SRCS} ${ZSTREAM_SRCS}
-    INCLUDES ${CORE_PRIV} ${ESP32_DIR}/priv ${TEST_DIR} ${ZSTREAM_INC})
+    SOURCES  test/test_udsota_esp32_ctl.c ${UDSOTA_ESP32_CTL_SRCS} ${SERVER_SRCS} ${ZSTREAM_SRCS}
+    INCLUDES ${CORE_PRIV} ${UDSOTA_ESP32_PRIV_INCLUDE_DIRS} ${TEST_DIR} ${ZSTREAM_INC})
 target_compile_definitions(test_udsota_esp32_ctl PRIVATE ${MINIZ_TEST_DEFS})
 
 # The device ID the port serves as F18C and the K_dev and keys over it, with the real server and key derivation.
 udsota_test(test_udsota_esp32_devid
-    SOURCES  test/test_udsota_esp32_devid.c ${ESP32_DIR}/udsota_esp32_devid.c ${CORE_DIR}/udsota_keys.c ${SERVER_SRCS}
-    INCLUDES ${CORE_PRIV} ${ESP32_DIR}/include ${ESP32_DIR}/priv)
+    SOURCES  test/test_udsota_esp32_devid.c ${UDSOTA_ESP32_DEVID_SRCS} ${UDSOTA_KEYS_SRCS} ${SERVER_SRCS}
+    INCLUDES ${CORE_PRIV} ${UDSOTA_ESP32_INCLUDE_DIRS} ${UDSOTA_ESP32_PRIV_INCLUDE_DIRS})
 
 # The 0x27 mode the port's config selects and the ECDSA key check over the device ID, with the real server, key
 # messages and device ID, and a stand-in verify on the host SHA-256.
 udsota_test(test_udsota_esp32_sa
-    SOURCES  test/test_udsota_esp32_sa.c ${ESP32_DIR}/udsota_esp32_sa.c ${ESP32_DIR}/udsota_esp32_devid.c
-             ${CORE_DIR}/udsota_keys.c ${CORE_DIR}/test/sha256_host.c ${SERVER_SRCS}
-    INCLUDES ${CORE_PRIV} ${CORE_DIR}/test ${ESP32_DIR}/include ${ESP32_DIR}/priv)
+    SOURCES  test/test_udsota_esp32_sa.c ${UDSOTA_ESP32_SA_SRCS} ${UDSOTA_ESP32_DEVID_SRCS}
+             ${UDSOTA_KEYS_SRCS} ${CORE_TEST}/sha256_host.c ${SERVER_SRCS}
+    INCLUDES ${CORE_PRIV} ${CORE_TEST} ${UDSOTA_ESP32_INCLUDE_DIRS} ${UDSOTA_ESP32_PRIV_INCLUDE_DIRS})
 
 # ---- Host fake of a two-slot OTA engine (file-backed, POSIX), the engine behind tools/linux_server's demo
 # server. Its test checks the fake and its SHA-256 against known answers.
 if(UNIX)
     udsota_test(test_fake_engine
-        SOURCES  test/test_fake_engine.c ${CORE_DIR}/test/fake_engine.c ${CORE_DIR}/test/sha256_host.c
-                 ${CORE_DIR}/udsota_image.c
-        INCLUDES ${CORE_DIR}/test)
+        SOURCES  test/test_fake_engine.c ${CORE_TEST}/fake_engine.c ${CORE_TEST}/sha256_host.c
+                 ${UDSOTA_IMAGE_SRCS}
+        INCLUDES ${CORE_TEST})
     target_compile_definitions(test_fake_engine PRIVATE FAKE_OTA_TEST_DIR="${CMAKE_CURRENT_BINARY_DIR}/fake_ota_test")
 endif()
 
@@ -224,7 +238,7 @@ if(UDSOTA_FUZZ AND UDSOTA_FUZZ_SAN_OK)
     # on the link line too, or gcc wants libubsan.
     function(udsota_fuzz name timeout)
         cmake_parse_arguments(F "" "" "SOURCES;INCLUDES;DEFS" ${ARGN})
-        udsota_test(${name} SOURCES ${CORE_DIR}/test/fuzz_udsota.c ${SERVER_SRCS} ${F_SOURCES}
+        udsota_test(${name} SOURCES ${CORE_TEST}/fuzz_udsota.c ${SERVER_SRCS} ${F_SOURCES}
                             INCLUDES ${CORE_PRIV} ${F_INCLUDES})
         target_compile_options(${name} PRIVATE ${FUZZ_SAN})
         target_link_options(${name} PRIVATE ${FUZZ_SAN})
@@ -258,7 +272,7 @@ if(UDSOTA_FUZZ AND UDSOTA_FUZZ_SAN_OK)
     else()
         message(WARNING "no AddressSanitizer runtime: fuzz_udsota_patch runs with UBSan only")
     endif()
-    add_executable(fuzz_udsota_patch test/fuzz_udsota_patch.c ${CORE_DIR}/udsota_coded.c ${CORE_DIR}/udsota_patch.c
+    add_executable(fuzz_udsota_patch test/fuzz_udsota_patch.c ${UDSOTA_CODED_SRCS}
                    ${ZSTREAM_SRCS} ${DELTA_DIR}/udsota_detools.c ${DELTA_DIR}/detools/detools.c
                    ${DELTA_DIR}/detools/heatshrink/heatshrink_decoder.c)
     target_include_directories(fuzz_udsota_patch PRIVATE ${CORE_INC} ${TEST_DIR} ${ZSTREAM_INC}
@@ -272,8 +286,8 @@ endif()
 
 # ---- tools/image_check: the ESP32 port's first-block check as a host program, for checking a real
 # ESP-IDF build (CI runs it on examples/esp32's image). Built here so it always compiles.
-add_executable(udsota_image_check tools/image_check.c ${ESP32_DIR}/udsota_esp32_image.c ${CORE_DIR}/udsota_image.c)
-target_include_directories(udsota_image_check PRIVATE ${CORE_INC} ${ESP32_DIR}/include)
+add_executable(udsota_image_check tools/image_check.c ${UDSOTA_ESP32_IMAGE_SRCS} ${UDSOTA_IMAGE_SRCS})
+target_include_directories(udsota_image_check PRIVATE ${CORE_INC} ${UDSOTA_ESP32_INCLUDE_DIRS})
 target_compile_options(udsota_image_check PRIVATE -Wall -Wextra -Werror)
 
 # ---- tools/linux_server: the core on Linux (SocketCAN or a stdin/stdout frame pipe) with a file-backed A/B
