@@ -227,21 +227,21 @@ static udsota_access_t access_of(const udsota_server_t *s)
  * anything engine.poll() still reports queued (a fire-and-forget abort included). */
 static bool worker_busy(const udsota_server_t *s)
 {
-    return s->job_running || s->worker_orphan || s->app_orphan || s->engine.poll(s->engine.ctx) == UDSOTA_PENDING;
+    return s->job_running || s->worker_orphan || s->app_orphan || s->update.engine.poll(s->update.engine.ctx) == UDSOTA_PENDING;
 }
 
 /* engine.status into *st, zeroed first; only called when engine.status is set. */
 static void status_now(const udsota_server_t *s, udsota_status_t *st)
 {
     memset(st, 0, sizeof *st);
-    s->engine.status(s->engine.ctx, st);
+    s->update.engine.status(s->update.engine.ctx, st);
 }
 
 /* Core slot rule for 10 02 and 34: the boot slot is the running slot (both known) and the running image is not
  * PENDING_VERIFY. True without engine.status (not used = not checked). */
 static bool slots_settled(const udsota_server_t *s)
 {
-    if (s->engine.status == NULL) {
+    if (s->update.engine.status == NULL) {
         return true;
     }
     udsota_status_t st;
@@ -258,7 +258,7 @@ typedef enum { CONFIRM_REFUSE, CONFIRM_RUN, CONFIRM_ALREADY } confirm_action_t;
  * (confirm is idempotent); any other state is refused. Without engine.status the engine decides. */
 static confirm_action_t confirm_action(const udsota_server_t *s)
 {
-    if (s->engine.status == NULL) {
+    if (s->update.engine.status == NULL) {
         return CONFIRM_RUN;
     }
     udsota_status_t st;
@@ -280,7 +280,7 @@ static confirm_action_t confirm_action(const udsota_server_t *s)
 /* ENTER_PROGRAMMING and START_DOWNLOAD: slots settled, worker idle and no transfer open, then the gate. */
 static uint8_t download_nrc(const udsota_server_t *s, udsota_op_t op)
 {
-    if (!slots_settled(s) || worker_busy(s) || s->download_active) {
+    if (!slots_settled(s) || worker_busy(s) || s->update.download_active) {
         return UDSOTA_NRC_CONDITIONS_NOT_CORRECT;
     }
     return gate(s, op);
@@ -293,12 +293,12 @@ static uint8_t restart_nrc(const udsota_server_t *s, udsota_op_t op)
 }
 
 /* CONTINUE_TRANSFER at a 36 or an FC point: the STmin monitor (when on), then the gate, which is asked either way
- * so that an STmin violation is counted only when timing alone failed. Judges s->cf_median_us and cf_stmin_us, the
+ * so that an STmin violation is counted only when timing alone failed. Judges s->update.cf_median_us and cf_stmin_us, the
  * last FC point's timing. 0 or the NRC. */
 static uint8_t transfer_nrc(udsota_server_t *s)
 {
     const bool slow_enough = !s->cfg.stmin_monitor ||
-                             (uint64_t)s->cf_median_us * 5u >= (uint64_t)s->cf_stmin_us * 4u;   /* NONE always passes */
+                             (uint64_t)s->update.cf_median_us * 5u >= (uint64_t)s->update.cf_stmin_us * 4u;   /* NONE always passes */
     const uint8_t g = gate(s, UDSOTA_OP_CONTINUE_TRANSFER);
     if (!slow_enough) {
         if (g == 0u) {
@@ -319,7 +319,7 @@ static udsota_phase_t phase_of(const udsota_server_t *s)
     case UDSOTA_SESSION_EXTENDED:
         return UDSOTA_PHASE_EXTENDED;
     case UDSOTA_SESSION_PROGRAMMING:
-        return s->download_active ? UDSOTA_PHASE_TRANSFERRING : UDSOTA_PHASE_PROGRAMMING;
+        return s->update.download_active ? UDSOTA_PHASE_TRANSFERRING : UDSOTA_PHASE_PROGRAMMING;
     default:
         return UDSOTA_PHASE_IDLE;
     }
@@ -404,17 +404,17 @@ static void answered(udsota_server_t *s, uint32_t now_ms)
  * cleared either way, so FF01 never sees a closed transfer without its handle. */
 static void abort_download(udsota_server_t *s)
 {
-    s->dl_complete = false;
-    if (!s->download_active && !s->ota_open) {
+    s->update.dl_complete = false;
+    if (!s->update.download_active && !s->update.ota_open) {
         return;
     }
-    if (s->ota_open) {
-        s->engine.abort(s->engine.ctx);
+    if (s->update.ota_open) {
+        s->update.engine.abort(s->update.engine.ctx);
     }
-    s->download_active = false;
-    s->ota_open = false;
-    s->last_dl.reason_code = UDSOTA_DL_ABORTED;
-    s->last_dl.bytes_received = s->dl_received;
+    s->update.download_active = false;
+    s->update.ota_open = false;
+    s->update.last_dl.reason_code = UDSOTA_DL_ABORTED;
+    s->update.last_dl.bytes_received = s->update.dl_received;
     udsota_sat_inc16(&s->counters.aborts);
 }
 
@@ -522,22 +522,22 @@ static size_t handle_read_did(udsota_server_t *s, const uint8_t *req, size_t len
         out[0] = s->session;
         n = 1;
     } else if (did == UDSOTA_DID_RESULT) {
-        n = udsota_pack_result(out, room, &s->last_dl);
+        n = udsota_pack_result(out, room, &s->update.last_dl);
     } else if (did == UDSOTA_DID_COUNTERS) {
         n = udsota_pack_counters(out, room, &s->counters);
-    } else if (did == UDSOTA_DID_SW_VERSION && s->engine.version != NULL) {
-        n = s->engine.version(s->engine.ctx, (char *)out, room);
+    } else if (did == UDSOTA_DID_SW_VERSION && s->update.engine.version != NULL) {
+        n = s->update.engine.version(s->update.engine.ctx, (char *)out, room);
     } else if (did == UDSOTA_DID_SERIAL && s->cfg.device_id != NULL && s->cfg.device_id_len != 0u) {
         n = s->cfg.device_id_len;
         if (n <= room) {
             memcpy(out, s->cfg.device_id, n);     /* longer: 0x31 below */
         }
-    } else if (did == UDSOTA_DID_STATUS && s->engine.status != NULL) {
+    } else if (did == UDSOTA_DID_STATUS && s->update.engine.status != NULL) {
         udsota_status_t st;
         status_now(s, &st);
         n = udsota_pack_status(out, room, &st);
-    } else if (did == UDSOTA_DID_RUNNING_SHA && s->engine.running_sha != NULL) {
-        n = s->engine.running_sha(s->engine.ctx, out, room);
+    } else if (did == UDSOTA_DID_RUNNING_SHA && s->update.engine.running_sha != NULL) {
+        n = s->update.engine.running_sha(s->update.engine.ctx, out, room);
     } else if (s->hooks.did_read != NULL) {
         n = s->hooks.did_read(s->hooks.ctx, did, out, room);
     }
@@ -591,14 +591,14 @@ static uint8_t dl_access_nrc(const udsota_server_t *s)
 /* Size a 34 may announce: the engine's slot, or UDSOTA_SLOT_SIZE_DEFAULT while it reports 0. */
 static uint32_t dl_slot_size(const udsota_server_t *s)
 {
-    return s->engine.slot_size != 0u ? s->engine.slot_size : UDSOTA_SLOT_SIZE_DEFAULT;
+    return s->update.engine.slot_size != 0u ? s->update.engine.slot_size : UDSOTA_SLOT_SIZE_DEFAULT;
 }
 
 /* Ends a download whose erase or write failed on the worker: aborts it, then records UDSOTA_DL_FLASH_ERROR. */
 static void dl_flash_failed(udsota_server_t *s)
 {
     abort_download(s);
-    s->last_dl.reason_code = UDSOTA_DL_FLASH_ERROR;
+    s->update.last_dl.reason_code = UDSOTA_DL_FLASH_ERROR;
 }
 
 /* True for a coded dataFormatIdentifier: 10 (raw DEFLATE), 20 (delta) or 30 (delta as raw DEFLATE). */
@@ -611,21 +611,21 @@ static bool dl_dfi_coded(uint8_t dfi)
  * zbegin and UDSOTA_COMPRESSION is on. */
 static bool dl_dfi_ok(const udsota_server_t *s, uint8_t dfi)
 {
-    return dfi == UDSOTA_DL_DFI || (UDSOTA_COMPRESSION && dl_dfi_coded(dfi) && s->engine.zbegin != NULL &&
-                                    (s->engine.zformats & UDSOTA_DL_FMT(dfi)) != 0u);
+    return dfi == UDSOTA_DL_DFI || (UDSOTA_COMPRESSION && dl_dfi_coded(dfi) && s->update.engine.zbegin != NULL &&
+                                    (s->update.engine.zformats & UDSOTA_DL_FMT(dfi)) != 0u);
 }
 
 /* True while the open download is coded. A macro, so that with UDSOTA_COMPRESSION 0 it is the constant 0 at any
  * optimisation level and every coded branch compiles away. */
-#define DL_Z(s) (UDSOTA_COMPRESSION && (s)->dl_compressed)
+#define DL_Z(s) (UDSOTA_COMPRESSION && (s)->update.dl_compressed)
 
 /* Bytes the 36s of this download may carry: memorySize, or UDSOTA_DL_Z_BOUND of it when coded. */
 static uint32_t dl_limit(const udsota_server_t *s)
 {
     if (!DL_Z(s)) {
-        return s->dl_announced;
+        return s->update.dl_announced;
     }
-    const uint64_t bound = UDSOTA_DL_Z_BOUND(s->dl_announced);
+    const uint64_t bound = UDSOTA_DL_Z_BOUND(s->update.dl_announced);
     return bound > UINT32_MAX ? UINT32_MAX : (uint32_t)bound;
 }
 
@@ -663,38 +663,38 @@ static size_t handle_request_download(udsota_server_t *s, const uint8_t *req, si
     }
     const bool compressed = UDSOTA_COMPRESSION && dl_dfi_coded(req[1]);
     if (compressed) {
-        if (s->ota_open) {                        /* released first, so its abort cannot free the new decoder */
-            s->engine.abort(s->engine.ctx);
-            s->ota_open = false;
+        if (s->update.ota_open) {                        /* released first, so its abort cannot free the new decoder */
+            s->update.engine.abort(s->update.engine.ctx);
+            s->update.ota_open = false;
         }
-        const int rc = s->engine.zbegin(s->engine.ctx, size, req[1]);
+        const int rc = s->update.engine.zbegin(s->update.engine.ctx, size, req[1]);
         if (rc != 0) {
-            s->last_dl.reason_code = dl_reason(rc, UDSOTA_DL_NO_MEMORY);
-            s->last_dl.bytes_received = 0u;
+            s->update.last_dl.reason_code = dl_reason(rc, UDSOTA_DL_NO_MEMORY);
+            s->update.last_dl.bytes_received = 0u;
             return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_CONDITIONS_NOT_CORRECT);
         }
     }
     /* Accepted. The other slot stops counting as verified before anything is queued. */
-    if (s->engine.unverify != NULL) {
-        s->engine.unverify(s->engine.ctx);
+    if (s->update.engine.unverify != NULL) {
+        s->update.engine.unverify(s->update.engine.ctx);
     }
-    s->slot_verified = false;                     /* a new download clears FF01's pass */
-    if (s->ota_open) {                            /* a finished image that never passed FF01: release its handle */
-        s->engine.abort(s->engine.ctx);
-        s->ota_open = false;
+    s->update.slot_verified = false;                     /* a new download clears FF01's pass */
+    if (s->update.ota_open) {                            /* a finished image that never passed FF01: release its handle */
+        s->update.engine.abort(s->update.engine.ctx);
+        s->update.ota_open = false;
     }
-    s->download_active = true;
-    s->ota_open = compressed;                     /* the engine holds the decoder from here */
-    s->dl_compressed = compressed;
-    s->dl_complete = false;
-    s->next_bsc = 1u;
-    s->dl_announced = size;
-    s->dl_received = 0u;
-    s->dl_written = 0u;                           /* where done starts: a resumed download would start it at its offset */
-    s->cf_median_us = UDSOTA_CF_MEDIAN_NONE;
-    s->cf_stmin_us = 0u;
-    s->last_dl.reason_code = UDSOTA_DL_OK;
-    s->last_dl.bytes_received = 0u;
+    s->update.download_active = true;
+    s->update.ota_open = compressed;                     /* the engine holds the decoder from here */
+    s->update.dl_compressed = compressed;
+    s->update.dl_complete = false;
+    s->update.next_bsc = 1u;
+    s->update.dl_announced = size;
+    s->update.dl_received = 0u;
+    s->update.dl_written = 0u;                           /* where done starts: a resumed download would start it at its offset */
+    s->update.cf_median_us = UDSOTA_CF_MEDIAN_NONE;
+    s->update.cf_stmin_us = 0u;
+    s->update.last_dl.reason_code = UDSOTA_DL_OK;
+    s->update.last_dl.bytes_received = 0u;
     resp[0] = UDSOTA_POS(sid);
     resp[1] = UDSOTA_DL_LFID;
     udsota_put_u16be(&resp[2], s->cfg.max_block_len);
@@ -715,28 +715,28 @@ static bool dl_z_refused(int result)
 static size_t dl_block_done(udsota_server_t *s, int result, uint8_t *resp, size_t resp_max, uint32_t now_ms)
 {
     (void)now_ms;
-    const uint8_t bsc = s->next_bsc;              /* unchanged since the 36 matched it: no 34 runs during a job */
+    const uint8_t bsc = s->update.next_bsc;              /* unchanged since the 36 matched it: no 34 runs during a job */
     if (result != 0 && DL_Z(s) && dl_z_refused(result)) {
         abort_download(s);
-        s->last_dl.reason_code = (uint8_t)result;
+        s->update.last_dl.reason_code = (uint8_t)result;
         return udsota_nrc(resp, resp_max, UDSOTA_SID_TRANSFER_DATA, UDSOTA_NRC_REQUEST_OUT_OF_RANGE);
     }
     if (result != 0) {
         dl_flash_failed(s);
         return udsota_nrc(resp, resp_max, UDSOTA_SID_TRANSFER_DATA, UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE);
     }
-    s->dl_received += s->job_arg;
+    s->update.dl_received += s->job_arg;
     if (!DL_Z(s)) {
-        s->dl_written += s->job_arg;              /* the block's bytes are image bytes */
-    } else if (s->engine.zwritten != NULL) {
-        const uint32_t written = s->engine.zwritten(s->engine.ctx);   /* coded: what the stream wrote */
-        if (written > s->dl_written) {
-            s->dl_written = written;              /* done never shrinks, whatever the engine says */
+        s->update.dl_written += s->job_arg;              /* the block's bytes are image bytes */
+    } else if (s->update.engine.zwritten != NULL) {
+        const uint32_t written = s->update.engine.zwritten(s->update.engine.ctx);   /* coded: what the stream wrote */
+        if (written > s->update.dl_written) {
+            s->update.dl_written = written;              /* done never shrinks, whatever the engine says */
         }
     }
-    s->progress_block = true;
-    s->next_bsc = (uint8_t)(bsc + 1u);            /* 0xFF wraps to 0x00 */
-    s->last_dl.bytes_received = s->dl_received;
+    s->update.progress_block = true;
+    s->update.next_bsc = (uint8_t)(bsc + 1u);            /* 0xFF wraps to 0x00 */
+    s->update.last_dl.bytes_received = s->update.dl_received;
     if (resp_max < 2u) {
         return 0;
     }
@@ -761,7 +761,7 @@ static size_t handle_transfer_data(udsota_server_t *s, const uint8_t *req, size_
     if (req_len < UDSOTA_TD_MIN_LEN || req_len > s->cfg.max_block_len) {
         return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_INCORRECT_LENGTH);
     }
-    if (!s->download_active) {
+    if (!s->update.download_active) {
         return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_REQUEST_SEQUENCE_ERROR);
     }
     if (resp_max < 3u) {
@@ -779,48 +779,48 @@ static size_t handle_transfer_data(udsota_server_t *s, const uint8_t *req, size_
     const size_t len = req_len - 2u;
     /* Repeat before overrun: the resend of a final block whose 76 was lost must still get 76.
      * dl_received > 0 means a block was accepted in this download, so there is a "last" counter to repeat. */
-    if (s->dl_received > 0u && bsc == (uint8_t)(s->next_bsc - 1u)) {
+    if (s->update.dl_received > 0u && bsc == (uint8_t)(s->update.next_bsc - 1u)) {
         udsota_sat_inc16(&s->counters.repeated_blocks);
         resp[0] = UDSOTA_POS(sid);
         resp[1] = bsc;
         return 2;
     }
-    if (bsc != s->next_bsc) {
+    if (bsc != s->update.next_bsc) {
         udsota_sat_inc16(&s->counters.seq_errors);
         return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_WRONG_BLOCK_SEQUENCE_COUNTER);
     }
-    if (len > dl_limit(s) - s->dl_received) {
+    if (len > dl_limit(s) - s->update.dl_received) {
         abort_download(s);                        /* iso14229 server.c:1060-1062: 0x71 ends the transfer */
         return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_TRANSFER_DATA_SUSPENDED);
     }
-    if (!DL_Z(s) && !s->ota_open) {
+    if (!DL_Z(s) && !s->update.ota_open) {
         /* First block: check the image before anything is erased. */
         udsota_reason_t why = UDSOTA_DL_OK;
-        if (s->engine.check_first(s->engine.ctx, data, len, &why) != 0) {
+        if (s->update.engine.check_first(s->update.engine.ctx, data, len, &why) != 0) {
             abort_download(s);
-            s->last_dl.reason_code = (uint8_t)(why != UDSOTA_DL_OK ? why : UDSOTA_DL_BAD_HEADER);
+            s->update.last_dl.reason_code = (uint8_t)(why != UDSOTA_DL_OK ? why : UDSOTA_DL_BAD_HEADER);
             return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_REQUEST_OUT_OF_RANGE);
         }
-        const int rc = s->engine.begin(s->engine.ctx, s->dl_announced);
+        const int rc = s->update.engine.begin(s->update.engine.ctx, s->update.dl_announced);
         if (rc != 0 && rc != UDSOTA_PENDING) {   /* not even queued: no handle is open */
             dl_flash_failed(s);
             return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE);
         }
-        s->ota_open = true;
+        s->update.ota_open = true;
     }
     /* Queued behind the erase on the first block; write and zwrite copy data before they return. */
-    const int rc = DL_Z(s) ? s->engine.zwrite(s->engine.ctx, data, len)
-                           : s->engine.write(s->engine.ctx, s->dl_received, data, len);
+    const int rc = DL_Z(s) ? s->update.engine.zwrite(s->update.engine.ctx, data, len)
+                           : s->update.engine.write(s->update.engine.ctx, s->update.dl_received, data, len);
     return udsota_job_start(s, sid, false, rc, dl_block_done, (uint32_t)len, resp, resp_max, now_ms);
 }
 
 /* The 37's positive tail: the transfer closes, FF01 may verify the open image, F1F1 reads OK; 77. */
 static size_t dl_exit_ok(udsota_server_t *s, uint8_t *resp)
 {
-    s->download_active = false;
-    s->dl_complete = true;                        /* FF01 may now verify the open handle */
-    s->last_dl.reason_code = UDSOTA_DL_OK;
-    s->last_dl.bytes_received = s->dl_received;
+    s->update.download_active = false;
+    s->update.dl_complete = true;                        /* FF01 may now verify the open handle */
+    s->update.last_dl.reason_code = UDSOTA_DL_OK;
+    s->update.last_dl.bytes_received = s->update.dl_received;
     resp[0] = UDSOTA_POS(UDSOTA_SID_TRANSFER_EXIT);
     return 1;
 }
@@ -833,15 +833,15 @@ static size_t dl_exit_done(udsota_server_t *s, int result, uint8_t *resp, size_t
     (void)now_ms;
     if (result != 0) {
         abort_download(s);
-        s->last_dl.reason_code = dl_reason(result, UDSOTA_DL_BAD_STREAM);
+        s->update.last_dl.reason_code = dl_reason(result, UDSOTA_DL_BAD_STREAM);
         return udsota_nrc(resp, resp_max, UDSOTA_SID_TRANSFER_EXIT, UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE);
     }
     if (resp_max < 1u) {
         return 0;
     }
-    if (s->dl_written != s->dl_announced) {       /* the stream ended at memorySize: every byte is written */
-        s->dl_written = s->dl_announced;
-        s->progress_block = true;
+    if (s->update.dl_written != s->update.dl_announced) {       /* the stream ended at memorySize: every byte is written */
+        s->update.dl_written = s->update.dl_announced;
+        s->update.progress_block = true;
     }
     return dl_exit_ok(s, resp);
 }
@@ -860,14 +860,14 @@ static size_t handle_transfer_exit(udsota_server_t *s, size_t req_len, uint8_t *
     if (req_len != 1u) {
         return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_INCORRECT_LENGTH);
     }
-    if (!s->download_active || (!DL_Z(s) && s->dl_received != s->dl_announced)) {
+    if (!s->update.download_active || (!DL_Z(s) && s->update.dl_received != s->update.dl_announced)) {
         return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_REQUEST_SEQUENCE_ERROR);
     }
     if (resp_max < 1u) {
         return 0;
     }
     if (DL_Z(s)) {
-        return udsota_job_start(s, sid, false, s->engine.zend(s->engine.ctx), dl_exit_done, 0, resp, resp_max, now_ms);
+        return udsota_job_start(s, sid, false, s->update.engine.zend(s->update.engine.ctx), dl_exit_done, 0, resp, resp_max, now_ms);
     }
     return dl_exit_ok(s, resp);
 }
@@ -877,12 +877,12 @@ static size_t handle_transfer_exit(udsota_server_t *s, size_t req_len, uint8_t *
 bool udsota_fc_check(udsota_server_t *s, uint32_t median_cf_us, uint32_t stmin_us, uint32_t now_ms)
 {
     (void)now_ms;
-    if (!s->download_active || s->job_running) {
+    if (!s->update.download_active || s->job_running) {
         return true;
     }
     if (!s->end_pending) {                        /* not latched: record the FC point's timing and ask the gate */
-        s->cf_median_us = median_cf_us;
-        s->cf_stmin_us = stmin_us;
+        s->update.cf_median_us = median_cf_us;
+        s->update.cf_stmin_us = stmin_us;
         if (transfer_nrc(s) == 0u) {
             return true;
         }
@@ -946,8 +946,8 @@ static size_t check_done(udsota_server_t *s, int result, uint8_t *resp, size_t r
 {
     (void)now_ms;
     const uint8_t reason = dl_reason(result, UDSOTA_DL_VERIFY_FAILED);
-    s->slot_verified = (reason == UDSOTA_DL_OK);
-    s->last_dl.reason_code = reason;
+    s->update.slot_verified = (reason == UDSOTA_DL_OK);
+    s->update.last_dl.reason_code = reason;
     return routine_pos(resp, resp_max, UDSOTA_RID_CHECK_PROG_DEPS, &reason, 1);
 }
 
@@ -956,7 +956,7 @@ static size_t check_done(udsota_server_t *s, int result, uint8_t *resp, size_t r
 static size_t activate_done(udsota_server_t *s, int result, uint8_t *resp, size_t resp_max, uint32_t now_ms)
 {
     if (result != 0) {
-        s->slot_verified = false;
+        s->update.slot_verified = false;
         return udsota_nrc(resp, resp_max, UDSOTA_SID_ROUTINE, UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE);
     }
     if (s->hooks.reset != NULL) {
@@ -1066,31 +1066,31 @@ static size_t handle_routine(udsota_server_t *s, const uint8_t *req, size_t len,
     }
     switch (rid) {
     case UDSOTA_RID_CHECK_PROG_DEPS:
-        if (s->slot_verified && !s->ota_open) {        /* passed, no new download since: repeat the verdict */
+        if (s->update.slot_verified && !s->update.ota_open) {        /* passed, no new download since: repeat the verdict */
             const uint8_t status = UDSOTA_DL_OK;
             return spr ? 0 : routine_pos(resp, resp_max, rid, &status, 1);
         }
-        if (!s->dl_complete || !s->ota_open) {
+        if (!s->update.dl_complete || !s->update.ota_open) {
             return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_REQUEST_SEQUENCE_ERROR);
         }
-        s->dl_complete = false;                        /* the engine's verify frees the handle whatever it finds, */
-        s->ota_open = false;                           /* so FF01 again is 0x24, or 00 after a pass */
-        s->slot_verified = false;
-        s->last_dl.reason_code = UDSOTA_DL_WORKER_TIMEOUT;    /* check_done overwrites it; stays if the 90 s cap fires */
-        return udsota_job_start(s, sid, spr, s->engine.verify(s->engine.ctx), check_done, 0, resp, resp_max, now_ms);
+        s->update.dl_complete = false;                        /* the engine's verify frees the handle whatever it finds, */
+        s->update.ota_open = false;                           /* so FF01 again is 0x24, or 00 after a pass */
+        s->update.slot_verified = false;
+        s->update.last_dl.reason_code = UDSOTA_DL_WORKER_TIMEOUT;    /* check_done overwrites it; stays if the 90 s cap fires */
+        return udsota_job_start(s, sid, spr, s->update.engine.verify(s->update.engine.ctx), check_done, 0, resp, resp_max, now_ms);
     case UDSOTA_RID_GET_RESUME_POINT: {
         const uint8_t status = UDSOTA_RESUME_NOT_AVAILABLE;   /* resume is not implemented: always not available */
         return spr ? 0 : routine_pos(resp, resp_max, rid, &status, 1);
     }
     case UDSOTA_RID_ACTIVATE_IMAGE: {
-        if (!s->slot_verified) {
+        if (!s->update.slot_verified) {
             return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_REQUEST_SEQUENCE_ERROR);
         }
         const uint8_t cond = restart_nrc(s, UDSOTA_OP_ACTIVATE);
         if (cond != 0u) {
             return udsota_nrc(resp, resp_max, sid, cond);
         }
-        return udsota_job_start(s, sid, spr, s->engine.activate(s->engine.ctx), activate_done, 0, resp, resp_max, now_ms);
+        return udsota_job_start(s, sid, spr, s->update.engine.activate(s->update.engine.ctx), activate_done, 0, resp, resp_max, now_ms);
     }
     default: {   /* UDSOTA_RID_CONFIRM_IMAGE: the gate first, then the core rule */
         const uint8_t cond = gate(s, UDSOTA_OP_CONFIRM);
@@ -1099,7 +1099,7 @@ static size_t handle_routine(udsota_server_t *s, const uint8_t *req, size_t len,
         }
         switch (confirm_action(s)) {
         case CONFIRM_RUN:
-            return udsota_job_start(s, sid, spr, s->engine.confirm(s->engine.ctx), confirm_done, 0,
+            return udsota_job_start(s, sid, spr, s->update.engine.confirm(s->update.engine.ctx), confirm_done, 0,
                                     resp, resp_max, now_ms);
         case CONFIRM_ALREADY:
             return spr ? 0 : routine_pos(resp, resp_max, rid, NULL, 0);   /* already confirmed: idempotent */
@@ -1116,16 +1116,16 @@ static size_t handle_routine(udsota_server_t *s, const uint8_t *req, size_t len,
 static udsota_progress_t progress_of(const udsota_server_t *s)
 {
     udsota_progress_t p = {.stage = UDSOTA_STAGE_IDLE, .done = 0u, .total = 0u,
-                           .last_reason = s->last_dl.reason_code};
+                           .last_reason = s->update.last_dl.reason_code};
     if (s->activating) {
         p.stage = UDSOTA_STAGE_ACTIVATING;
     } else if (s->job_running && s->job_done == check_done) {
         p.stage = UDSOTA_STAGE_VERIFYING;              /* engines report no hash progress: 0 of 0 */
-    } else if (s->download_active || (s->dl_complete && s->ota_open)) {
-        const bool erasing = s->download_active && s->dl_received == 0u;   /* no 36 accepted yet */
+    } else if (s->update.download_active || (s->update.dl_complete && s->update.ota_open)) {
+        const bool erasing = s->update.download_active && s->update.dl_received == 0u;   /* no 36 accepted yet */
         p.stage = erasing ? UDSOTA_STAGE_ERASING : UDSOTA_STAGE_WRITING;
-        p.total = s->dl_announced;
-        p.done = (s->dl_written < p.total) ? s->dl_written : p.total;
+        p.total = s->update.dl_announced;
+        p.done = (s->update.dl_written < p.total) ? s->update.dl_written : p.total;
     }
     return p;
 }
@@ -1135,13 +1135,13 @@ static udsota_progress_t progress_of(const udsota_server_t *s)
 static void progress_sync(udsota_server_t *s)
 {
     const udsota_progress_t p = progress_of(s);
-    const bool block = s->progress_block;
-    s->progress_block = false;
-    if ((uint8_t)p.stage == s->progress_stage && !block && p.last_reason == s->progress_reason) {
+    const bool block = s->update.progress_block;
+    s->update.progress_block = false;
+    if ((uint8_t)p.stage == s->update.progress_stage && !block && p.last_reason == s->update.progress_reason) {
         return;
     }
-    s->progress_stage = (uint8_t)p.stage;
-    s->progress_reason = p.last_reason;
+    s->update.progress_stage = (uint8_t)p.stage;
+    s->update.progress_reason = p.last_reason;
     if (s->hooks.progress != NULL) {
         s->hooks.progress(s->hooks.ctx, &p);
     }
@@ -1339,7 +1339,7 @@ bool udsota_init(udsota_server_t *s, const udsota_config_t *cfg, const udsota_en
     memset(s, 0, sizeof *s);
     s->cfg = cfg_resolve(cfg);
     if (engine != NULL) {
-        s->engine = *engine;
+        s->update.engine = *engine;
     }
     if (security != NULL) {
         s->sec = *security;
@@ -1386,7 +1386,7 @@ udsota_phase_t udsota_phase(const udsota_server_t *s)
 /* True between an accepted 34 and 37 or an abort. */
 bool udsota_download_active(const udsota_server_t *s)
 {
-    return s->download_active;
+    return s->update.download_active;
 }
 
 /* Finishes a handler whose op may have queued worker work (see udsota_service.h). */
@@ -1508,7 +1508,7 @@ static size_t finish_job(udsota_server_t *s, int rc, uint8_t *resp, size_t resp_
  * the 90 s cap (0x72, session ends), or the 0x78 cadence. */
 static size_t poll_job(udsota_server_t *s, uint8_t *resp, size_t resp_max, uint32_t now_ms)
 {
-    const int rc = s->job_app ? app_poll(s, resp, resp_max) : s->engine.poll(s->engine.ctx);
+    const int rc = s->job_app ? app_poll(s, resp, resp_max) : s->update.engine.poll(s->update.engine.ctx);
     if (rc != UDSOTA_PENDING) {
         s->job_app = false;
         return finish_job(s, rc, resp, resp_max, now_ms);
@@ -1516,12 +1516,12 @@ static size_t poll_job(udsota_server_t *s, uint8_t *resp, size_t resp_max, uint3
     const uint32_t elapsed = now_ms - s->job_start_ms;
     if (elapsed >= UDSOTA_JOB_CAP_MS) {
         const uint8_t sid = s->job_sid;
-        const bool was_download = !s->job_app && (s->download_active || s->ota_open);
+        const bool was_download = !s->job_app && (s->update.download_active || s->update.ota_open);
         orphan_job(s);   /* its owner still runs it; 10 02 waits for it */
         udsota_sat_inc16(&s->counters.resp_pending_caps);
         enter_session(s, UDSOTA_SESSION_DEFAULT);
         if (was_download) {
-            s->last_dl.reason_code = UDSOTA_DL_WORKER_TIMEOUT;
+            s->update.last_dl.reason_code = UDSOTA_DL_WORKER_TIMEOUT;
         }
         return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE);
     }
@@ -1542,7 +1542,7 @@ static size_t poll_step(udsota_server_t *s, uint8_t *resp, size_t resp_max, uint
     if (s->reset_phase != RESET_IDLE) {
         return reset_poll(s, now_ms);
     }
-    if (s->worker_orphan && !s->job_running && s->engine.poll(s->engine.ctx) != UDSOTA_PENDING) {
+    if (s->worker_orphan && !s->job_running && s->update.engine.poll(s->update.engine.ctx) != UDSOTA_PENDING) {
         s->worker_orphan = false;
     }
     if (s->app_orphan && app_poll(s, resp, resp_max) != UDSOTA_PENDING) {

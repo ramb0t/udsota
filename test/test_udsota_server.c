@@ -218,10 +218,10 @@ static void test_programming_gated_by_core_and_gate(void)
     g_mock.status.running_state = UDSOTA_IMG_PENDING_VERIFY;
     EXPECT_NRC(SEND(0x10, 0x02), 0x10, 0x22);
     g_mock.status.running_state = UDSOTA_IMG_VALID;
-    s.download_active = true;                                  /* the server's own state counts too */
+    s.update.download_active = true;                                  /* the server's own state counts too */
     EXPECT_NRC(SEND(0x10, 0x02), 0x10, 0x22);
     TEST_ASSERT_EQUAL_HEX8(0x01, session_now());
-    s.download_active = false;
+    s.update.download_active = false;
     enter(0x02);
 }
 
@@ -288,8 +288,8 @@ static void test_identity_dids_from_engine_cfg_and_hooks(void)
 static void test_server_owned_dids(void)
 {
     EXPECT(SEND(0x22, 0xF1, 0x86), 0x62, 0xF1, 0x86, 0x01);
-    s.last_dl.reason_code = UDSOTA_DL_NOT_NEWER;
-    s.last_dl.bytes_received = 0x00001FFDu;
+    s.update.last_dl.reason_code = UDSOTA_DL_NOT_NEWER;
+    s.update.last_dl.bytes_received = 0x00001FFDu;
     EXPECT(SEND(0x22, 0xF1, 0xF1), 0x62, 0xF1, 0xF1, 0x06, 0x00, 0x00, 0x1F, 0xFD);
     s.counters.seq_errors = 0x0102;
     s.counters.resp_frames_dropped = 0xFFFF;
@@ -397,36 +397,36 @@ static void test_rx_timeout_restarts_s3(void)
 static void test_s3_fallback_aborts_open_download(void)
 {
     enter(0x02);
-    s.download_active = true;
-    s.ota_open = true;
-    s.dl_received = 8186u;
-    s.slot_verified = true;
+    s.update.download_active = true;
+    s.update.ota_open = true;
+    s.update.dl_received = 8186u;
+    s.update.slot_verified = true;
     poll_at(now + 5000u);
     TEST_ASSERT_EQUAL_HEX8(0x01, s.session);
     TEST_ASSERT_EQUAL_UINT(1, m.aborts);
-    TEST_ASSERT_FALSE(s.download_active);
-    TEST_ASSERT_FALSE(s.ota_open);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_ABORTED, s.last_dl.reason_code);
-    TEST_ASSERT_EQUAL_UINT32(8186u, s.last_dl.bytes_received);
+    TEST_ASSERT_FALSE(s.update.download_active);
+    TEST_ASSERT_FALSE(s.update.ota_open);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_ABORTED, s.update.last_dl.reason_code);
+    TEST_ASSERT_EQUAL_UINT32(8186u, s.update.last_dl.bytes_received);
     TEST_ASSERT_EQUAL_HEX16(1, s.counters.aborts);
-    TEST_ASSERT_TRUE(s.slot_verified);
+    TEST_ASSERT_TRUE(s.update.slot_verified);
 }
 
 /* 10 01 mid-download also queues the abort; an accepted 0x34 with no 0x36 yet ends without one. */
 static void test_default_session_request_aborts_download(void)
 {
     enter(0x02);
-    s.download_active = true;
-    s.ota_open = true;
+    s.update.download_active = true;
+    s.update.ota_open = true;
     enter(0x01);
     TEST_ASSERT_EQUAL_UINT(1, m.aborts);
-    TEST_ASSERT_FALSE(s.ota_open);
+    TEST_ASSERT_FALSE(s.update.ota_open);
 
     enter(0x02);
-    s.download_active = true;                                  /* 0x34 accepted, no handle yet */
+    s.update.download_active = true;                                  /* 0x34 accepted, no handle yet */
     enter(0x01);
     TEST_ASSERT_EQUAL_UINT(1, m.aborts);
-    TEST_ASSERT_FALSE(s.download_active);
+    TEST_ASSERT_FALSE(s.update.download_active);
     TEST_ASSERT_EQUAL_HEX16(2, s.counters.aborts);
 }
 
@@ -515,8 +515,8 @@ static void test_requests_during_job(void)
 static void test_job_cap_at_90s(void)
 {
     enter(0x02);
-    s.download_active = true;
-    s.ota_open = true;
+    s.update.download_active = true;
+    s.update.ota_open = true;
     const uint32_t t0 = now;
     start_job(false);
     unsigned pendings = 0;
@@ -533,7 +533,7 @@ static void test_job_cap_at_90s(void)
     TEST_ASSERT_FALSE(s.job_running);
     TEST_ASSERT_EQUAL_HEX8(0x01, s.session);
     TEST_ASSERT_EQUAL_UINT(1, m.aborts);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_WORKER_TIMEOUT, s.last_dl.reason_code);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_WORKER_TIMEOUT, s.update.last_dl.reason_code);
     TEST_ASSERT_EQUAL_HEX16(1, s.counters.resp_pending_caps);
     TEST_ASSERT_TRUE(s.worker_orphan);
 

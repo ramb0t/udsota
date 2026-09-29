@@ -109,7 +109,7 @@ static int s_check(void *ctx, const uint8_t *first, size_t len, udsota_reason_t 
         .diag_request_id = 0x710u, .diag_response_id = 0x718u,
         .running_version = {0, 0, 0}, .running_is_release = false, .slot_size = UDSOTA_SLOT_SIZE_DEFAULT,
     };
-    *why = udsota_image_check(first, len, srv.dl_announced, &ic, NULL);
+    *why = udsota_image_check(first, len, srv.update.dl_announced, &ic, NULL);
     return *why == UDSOTA_DL_OK ? 0 : 1;
 }
 
@@ -278,7 +278,7 @@ static size_t send_routine(uint16_t rid)
 /* Asserts F1F1's reason. */
 static void expect_reason(uint8_t reason)
 {
-    TEST_ASSERT_EQUAL_UINT8(reason, srv.last_dl.reason_code);
+    TEST_ASSERT_EQUAL_UINT8(reason, srv.update.last_dl.reason_code);
 }
 
 /* The whole download of g_p under dfi in chunk-byte 36s, then 37 77 and FF01 passing on DELTA_NEW. */
@@ -552,7 +552,7 @@ static void test_unserved_formats_answer_31_without_side_effects(void)
     send_37();
     EXPECT(0x77);
     const unsigned aborts = e.aborts;
-    srv.last_dl.reason_code = UDSOTA_DL_NOT_NEWER;             /* a marker F1F1 must keep */
+    srv.update.last_dl.reason_code = UDSOTA_DL_NOT_NEWER;             /* a marker F1F1 must keep */
     const uint8_t dfis[] = {UDSOTA_DL_DFI_DELTA, UDSOTA_DL_DFI_DELTA_DEFLATE, 0x40};
     for (size_t i = 0; i < sizeof dfis; i++) {
         send_34(dfis[i], IMG_LEN);
@@ -563,15 +563,15 @@ static void test_unserved_formats_answer_31_without_side_effects(void)
     expect_reason(UDSOTA_DL_NOT_NEWER);
     udsota_engine_t all = ENGINE;                              /* a mask naming every nibble: 40 is still no coded DFI */
     all.zformats = 0xFFFFu;
-    srv.engine = all;
+    srv.update.engine = all;
     const uint8_t unknown[] = {0x40, 0x11, 0x01, 0xF0};
     for (size_t i = 0; i < sizeof unknown; i++) {
         send_34(unknown[i], IMG_LEN);
         EXPECT(0x7F, 0x34, 0x31);
     }
     TEST_ASSERT_EQUAL_UINT(0u, e.zbegins);
-    srv.engine = only10;
-    srv.last_dl.reason_code = UDSOTA_DL_OK;
+    srv.update.engine = only10;
+    srv.update.last_dl.reason_code = UDSOTA_DL_OK;
     send_routine(UDSOTA_RID_CHECK_PROG_DEPS);                  /* the unverified image is still there */
     EXPECT(0x71, 0x01, 0xFF, 0x01, UDSOTA_DL_OK);
 }

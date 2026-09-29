@@ -77,7 +77,7 @@ static int s_check(void *ctx, const uint8_t *first, size_t len, udsota_reason_t 
         .diag_request_id = EXAMPLE_REQ_ID, .diag_response_id = EXAMPLE_RESP_ID,
         .running_version = {0, 0, 0}, .running_is_release = false, .slot_size = UDSOTA_SLOT_SIZE_DEFAULT,
     };
-    *why = udsota_image_check(first, len, srv.dl_announced, &ic, NULL);
+    *why = udsota_image_check(first, len, srv.update.dl_announced, &ic, NULL);
     return *why == UDSOTA_DL_OK ? 0 : 1;
 }
 
@@ -288,8 +288,8 @@ static size_t send_routine(uint16_t rid)
 /* Asserts F1F1: reason and bytes received. */
 static void expect_result(uint8_t reason, uint32_t bytes)
 {
-    TEST_ASSERT_EQUAL_UINT8(reason, srv.last_dl.reason_code);
-    TEST_ASSERT_EQUAL_UINT32(bytes, srv.last_dl.bytes_received);
+    TEST_ASSERT_EQUAL_UINT8(reason, srv.update.last_dl.reason_code);
+    TEST_ASSERT_EQUAL_UINT32(bytes, srv.update.last_dl.bytes_received);
 }
 
 /* ---- tests ---- */
@@ -303,7 +303,7 @@ static void test_compressed_happy_path(void)
     enter_programming();
     send_34(UDSOTA_DL_DFI_DEFLATE, IMG_LEN);
     EXPECT(0x74, 0x20, 0x0F, 0xFF);
-    TEST_ASSERT_TRUE(srv.dl_compressed);
+    TEST_ASSERT_TRUE(srv.update.dl_compressed);
     TEST_ASSERT_EQUAL_UINT(2u, e.allocs);                       /* the state and the dictionary, at 34 */
     send_stream(BLOCK);
     TEST_ASSERT_EQUAL_UINT(1u, e.checks);
@@ -319,7 +319,7 @@ static void test_compressed_happy_path(void)
     send_routine(UDSOTA_RID_CHECK_PROG_DEPS);
     EXPECT(0x71, 0x01, 0xFF, 0x01, 0x00);
     TEST_ASSERT_EQUAL_MEMORY(g_img, e.flash, IMG_LEN);
-    TEST_ASSERT_TRUE(srv.slot_verified);
+    TEST_ASSERT_TRUE(srv.update.slot_verified);
 }
 
 /* First-block buffering: stored blocks of 100 bytes inflate to 95 bytes each, so the first three 36s hold 285 bytes
@@ -363,7 +363,7 @@ static void test_stream_ending_before_the_check_is_bad_header(void)
     expect_result(UDSOTA_DL_BAD_HEADER, 0u);
     TEST_ASSERT_EQUAL_UINT(0u, e.checks);
     TEST_ASSERT_EQUAL_UINT(0u, e.begins);
-    TEST_ASSERT_FALSE(srv.download_active);
+    TEST_ASSERT_FALSE(srv.update.download_active);
     TEST_ASSERT_EQUAL_UINT(e.allocs, e.frees);
 }
 
@@ -378,7 +378,7 @@ static void test_stream_ending_early_fails_at_37(void)
     send_37();
     EXPECT(0x7F, 0x37, 0x72);
     expect_result(UDSOTA_DL_BAD_STREAM, (uint32_t)g_z_len);
-    TEST_ASSERT_FALSE(srv.download_active);
+    TEST_ASSERT_FALSE(srv.update.download_active);
     TEST_ASSERT_EQUAL_UINT(e.allocs, e.frees);
     send_routine(UDSOTA_RID_CHECK_PROG_DEPS);
     EXPECT(0x7F, 0x31, 0x24);
@@ -394,7 +394,7 @@ static void test_truncated_stream_fails_at_37(void)
     send_stream(BLOCK);
     send_37();
     EXPECT(0x7F, 0x37, 0x72);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_BAD_STREAM, srv.last_dl.reason_code);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_BAD_STREAM, srv.update.last_dl.reason_code);
 }
 
 /* Data after the end of the stream: the 36 carrying it passes, and 37 answers 0x72, BAD_STREAM. */
@@ -409,7 +409,7 @@ static void test_trailing_data_fails_at_37(void)
     TEST_ASSERT_TRUE(e.zs.trailing);
     send_37();
     EXPECT(0x7F, 0x37, 0x72);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_BAD_STREAM, srv.last_dl.reason_code);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_BAD_STREAM, srv.update.last_dl.reason_code);
 }
 
 /* A stream that inflates to more than memorySize is refused at the 36 that overflows: 0x31, F1F1 BAD_STREAM, the
@@ -426,8 +426,8 @@ static void test_stream_inflating_past_memory_size(void)
         if (g_resp[0] == UDSOTA_NEG_RESPONSE) break;
     }
     EXPECT(0x7F, 0x36, 0x31);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_BAD_STREAM, srv.last_dl.reason_code);
-    TEST_ASSERT_FALSE(srv.download_active);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_BAD_STREAM, srv.update.last_dl.reason_code);
+    TEST_ASSERT_FALSE(srv.update.download_active);
     TEST_ASSERT_TRUE(e.next_off <= IMG_LEN - 1000u);
     TEST_ASSERT_EQUAL_UINT(e.allocs, e.frees);
 }
@@ -454,7 +454,7 @@ static void test_corrupt_stream(void)
     EXPECT(0x74, 0x20, 0x0F, 0xFF);
     send_36(1, 0u, g_z_len);
     EXPECT(0x7F, 0x36, 0x31);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_BAD_STREAM, srv.last_dl.reason_code);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_BAD_STREAM, srv.update.last_dl.reason_code);
 }
 
 /* The first-block rules run on the inflated bytes: an image for another product is refused with 0x31 and
@@ -481,8 +481,8 @@ static void test_allocation_failure_at_34(void)
     send_34(UDSOTA_DL_DFI_DEFLATE, IMG_LEN);
     EXPECT(0x7F, 0x34, 0x22);
     expect_result(UDSOTA_DL_NO_MEMORY, 0u);
-    TEST_ASSERT_FALSE(srv.download_active);
-    TEST_ASSERT_FALSE(srv.ota_open);
+    TEST_ASSERT_FALSE(srv.update.download_active);
+    TEST_ASSERT_FALSE(srv.update.ota_open);
     TEST_ASSERT_EQUAL_INT(UDSOTA_PHASE_PROGRAMMING, udsota_phase(&srv));
     deflate_into_z(g_img, IMG_LEN);
     send_36(1, 0u, 100u);
@@ -503,11 +503,11 @@ static void test_null_decompressor_refuses_dfi_10_as_before(void)
     raw.zwritten = NULL;
     boot(&raw);
     enter_programming();
-    srv.last_dl.reason_code = UDSOTA_DL_VERIFY_FAILED;
+    srv.update.last_dl.reason_code = UDSOTA_DL_VERIFY_FAILED;
     send_34(UDSOTA_DL_DFI_DEFLATE, IMG_LEN);
     EXPECT(0x7F, 0x34, 0x31);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_VERIFY_FAILED, srv.last_dl.reason_code);
-    TEST_ASSERT_FALSE(srv.download_active);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_VERIFY_FAILED, srv.update.last_dl.reason_code);
+    TEST_ASSERT_FALSE(srv.update.download_active);
     TEST_ASSERT_EQUAL_UINT(0u, e.allocs);
     send_34(UDSOTA_DL_DFI, IMG_LEN);
     EXPECT(0x74, 0x20, 0x0F, 0xFF);
@@ -577,7 +577,7 @@ static void test_compressed_bytes_are_bounded(void)
     EXPECT(0x76, 0x01);
     send_36(2, 5u, 1470u);
     EXPECT(0x7F, 0x36, 0x71);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_ABORTED, srv.last_dl.reason_code);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_ABORTED, srv.update.last_dl.reason_code);
     TEST_ASSERT_EQUAL_UINT(e.allocs, e.frees);
 }
 
@@ -593,7 +593,7 @@ static void test_abort_mid_stream_frees_the_inflater(void)
     send(sess, sizeof sess);
     TEST_ASSERT_EQUAL_UINT(1u, e.aborts);
     TEST_ASSERT_EQUAL_UINT(e.allocs, e.frees);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_ABORTED, srv.last_dl.reason_code);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_ABORTED, srv.update.last_dl.reason_code);
 }
 
 /* A 34 that replaces a finished, unverified compressed image releases it before opening the new stream. */
@@ -643,7 +643,7 @@ static void test_worker_jobs_answer_pending_then_final(void)
     send_34(UDSOTA_DL_DFI_DEFLATE, IMG_LEN);
     send_36(1, 0u, BLOCK);
     EXPECT(0x7F, 0x36, 0x31);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_BAD_PROJECT, srv.last_dl.reason_code);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_BAD_PROJECT, srv.update.last_dl.reason_code);
 }
 
 /* udsota_zstream on its own: a NULL or short buffer is refused at open, and bytes fed after a failure keep
@@ -715,7 +715,7 @@ static void test_compressed_progress_counts_image_bytes(void)
         last = p.done;
     }
     TEST_ASSERT_TRUE(grew);
-    TEST_ASSERT_NOT_EQUAL_UINT32(srv.dl_received, IMG_LEN);   /* the 36s carried more than the image: headers */
+    TEST_ASSERT_NOT_EQUAL_UINT32(srv.update.dl_received, IMG_LEN);   /* the 36s carried more than the image: headers */
     expect_progress(UDSOTA_STAGE_WRITING, IMG_LEN, IMG_LEN);   /* the last 76 flushed the stream */
     send_37();
     EXPECT(0x77);

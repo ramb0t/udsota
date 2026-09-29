@@ -141,7 +141,7 @@ static void test_functional_unserved_services_are_silent(void)
     TEST_ASSERT_EQUAL_UINT(0, func(NULL, 2));
     TEST_ASSERT_EQUAL_UINT(6, PHYS(0x10, 0x02));
     TEST_ASSERT_EQUAL_UINT(0, FUNC(0x34, 0x00, 0x44, 0, 0, 0, 0, 0, 0, 0, 0x40));
-    TEST_ASSERT_FALSE(s.download_active);
+    TEST_ASSERT_FALSE(s.update.download_active);
 }
 
 /* 28 and 85 in the default session: physically 0x7F, functionally nothing. */
@@ -166,7 +166,7 @@ static void test_functional_during_a_job(void)
     TEST_ASSERT_EQUAL_UINT(0, FUNC(0x22, 0xF1, 0x86));
     TEST_ASSERT_EQUAL_UINT(0, FUNC(0x10, 0x01));
     TEST_ASSERT_TRUE(s.job_running);
-    TEST_ASSERT_TRUE(s.download_active);
+    TEST_ASSERT_TRUE(s.update.download_active);
 }
 
 /* 28: the hook gets controlType and communicationType, 68 <ct> answers, SPRMIB silences it, and the hook's NRC,

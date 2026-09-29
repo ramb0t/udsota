@@ -205,8 +205,8 @@ static void enter_default(void)
 /* Stands in for 34/36/37, which test_udsota_server_download.c tests: the transfer is closed and the OTA handle open. */
 static void mark_transfer_exited(void)
 {
-    srv.dl_complete = true;
-    srv.ota_open = true;
+    srv.update.dl_complete = true;
+    srv.update.ota_open = true;
 }
 
 /* A passing FF01 on a closed transfer; the server must be in programming with level 03. */
@@ -388,10 +388,10 @@ static void test_ff01_without_closed_transfer_is_24(void)
 {
     enter_programming(true);
     expect_nrc(REQ(0x31, 0x01, 0xFF, 0x01), UDSOTA_NRC_REQUEST_SEQUENCE_ERROR);
-    srv.dl_complete = true;                                   /* closed, but the handle was aborted */
+    srv.update.dl_complete = true;                                   /* closed, but the handle was aborted */
     expect_nrc(REQ(0x31, 0x01, 0xFF, 0x01), UDSOTA_NRC_REQUEST_SEQUENCE_ERROR);
-    srv.dl_complete = false;
-    srv.ota_open = true;                                      /* open, but 0x37 not accepted */
+    srv.update.dl_complete = false;
+    srv.update.ota_open = true;                                      /* open, but 0x37 not accepted */
     expect_nrc(REQ(0x31, 0x01, 0xFF, 0x01), UDSOTA_NRC_REQUEST_SEQUENCE_ERROR);
     TEST_ASSERT_EQUAL_UINT(0, m.n_end);
 }
@@ -400,13 +400,13 @@ static void test_ff01_without_closed_transfer_is_24(void)
 static void test_ff01_pass(void)
 {
     enter_programming(true);
-    srv.last_dl.reason_code = UDSOTA_DL_ABORTED;
+    srv.update.last_dl.reason_code = UDSOTA_DL_ABORTED;
     ff01_pass();
     TEST_ASSERT_EQUAL_UINT(1, m.n_end);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_OK, srv.last_dl.reason_code);
-    TEST_ASSERT_TRUE(srv.slot_verified);
-    TEST_ASSERT_FALSE(srv.ota_open);
-    TEST_ASSERT_FALSE(srv.dl_complete);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_OK, srv.update.last_dl.reason_code);
+    TEST_ASSERT_TRUE(srv.update.slot_verified);
+    TEST_ASSERT_FALSE(srv.update.ota_open);
+    TEST_ASSERT_FALSE(srv.update.dl_complete);
 }
 
 /* A failed FF01 is still a positive answer: the status byte and F1F1 carry the reason, and F001 stays refused. */
@@ -416,8 +416,8 @@ static void test_ff01_fail_reports_reason(void)
     mark_transfer_exited();
     m.end_result = UDSOTA_DL_VERIFY_FAILED;
     expect_pos(REQ(0x31, 0x01, 0xFF, 0x01), UDSOTA_RID_CHECK_PROG_DEPS, UDSOTA_DL_VERIFY_FAILED);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_VERIFY_FAILED, srv.last_dl.reason_code);
-    TEST_ASSERT_FALSE(srv.slot_verified);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_VERIFY_FAILED, srv.update.last_dl.reason_code);
+    TEST_ASSERT_FALSE(srv.update.slot_verified);
     expect_nrc(REQ(0x31, 0x01, 0xF0, 0x01), UDSOTA_NRC_REQUEST_SEQUENCE_ERROR);
     TEST_ASSERT_EQUAL_UINT(0, m.n_activate);
 }
@@ -459,8 +459,8 @@ static void test_ff01_again_after_pass_repeats_verdict(void)
     expect_pos(REQ_RAW(0x31, 0x01, 0xFF, 0x01), UDSOTA_RID_CHECK_PROG_DEPS, UDSOTA_DL_OK);   /* at once: no job */
     TEST_ASSERT_FALSE(srv.job_running);
     TEST_ASSERT_EQUAL_UINT(1, m.n_end);
-    TEST_ASSERT_TRUE(srv.slot_verified);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_OK, srv.last_dl.reason_code);
+    TEST_ASSERT_TRUE(srv.update.slot_verified);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_OK, srv.update.last_dl.reason_code);
     TEST_ASSERT_EQUAL_UINT(0, REQ_RAW(0x31, 0x81, 0xFF, 0x01));                    /* SPRMIB: silent */
     TEST_ASSERT_EQUAL_UINT(1, m.n_end);
 }
@@ -501,8 +501,8 @@ static void test_ff01_cap_records_worker_timeout(void)
     m.hold = true;
     TEST_ASSERT_EQUAL_UINT(0, REQ_RAW(0x31, 0x01, 0xFF, 0x01));
     expect_nrc(poll_to_cap(now), UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_WORKER_TIMEOUT, srv.last_dl.reason_code);
-    TEST_ASSERT_FALSE(srv.slot_verified);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_WORKER_TIMEOUT, srv.update.last_dl.reason_code);
+    TEST_ASSERT_FALSE(srv.update.slot_verified);
 }
 
 /* Leaving programming after 0x37 aborts the open handle (the server's enter_session), so FF01 next session is 0x24. */
@@ -527,11 +527,11 @@ static void test_s3_fallback_after_exit_clears_dl_complete(void)
     memset(&blk[2], 0x5A, IMG_LEN);
     TEST_ASSERT_EQUAL_UINT(2, send(blk, sizeof blk));
     TEST_ASSERT_EQUAL_UINT(1, REQ(0x37));
-    TEST_ASSERT_TRUE(srv.dl_complete);
+    TEST_ASSERT_TRUE(srv.update.dl_complete);
     TEST_ASSERT_EQUAL_UINT(0, poll_after(UDSOTA_S3_MS));         /* S3 expires: back to default, handle aborted */
     TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_DEFAULT, srv.session);
-    TEST_ASSERT_FALSE(srv.dl_complete);
-    TEST_ASSERT_FALSE(srv.ota_open);
+    TEST_ASSERT_FALSE(srv.update.dl_complete);
+    TEST_ASSERT_FALSE(srv.update.ota_open);
     enter_programming(true);
     expect_nrc(REQ(0x31, 0x01, 0xFF, 0x01), UDSOTA_NRC_REQUEST_SEQUENCE_ERROR);
     TEST_ASSERT_EQUAL_UINT(0, m.n_end);
@@ -554,7 +554,7 @@ static void test_activate_after_new_download_is_24(void)
     ff01_pass();
     request_download();
     TEST_ASSERT_EQUAL_UINT(1, m.n_unverify);                  /* the accepted 0x34 unverified the slot */
-    TEST_ASSERT_FALSE(srv.slot_verified);
+    TEST_ASSERT_FALSE(srv.update.slot_verified);
     expect_nrc(REQ(0x31, 0x01, 0xF0, 0x01), UDSOTA_NRC_REQUEST_SEQUENCE_ERROR);
     TEST_ASSERT_EQUAL_UINT(0, m.n_activate);
 }
@@ -796,7 +796,7 @@ static void test_sprmib(void)
     TEST_ASSERT_EQUAL_UINT(0, REQ_RAW(0x31, 0x81, 0xF0, 0x00));
     mark_transfer_exited();
     TEST_ASSERT_EQUAL_UINT(0, REQ(0x31, 0x81, 0xFF, 0x01));
-    TEST_ASSERT_TRUE(srv.slot_verified);                      /* it ran; only the answer was dropped */
+    TEST_ASSERT_TRUE(srv.update.slot_verified);                      /* it ran; only the answer was dropped */
     mark_transfer_exited();
     m.hold = true;
     TEST_ASSERT_EQUAL_UINT(0, REQ_RAW(0x31, 0x81, 0xFF, 0x01));
@@ -1011,8 +1011,8 @@ static void test_app_cap_during_download_is_aborted(void)
     app.hold = true;
     TEST_ASSERT_EQUAL_UINT(0, REQ_RAW(0x31, 0x01, 0x12, 0x34));
     expect_nrc(poll_to_cap(now), UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE);
-    TEST_ASSERT_FALSE(srv.download_active);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_ABORTED, srv.last_dl.reason_code);
+    TEST_ASSERT_FALSE(srv.update.download_active);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_ABORTED, srv.update.last_dl.reason_code);
     TEST_ASSERT_TRUE(srv.app_orphan);
 }
 

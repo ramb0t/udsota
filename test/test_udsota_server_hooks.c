@@ -330,7 +330,7 @@ static void test_gate_denial_at_transfer_ends_it(void)
     TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_DEFAULT, s.session);
     TEST_ASSERT_EQUAL_UINT8(0, s.security);
     TEST_ASSERT_EQUAL_UINT(1, e.aborts);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_ABORTED, s.last_dl.reason_code);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_ABORTED, s.update.last_dl.reason_code);
     TEST_ASSERT_EQUAL_UINT16(0, s.counters.stmin_violations);
 }
 
@@ -477,8 +477,8 @@ static void test_end_session_mid_transfer(void)
     TEST_ASSERT_EQUAL_UINT8(0, s.security);
     TEST_ASSERT_FALSE(udsota_download_active(&s));
     TEST_ASSERT_EQUAL_UINT(1, e.aborts);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_ABORTED, s.last_dl.reason_code);
-    TEST_ASSERT_EQUAL_UINT32(BLK, s.last_dl.bytes_received);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_ABORTED, s.update.last_dl.reason_code);
+    TEST_ASSERT_EQUAL_UINT32(BLK, s.update.last_dl.bytes_received);
     TEST_ASSERT_EQUAL_INT(UDSOTA_PHASE_IDLE, g_mock.phases[g_mock.phase_n - 1u]);
     block(2);
     EXPECT(0x7F, 0x36, 0x7F);
@@ -512,8 +512,8 @@ static void test_end_session_with_pending_write(void)
     TEST_ASSERT_FALSE(s.worker_orphan);
     TEST_ASSERT_FALSE(udsota_download_active(&s));
     TEST_ASSERT_EQUAL_UINT(1, e.aborts);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_ABORTED, s.last_dl.reason_code);
-    TEST_ASSERT_EQUAL_UINT32(BLK, s.last_dl.bytes_received);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_ABORTED, s.update.last_dl.reason_code);
+    TEST_ASSERT_EQUAL_UINT32(BLK, s.update.last_dl.bytes_received);
     TEST_ASSERT_EQUAL_INT(UDSOTA_PHASE_IDLE, udsota_phase(&s));
     block(2);
     EXPECT(0x7F, 0x36, 0x7F);
@@ -568,8 +568,8 @@ static void test_end_session_latch_applied_at_fc_point(void)
     TEST_ASSERT_EQUAL_UINT8(0, s.security);
     TEST_ASSERT_FALSE(udsota_download_active(&s));
     TEST_ASSERT_EQUAL_UINT(1, e.aborts);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_ABORTED, s.last_dl.reason_code);
-    TEST_ASSERT_EQUAL_UINT32(BLK, s.last_dl.bytes_received);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_ABORTED, s.update.last_dl.reason_code);
+    TEST_ASSERT_EQUAL_UINT32(BLK, s.update.last_dl.bytes_received);
     REQ(0x22, 0xF1, 0x86);
     EXPECT(0x62, 0xF1, 0x86, UDSOTA_SESSION_DEFAULT);
 }
@@ -636,12 +636,12 @@ static void test_end_session_during_pending_verify(void)
     now += 5u;
     rlen = udsota_poll(&s, resp, sizeof resp, now);
     EXPECT(0x71, 0x01, HI(UDSOTA_RID_CHECK_PROG_DEPS), LO(UDSOTA_RID_CHECK_PROG_DEPS), UDSOTA_DL_OK);
-    TEST_ASSERT_TRUE(s.slot_verified);
+    TEST_ASSERT_TRUE(s.update.slot_verified);
     now += 5u;
     udsota_poll(&s, resp, sizeof resp, now);
     TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_DEFAULT, s.session);
-    TEST_ASSERT_TRUE(s.slot_verified);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_OK, s.last_dl.reason_code);
+    TEST_ASSERT_TRUE(s.update.slot_verified);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_OK, s.update.last_dl.reason_code);
 }
 
 /* A worker orphan does not hold end_session back: after the 90 s cap, a new extended session ends at once. */

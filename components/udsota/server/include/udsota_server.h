@@ -6,7 +6,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "udsota_server_wire.h"
-#include "udsota_update_state.h"   /* udsota_engine_t, udsota_result_t and udsota_progress_t, which the context names */
+#include "udsota_update_state.h"   /* udsota_update_t and udsota_progress_t, which the context names */
 
 /* ---- Server-internal timing and limits (not on the wire) ---- */
 #define UDSOTA_JOB_CAP_MS         90000u    /* 0x78 stops here: NRC 0x72 and the session ends (twice the worst-case erase) */
@@ -165,7 +165,6 @@ typedef size_t (*udsota_job_done_fn)(struct udsota_server *s, int result, uint8_
 typedef struct udsota_server {
     /* What udsota_init() was given: copies, with every 0 in cfg resolved to its default (cfg's pointers stay the caller's). */
     udsota_config_t   cfg;
-    udsota_engine_t   engine;
     udsota_security_t sec;               /* used only when secured */
     bool              secured;           /* init got a security struct: 0x27 served and keys required */
     udsota_hooks_t    hooks;             /* all NULL when init got NULL */
@@ -198,21 +197,7 @@ typedef struct udsota_server {
                                             runs; only hooks.routine_poll clears it */
     size_t            job_out_len;       /* app routine: bytes of its out record, written at resp[4] */
     bool              end_pending;       /* udsota_end_session arrived during a job: applied once the job has answered */
-    /* Download. */
-    bool              download_active;   /* between an accepted 0x34 and 0x37 or an abort */
-    bool              ota_open;          /* the engine holds an open image: from the first 0x36's begin (from the 34's
-                                            zbegin when coded) to FF01 or an abort */
-    uint8_t           next_bsc;          /* expected blockSequenceCounter (1 after 0x34, wraps 0xFF->0x00) */
-    uint32_t          dl_announced;      /* memorySize from 0x34 */
-    uint32_t          dl_received;       /* data bytes accepted; the offset engine.write gets (coded bytes with
-                                            dl_compressed) */
-    bool              dl_compressed;     /* the 34 had a coded DFI (10, 20 or 30): 36 goes to engine.zwrite and 37
-                                            asks engine.zend */
-    bool              slot_verified;     /* FF01 passed since the last download or reboot; survives session changes */
-    bool              dl_complete;       /* 0x37 accepted: FF01 may verify the open image */
-    uint32_t          cf_median_us;      /* 64-CF median from the last FC point (UDSOTA_CF_MEDIAN_NONE before one) */
-    uint32_t          cf_stmin_us;       /* the STmin that FC point judged it against */
-    udsota_result_t   last_dl;           /* F1F1, answered by the server itself */
+    udsota_update_t   update;            /* the firmware updater's state (udsota_update_state.h), engine included */
     udsota_counters_t counters;          /* F1F2, answered by the server itself; the transport bumps its counters here */
     /* SecurityAccess. RAM only: a reset re-arms the boot delay instead. */
     bool              sa_seed_valid;
@@ -225,14 +210,6 @@ typedef struct udsota_server {
     /* Respond-then-restart. */
     uint8_t           reset_phase;       /* 0 idle, 1 armed (the answer is leaving), 2 fired */
     uint32_t          reset_armed_ms;
-    /* Progress (udsota_progress). */
-    uint32_t          dl_written;        /* image bytes written in this download, udsota_progress_t.done: set by the
-                                            34 and advanced with dl_received after each 76. A download whose 36s carry
-                                            other than image bytes (a coded one) sets it from the engine's count */
-    uint8_t           progress_stage;    /* udsota_stage_t last reported to hooks.progress */
-    uint8_t           progress_reason;   /* last_reason last reported to hooks.progress: a coded 34 refused for
-                                            memory changes it without changing the stage */
-    bool              progress_block;    /* a block was written since the last report */
 } udsota_server_t;
 
 /* udsota_init without the updater: resets s to the default session, locked and idle, and copies cfg (NULL = every

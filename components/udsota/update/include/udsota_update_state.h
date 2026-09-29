@@ -1,5 +1,5 @@
-/* The updater's types the server context embeds or names: the engine, the download reason codes, the F1F0 and
- * F1F1 records and the progress report. Self-contained (only stdint, stddef and stdbool), so a server-only build
+/* The updater's types the server context embeds or names: its state (udsota_update_t), the engine, the download
+ * reason codes, the F1F0 and F1F1 records and the progress report. Self-contained (only stdint, stddef and stdbool), so a server-only build
  * can take this one updater header alone. udsota_update_wire.h holds the rest of the updater's wire contract. */
 #pragma once
 #include <stdbool.h>
@@ -118,3 +118,29 @@ typedef struct {   /* required; only unverify, status, running_sha, version and 
     uint16_t zformats;                            /* the coded DFIs served: UDSOTA_DL_FMT(0x10) | ...; 0 serves none,
                                                      whatever zbegin is */
 } udsota_engine_t;
+
+/* The updater's state, the server context's `update` member. */
+typedef struct {
+    udsota_engine_t   engine;            /* udsota_init's engine, copied */
+    udsota_result_t   last_dl;           /* F1F1, answered by the server itself */
+    uint32_t          dl_announced;      /* memorySize from 0x34 */
+    uint32_t          dl_received;       /* data bytes accepted; the offset engine.write gets (coded bytes with
+                                            dl_compressed) */
+    uint32_t          dl_written;        /* image bytes written in this download, udsota_progress_t.done: set by the
+                                            34 and advanced with dl_received after each 76. A download whose 36s carry
+                                            other than image bytes (a coded one) sets it from the engine's count */
+    uint32_t          cf_median_us;      /* 64-CF median from the last FC point (UDSOTA_CF_MEDIAN_NONE before one) */
+    uint32_t          cf_stmin_us;       /* the STmin that FC point judged it against */
+    bool              download_active;   /* between an accepted 0x34 and 0x37 or an abort */
+    bool              ota_open;          /* the engine holds an open image: from the first 0x36's begin (from the 34's
+                                            zbegin when coded) to FF01 or an abort */
+    bool              dl_compressed;     /* the 34 had a coded DFI (10, 20 or 30): 36 goes to engine.zwrite and 37
+                                            asks engine.zend */
+    bool              slot_verified;     /* FF01 passed since the last download or reboot; survives session changes */
+    bool              dl_complete;       /* 0x37 accepted: FF01 may verify the open image */
+    bool              progress_block;    /* a block was written since the last report */
+    uint8_t           next_bsc;          /* expected blockSequenceCounter (1 after 0x34, wraps 0xFF->0x00) */
+    uint8_t           progress_stage;    /* udsota_stage_t last reported to hooks.progress */
+    uint8_t           progress_reason;   /* last_reason last reported to hooks.progress: a coded 34 refused for
+                                            memory changes it without changing the stage */
+} udsota_update_t;
