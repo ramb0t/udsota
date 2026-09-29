@@ -30,10 +30,12 @@ const udsota_engine_t *udsota_esp32_engine(void);
  * SHA prefix, flag 0x01 (IDF checks update signatures) and 0x02 (this boot ignored config). Any task, not
  * from an ISR, and safe before the engine starts: the slots read UDSOTA_SLOT_NONE until the boot read has
  * finished. With rollback off the running state is never PENDING_VERIFY. Without CONFIG_UDSOTA_ESP32_UPDATER the
- * slots always read UDSOTA_SLOT_NONE and only the flags are set, with the same meaning. */
+ * slots always read UDSOTA_SLOT_NONE and only the flags are set, with the same meaning, and nothing serves F1F0
+ * unless the app's did_read does, with udsota_pack_status() over this. */
 void udsota_esp32_status(udsota_status_t *out);
-/* True when the running image is PENDING_VERIFY and is the boot slot; from the cache, any task. Always false
- * without CONFIG_UDSOTA_ESP32_UPDATER. */
+/* True when the running image is PENDING_VERIFY and is the boot slot; from the cache, any task. Without
+ * CONFIG_UDSOTA_ESP32_UPDATER always false, and the OTA state is never read: with rollback on, confirming an image
+ * another updater wrote is that updater's job (esp_ota_mark_app_valid_cancel_rollback()). */
 bool udsota_esp32_image_unconfirmed(void);
 /* True while an engine job is queued or running, or the started worker's boot read has not finished; false when
  * the engine never started, and always without CONFIG_UDSOTA_ESP32_UPDATER. Any task. */

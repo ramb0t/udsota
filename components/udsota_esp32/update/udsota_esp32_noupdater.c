@@ -1,7 +1,8 @@
 /* udsota ESP32 port without CONFIG_UDSOTA_ESP32_UPDATER: the updater's public functions (udsota_esp32.h) as stubs,
  * and the seam call that starts the server alone. Built in place of udsota_esp32_engine.c and udsota_esp32_image.c,
- * so no engine, flash worker, esp_ota_* or core updater code is linked. udsota_esp32_image_check() has no stub: a
- * caller gets a link error. */
+ * so no engine, flash worker, OTA write path (esp_ota_begin/write/end/set_boot_partition) or core updater code is
+ * linked; ESP-IDF's own esp_partition still links esp_ota_get_running_partition. udsota_esp32_image_check() has no
+ * stub: a caller gets a link error. */
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -21,7 +22,8 @@ bool udsota_esp32_engine_busy(void)
     return false;
 }
 
-/* Never unconfirmed: nothing here reads the OTA state. */
+/* Always false: nothing here reads the OTA state, so this says nothing about an image another updater wrote. With
+ * rollback on, that updater confirms it (esp_ota_mark_app_valid_cancel_rollback()). */
 bool udsota_esp32_image_unconfirmed(void)
 {
     return false;

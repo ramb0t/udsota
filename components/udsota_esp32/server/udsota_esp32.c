@@ -310,11 +310,18 @@ esp_err_t udsota_esp32_start(const udsota_config_t *cfg, const udsota_hooks_t *h
     atomic_store_explicit(&s_q, q, memory_order_release);   /* last: on_frame queues only from now */
 #if defined(CONFIG_UDSOTA_ESP32_DEBUG_MEASURE)
     const size_t int_after = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-    const udsota_engine_t *eng = udsota_esp32_engine();   /* NULL without the updater */
-    ESP_LOGI(TAG, "on 0x%03" PRIX32 "/0x%03" PRIX32 ": internal heap -%d B (worker and keys included), "
-             "PSRAM %u B buffers + %d B stack, slot %" PRIu32 " B",
-             (uint32_t)s_cfg.req_id, (uint32_t)s_cfg.resp_id, (int)int_before - (int)int_after,
-             (unsigned)sizeof *bufs, CONFIG_UDSOTA_ESP32_TASK_STACK, (eng != NULL) ? eng->slot_size : 0u);
+    const udsota_engine_t *eng = udsota_esp32_engine();   /* NULL without the updater: no worker and no slot */
+    if (eng != NULL) {
+        ESP_LOGI(TAG, "on 0x%03" PRIX32 "/0x%03" PRIX32 ": internal heap -%d B (worker and keys included), "
+                 "PSRAM %u B buffers + %d B stack, slot %" PRIu32 " B",
+                 (uint32_t)s_cfg.req_id, (uint32_t)s_cfg.resp_id, (int)int_before - (int)int_after,
+                 (unsigned)sizeof *bufs, CONFIG_UDSOTA_ESP32_TASK_STACK, eng->slot_size);
+    } else {
+        ESP_LOGI(TAG, "on 0x%03" PRIX32 "/0x%03" PRIX32 ": internal heap -%d B (keys included; no updater, so no "
+                 "worker), PSRAM %u B buffers + %d B stack",
+                 (uint32_t)s_cfg.req_id, (uint32_t)s_cfg.resp_id, (int)int_before - (int)int_after,
+                 (unsigned)sizeof *bufs, CONFIG_UDSOTA_ESP32_TASK_STACK);
+    }
 #else
     ESP_LOGD(TAG, "on 0x%03" PRIX32 "/0x%03" PRIX32, (uint32_t)s_cfg.req_id, (uint32_t)s_cfg.resp_id);
 #endif

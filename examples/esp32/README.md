@@ -18,7 +18,7 @@ idf.py -C examples/esp32 -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.com
 
 `sdkconfig.delta` instead takes delta downloads as well (`udsota flash --diff-from`), which rebuild the new image from the running one and a patch. Keep the `.bin` of every build you flash: it is the base the next patch is made from.
 
-`sdkconfig.noupdater` builds the port as a UDS server alone, with `CONFIG_UDSOTA_ESP32_UPDATER` off: 0x34, 0x36 and 0x37 answer 0x11, and there is no flash worker and no `esp_ota` code. It excludes the other two, which need the updater. The port's [README](../../components/udsota_esp32/README.md) lists what changes.
+`sdkconfig.noupdater` builds the port as a UDS server alone, with `CONFIG_UDSOTA_ESP32_UPDATER` off: 0x34, 0x36 and 0x37 answer 0x11, there is no flash worker and no OTA write path (ESP-IDF itself still links `esp_ota_get_running_partition`), and rollback is off, since nothing confirms an image. It excludes the other two, which need the updater. The port's [README](../../components/udsota_esp32/README.md) lists what changes.
 
 ```sh
 idf.py -C examples/esp32 -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.noupdater" set-target esp32s3 build

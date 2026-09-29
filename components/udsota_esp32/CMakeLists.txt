@@ -8,7 +8,8 @@
 # file lists are in sources.cmake.
 include(${CMAKE_CURRENT_LIST_DIR}/sources.cmake)
 # Without CONFIG_UDSOTA_ESP32_UPDATER the updater's files give way to its stubs (udsota_esp32_noupdater.c), and
-# nothing references the engine, esp_ota_* or the core's updater, so none of it is linked.
+# nothing references the engine, the OTA write path (esp_ota_begin/write/end/set_boot_partition) or the core's
+# updater, so none of it is linked. ESP-IDF's own esp_partition still links esp_ota_get_running_partition.
 if(CONFIG_UDSOTA_ESP32_UPDATER)
     set(srcs ${UDSOTA_ESP32_SRCS})
 else()
