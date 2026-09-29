@@ -6,7 +6,7 @@
 #include <string.h>
 #include "unity.h"
 #include "udsota.h"
-#include "udsota_priv.h"
+#include "udsota_service.h"
 #include "udsota_mock.h"
 
 #define T0         60000u   /* past the 10 s post-boot 0x27 delay */

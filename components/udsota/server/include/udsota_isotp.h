@@ -12,7 +12,7 @@
 #include <stdint.h>
 #include "isotp.h"
 #include "isotp_port.h"
-#include "udsota.h"
+#include "udsota_server.h"
 #include "udsota_rxwatch.h"
 
 #define UDSOTA_TX_RETRY 1                     /* can.send: no room now, keep the frame and retry */

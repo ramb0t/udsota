@@ -3,7 +3,7 @@
 #include <string.h>
 #include "unity.h"
 #include "udsota.h"
-#include "udsota_priv.h"
+#include "udsota_service.h"
 #include "udsota_mock.h"
 
 #define RESP_MAX 64u

@@ -4,7 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include "udsota_wire.h"   /* udsota_reason_t */
+#include "udsota_update_wire.h"   /* udsota_reason_t */
 
 /* Bytes of the first block the checks read: esp_image_header_t 24 + segment header 8 +
  * esp_app_desc_t 256 + udsota_image_desc_t 32. */

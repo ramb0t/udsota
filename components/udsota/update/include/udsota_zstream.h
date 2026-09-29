@@ -8,7 +8,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "udsota_isink.h"  /* udsota_zsink_t, udsota_isink_t */
-#include "udsota_wire.h"   /* udsota_reason_t */
+#include "udsota_update_wire.h"   /* udsota_reason_t */
 
 /* udsota_inflate_t.feed results. */
 #define UDSOTA_INFLATE_MORE   0    /* all input taken or the output full: call again with more input or room */

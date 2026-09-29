@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <string.h>
 #include "udsota_isotp.h"
-#include "udsota_wire.h"
+#include "udsota_server_wire.h"
 
 #define PCI_CF   0x2u      /* Consecutive Frame: the high nibble of byte 0 */
 #define PCI_FC   0x3u      /* Flow Control */

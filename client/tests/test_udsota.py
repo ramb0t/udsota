@@ -1130,11 +1130,29 @@ WIRE_DEFINES = {"UDSOTA_DID_ACTIVE_SESSION": "DID_SESSION", "UDSOTA_DID_SW_VERSI
                 "UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE": "NRC_PROGRAMMING_FAILURE"}
 
 
-# udsota_wire.h without comments, or a skip when the checkout has no components/ (a wheel-only install).
+# Where udsota_wire.h's own #includes resolve: it is an umbrella over the server's and the updater's wire headers.
+WIRE_DIRS = (WIRE_H.parent, WIRE_H.parents[1] / "server" / "include", WIRE_H.parents[1] / "update" / "include")
+
+
+# udsota_wire.h without comments, each udsota header it includes spliced in at its #include, recursively and once
+# each, or a skip when the checkout has no components/ (a wheel-only install).
 def wire_header():
     if not WIRE_H.is_file():
         pytest.skip("no %s (not a repo checkout)" % WIRE_H)
-    return re.sub(r"/\*.*?\*/", "", WIRE_H.read_text(), flags=re.S)
+    seen = set()
+
+    def expand(path):
+        seen.add(path.name)
+        text = re.sub(r"/\*.*?\*/", "", path.read_text(), flags=re.S)
+
+        def include(m):
+            if m[1] in seen:
+                return ""
+            found = [d / m[1] for d in WIRE_DIRS if (d / m[1]).is_file()]
+            assert found, "%s includes %s, found in none of %s" % (path.name, m[1], [str(d) for d in WIRE_DIRS])
+            return expand(found[0])
+        return re.sub(r'^[ \t]*#include[ \t]+"(udsota_\w+\.h)"[^\n]*$', include, text, flags=re.M)
+    return expand(WIRE_H)
 
 
 # Check wire.py's reason names match udsota_reason_t in udsota_wire.h, by name and value.

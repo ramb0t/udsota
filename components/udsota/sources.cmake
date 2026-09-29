@@ -2,7 +2,8 @@
 # out-of-tree host build all take. include() it; it only set()s variables, so ESP-IDF's requirements pass can read it.
 #
 # By directory: UDSOTA_SERVER_SRCS, UDSOTA_UPDATE_SRCS, UDSOTA_BOOTLOOP_SRCS, and UDSOTA_SRCS (all three), with their
-# include dirs; UDSOTA_INCLUDE_DIRS (every public one) and UDSOTA_PRIV_INCLUDE_DIRS. By unit, for a host test that
+# include dirs; UDSOTA_INCLUDE_DIRS (every public one) and UDSOTA_PRIV_INCLUDE_DIRS (empty: kept so a list that names it
+# still expands). By unit, for a host test that
 # links only part: UDSOTA_SERVICES_SRCS is udsota_init() and every service, no transport; UDSOTA_ZSTREAM_SRCS needs a
 # udsota_inflate_t (udsota_tinfl.c) beside it, and UDSOTA_CODED_SRCS the zstream list and a udsota_patch_t
 # (udsota_detools.c).
@@ -22,7 +23,7 @@ set(UDSOTA_UPDATE_INCLUDE_DIRS   ${_udsota_d}/update/include)
 set(UDSOTA_BOOTLOOP_INCLUDE_DIRS ${_udsota_d}/bootloop/include)
 set(UDSOTA_INCLUDE_DIRS          ${_udsota_d}/include ${UDSOTA_SERVER_INCLUDE_DIRS} ${UDSOTA_UPDATE_INCLUDE_DIRS}
                                  ${UDSOTA_BOOTLOOP_INCLUDE_DIRS})
-set(UDSOTA_PRIV_INCLUDE_DIRS     ${_udsota_d}/server/priv)
+set(UDSOTA_PRIV_INCLUDE_DIRS     "")
 
 set(UDSOTA_SERVICES_SRCS ${_udsota_d}/server/udsota_server.c ${_udsota_d}/server/udsota_codec.c)
 set(UDSOTA_CODEC_SRCS    ${_udsota_d}/server/udsota_codec.c)

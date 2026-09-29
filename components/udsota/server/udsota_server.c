@@ -3,8 +3,11 @@
  * ESP-IDF: the transport feeds it reassembled requests, reception events and now_ms, and sends whatever it
  * returns. */
 #include <string.h>
-#include "udsota.h"
-#include "udsota_priv.h"
+#include "udsota_server.h"
+#include "udsota_service.h"
+/* The updater's half, until it moves to update/udsota_update.c: */
+#include "udsota_update.h"
+#include "udsota_update_wire.h"
 #include "udsota_rxwatch.h"   /* UDSOTA_CF_MEDIAN_NONE */
 
 /* ---- SecurityAccess 0x27: seed, then an HMAC key or a verified one (sec.verify), lockout, relock. RAM only. ---- */
@@ -1386,7 +1389,7 @@ bool udsota_download_active(const udsota_server_t *s)
     return s->download_active;
 }
 
-/* Finishes a handler whose op may have queued worker work (see udsota_priv.h). */
+/* Finishes a handler whose op may have queued worker work (see udsota_service.h). */
 size_t udsota_job_start(udsota_server_t *s, uint8_t sid, bool suppress_pos, int rc, udsota_job_done_fn done,
                      uint32_t arg, uint8_t *resp, size_t resp_max, uint32_t now_ms)
 {

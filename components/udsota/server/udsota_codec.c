@@ -1,6 +1,7 @@
 /* Byte codecs for the UDS contract layouts (F1F0, F1F1, F1F2) and big-endian helpers. Pure. */
 #include <string.h>
-#include "udsota_wire.h"
+#include "udsota_server_wire.h"
+#include "udsota_update_wire.h"   /* F1F0 and F1F1, until update/udsota_update_codec.c takes them */
 
 /* Writes v big-endian into p[0..1]. */
 void udsota_put_u16be(uint8_t *p, uint16_t v)

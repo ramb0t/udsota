@@ -5,7 +5,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include "udsota_wire.h"   /* udsota_reason_t */
+#include "udsota_update_wire.h"   /* udsota_reason_t */
 
 /* Where an image's bytes go: the engine's own synchronous first-block check, erase and write. Each returns 0 on
  * success. */

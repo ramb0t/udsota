@@ -8,7 +8,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "udsota_isink.h"  /* udsota_isink_t */
-#include "udsota_wire.h"   /* udsota_reason_t */
+#include "udsota_update_wire.h"   /* udsota_reason_t */
 
 #define UDSOTA_PATCH_MAGIC       0xfccdde10u   /* the header's first 4 bytes, little-endian (esp_delta_ota's magic) */
 #define UDSOTA_PATCH_HEADER_LEN  64u           /* magic, base hash, reserved */
