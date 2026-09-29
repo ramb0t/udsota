@@ -37,7 +37,7 @@ jobs:
         run: python -m pip install "./client[diff]" pytest
       - name: Run the client tests
         run: python -m pytest -q client/tests
-      - name: Run the release tool's tests (they fail if the current __version__ has no dated CHANGELOG section)
+      - name: Run the release tool's tests (they fail unless CHANGELOG and udsota.h agree with the current __version__)
         run: python -m pytest -q tools/test_release.py
       - name: Smoke-test the installed wheel from outside the tree
         run: |

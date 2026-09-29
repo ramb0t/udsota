@@ -1,10 +1,11 @@
-"""Release checks, release notes and version bumps, from CHANGELOG.md and the client's __version__ (see RELEASING.md).
+"""Release checks, release notes and version bumps, from CHANGELOG.md, the client's __version__ and udsota.h's
+UDSOTA_VERSION macros (see RELEASING.md).
 
-  python tools/release.py check v0.4.0    # the tag, CHANGELOG heading and client/udsota/__init__.py agree
+  python tools/release.py check v0.4.0    # the tag, CHANGELOG heading, client/udsota/__init__.py and udsota.h agree
   python tools/release.py notes v0.4.0    # the CHANGELOG section for 0.4.0, for the GitHub Release
-  python tools/release.py bump minor --latest v0.4.0   # date [Unreleased] as 0.5.0, set __version__, print 0.5.0
+  python tools/release.py bump minor --latest v0.4.0   # date [Unreleased] as 0.5.0, set __version__ and udsota.h
 
---changelog and --init read other files, as the release workflow does for a tagged commit (git show)."""
+--changelog, --init and --header read other files, as the release workflow does for a tagged commit (git show)."""
 import argparse
 import datetime
 import pathlib
@@ -17,6 +18,9 @@ TAG = re.compile(r"v(\d+\.\d+\.\d+)")
 HEADING = re.compile(r"^## \[(?P<version>[^\]]+)\] - (?P<date>.+)$", re.M)
 DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 CLIENT_VERSION = re.compile(r'^__version__ = "([^"]+)"', re.M)
+HEADER = "components/udsota/include/udsota.h"
+HEADER_VERSION = re.compile(r'^(#define UDSOTA_VERSION[ \t]+)"([^"]*)"', re.M)
+HEADER_PARTS = [re.compile(r"^(#define UDSOTA_VERSION_%s[ \t]+)(\d+)" % p, re.M) for p in ("MAJOR", "MINOR", "PATCH")]
 RELATIVE_LINK = re.compile(r"\]\((?![a-z][a-z0-9+.-]*:)([^)\s]+)\)")
 UNRELEASED = re.compile(r"^## \[Unreleased\]\n(?P<body>.*?)(?=^## \[|\Z)", re.M | re.S)
 
@@ -39,8 +43,35 @@ def section(changelog, version):
     raise ValueError("CHANGELOG.md has no ## [%s] section" % version)
 
 
-# Every way tag disagrees with the CHANGELOG and the client's __version__ (empty when they agree).
-def problems(tag, changelog, client_init):
+# Every way the header's UDSOTA_VERSION and UDSOTA_VERSION_MAJOR, _MINOR and _PATCH disagree with version.
+def header_problems(header, version):
+    found = []
+    m = HEADER_VERSION.search(header)
+    if m is None:
+        found.append("%s defines no UDSOTA_VERSION" % HEADER)
+    elif m[2] != version:
+        found.append("%s has UDSOTA_VERSION %r, not %r" % (HEADER, m[2], version))
+    parts = [p.search(header) for p in HEADER_PARTS]
+    if None in parts:
+        found.append("%s defines no UDSOTA_VERSION_MAJOR, _MINOR and _PATCH" % HEADER)
+    else:
+        numbers = ".".join(str(int(p[2])) for p in parts)
+        if numbers != version:
+            found.append("%s has UDSOTA_VERSION_MAJOR, _MINOR and _PATCH %s, not %s" % (HEADER, numbers, version))
+    return found
+
+
+# header with UDSOTA_VERSION and its three numbers set to version (X.Y.Z).
+def set_header_version(header, version):
+    header = HEADER_VERSION.sub(lambda m: '%s"%s"' % (m[1], version), header)
+    for p, n in zip(HEADER_PARTS, version.split(".")):
+        header = p.sub(lambda m: m[1] + n, header)
+    return header
+
+
+# Every way tag disagrees with the CHANGELOG, the client's __version__ and the header's UDSOTA_VERSION macros (empty
+# when they agree).
+def problems(tag, changelog, client_init, header):
     try:
         version = version_of(tag)
     except ValueError as e:
@@ -59,7 +90,7 @@ def problems(tag, changelog, client_init):
         found.append("client/udsota/__init__.py sets no __version__")
     elif m[1] != version:
         found.append("client/udsota/__init__.py has __version__ %r, not %r" % (m[1], version))
-    return found
+    return found + header_problems(header, version)
 
 
 # text with each relative Markdown link made absolute at tag, so it still works on a Release page; a bare
@@ -105,14 +136,15 @@ def cut(changelog, version, date):
                                                        changelog[m.end():])
 
 
-# Date [Unreleased] as the version after the latest tag and set __version__ to it, once the latest tag agrees
-# with both files; returns (changelog, client_init, version).
-def bump(part, latest_tag, changelog, client_init, date):
-    found = problems(latest_tag, changelog, client_init)
+# Date [Unreleased] as the version after the latest tag and set __version__ and the header's macros to it, once the
+# latest tag agrees with all three files; returns (changelog, client_init, header, version).
+def bump(part, latest_tag, changelog, client_init, header, date):
+    found = problems(latest_tag, changelog, client_init, header)
     if found:
         raise ValueError("the files don't match %s: %s" % (latest_tag, "; ".join(found)))
     version = next_version(version_of(latest_tag), part)
-    return cut(changelog, version, date), CLIENT_VERSION.sub('__version__ = "%s"' % version, client_init), version
+    return (cut(changelog, version, date), CLIENT_VERSION.sub('__version__ = "%s"' % version, client_init),
+            set_header_version(header, version), version)
 
 
 # Parse the arguments and run check, notes or bump; returns the exit code.
@@ -124,28 +156,32 @@ def main(argv=None):
     p.add_argument("--date", default=datetime.date.today().isoformat(), help="bump: the release date")
     p.add_argument("--changelog", type=pathlib.Path, default=ROOT / "CHANGELOG.md")
     p.add_argument("--init", type=pathlib.Path, default=ROOT / "client" / "udsota" / "__init__.py")
+    p.add_argument("--header", type=pathlib.Path, default=ROOT / HEADER)
     args = p.parse_args(argv)
     changelog = args.changelog.read_text(encoding="utf-8")
     try:
         if args.cmd == "bump":
             if args.latest is None:
                 p.error("bump needs --latest")
-            changelog, client_init, version = bump(args.tag, args.latest, changelog,
-                                                   args.init.read_text(encoding="utf-8"), args.date)
+            changelog, client_init, header, version = bump(args.tag, args.latest, changelog,
+                                                           args.init.read_text(encoding="utf-8"),
+                                                           args.header.read_text(encoding="utf-8"), args.date)
             args.changelog.write_text(changelog, encoding="utf-8")
             args.init.write_text(client_init, encoding="utf-8")
+            args.header.write_text(header, encoding="utf-8")
             print(version)
             return 0
         if args.cmd == "notes":
             sys.stdout.write(notes(args.tag, changelog))
             return 0
-        found = problems(args.tag, changelog, args.init.read_text(encoding="utf-8"))
+        found = problems(args.tag, changelog, args.init.read_text(encoding="utf-8"),
+                         args.header.read_text(encoding="utf-8"))
     except ValueError as e:
         found = [str(e)]
     for f in found:
         print("release: %s" % f, file=sys.stderr)
     if not found:
-        print("release: %s matches CHANGELOG.md and the client's __version__" % args.tag)
+        print("release: %s matches CHANGELOG.md, the client's __version__ and udsota.h" % args.tag)
     return 1 if found else 0
 
 
