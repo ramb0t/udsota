@@ -75,7 +75,9 @@ jobs:
     strategy:
       matrix:
         target: [esp32s3, esp32]
-        config: [default, compression, delta, noupdater]
+        # A config names the example's sdkconfig.* fragments, joined by +. delta+debugmeasure compiles every
+        # CONFIG_UDSOTA_ESP32_DEBUG_MEASURE block but the engine's XIP-from-PSRAM branch, which needs SPIRAM.
+        config: [default, compression, delta, noupdater, delta+debugmeasure]
     steps:
       - uses: actions/checkout@v4
       - name: Build the example for ${{ matrix.target }} (${{ matrix.config }})
@@ -84,7 +86,8 @@ jobs:
           . "$IDF_PATH/export.sh"
           b="$PWD/examples/esp32/build/${{ matrix.target }}"
           d="$PWD/examples/esp32/sdkconfig.defaults"
-          [ "${{ matrix.config }}" = default ] || d="$d;$PWD/examples/esp32/sdkconfig.${{ matrix.config }}"
+          c="${{ matrix.config }}"
+          [ "$c" = default ] || for f in ${c//+/ }; do d="$d;$PWD/examples/esp32/sdkconfig.$f"; done
           mkdir -p "${b%/*}"   # tee opens $b.log before idf.py has made the build tree
           idf.py -C examples/esp32 -B "$b" -D SDKCONFIG="$b/sdkconfig" -D SDKCONFIG_DEFAULTS="$d" set-target ${{ matrix.target }} build 2>&1 | tee "$b.log"
           if grep -E 'warning:' "$b.log"; then exit 1; fi   # a bare `! grep` gates the step only while it is the last line

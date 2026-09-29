@@ -4,6 +4,8 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ## [Unreleased]
 
+- Fixed, ESP32 port: `CONFIG_UDSOTA_ESP32_DEBUG_MEASURE` builds on the ESP32; its cache-off check called `flash_mmap_remain()`, which ESP-IDF has only on the other targets. The check now reports what ESP-IDF does, so on an esp32s3 running code from flash, the default, the "cache off" warning fires at each download's first block, where it said nothing before. Builds without the option are unchanged. CI builds the example with the option (`sdkconfig.debugmeasure`, new) and delta on, on both targets.
+
 ## [0.9.0] - 2026-09-29
 
 The UDS server and the firmware updater separate behind a one-way seam, each in its own directories, so a device can run udsota as its UDS server alone; the ESP32 port gains a build without the updater. Nothing changes on the wire.
