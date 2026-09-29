@@ -654,7 +654,8 @@ static void test_F3_app_routine_job(void)
     TEST_ASSERT_EQUAL_UINT32(UDSOTA_JOB_POLL_MS, udsota_ms_to_deadline(&s, now));
 }
 
-/* F4: S3 and udsota_end_session, at once and latched during a job, end in default with the phase IDLE. */
+/* F4: S3, and udsota_end_session at once and latched during a job, from extended and from programming, end in
+ * default with the phase IDLE. */
 static void test_F4_session_ends(void)
 {
     enter(ST_PROG, false);
@@ -665,21 +666,29 @@ static void test_F4_session_ends(void)
     TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_DEFAULT, s.session);
     TEST_ASSERT_EQUAL_INT(UDSOTA_PHASE_IDLE, udsota_phase(&s));
 
-    enter(ST_EXT, false);
-    udsota_end_session(&s, now);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_DEFAULT, s.session);
-    TEST_ASSERT_EQUAL_INT(UDSOTA_PHASE_IDLE, udsota_phase(&s));
+    const state_t states[] = {ST_EXT, ST_PROG};
+    const udsota_phase_t phases[] = {UDSOTA_PHASE_EXTENDED, UDSOTA_PHASE_PROGRAMMING};
+    for (size_t i = 0; i < 2u; i++) {
+        enter(states[i], false);
+        REQ(0x3E, 0x00);                       /* reports the session's phase */
+        TEST_ASSERT_EQUAL_INT_MESSAGE(phases[i], udsota_phase(&s), msg);
+        udsota_end_session(&s, now);
+        TEST_ASSERT_EQUAL_UINT8_MESSAGE(UDSOTA_SESSION_DEFAULT, s.session, msg);
+        TEST_ASSERT_EQUAL_INT_MESSAGE(UDSOTA_PHASE_IDLE, udsota_phase(&s), msg);
 
-    enter(ST_EXT, true);
-    start_pending_app_routine();
-    udsota_end_session(&s, now);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_EXTENDED, s.session);   /* latched: the job still answers */
-    app.poll_pending = false;
-    poll_at(now + UDSOTA_JOB_POLL_MS);
-    EXPECT(0x71, 0x01, HI(APP_RID), LO(APP_RID), APP_BYTE);
-    poll_at(now + UDSOTA_JOB_POLL_MS);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_DEFAULT, s.session);
-    TEST_ASSERT_EQUAL_INT(UDSOTA_PHASE_IDLE, udsota_phase(&s));
+        enter(states[i], true);
+        REQ(0x3E, 0x00);
+        TEST_ASSERT_EQUAL_INT_MESSAGE(phases[i], udsota_phase(&s), msg);
+        start_pending_app_routine();
+        udsota_end_session(&s, now);
+        TEST_ASSERT_EQUAL_UINT8_MESSAGE(k_state_session[states[i]], s.session, msg);   /* latched: the job answers */
+        app.poll_pending = false;
+        poll_at(now + UDSOTA_JOB_POLL_MS);
+        EXPECT(0x71, 0x01, HI(APP_RID), LO(APP_RID), APP_BYTE);
+        poll_at(now + UDSOTA_JOB_POLL_MS);
+        TEST_ASSERT_EQUAL_UINT8_MESSAGE(UDSOTA_SESSION_DEFAULT, s.session, msg);
+        TEST_ASSERT_EQUAL_INT_MESSAGE(UDSOTA_PHASE_IDLE, udsota_phase(&s), msg);
+    }
 }
 
 /* F5: the transport's FC check allows and counts nothing; progress reads IDLE 0 of 0 and hooks.progress never ran. */

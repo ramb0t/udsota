@@ -782,6 +782,53 @@ static void test_no_confirm_without_client_request(void)
     TEST_ASSERT_EQUAL_UINT(0, m.n_confirm);
 }
 
+/* 22 F1F1 into out (5 bytes: reason, bytes received); asserts the positive answer. */
+static void read_f1f1(uint8_t out[UDSOTA_RESULT_LEN])
+{
+    TEST_ASSERT_EQUAL_UINT(3u + UDSOTA_RESULT_LEN, REQ(0x22, 0xF1, 0xF1));
+    TEST_ASSERT_EQUAL_HEX8(0x62, resp[0]);
+    memcpy(out, &resp[3], UDSOTA_RESULT_LEN);
+}
+
+/* A ConfirmImage still running at the 90 s cap with no download open ends with 0x72 and leaves F1F1 as it was: the
+ * cap records UDSOTA_DL_WORKER_TIMEOUT only over a transfer or image it ended. */
+static void test_confirm_cap_leaves_f1f1(void)
+{
+    enter_programming(true);
+    request_download();
+    enter_extended();                                         /* the session change aborts it: F1F1 reads ABORTED */
+    uint8_t before[UDSOTA_RESULT_LEN];
+    read_f1f1(before);
+    TEST_ASSERT_EQUAL_HEX8(UDSOTA_DL_ABORTED, before[0]);
+    confirm_ready();
+    m.hold = true;
+    TEST_ASSERT_EQUAL_UINT(0, REQ_RAW(0x31, 0x01, 0xF0, 0x02));
+    TEST_ASSERT_FALSE(udsota_download_active(&srv));
+    expect_nrc(poll_to_cap(now), UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE);
+    TEST_ASSERT_TRUE(srv.worker_orphan);
+    uint8_t after[UDSOTA_RESULT_LEN];
+    read_f1f1(after);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(before, after, UDSOTA_RESULT_LEN);
+}
+
+/* An 11 01 whose restart fails ends the open transfer as UDSOTA_DL_ABORTED (the restart ended the session), not
+ * UDSOTA_DL_WORKER_TIMEOUT, which only the 90 s cap of the updater's own job records. */
+static void test_failed_reset_aborts_transfer(void)
+{
+    enter_programming(true);
+    request_download();
+    g_mock.reset_ok = false;
+    TEST_ASSERT_EQUAL_UINT(2, REQ(0x11, 0x01));
+    TEST_ASSERT_EQUAL_HEX8(0x51, resp[0]);
+    TEST_ASSERT_EQUAL_UINT(0, poll_after(1));                 /* tx drained: the restart fires, and fails */
+    TEST_ASSERT_EQUAL_UINT(1, g_mock.resets);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_DEFAULT, srv.session);
+    TEST_ASSERT_FALSE(udsota_download_active(&srv));
+    uint8_t f1f1[UDSOTA_RESULT_LEN];
+    read_f1f1(f1f1);
+    TEST_ASSERT_EQUAL_HEX8(UDSOTA_DL_ABORTED, f1f1[0]);
+}
+
 /* GetResumePoint keeps its RID reserved and answers status 0xFF "not available". */
 static void test_resume_point_reserved(void)
 {
@@ -1078,6 +1125,8 @@ int main(void)
     RUN_TEST(test_confirm_refusals);
     RUN_TEST(test_confirm_failure_is_72);
     RUN_TEST(test_no_confirm_without_client_request);
+    RUN_TEST(test_confirm_cap_leaves_f1f1);
+    RUN_TEST(test_failed_reset_aborts_transfer);
     RUN_TEST(test_resume_point_reserved);
     RUN_TEST(test_sprmib);
     RUN_TEST(test_app_routine_answers_at_once);

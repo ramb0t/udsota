@@ -15,9 +15,10 @@
 #define UDSOTA_READ_DID_MAX       1u        /* DIDs per 0x22 request; more is NRC 0x13 (ISO 14229-1 0x22 NRC table) */
 #define UDSOTA_RESET_TX_WAIT_MS   100u      /* ActivateImage and 11 01: restart once tx_pending()==0, or after this long */
 
-/* An engine op that queued work on the flash worker returns UDSOTA_PENDING instead of a result; the server
- * then waits on engine.poll. hooks.routine and hooks.routine_poll return it too, for an app routine still
- * running; the server then waits on routine_poll. INT32_MAX: never an esp_err_t, never 0. */
+/* A handler of the registered service (udsota_service.h) whose work is still queued passes UDSOTA_PENDING to
+ * udsota_job_start instead of a result; the server then waits on the service's poll (the updater's: engine.poll).
+ * hooks.routine and hooks.routine_poll return it too, for an app routine still running; the server then waits on
+ * routine_poll. INT32_MAX: never an esp_err_t, never 0. */
 #define UDSOTA_PENDING  0x7FFFFFFF
 
 #define UDSOTA_STMIN_DEFAULT_US    2000u      /* the transport's FC STmin while cfg.stmin_us is 0 */
@@ -251,9 +252,11 @@ void   udsota_on_rx_first_frame(udsota_server_t *s, uint32_t now_ms);
 void   udsota_on_rx_timeout(udsota_server_t *s, uint32_t now_ms);
 /* True while ActivateImage or 11 01 has armed the restart and waits for its answer to leave. */
 bool   udsota_restart_armed(const udsota_server_t *s);
-/* FC-point check during a download: applies a latched udsota_end_session, else records the CF timing, applies the
- * STmin monitor and asks gate(CONTINUE_TRANSFER). False = withhold the FC; the download and the session have ended
- * and F1F2 counts it. */
+/* FC-point check while the registered service has a transfer open (udsota_download_active) and no job runs: a
+ * latched udsota_end_session withholds the FC, else the service's fc_point decides (the updater records the CF timing,
+ * applies the STmin monitor and asks gate(CONTINUE_TRANSFER)). False = withhold the FC; the session has ended (and
+ * with it the transfer) and F1F2 counts it. True, counting nothing, with no service or no transfer open. */
 bool   udsota_fc_check(udsota_server_t *s, uint32_t median_cf_us, uint32_t stmin_us, uint32_t now_ms);
-/* True between an accepted 34 and 37 or an abort (the transport's receive-limit switch). */
+/* True while the registered service has a transfer open (the updater: between an accepted 34 and 37 or an abort);
+ * always false with no service. The transport's receive-limit switch. */
 bool   udsota_download_active(const udsota_server_t *s);
