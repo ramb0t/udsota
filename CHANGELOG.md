@@ -4,6 +4,9 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ## [Unreleased]
 
+- **Breaking**, host builds: each component's sources move into `server/` (the generic UDS server and its transport), `update/` (the firmware updater) and `bootloop/` (the boot-loop breaker), and a new `sources.cmake` in `components/udsota` and `components/udsota_esp32` exports their file lists and include dirs. A host build that names udsota's files, such as an integrator's unit tests, `include()`s both files and takes their variables instead: `UDSOTA_SRCS`, `UDSOTA_INCLUDE_DIRS` and `UDSOTA_PRIV_INCLUDE_DIRS` for the whole core, or a unit's list, such as `UDSOTA_SERVICES_SRCS` for what was `udsota_server.c` and `udsota_codec.c`, `UDSOTA_IMAGE_SRCS`, and `UDSOTA_ESP32_INCLUDE_DIRS`, which gains `update/include`. ESP-IDF builds, header names and the wire are unchanged. The host build now stops at configure time if a component holds a `.c` file its `sources.cmake` does not list.
+- Internal: the fuzz harness's PASS line ends with `digest=`, a hash of every request it sends and every answer it gets, so a changed answer shows even where the counts do not.
+
 ## [0.8.0] - 2026-09-29
 
 `udsota pack`, for updates that a flasher other than the client sends, and a README that walks through using udsota and managing its keys.
