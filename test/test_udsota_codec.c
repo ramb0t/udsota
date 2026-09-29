@@ -259,10 +259,14 @@ static void test_did_rid_values_pinned(void)
     TEST_ASSERT_EQUAL_HEX8(0xFF, UDSOTA_RESUME_NOT_AVAILABLE);
 }
 
-/* The RequestDownload constants give the positive response 74 20 0F FF and 4093 data bytes per 0x36. */
+/* The dataFormatIdentifiers the client sends, and the RequestDownload constants that give the positive response
+ * 74 20 0F FF and 4093 data bytes per 0x36. */
 static void test_download_values_pinned(void)
 {
     TEST_ASSERT_EQUAL_HEX8(0x00, UDSOTA_DL_DFI);
+    TEST_ASSERT_EQUAL_HEX8(0x10, UDSOTA_DL_DFI_DEFLATE);
+    TEST_ASSERT_EQUAL_HEX8(0x20, UDSOTA_DL_DFI_DELTA);
+    TEST_ASSERT_EQUAL_HEX8(0x30, UDSOTA_DL_DFI_DELTA_DEFLATE);
     TEST_ASSERT_EQUAL_HEX8(0x44, UDSOTA_DL_ALFID);
     TEST_ASSERT_EQUAL_UINT(4095, UDSOTA_DL_MAX_BLOCK_LEN);
     TEST_ASSERT_EQUAL_UINT(4093, UDSOTA_DL_MAX_DATA);
@@ -287,6 +291,10 @@ static void test_reason_codes_pinned(void)
     TEST_ASSERT_EQUAL_INT(9, UDSOTA_DL_SIG_FAILED);
     TEST_ASSERT_EQUAL_INT(10, UDSOTA_DL_WORKER_TIMEOUT);
     TEST_ASSERT_EQUAL_INT(11, UDSOTA_DL_ABORTED);
+    TEST_ASSERT_EQUAL_INT(12, UDSOTA_DL_FLASH_ERROR);
+    TEST_ASSERT_EQUAL_INT(13, UDSOTA_DL_BAD_STREAM);
+    TEST_ASSERT_EQUAL_INT(14, UDSOTA_DL_NO_MEMORY);
+    TEST_ASSERT_EQUAL_INT(15, UDSOTA_DL_BAD_BASE);
 }
 
 /* F1F0 slot numbers, state encodings and flag bits are wire values the PC tool decodes. */

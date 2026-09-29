@@ -1,10 +1,11 @@
 /* Mutation fuzzing of the delta patch path a device runs on untrusted input: udsota_coded over the real detools and
  * tinfl, fed mutants of test/fixtures/delta_fixtures.h's patches (bit flips, byte overwrites, truncations,
  * insertions, deletions, bytes appended after the end and header edits) in random splits, under DFI 0x20 and 0x30,
- * with 0x30's DEFLATE layer mutated as well as the patch inside it. Deterministic (a fixed LCG
- * seed), and built with the sanitizers. Every mutant must end without a crash, with every base read inside the
- * running image, the first-block check before the erase, every write at the next image offset and never past
- * memorySize, and only a download that rebuilt all memorySize bytes, with no base read refused, may pass its 37. DELTA_PTAIL's mutants also exercise image bytes the 37 writes. Prints one PASS line; exits 1 at the first broken invariant. */
+ * with 0x30's DEFLATE layer mutated as well as the patch inside it. Deterministic (a fixed LCG seed), and built
+ * with the sanitizers. Every mutant must end without a crash, with every base read inside the running image, the
+ * first-block check before the erase, every write at the next image offset and never past memorySize, and only a
+ * download that rebuilt all memorySize bytes, with no base read refused, may pass its 37. DELTA_PTAIL's mutants
+ * also exercise image bytes the 37 writes. Prints one PASS line; exits 1 at the first broken invariant. */
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -194,32 +195,24 @@ static void run(uint8_t dfi, const uint8_t *payload, size_t n)
 
 int main(void)
 {
+    static const struct { const uint8_t *p; size_t n; uint8_t dfi; } F[] = {   /* forms 0-3: a fixture, mutated */
+        {DELTA_P20, sizeof DELTA_P20, UDSOTA_DL_DFI_DELTA},                  /* the heatshrink patch */
+        {DELTA_PNONE, sizeof DELTA_PNONE, UDSOTA_DL_DFI_DELTA},              /* the uncompressed patch */
+        {DELTA_PTAIL, sizeof DELTA_PTAIL, UDSOTA_DL_DFI_DELTA},              /* last image bytes wait for the 37 */
+        {DELTA_P30, sizeof DELTA_P30, UDSOTA_DL_DFI_DELTA_DEFLATE},          /* the DEFLATE stream itself */
+    };
     static uint8_t p[PATCH_CAP], raw[PATCH_CAP];
     for (g_it = 0; g_it < ITERATIONS; g_it++) {
         const unsigned form = g_it % 5u;
-        size_t n;
-        if (form == 0u) {                               /* 0x20: the heatshrink patch, mutated */
-            memcpy(p, DELTA_P20, sizeof DELTA_P20);
-            n = mutate(p, sizeof DELTA_P20, sizeof p);
-            run(UDSOTA_DL_DFI_DELTA, p, n);
-        } else if (form == 1u) {                        /* 0x20: the uncompressed patch, mutated */
-            memcpy(p, DELTA_PNONE, sizeof DELTA_PNONE);
-            n = mutate(p, sizeof DELTA_PNONE, sizeof p);
-            run(UDSOTA_DL_DFI_DELTA, p, n);
-        } else if (form == 2u) {                        /* 0x20: the patch whose last image bytes wait for the 37 */
-            memcpy(p, DELTA_PTAIL, sizeof DELTA_PTAIL);
-            n = mutate(p, sizeof DELTA_PTAIL, sizeof p);
-            run(UDSOTA_DL_DFI_DELTA, p, n);
-        } else if (form == 3u) {                        /* 0x30: the DEFLATE stream itself mutated */
-            memcpy(p, DELTA_P30, sizeof DELTA_P30);
-            n = mutate(p, sizeof DELTA_P30, sizeof p);
-            run(UDSOTA_DL_DFI_DELTA_DEFLATE, p, n);
+        if (form < 4u) {
+            memcpy(p, F[form].p, F[form].n);
+            const size_t n = mutate(p, F[form].n, sizeof p);
+            run(F[form].dfi, p, n);
         } else {                                        /* 0x30: the uncompressed patch mutated, then deflated */
             memcpy(raw, DELTA_PNONE, sizeof DELTA_PNONE);
             const size_t rn = mutate(raw, sizeof DELTA_PNONE, sizeof raw);
             const int flags = (int)tdefl_create_comp_flags_from_zip_params(6, -15, MZ_DEFAULT_STRATEGY);
-            n = tdefl_compress_mem_to_mem(p, sizeof p, raw, rn, flags);
-            run(UDSOTA_DL_DFI_DELTA_DEFLATE, p, n);
+            run(UDSOTA_DL_DFI_DELTA_DEFLATE, p, tdefl_compress_mem_to_mem(p, sizeof p, raw, rn, flags));
         }
     }
     printf("%s fuzz_udsota_patch: %u mutants, %u passed their 37 (rebuilding whole images, %u of them writing at the "

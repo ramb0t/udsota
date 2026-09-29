@@ -339,7 +339,6 @@ static void test_wrong_descriptor_magic_refused_before_erase(void)
     TEST_ASSERT_EQUAL_STRING("C", m.log);
     TEST_ASSERT_EQUAL_UINT32(0, m.begin_size);
     TEST_ASSERT_EQUAL_UINT(0, m.writes);
-    TEST_ASSERT_EQUAL_INT(3, UDSOTA_DL_BAD_BOARD);                        /* the wire value a client reports */
     const uint8_t rd[] = {UDSOTA_SID_READ_DID, 0xF1, 0xF1};
     send(rd, sizeof rd);
     EXPECT(0x62, 0xF1, 0xF1, UDSOTA_DL_BAD_BOARD, 0x00, 0x00, 0x00, 0x00);
@@ -755,13 +754,6 @@ static void test_op_not_queued_0x72(void)
     TEST_ASSERT_EQUAL_UINT32(UDSOTA_DL_MAX_DATA, srv.last_dl.bytes_received);
 }
 
-/* The new reason code is on the wire: appended after UDSOTA_DL_ABORTED, never renumbered. */
-static void test_dl_flash_error_wire_value(void)
-{
-    TEST_ASSERT_EQUAL_INT(11, UDSOTA_DL_ABORTED);
-    TEST_ASSERT_EQUAL_INT(12, UDSOTA_DL_FLASH_ERROR);
-}
-
 /* An accepted 34 un-verifies the other slot once, before anything is queued, even with FF01 passed. */
 static void test_accepted_download_unverifies_slot(void)
 {
@@ -889,7 +881,6 @@ int main(void)
     RUN_TEST(test_worker_write_failure_0x72);
     RUN_TEST(test_worker_erase_failure_0x72);
     RUN_TEST(test_op_not_queued_0x72);
-    RUN_TEST(test_dl_flash_error_wire_value);
     RUN_TEST(test_accepted_download_unverifies_slot);
     RUN_TEST(test_unverify_precedes_old_handle_abort);
     RUN_TEST(test_refused_download_does_not_unverify);

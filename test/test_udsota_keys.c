@@ -45,6 +45,13 @@ static bool rec_hmac(const uint8_t *key, size_t key_len, const uint8_t *msg, siz
  *   python3 -c 'import hmac,hashlib as h; i=bytes([2,0,0,0,0,1]); k=hmac.new(bytes(range(32)),b"udsota-kat"+i,h.sha256).digest();
  *               print(k.hex(), hmac.new(k,bytes(range(16,32))+b"\x01"+i,h.sha256).hexdigest())' */
 
+static const uint8_t T_MASTER[32] = {   /* 00..1F */
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+};
+static const uint8_t T_SEED[16] = {   /* 10..1F */
+    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+};
 static const uint8_t T_ID[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
 static const uint8_t T_TC2[32] = {
     0x5b, 0xdc, 0xc1, 0x46, 0xbf, 0x60, 0x75, 0x4e, 0x6a, 0x04, 0x24, 0x26, 0x08, 0x95, 0x75, 0xc7,
@@ -71,26 +78,14 @@ static uint8_t g_vmsg[UDSOTA_KEYS_SIG_MSG_MAX];
 static size_t  g_vmsg_len;
 static int     g_vanswer;   /* what always_verify answers */
 
-/* Fills the test master (0..31) and test seed (0x10..0x1F). */
-static void test_inputs(uint8_t master[32], uint8_t seed[16])
-{
-    for (int i = 0; i < 32; i++) {
-        master[i] = (uint8_t)i;
-    }
-    for (int i = 0; i < 16; i++) {
-        seed[i] = (uint8_t)(0x10 + i);
-    }
-}
-
 /* Answers the four known (key, msg) pairs with their true HMAC; any other input fails. */
 static bool canned_hmac(const uint8_t *key, size_t key_len, const uint8_t *msg, size_t msg_len,
                         uint8_t out[UDSOTA_KEYS_HMAC_LEN])
 {
-    uint8_t master[32], seed[16], kdev_msg[16], key_msg[23];
-    test_inputs(master, seed);
+    uint8_t kdev_msg[16], key_msg[23];
     memcpy(kdev_msg, "udsota-kat", 10);
     memcpy(&kdev_msg[10], T_ID, 6);
-    memcpy(key_msg, seed, 16);
+    memcpy(key_msg, T_SEED, 16);
     memcpy(&key_msg[17], T_ID, 6);
 
     int which = -1;
@@ -98,7 +93,7 @@ static bool canned_hmac(const uint8_t *key, size_t key_len, const uint8_t *msg, 
     if (key_len == 4 && memcmp(key, "Jefe", 4) == 0 && msg_len == 28
         && memcmp(msg, "what do ya want for nothing?", 28) == 0) {
         which = 0; answer = T_TC2;
-    } else if (key_len == 32 && memcmp(key, master, 32) == 0 && msg_len == 16
+    } else if (key_len == 32 && memcmp(key, T_MASTER, 32) == 0 && msg_len == 16
                && memcmp(msg, kdev_msg, 16) == 0) {
         which = 1; answer = T_KDEV;
     } else if (key_len == 32 && memcmp(key, T_KDEV, 32) == 0 && msg_len == 23) {
@@ -139,12 +134,11 @@ void tearDown(void) {}
 /* K_dev = HMAC(master, "udsota-example" || MAC): a 32-byte key and a 20-byte message, whole output. */
 static void test_kdev_hashes_label_then_id_under_master(void)
 {
-    uint8_t master[32], seed[16], kdev[32];
-    test_inputs(master, seed);
-    TEST_ASSERT_TRUE(udsota_keys_derive_kdev(rec_hmac, master, 32, "udsota-example", T_ID, 6, kdev));
+    uint8_t kdev[32];
+    TEST_ASSERT_TRUE(udsota_keys_derive_kdev(rec_hmac, T_MASTER, 32, "udsota-example", T_ID, 6, kdev));
     TEST_ASSERT_EQUAL_INT(1, g_ncalls);
     TEST_ASSERT_EQUAL_UINT(32, g_calls[0].key_len);
-    TEST_ASSERT_EQUAL_HEX8_ARRAY(master, g_calls[0].key, 32);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(T_MASTER, g_calls[0].key, 32);
     const uint8_t want_msg[20] = {'u', 'd', 's', 'o', 't', 'a', '-', 'e', 'x', 'a', 'm', 'p', 'l', 'e',
                                   0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
     TEST_ASSERT_EQUAL_UINT(20, g_calls[0].msg_len);
@@ -158,12 +152,11 @@ static void test_kdev_hashes_label_then_id_under_master(void)
  * 8-byte ID follows the label. */
 static void test_kdev_takes_key_and_id_lengths_from_the_caller(void)
 {
-    uint8_t master[32], seed[16], kdev[32];
+    uint8_t kdev[32];
     const uint8_t id[8] = {1, 2, 3, 4, 5, 6, 7, 8};
-    test_inputs(master, seed);
-    TEST_ASSERT_TRUE(udsota_keys_derive_kdev(rec_hmac, master, 16, "udsota-example", id, sizeof id, kdev));
+    TEST_ASSERT_TRUE(udsota_keys_derive_kdev(rec_hmac, T_MASTER, 16, "udsota-example", id, sizeof id, kdev));
     TEST_ASSERT_EQUAL_UINT(16, g_calls[0].key_len);
-    TEST_ASSERT_EQUAL_HEX8_ARRAY(master, g_calls[0].key, 16);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(T_MASTER, g_calls[0].key, 16);
     TEST_ASSERT_EQUAL_UINT(14 + 8, g_calls[0].msg_len);
     TEST_ASSERT_EQUAL_HEX8_ARRAY(id, &g_calls[0].msg[14], 8);
 }
@@ -171,15 +164,14 @@ static void test_kdev_takes_key_and_id_lengths_from_the_caller(void)
 /* The key is HMAC(K_dev, seed || level || ID) truncated to its first 16 bytes. */
 static void test_key_hashes_seed_level_id_under_kdev_and_keeps_16_bytes(void)
 {
-    uint8_t master[32], seed[16], key[17];
-    test_inputs(master, seed);
+    uint8_t key[17];
     memset(key, 0xEE, sizeof key);
-    TEST_ASSERT_TRUE(udsota_keys_derive_key(rec_hmac, T_KDEV, seed, 0x03, T_ID, 6, key));
+    TEST_ASSERT_TRUE(udsota_keys_derive_key(rec_hmac, T_KDEV, T_SEED, 0x03, T_ID, 6, key));
     TEST_ASSERT_EQUAL_INT(1, g_ncalls);
     TEST_ASSERT_EQUAL_UINT(32, g_calls[0].key_len);
     TEST_ASSERT_EQUAL_HEX8_ARRAY(T_KDEV, g_calls[0].key, 32);
     TEST_ASSERT_EQUAL_UINT(23, g_calls[0].msg_len);
-    TEST_ASSERT_EQUAL_HEX8_ARRAY(seed, g_calls[0].msg, 16);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(T_SEED, g_calls[0].msg, 16);
     TEST_ASSERT_EQUAL_HEX8(0x03, g_calls[0].msg[16]);
     TEST_ASSERT_EQUAL_HEX8_ARRAY(T_ID, &g_calls[0].msg[17], 6);
     for (int i = 0; i < 16; i++) {
@@ -191,20 +183,18 @@ static void test_key_hashes_seed_level_id_under_kdev_and_keeps_16_bytes(void)
 /* Level 0x01 puts 0x01 in the message: the requestSeed byte, not the sendKey byte. */
 static void test_key_level_byte_is_the_request_seed_byte(void)
 {
-    uint8_t master[32], seed[16], key[16];
-    test_inputs(master, seed);
-    TEST_ASSERT_TRUE(udsota_keys_derive_key(rec_hmac, T_KDEV, seed, 0x01, T_ID, 6, key));
+    uint8_t key[16];
+    TEST_ASSERT_TRUE(udsota_keys_derive_key(rec_hmac, T_KDEV, T_SEED, 0x01, T_ID, 6, key));
     TEST_ASSERT_EQUAL_HEX8(0x01, g_calls[0].msg[16]);
 }
 
 /* Any requestSeed byte a server may be configured with (odd, up to 0x7D) is hashed as given. */
 static void test_key_accepts_any_request_seed_level(void)
 {
-    uint8_t master[32], seed[16], key[16];
-    test_inputs(master, seed);
+    uint8_t key[16];
     const uint8_t ok[] = {0x05, 0x41, 0x7D};
     for (size_t i = 0; i < sizeof ok; i++) {
-        TEST_ASSERT_TRUE(udsota_keys_derive_key(rec_hmac, T_KDEV, seed, ok[i], T_ID, 6, key));
+        TEST_ASSERT_TRUE(udsota_keys_derive_key(rec_hmac, T_KDEV, T_SEED, ok[i], T_ID, 6, key));
         TEST_ASSERT_EQUAL_HEX8(ok[i], g_calls[i].msg[16]);
     }
 }
@@ -212,12 +202,11 @@ static void test_key_accepts_any_request_seed_level(void)
 /* 0, the even sendKey bytes, 0x7F (its sendKey is 0x80) and anything with the suppress bit fail without hashing, key zeroed. */
 static void test_key_refuses_other_levels_without_hashing(void)
 {
-    uint8_t master[32], seed[16], key[16];
-    test_inputs(master, seed);
+    uint8_t key[16];
     const uint8_t bad[] = {0x00, 0x02, 0x04, 0x7F, 0x80, 0x81, 0xFF};
     for (size_t i = 0; i < sizeof bad; i++) {
         memset(key, 0xEE, sizeof key);
-        TEST_ASSERT_FALSE(udsota_keys_derive_key(rec_hmac, T_KDEV, seed, bad[i], T_ID, 6, key));
+        TEST_ASSERT_FALSE(udsota_keys_derive_key(rec_hmac, T_KDEV, T_SEED, bad[i], T_ID, 6, key));
         TEST_ASSERT_EACH_EQUAL_HEX8(0x00, key, 16);
     }
     TEST_ASSERT_EQUAL_INT(0, g_ncalls);
@@ -227,65 +216,62 @@ static void test_key_refuses_other_levels_without_hashing(void)
  * an empty master, fails closed without hashing. An empty label hashes the ID alone. */
 static void test_label_and_id_bounds(void)
 {
-    uint8_t master[32], seed[16], kdev[32], key[16], id[UDSOTA_KEYS_ID_MAX + 1];
+    uint8_t kdev[32], key[16], id[UDSOTA_KEYS_ID_MAX + 1];
     char label[UDSOTA_KEYS_LABEL_MAX + 2];
-    test_inputs(master, seed);
     memset(id, 0x5A, sizeof id);
     memset(label, 'L', sizeof label - 1);
     label[sizeof label - 1] = '\0';                               /* UDSOTA_KEYS_LABEL_MAX + 1 characters */
     memset(kdev, 0xEE, sizeof kdev);
-    TEST_ASSERT_FALSE(udsota_keys_derive_kdev(rec_hmac, master, 32, label, T_ID, 6, kdev));
+    TEST_ASSERT_FALSE(udsota_keys_derive_kdev(rec_hmac, T_MASTER, 32, label, T_ID, 6, kdev));
     TEST_ASSERT_EACH_EQUAL_HEX8(0x00, kdev, 32);
-    TEST_ASSERT_FALSE(udsota_keys_derive_kdev(rec_hmac, master, 32, "L", id, UDSOTA_KEYS_ID_MAX + 1, kdev));
-    TEST_ASSERT_FALSE(udsota_keys_derive_kdev(rec_hmac, master, 0, "L", T_ID, 6, kdev));
+    TEST_ASSERT_FALSE(udsota_keys_derive_kdev(rec_hmac, T_MASTER, 32, "L", id, UDSOTA_KEYS_ID_MAX + 1, kdev));
+    TEST_ASSERT_FALSE(udsota_keys_derive_kdev(rec_hmac, T_MASTER, 0, "L", T_ID, 6, kdev));
     memset(key, 0xEE, sizeof key);
-    TEST_ASSERT_FALSE(udsota_keys_derive_key(rec_hmac, T_KDEV, seed, 0x01, id, UDSOTA_KEYS_ID_MAX + 1, key));
+    TEST_ASSERT_FALSE(udsota_keys_derive_key(rec_hmac, T_KDEV, T_SEED, 0x01, id, UDSOTA_KEYS_ID_MAX + 1, key));
     TEST_ASSERT_EACH_EQUAL_HEX8(0x00, key, 16);
     TEST_ASSERT_EQUAL_INT(0, g_ncalls);
 
     label[UDSOTA_KEYS_LABEL_MAX] = '\0';                          /* exactly UDSOTA_KEYS_LABEL_MAX */
-    TEST_ASSERT_TRUE(udsota_keys_derive_kdev(rec_hmac, master, 32, label, id, UDSOTA_KEYS_ID_MAX, kdev));
+    TEST_ASSERT_TRUE(udsota_keys_derive_kdev(rec_hmac, T_MASTER, 32, label, id, UDSOTA_KEYS_ID_MAX, kdev));
     TEST_ASSERT_EQUAL_UINT(UDSOTA_KEYS_LABEL_MAX + UDSOTA_KEYS_ID_MAX, g_calls[0].msg_len);
-    TEST_ASSERT_TRUE(udsota_keys_derive_kdev(rec_hmac, master, 32, "", T_ID, 6, kdev));
+    TEST_ASSERT_TRUE(udsota_keys_derive_kdev(rec_hmac, T_MASTER, 32, "", T_ID, 6, kdev));
     TEST_ASSERT_EQUAL_UINT(6, g_calls[1].msg_len);
     TEST_ASSERT_EQUAL_HEX8_ARRAY(T_ID, g_calls[1].msg, 6);
-    TEST_ASSERT_TRUE(udsota_keys_derive_key(rec_hmac, T_KDEV, seed, 0x01, id, UDSOTA_KEYS_ID_MAX, key));
+    TEST_ASSERT_TRUE(udsota_keys_derive_key(rec_hmac, T_KDEV, T_SEED, 0x01, id, UDSOTA_KEYS_ID_MAX, key));
     TEST_ASSERT_EQUAL_UINT(16 + 1 + UDSOTA_KEYS_ID_MAX, g_calls[2].msg_len);
 }
 
 /* An HMAC failure fails both derivations and leaves their outputs zeroed, never half-written. */
 static void test_hmac_failure_zeroes_outputs(void)
 {
-    uint8_t master[32], seed[16], kdev[32], key[16];
-    test_inputs(master, seed);
+    uint8_t kdev[32], key[16];
     g_fail = true;
     memset(kdev, 0xEE, sizeof kdev);
-    TEST_ASSERT_FALSE(udsota_keys_derive_kdev(rec_hmac, master, 32, "udsota-example", T_ID, 6, kdev));
+    TEST_ASSERT_FALSE(udsota_keys_derive_kdev(rec_hmac, T_MASTER, 32, "udsota-example", T_ID, 6, kdev));
     TEST_ASSERT_EACH_EQUAL_HEX8(0x00, kdev, 32);
     memset(key, 0xEE, sizeof key);
-    TEST_ASSERT_FALSE(udsota_keys_derive_key(rec_hmac, T_KDEV, seed, 0x03, T_ID, 6, key));
+    TEST_ASSERT_FALSE(udsota_keys_derive_key(rec_hmac, T_KDEV, T_SEED, 0x03, T_ID, 6, key));
     TEST_ASSERT_EACH_EQUAL_HEX8(0x00, key, 16);
 }
 
 /* NULL inputs fail closed with the output zeroed, and a NULL output is refused without a crash. */
 static void test_null_arguments_fail_closed(void)
 {
-    uint8_t master[32], seed[16], kdev[32], key[16];
-    test_inputs(master, seed);
+    uint8_t kdev[32], key[16];
     memset(kdev, 0xEE, sizeof kdev);
-    TEST_ASSERT_FALSE(udsota_keys_derive_kdev(NULL, master, 32, "udsota-example", T_ID, 6, kdev));
+    TEST_ASSERT_FALSE(udsota_keys_derive_kdev(NULL, T_MASTER, 32, "udsota-example", T_ID, 6, kdev));
     TEST_ASSERT_EACH_EQUAL_HEX8(0x00, kdev, 32);
     TEST_ASSERT_FALSE(udsota_keys_derive_kdev(rec_hmac, NULL, 32, "udsota-example", T_ID, 6, kdev));
-    TEST_ASSERT_FALSE(udsota_keys_derive_kdev(rec_hmac, master, 32, NULL, T_ID, 6, kdev));
-    TEST_ASSERT_FALSE(udsota_keys_derive_kdev(rec_hmac, master, 32, "udsota-example", NULL, 6, kdev));
-    TEST_ASSERT_FALSE(udsota_keys_derive_kdev(rec_hmac, master, 32, "udsota-example", T_ID, 6, NULL));
+    TEST_ASSERT_FALSE(udsota_keys_derive_kdev(rec_hmac, T_MASTER, 32, NULL, T_ID, 6, kdev));
+    TEST_ASSERT_FALSE(udsota_keys_derive_kdev(rec_hmac, T_MASTER, 32, "udsota-example", NULL, 6, kdev));
+    TEST_ASSERT_FALSE(udsota_keys_derive_kdev(rec_hmac, T_MASTER, 32, "udsota-example", T_ID, 6, NULL));
     memset(key, 0xEE, sizeof key);
-    TEST_ASSERT_FALSE(udsota_keys_derive_key(NULL, T_KDEV, seed, 0x03, T_ID, 6, key));
+    TEST_ASSERT_FALSE(udsota_keys_derive_key(NULL, T_KDEV, T_SEED, 0x03, T_ID, 6, key));
     TEST_ASSERT_EACH_EQUAL_HEX8(0x00, key, 16);
-    TEST_ASSERT_FALSE(udsota_keys_derive_key(rec_hmac, NULL, seed, 0x03, T_ID, 6, key));
+    TEST_ASSERT_FALSE(udsota_keys_derive_key(rec_hmac, NULL, T_SEED, 0x03, T_ID, 6, key));
     TEST_ASSERT_FALSE(udsota_keys_derive_key(rec_hmac, T_KDEV, NULL, 0x03, T_ID, 6, key));
-    TEST_ASSERT_FALSE(udsota_keys_derive_key(rec_hmac, T_KDEV, seed, 0x03, NULL, 6, key));
-    TEST_ASSERT_FALSE(udsota_keys_derive_key(rec_hmac, T_KDEV, seed, 0x03, T_ID, 6, NULL));
+    TEST_ASSERT_FALSE(udsota_keys_derive_key(rec_hmac, T_KDEV, T_SEED, 0x03, NULL, 6, key));
+    TEST_ASSERT_FALSE(udsota_keys_derive_key(rec_hmac, T_KDEV, T_SEED, 0x03, T_ID, 6, NULL));
     TEST_ASSERT_EQUAL_INT(0, g_ncalls);
 }
 
@@ -348,10 +334,9 @@ static int kat_verify(const uint8_t *pubkey, const uint8_t *msg, size_t msg_len,
 /* The message is tag || seed || level || id_len || id: the known bytes, and their known SHA-256. */
 static void test_sig_msg_known_answer(void)
 {
-    uint8_t master[32], seed[16], msg[UDSOTA_KEYS_SIG_MSG_MAX + 1], digest[32];
-    test_inputs(master, seed);
+    uint8_t msg[UDSOTA_KEYS_SIG_MSG_MAX + 1], digest[32];
     memset(msg, 0xEE, sizeof msg);
-    TEST_ASSERT_EQUAL_UINT(sizeof T_SIG_MSG_L3, udsota_keys_sig_msg(seed, 0x03, T_ID, sizeof T_ID, msg));
+    TEST_ASSERT_EQUAL_UINT(sizeof T_SIG_MSG_L3, udsota_keys_sig_msg(T_SEED, 0x03, T_ID, sizeof T_ID, msg));
     TEST_ASSERT_EQUAL_HEX8_ARRAY(T_SIG_MSG_L3, msg, sizeof T_SIG_MSG_L3);
     TEST_ASSERT_EQUAL_HEX8(0xEE, msg[sizeof T_SIG_MSG_L3]);   /* nothing past the message */
     TEST_ASSERT_TRUE(sha256_host(msg, sizeof T_SIG_MSG_L3, digest));
@@ -362,34 +347,32 @@ static void test_sig_msg_known_answer(void)
  * ID fills UDSOTA_KEYS_SIG_MSG_MAX exactly. */
 static void test_sig_msg_binds_level_and_id(void)
 {
-    uint8_t master[32], seed[16], msg[UDSOTA_KEYS_SIG_MSG_MAX], id[UDSOTA_KEYS_ID_MAX];
-    test_inputs(master, seed);
-    TEST_ASSERT_EQUAL_UINT(42, udsota_keys_sig_msg(seed, 0x01, T_ID, sizeof T_ID, msg));
+    uint8_t msg[UDSOTA_KEYS_SIG_MSG_MAX], id[UDSOTA_KEYS_ID_MAX];
+    TEST_ASSERT_EQUAL_UINT(42, udsota_keys_sig_msg(T_SEED, 0x01, T_ID, sizeof T_ID, msg));
     TEST_ASSERT_EQUAL_HEX8(0x01, msg[34]);
     TEST_ASSERT_EQUAL_HEX8_ARRAY(T_SIG_MSG_L3, msg, 34);
     TEST_ASSERT_EQUAL_HEX8_ARRAY(&T_SIG_MSG_L3[35], &msg[35], 7);
     memset(id, 0x5A, sizeof id);
-    TEST_ASSERT_EQUAL_UINT(UDSOTA_KEYS_SIG_MSG_MAX, udsota_keys_sig_msg(seed, 0x7D, id, sizeof id, msg));
+    TEST_ASSERT_EQUAL_UINT(UDSOTA_KEYS_SIG_MSG_MAX, udsota_keys_sig_msg(T_SEED, 0x7D, id, sizeof id, msg));
     TEST_ASSERT_EQUAL_HEX8(UDSOTA_KEYS_ID_MAX, msg[35]);
     TEST_ASSERT_EACH_EQUAL_HEX8(0x5A, &msg[36], UDSOTA_KEYS_ID_MAX);
-    TEST_ASSERT_EQUAL_UINT(36, udsota_keys_sig_msg(seed, 0x03, id, 0, msg));   /* an empty ID is still length-prefixed */
+    TEST_ASSERT_EQUAL_UINT(36, udsota_keys_sig_msg(T_SEED, 0x03, id, 0, msg));   /* an empty ID is still length-prefixed */
     TEST_ASSERT_EQUAL_HEX8(0x00, msg[35]);
 }
 
 /* A bad level, an ID over UDSOTA_KEYS_ID_MAX or a NULL argument builds nothing and writes nothing. */
 static void test_sig_msg_refuses_bad_input(void)
 {
-    uint8_t master[32], seed[16], msg[UDSOTA_KEYS_SIG_MSG_MAX], id[UDSOTA_KEYS_ID_MAX + 1] = {0};
-    test_inputs(master, seed);
+    uint8_t msg[UDSOTA_KEYS_SIG_MSG_MAX], id[UDSOTA_KEYS_ID_MAX + 1] = {0};
     memset(msg, 0xEE, sizeof msg);
     const uint8_t bad[] = {0x00, 0x02, 0x7F, 0x81};
     for (size_t i = 0; i < sizeof bad; i++) {
-        TEST_ASSERT_EQUAL_UINT(0, udsota_keys_sig_msg(seed, bad[i], T_ID, sizeof T_ID, msg));
+        TEST_ASSERT_EQUAL_UINT(0, udsota_keys_sig_msg(T_SEED, bad[i], T_ID, sizeof T_ID, msg));
     }
-    TEST_ASSERT_EQUAL_UINT(0, udsota_keys_sig_msg(seed, 0x03, id, sizeof id, msg));
+    TEST_ASSERT_EQUAL_UINT(0, udsota_keys_sig_msg(T_SEED, 0x03, id, sizeof id, msg));
     TEST_ASSERT_EQUAL_UINT(0, udsota_keys_sig_msg(NULL, 0x03, T_ID, sizeof T_ID, msg));
-    TEST_ASSERT_EQUAL_UINT(0, udsota_keys_sig_msg(seed, 0x03, NULL, sizeof T_ID, msg));
-    TEST_ASSERT_EQUAL_UINT(0, udsota_keys_sig_msg(seed, 0x03, T_ID, sizeof T_ID, NULL));
+    TEST_ASSERT_EQUAL_UINT(0, udsota_keys_sig_msg(T_SEED, 0x03, NULL, sizeof T_ID, msg));
+    TEST_ASSERT_EQUAL_UINT(0, udsota_keys_sig_msg(T_SEED, 0x03, T_ID, sizeof T_ID, NULL));
     TEST_ASSERT_EACH_EQUAL_HEX8(0xEE, msg, sizeof msg);
 }
 

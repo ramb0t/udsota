@@ -27,44 +27,47 @@ static udsota_esp32_ctl_t s_ctl;
 static udsota_hooks_t     s_hooks;
 static udsota_server_t    s_srv;
 static int                s_marker;          /* the app's ctx */
-static const void        *s_ctx_seen;        /* the ctx an app hook last received */
-static int                s_phase_calls;
-static int                s_depth, s_max_depth;
-static udsota_phase_t     s_seen_arg;        /* the app phase hook's last argument */
-static udsota_phase_t     s_seen_read;       /* what udsota_esp32_ctl_phase() returned inside it */
-static bool               s_end_from_hook;   /* the app phase hook asks for an end-session on EXTENDED */
-static int                s_default_resets, s_app_resets;
-static uint8_t            s_running_state;   /* the mock engine's running image state */
-static int                s_poll;            /* the mock engine's poll() and confirm() result */
-static int                s_writes, s_routines, s_routine_polls;   /* app write and routine hook calls */
-static uint16_t           s_write_did, s_routine_rid;
-static uint8_t            s_write_data[4];   /* the first bytes of the last value written */
-static size_t             s_write_len, s_routine_in_len;
-static uint8_t            s_routine_in0;     /* the first option byte of the last routine */
-static udsota_access_t    s_write_access, s_routine_access;
-static int                s_routine_poll_ret;   /* what app_routine_poll returns */
-static int                s_progress_calls;  /* app progress hook calls */
-static udsota_progress_t  s_progress_arg;    /* what the app's progress hook last got */
-static udsota_progress_t  s_progress_read;   /* what udsota_esp32_ctl_progress() returned inside it */
-static int                s_lock_depth;      /* the fake lock: held now, and its most, lock and unlock calls */
-static int                s_lock_max, s_locks, s_unlocks;
-static int                s_lock_depth_in_hook;   /* s_lock_depth while the app's progress hook ran */
-static const void        *s_lock_ctx_seen;
-static char               s_version_at_lock[UDSOTA_ESP32_CTL_VERSION_MAX];     /* s_ctl's, as the last lock began */
-static char               s_version_at_unlock[UDSOTA_ESP32_CTL_VERSION_MAX];   /* and as it ended */
-static udsota_stage_t     s_stage_at_lock, s_stage_at_unlock;
-static bool               s_refuse_first;    /* the mock first-block check refuses the block */
-static bool               s_zbegin_fail;     /* the compressed engine's zbegin fails for memory */
+/* The recorders and knobs setUp resets: one struct, so a new one can't be missed. */
+static struct {
+    const void        *ctx_seen;        /* the ctx an app hook last received */
+    int                phase_calls;
+    int                depth, max_depth;
+    udsota_phase_t     seen_arg;        /* the app phase hook's last argument */
+    udsota_phase_t     seen_read;       /* what udsota_esp32_ctl_phase() returned inside it */
+    bool               end_from_hook;   /* the app phase hook asks for an end-session on EXTENDED */
+    int                default_resets, app_resets;
+    uint8_t            running_state;   /* the mock engine's running image state */
+    int                poll;            /* the mock engine's poll() and confirm() result */
+    int                writes, routines, routine_polls;   /* app write and routine hook calls */
+    uint16_t           write_did, routine_rid;
+    uint8_t            write_data[4];   /* the first bytes of the last value written */
+    size_t             write_len, routine_in_len;
+    uint8_t            routine_in0;     /* the first option byte of the last routine */
+    udsota_access_t    write_access, routine_access;
+    int                routine_poll_ret;   /* what app_routine_poll returns */
+    int                progress_calls;  /* app progress hook calls */
+    udsota_progress_t  progress_arg;    /* what the app's progress hook last got */
+    udsota_progress_t  progress_read;   /* what udsota_esp32_ctl_progress() returned inside it */
+    int                lock_depth;      /* the fake lock: held now, and its most, lock and unlock calls */
+    int                lock_max, locks, unlocks;
+    int                lock_depth_in_hook;   /* lock_depth while the app's progress hook ran */
+    const void        *lock_ctx_seen;
+    char               version_at_lock[UDSOTA_ESP32_CTL_VERSION_MAX];     /* s_ctl's, as the last lock began */
+    char               version_at_unlock[UDSOTA_ESP32_CTL_VERSION_MAX];   /* and as it ended */
+    udsota_stage_t     stage_at_lock, stage_at_unlock;
+    bool               refuse_first;    /* the mock first-block check refuses the block */
+    bool               zbegin_fail;     /* the compressed engine's zbegin fails for memory */
+    char               version_in_hook[UDSOTA_ESP32_CTL_VERSION_MAX];     /* what the app's progress hook read */
+} r;
 static udsota_zstream_t   s_zs;              /* the compressed engine's stream over the real tinfl */
 static udsota_tinfl_t     s_tinfl;
 static uint8_t            s_zout[1024];
-static char               s_version_in_hook[UDSOTA_ESP32_CTL_VERSION_MAX];     /* what the app's progress hook read */
 
-/* Mock engine, as the port's check_first_block(): the block passes unless s_refuse_first, then goes to the
+/* Mock engine, as the port's check_first_block(): the block passes unless r.refuse_first, then goes to the
  * control block's rule with its reason, as the port hands it every judged first block. */
 static int eng_check_first(void *ctx, const uint8_t *first, size_t len, udsota_reason_t *why)
 {
-    *why = s_refuse_first ? UDSOTA_DL_BAD_HEADER : UDSOTA_DL_OK;
+    *why = r.refuse_first ? UDSOTA_DL_BAD_HEADER : UDSOTA_DL_OK;
     udsota_esp32_ctl_first_block(&s_ctl, *why, first, len);
     return (*why == UDSOTA_DL_OK) ? 0 : 1;
 }
@@ -87,16 +90,16 @@ static int eng_ok(void *ctx)
     return 0;
 }
 
-/* Mock engine: confirm queues a job (s_poll is UDSOTA_PENDING) or succeeds at once. */
+/* Mock engine: confirm queues a job (r.poll is UDSOTA_PENDING) or succeeds at once. */
 static int eng_confirm(void *ctx)
 {
-    return s_poll;
+    return r.poll;
 }
 
 /* Mock engine: UDSOTA_PENDING while the test holds the job open, then its result. */
 static int eng_poll(void *ctx)
 {
-    return s_poll;
+    return r.poll;
 }
 
 /* Mock engine: abort has nothing to stop. */
@@ -104,13 +107,13 @@ static void eng_abort(void *ctx)
 {
 }
 
-/* Mock engine: slot 0 runs and is the boot slot, in s_running_state. */
+/* Mock engine: slot 0 runs and is the boot slot, in r.running_state. */
 static void eng_status(void *ctx, udsota_status_t *out)
 {
     memset(out, 0, sizeof *out);
     out->running_slot = UDSOTA_SLOT_OTA0;
     out->boot_slot = UDSOTA_SLOT_OTA0;
-    out->running_state = s_running_state;
+    out->running_state = r.running_state;
 }
 
 /* ---- A compressed engine: udsota_zstream over the real tinfl, as the port's worker runs it ---- */
@@ -135,11 +138,11 @@ static int z_write(void *ctx, uint32_t off, const uint8_t *d, size_t n)
     return 0;
 }
 
-/* engine.zbegin, as the port's: with s_zbegin_fail, empties the version and refuses for memory; else opens the
+/* engine.zbegin, as the port's: with r.zbegin_fail, empties the version and refuses for memory; else opens the
  * stream. */
 static int eng_zbegin(void *ctx, uint32_t size, uint8_t dfi)
 {
-    if (s_zbegin_fail) {
+    if (r.zbegin_fail) {
         udsota_esp32_ctl_clear_version(&s_ctl);
         return UDSOTA_DL_NO_MEMORY;
     }
@@ -190,59 +193,59 @@ static const udsota_engine_t k_engine = {
 /* The app's phase hook: calls back into the port as an app may, and records what it saw. */
 static void app_phase(void *ctx, udsota_phase_t p)
 {
-    s_ctx_seen = ctx;
-    s_depth++;
-    if (s_depth > s_max_depth) {
-        s_max_depth = s_depth;
+    r.ctx_seen = ctx;
+    r.depth++;
+    if (r.depth > r.max_depth) {
+        r.max_depth = r.depth;
     }
-    s_phase_calls++;
-    s_seen_arg = p;
-    s_seen_read = udsota_esp32_ctl_phase(&s_ctl);
-    if (s_end_from_hook && p == UDSOTA_PHASE_EXTENDED) {
+    r.phase_calls++;
+    r.seen_arg = p;
+    r.seen_read = udsota_esp32_ctl_phase(&s_ctl);
+    if (r.end_from_hook && p == UDSOTA_PHASE_EXTENDED) {
         udsota_esp32_ctl_request_end(&s_ctl);
     }
-    s_depth--;
+    r.depth--;
 }
 
 /* The app's gate: refuses 11 01 only. */
 static uint8_t app_gate(void *ctx, udsota_op_t op)
 {
-    s_ctx_seen = ctx;
+    r.ctx_seen = ctx;
     return (op == UDSOTA_OP_RESET) ? 0x22u : 0u;
 }
 
 /* The app's did_read: answers three bytes for any DID. */
 static size_t app_did_read(void *ctx, uint16_t did, uint8_t *buf, size_t max)
 {
-    s_ctx_seen = ctx;
+    r.ctx_seen = ctx;
     return 3u;
 }
 
 /* The port's default reset stand-in: counts, and "fails" so the caller would re-open. */
 static bool default_reset(void *ctx)
 {
-    s_ctx_seen = ctx;
-    s_default_resets++;
+    r.ctx_seen = ctx;
+    r.default_resets++;
     return false;
 }
 
 /* The app's reset: counts, and "fails". */
 static bool app_reset(void *ctx)
 {
-    s_ctx_seen = ctx;
-    s_app_resets++;
+    r.ctx_seen = ctx;
+    r.app_resets++;
     return false;
 }
 
 /* The app's did_write: records what arrived and accepts the write. */
 static uint8_t app_did_write(void *ctx, uint16_t did, const uint8_t *data, size_t len, udsota_access_t access)
 {
-    s_ctx_seen = ctx;
-    s_writes++;
-    s_write_did = did;
-    s_write_len = len;
-    memcpy(s_write_data, data, (len < sizeof s_write_data) ? len : sizeof s_write_data);
-    s_write_access = access;
+    r.ctx_seen = ctx;
+    r.writes++;
+    r.write_did = did;
+    r.write_len = len;
+    memcpy(r.write_data, data, (len < sizeof r.write_data) ? len : sizeof r.write_data);
+    r.write_access = access;
     return 0u;
 }
 
@@ -250,62 +253,62 @@ static uint8_t app_did_write(void *ctx, uint16_t did, const uint8_t *data, size_
 static int app_routine(void *ctx, uint16_t rid, const uint8_t *in, size_t in_len,
                        uint8_t *out, size_t out_max, size_t *out_len, udsota_access_t access)
 {
-    s_ctx_seen = ctx;
-    s_routines++;
-    s_routine_rid = rid;
-    s_routine_in_len = in_len;
-    s_routine_in0 = (in_len > 0u) ? in[0] : 0u;
-    s_routine_access = access;
+    r.ctx_seen = ctx;
+    r.routines++;
+    r.routine_rid = rid;
+    r.routine_in_len = in_len;
+    r.routine_in0 = (in_len > 0u) ? in[0] : 0u;
+    r.routine_access = access;
     *out_len = 0u;
     return UDSOTA_PENDING;
 }
 
-/* The app's routine_poll: returns s_routine_poll_ret, with one status byte 00 when that is 0. */
+/* The app's routine_poll: returns r.routine_poll_ret, with one status byte 00 when that is 0. */
 static int app_routine_poll(void *ctx, uint8_t *out, size_t out_max, size_t *out_len)
 {
-    s_ctx_seen = ctx;
-    s_routine_polls++;
+    r.ctx_seen = ctx;
+    r.routine_polls++;
     *out_len = 0u;
-    if (s_routine_poll_ret == 0 && out_max >= 1u) {
+    if (r.routine_poll_ret == 0 && out_max >= 1u) {
         out[0] = 0x00u;
         *out_len = 1u;
     }
-    return s_routine_poll_ret;
+    return r.routine_poll_ret;
 }
 
 /* The app's progress hook: records its ctx and argument, whether the port's lock was held, and what the
  * snapshot reads from inside it (a call back into the port). */
 static void app_progress(void *ctx, const udsota_progress_t *p)
 {
-    s_ctx_seen = ctx;
-    s_progress_calls++;
-    s_progress_arg = *p;
-    s_lock_depth_in_hook = s_lock_depth;
-    udsota_esp32_ctl_progress(&s_ctl, &s_progress_read);
-    (void)udsota_esp32_ctl_version(&s_ctl, s_version_in_hook);
+    r.ctx_seen = ctx;
+    r.progress_calls++;
+    r.progress_arg = *p;
+    r.lock_depth_in_hook = r.lock_depth;
+    udsota_esp32_ctl_progress(&s_ctl, &r.progress_read);
+    (void)udsota_esp32_ctl_version(&s_ctl, r.version_in_hook);
 }
 
 /* The fake snapshot lock: counts, and tracks how deep it is held. */
 static void fake_lock(void *ctx)
 {
-    s_lock_ctx_seen = ctx;
-    s_locks++;
-    s_lock_depth++;
-    memcpy(s_version_at_lock, s_ctl.version, sizeof s_version_at_lock);
-    s_stage_at_lock = s_ctl.progress.stage;
-    if (s_lock_depth > s_lock_max) {
-        s_lock_max = s_lock_depth;
+    r.lock_ctx_seen = ctx;
+    r.locks++;
+    r.lock_depth++;
+    memcpy(r.version_at_lock, s_ctl.version, sizeof r.version_at_lock);
+    r.stage_at_lock = s_ctl.progress.stage;
+    if (r.lock_depth > r.lock_max) {
+        r.lock_max = r.lock_depth;
     }
 }
 
 /* The fake snapshot unlock. */
 static void fake_unlock(void *ctx)
 {
-    s_lock_ctx_seen = ctx;
-    s_unlocks++;
-    s_lock_depth--;
-    memcpy(s_version_at_unlock, s_ctl.version, sizeof s_version_at_unlock);
-    s_stage_at_unlock = s_ctl.progress.stage;
+    r.lock_ctx_seen = ctx;
+    r.unlocks++;
+    r.lock_depth--;
+    memcpy(r.version_at_unlock, s_ctl.version, sizeof r.version_at_unlock);
+    r.stage_at_unlock = s_ctl.progress.stage;
 }
 
 /* Wraps app's hooks and starts a server on them with default config and no security. */
@@ -329,46 +332,11 @@ static void enter_extended(uint32_t now)
 /* Unity hook: clears the recorders; the engine is idle with a VALID image. */
 void setUp(void)
 {
-    s_ctx_seen = NULL;
-    s_phase_calls = 0;
-    s_depth = 0;
-    s_max_depth = 0;
-    s_seen_arg = UDSOTA_PHASE_IDLE;
-    s_seen_read = UDSOTA_PHASE_IDLE;
-    s_end_from_hook = false;
-    s_default_resets = 0;
-    s_app_resets = 0;
-    s_running_state = UDSOTA_IMG_VALID;
-    s_poll = 0;
-    s_writes = 0;
-    s_routines = 0;
-    s_routine_polls = 0;
-    s_write_did = 0u;
-    s_routine_rid = 0u;
-    memset(s_write_data, 0, sizeof s_write_data);
-    s_write_len = 0u;
-    s_routine_in_len = 0u;
-    s_routine_in0 = 0u;
-    s_write_access = (udsota_access_t){0};
-    s_routine_access = (udsota_access_t){0};
-    s_routine_poll_ret = 0;
-    s_progress_calls = 0;
-    s_progress_arg = (udsota_progress_t){0};
-    s_progress_read = (udsota_progress_t){0};
-    s_lock_depth = 0;
-    s_lock_max = 0;
-    s_locks = 0;
-    s_unlocks = 0;
-    s_lock_depth_in_hook = -1;
-    s_lock_ctx_seen = NULL;
-    memset(s_version_at_lock, 0, sizeof s_version_at_lock);
-    memset(s_version_at_unlock, 0, sizeof s_version_at_unlock);
-    s_stage_at_lock = UDSOTA_STAGE_IDLE;
-    s_stage_at_unlock = UDSOTA_STAGE_IDLE;
-    s_refuse_first = false;
-    s_zbegin_fail = false;
+    memset(&r, 0, sizeof r);
+    r.running_state = UDSOTA_IMG_VALID;
+    r.lock_depth_in_hook = -1;
+    memset(r.version_in_hook, 0x55, sizeof r.version_in_hook);
     udsota_zstream_close(&s_zs);
-    memset(s_version_in_hook, 0x55, sizeof s_version_in_hook);
 }
 
 /* Unity hook: nothing to undo. */
@@ -380,21 +348,21 @@ static void test_end_session_from_phase_hook_runs_after_the_request(void)
 {
     const udsota_hooks_t app = { .phase = app_phase, .ctx = &s_marker };
     start(&app);
-    s_end_from_hook = true;
-    const int before = s_phase_calls;
+    r.end_from_hook = true;
+    const int before = r.phase_calls;
     enter_extended(NOW);
-    TEST_ASSERT_EQUAL_INT(before + 1, s_phase_calls);
-    TEST_ASSERT_EQUAL_INT(UDSOTA_PHASE_EXTENDED, s_seen_arg);
-    TEST_ASSERT_EQUAL_INT(UDSOTA_PHASE_EXTENDED, s_seen_read);       /* stored before the app's hook ran */
-    TEST_ASSERT_EQUAL_PTR(&s_marker, s_ctx_seen);
+    TEST_ASSERT_EQUAL_INT(before + 1, r.phase_calls);
+    TEST_ASSERT_EQUAL_INT(UDSOTA_PHASE_EXTENDED, r.seen_arg);
+    TEST_ASSERT_EQUAL_INT(UDSOTA_PHASE_EXTENDED, r.seen_read);       /* stored before the app's hook ran */
+    TEST_ASSERT_EQUAL_PTR(&s_marker, r.ctx_seen);
     TEST_ASSERT_EQUAL_INT(UDSOTA_PHASE_EXTENDED, udsota_phase(&s_srv));   /* not ended inside the request */
     TEST_ASSERT_TRUE(udsota_esp32_ctl_run_end(&s_ctl, &s_srv, NOW + 1u));
     TEST_ASSERT_EQUAL_INT(UDSOTA_PHASE_IDLE, udsota_phase(&s_srv));
     TEST_ASSERT_EQUAL_INT(UDSOTA_PHASE_IDLE, udsota_esp32_ctl_phase(&s_ctl));
-    TEST_ASSERT_EQUAL_INT(before + 2, s_phase_calls);
-    TEST_ASSERT_EQUAL_INT(1, s_max_depth);
+    TEST_ASSERT_EQUAL_INT(before + 2, r.phase_calls);
+    TEST_ASSERT_EQUAL_INT(1, r.max_depth);
     TEST_ASSERT_FALSE(udsota_esp32_ctl_run_end(&s_ctl, &s_srv, NOW + 2u));
-    TEST_ASSERT_EQUAL_INT(before + 2, s_phase_calls);
+    TEST_ASSERT_EQUAL_INT(before + 2, r.phase_calls);
 }
 
 /* An end requested while a ConfirmImage job runs is latched by the core: the session stays open until
@@ -403,9 +371,9 @@ static void test_end_requested_during_a_job_applies_after_its_answer(void)
 {
     const udsota_hooks_t app = { .phase = app_phase, .ctx = &s_marker };
     start(&app);
-    s_running_state = UDSOTA_IMG_PENDING_VERIFY;
+    r.running_state = UDSOTA_IMG_PENDING_VERIFY;
     enter_extended(NOW);
-    s_poll = UDSOTA_PENDING;
+    r.poll = UDSOTA_PENDING;
     const uint8_t conf[] = {0x31, 0x01, (uint8_t)(UDSOTA_RID_CONFIRM_IMAGE >> 8), (uint8_t)UDSOTA_RID_CONFIRM_IMAGE};
     uint8_t resp[16];
     TEST_ASSERT_EQUAL_UINT(0u, udsota_on_request(&s_srv, conf, sizeof conf, resp, sizeof resp, NOW + 1u));
@@ -414,14 +382,14 @@ static void test_end_requested_during_a_job_applies_after_its_answer(void)
     TEST_ASSERT_EQUAL_INT(UDSOTA_PHASE_EXTENDED, udsota_phase(&s_srv));
     TEST_ASSERT_EQUAL_UINT(0u, udsota_poll(&s_srv, resp, sizeof resp, NOW + 3u));   /* job still running */
     TEST_ASSERT_EQUAL_INT(UDSOTA_PHASE_EXTENDED, udsota_phase(&s_srv));
-    s_poll = 0;
+    r.poll = 0;
     const size_t n = udsota_poll(&s_srv, resp, sizeof resp, NOW + 4u);
     TEST_ASSERT_TRUE(n >= 4u);
     TEST_ASSERT_EQUAL_HEX8(0x71, resp[0]);                               /* the job's answer still goes out */
     (void)udsota_poll(&s_srv, resp, sizeof resp, NOW + 5u);
     TEST_ASSERT_EQUAL_INT(UDSOTA_PHASE_IDLE, udsota_phase(&s_srv));
     TEST_ASSERT_EQUAL_INT(UDSOTA_PHASE_IDLE, udsota_esp32_ctl_phase(&s_ctl));
-    TEST_ASSERT_EQUAL_INT(1, s_max_depth);
+    TEST_ASSERT_EQUAL_INT(1, r.max_depth);
 }
 
 /* Requests raised before the diag task runs count once; with no app hooks the phase copy still
@@ -443,7 +411,7 @@ static void test_requests_coalesce_and_phase_tracks_without_app_hooks(void)
 static uint8_t app_comm_control(void *ctx, uint8_t control, uint8_t comm_type)
 {
     (void)comm_type;
-    s_ctx_seen = ctx;
+    r.ctx_seen = ctx;
     return control == 0x03u ? 0x22u : 0u;
 }
 
@@ -451,7 +419,7 @@ static uint8_t app_comm_control(void *ctx, uint8_t control, uint8_t comm_type)
 static void app_dtc_setting(void *ctx, bool on)
 {
     (void)on;
-    s_ctx_seen = ctx;
+    r.ctx_seen = ctx;
 }
 
 /* The wrapped hooks pass the app's ctx, keep a NULL gate, did_read or stmin_us NULL so the core's
@@ -465,19 +433,19 @@ static void test_wrapped_hooks_forward_app_ctx_and_keep_nulls(void)
     TEST_ASSERT_TRUE(s_hooks.did_read == NULL && s_hooks.stmin_us == NULL);
     TEST_ASSERT_EQUAL_HEX8(0x22, s_hooks.gate(s_hooks.ctx, UDSOTA_OP_RESET));
     TEST_ASSERT_EQUAL_HEX8(0x00, s_hooks.gate(s_hooks.ctx, UDSOTA_OP_ACTIVATE));
-    TEST_ASSERT_EQUAL_PTR(&s_marker, s_ctx_seen);
-    s_ctx_seen = NULL;
+    TEST_ASSERT_EQUAL_PTR(&s_marker, r.ctx_seen);
+    r.ctx_seen = NULL;
     TEST_ASSERT_FALSE(s_hooks.reset(s_hooks.ctx));
-    TEST_ASSERT_EQUAL_INT(1, s_default_resets);
-    TEST_ASSERT_EQUAL_PTR(&s_marker, s_ctx_seen);
+    TEST_ASSERT_EQUAL_INT(1, r.default_resets);
+    TEST_ASSERT_EQUAL_PTR(&s_marker, r.ctx_seen);
 
     const udsota_hooks_t app2 = { .did_read = app_did_read, .reset = app_reset, .ctx = &s_marker };
     udsota_esp32_ctl_init(&s_ctl, &app2, default_reset, &s_hooks);
     uint8_t buf[4];
     TEST_ASSERT_EQUAL_UINT(3u, s_hooks.did_read(s_hooks.ctx, 0xF191u, buf, sizeof buf));
     TEST_ASSERT_FALSE(s_hooks.reset(s_hooks.ctx));
-    TEST_ASSERT_EQUAL_INT(1, s_app_resets);
-    TEST_ASSERT_EQUAL_INT(1, s_default_resets);
+    TEST_ASSERT_EQUAL_INT(1, r.app_resets);
+    TEST_ASSERT_EQUAL_INT(1, r.default_resets);
 
     udsota_esp32_ctl_init(&s_ctl, NULL, NULL, &s_hooks);
     TEST_ASSERT_TRUE(s_hooks.reset == NULL && s_hooks.gate == NULL && s_hooks.phase != NULL);
@@ -485,12 +453,12 @@ static void test_wrapped_hooks_forward_app_ctx_and_keep_nulls(void)
 
     const udsota_hooks_t app3 = { .comm_control = app_comm_control, .dtc_setting = app_dtc_setting, .ctx = &s_marker };
     udsota_esp32_ctl_init(&s_ctl, &app3, NULL, &s_hooks);
-    s_ctx_seen = NULL;
+    r.ctx_seen = NULL;
     TEST_ASSERT_EQUAL_HEX8(0x22, s_hooks.comm_control(s_hooks.ctx, 0x03, 0x01));
-    TEST_ASSERT_EQUAL_PTR(&s_marker, s_ctx_seen);
-    s_ctx_seen = NULL;
+    TEST_ASSERT_EQUAL_PTR(&s_marker, r.ctx_seen);
+    r.ctx_seen = NULL;
     s_hooks.dtc_setting(s_hooks.ctx, false);
-    TEST_ASSERT_EQUAL_PTR(&s_marker, s_ctx_seen);
+    TEST_ASSERT_EQUAL_PTR(&s_marker, r.ctx_seen);
 }
 
 /* 2E and 31 01 on an app RID reach the app's did_write, routine and routine_poll through the port and the
@@ -510,31 +478,31 @@ static void test_write_and_routine_hooks_reach_the_app(void)
     TEST_ASSERT_EQUAL_HEX8(0x6E, resp[0]);
     TEST_ASSERT_EQUAL_HEX8(0x02, resp[1]);
     TEST_ASSERT_EQUAL_HEX8(0x00, resp[2]);
-    TEST_ASSERT_EQUAL_INT(1, s_writes);
-    TEST_ASSERT_EQUAL_PTR(&s_marker, s_ctx_seen);
-    TEST_ASSERT_EQUAL_HEX16(0x0200, s_write_did);
-    TEST_ASSERT_EQUAL_UINT(1u, s_write_len);
-    TEST_ASSERT_EQUAL_HEX8(0xAB, s_write_data[0]);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_EXTENDED, s_write_access.session);
-    TEST_ASSERT_EQUAL_UINT8(0u, s_write_access.unlocked_level);   /* no security: nothing unlocked */
+    TEST_ASSERT_EQUAL_INT(1, r.writes);
+    TEST_ASSERT_EQUAL_PTR(&s_marker, r.ctx_seen);
+    TEST_ASSERT_EQUAL_HEX16(0x0200, r.write_did);
+    TEST_ASSERT_EQUAL_UINT(1u, r.write_len);
+    TEST_ASSERT_EQUAL_HEX8(0xAB, r.write_data[0]);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_EXTENDED, r.write_access.session);
+    TEST_ASSERT_EQUAL_UINT8(0u, r.write_access.unlocked_level);   /* no security: nothing unlocked */
 
-    s_ctx_seen = NULL;
-    s_routine_poll_ret = UDSOTA_PENDING;
+    r.ctx_seen = NULL;
+    r.routine_poll_ret = UDSOTA_PENDING;
     const uint8_t rc[] = {0x31, 0x01, 0x12, 0x34, 0x07};
     TEST_ASSERT_EQUAL_UINT(0u, udsota_on_request(&s_srv, rc, sizeof rc, resp, sizeof resp, NOW + 2u));
-    TEST_ASSERT_EQUAL_INT(1, s_routines);
-    TEST_ASSERT_EQUAL_PTR(&s_marker, s_ctx_seen);
-    TEST_ASSERT_EQUAL_HEX16(0x1234, s_routine_rid);
-    TEST_ASSERT_EQUAL_UINT(1u, s_routine_in_len);
-    TEST_ASSERT_EQUAL_HEX8(0x07, s_routine_in0);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_EXTENDED, s_routine_access.session);
-    TEST_ASSERT_EQUAL_UINT32(s_write_access.epoch, s_routine_access.epoch);   /* same session, same epoch */
+    TEST_ASSERT_EQUAL_INT(1, r.routines);
+    TEST_ASSERT_EQUAL_PTR(&s_marker, r.ctx_seen);
+    TEST_ASSERT_EQUAL_HEX16(0x1234, r.routine_rid);
+    TEST_ASSERT_EQUAL_UINT(1u, r.routine_in_len);
+    TEST_ASSERT_EQUAL_HEX8(0x07, r.routine_in0);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_EXTENDED, r.routine_access.session);
+    TEST_ASSERT_EQUAL_UINT32(r.write_access.epoch, r.routine_access.epoch);   /* same session, same epoch */
 
-    s_ctx_seen = NULL;
+    r.ctx_seen = NULL;
     TEST_ASSERT_EQUAL_UINT(0u, udsota_poll(&s_srv, resp, sizeof resp, NOW + 3u));   /* pending, before any 0x78 */
-    TEST_ASSERT_TRUE(s_routine_polls >= 1);
-    TEST_ASSERT_EQUAL_PTR(&s_marker, s_ctx_seen);
-    s_routine_poll_ret = 0;
+    TEST_ASSERT_TRUE(r.routine_polls >= 1);
+    TEST_ASSERT_EQUAL_PTR(&s_marker, r.ctx_seen);
+    r.routine_poll_ret = 0;
     TEST_ASSERT_EQUAL_UINT(5u, udsota_poll(&s_srv, resp, sizeof resp, NOW + 4u));
     TEST_ASSERT_EQUAL_HEX8(0x71, resp[0]);
     TEST_ASSERT_EQUAL_HEX8(0x01, resp[1]);
@@ -545,8 +513,8 @@ static void test_write_and_routine_hooks_reach_the_app(void)
     enter_extended(NOW + 5u);                         /* a repeat 10 03 enters the session again */
     TEST_ASSERT_EQUAL_UINT(3u, udsota_on_request(&s_srv, wr, sizeof wr, resp, sizeof resp, NOW + 6u));
     TEST_ASSERT_EQUAL_HEX8(0x6E, resp[0]);
-    TEST_ASSERT_EQUAL_INT(2, s_writes);
-    TEST_ASSERT_EQUAL_UINT32(s_routine_access.epoch + 1u, s_write_access.epoch);
+    TEST_ASSERT_EQUAL_INT(2, r.writes);
+    TEST_ASSERT_EQUAL_UINT32(r.routine_access.epoch + 1u, r.write_access.epoch);
 }
 
 /* Each of did_write, routine and routine_poll is wrapped only when the app sets it, and a direct call
@@ -564,7 +532,7 @@ static void test_write_and_routine_wrappers_follow_each_app_hook(void)
     TEST_ASSERT_NOT_NULL(s_hooks.routine_poll);
     TEST_ASSERT_EQUAL_INT(0, s_hooks.routine_poll(s_hooks.ctx, out, sizeof out, &n));
     TEST_ASSERT_EQUAL_UINT(1u, n);
-    TEST_ASSERT_EQUAL_PTR(&s_marker, s_ctx_seen);
+    TEST_ASSERT_EQUAL_PTR(&s_marker, r.ctx_seen);
 
     const udsota_hooks_t only_write = { .did_write = app_did_write, .ctx = &s_marker };
     udsota_esp32_ctl_init(&s_ctl, &only_write, default_reset, &s_hooks);
@@ -572,15 +540,15 @@ static void test_write_and_routine_wrappers_follow_each_app_hook(void)
     TEST_ASSERT_NULL(s_hooks.routine);
     TEST_ASSERT_NULL(s_hooks.routine_poll);
     const uint8_t v[] = {0x01, 0x02};
-    s_ctx_seen = NULL;
+    r.ctx_seen = NULL;
     TEST_ASSERT_EQUAL_HEX8(0x00, s_hooks.did_write(s_hooks.ctx, 0xF1B0u, v, sizeof v, acc));
-    TEST_ASSERT_EQUAL_PTR(&s_marker, s_ctx_seen);
-    TEST_ASSERT_EQUAL_HEX16(0xF1B0, s_write_did);
-    TEST_ASSERT_EQUAL_UINT(2u, s_write_len);
-    TEST_ASSERT_EQUAL_HEX8(0x02, s_write_data[1]);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_PROGRAMMING, s_write_access.session);
-    TEST_ASSERT_EQUAL_UINT8(0x03u, s_write_access.unlocked_level);
-    TEST_ASSERT_EQUAL_UINT32(7u, s_write_access.epoch);
+    TEST_ASSERT_EQUAL_PTR(&s_marker, r.ctx_seen);
+    TEST_ASSERT_EQUAL_HEX16(0xF1B0, r.write_did);
+    TEST_ASSERT_EQUAL_UINT(2u, r.write_len);
+    TEST_ASSERT_EQUAL_HEX8(0x02, r.write_data[1]);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_PROGRAMMING, r.write_access.session);
+    TEST_ASSERT_EQUAL_UINT8(0x03u, r.write_access.unlocked_level);
+    TEST_ASSERT_EQUAL_UINT32(7u, r.write_access.epoch);
 
     const udsota_hooks_t only_routine = { .routine = app_routine, .ctx = &s_marker };
     udsota_esp32_ctl_init(&s_ctl, &only_routine, default_reset, &s_hooks);
@@ -588,14 +556,14 @@ static void test_write_and_routine_wrappers_follow_each_app_hook(void)
     TEST_ASSERT_NOT_NULL(s_hooks.routine);
     TEST_ASSERT_NULL(s_hooks.routine_poll);
     const uint8_t in[] = {0x07};
-    s_ctx_seen = NULL;
+    r.ctx_seen = NULL;
     TEST_ASSERT_EQUAL_INT(UDSOTA_PENDING, s_hooks.routine(s_hooks.ctx, 0x1234u, in, sizeof in, out, sizeof out, &n, acc));
-    TEST_ASSERT_EQUAL_PTR(&s_marker, s_ctx_seen);
-    TEST_ASSERT_EQUAL_HEX16(0x1234, s_routine_rid);
-    TEST_ASSERT_EQUAL_UINT(1u, s_routine_in_len);
-    TEST_ASSERT_EQUAL_HEX8(0x07, s_routine_in0);
-    TEST_ASSERT_EQUAL_UINT8(0x03u, s_routine_access.unlocked_level);
-    TEST_ASSERT_EQUAL_UINT32(7u, s_routine_access.epoch);
+    TEST_ASSERT_EQUAL_PTR(&s_marker, r.ctx_seen);
+    TEST_ASSERT_EQUAL_HEX16(0x1234, r.routine_rid);
+    TEST_ASSERT_EQUAL_UINT(1u, r.routine_in_len);
+    TEST_ASSERT_EQUAL_HEX8(0x07, r.routine_in0);
+    TEST_ASSERT_EQUAL_UINT8(0x03u, r.routine_access.unlocked_level);
+    TEST_ASSERT_EQUAL_UINT32(7u, r.routine_access.epoch);
 }
 
 /* With no app write or routine hooks the port leaves all three NULL, so the core answers as it always has:
@@ -646,7 +614,7 @@ static void test_progress_snapshot_copies_the_report_and_forwards_it(void)
     const udsota_hooks_t app = { .progress = app_progress, .ctx = &s_marker };
     start(&app);
     TEST_ASSERT_NOT_NULL(s_hooks.progress);
-    udsota_esp32_ctl_set_lock(&s_ctl, fake_lock, fake_unlock, &s_lock_depth);
+    udsota_esp32_ctl_set_lock(&s_ctl, fake_lock, fake_unlock, &r.lock_depth);
     udsota_progress_t snap;
     udsota_esp32_ctl_progress(&s_ctl, &snap);
     TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_IDLE, snap.stage);
@@ -658,32 +626,32 @@ static void test_progress_snapshot_copies_the_report_and_forwards_it(void)
     const uint8_t blk2[] = {0x36, 0x02, 6, 7, 8};
     exchange(prog, sizeof prog, 0x50, NOW);
     exchange(rd, sizeof rd, 0x74, NOW + 1u);
-    TEST_ASSERT_EQUAL_INT(1, s_progress_calls);
-    TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_ERASING, s_progress_arg.stage);
-    TEST_ASSERT_EQUAL_UINT32(8u, s_progress_arg.total);
+    TEST_ASSERT_EQUAL_INT(1, r.progress_calls);
+    TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_ERASING, r.progress_arg.stage);
+    TEST_ASSERT_EQUAL_UINT32(8u, r.progress_arg.total);
     expect_snapshot_is_server();
     exchange(blk1, sizeof blk1, 0x76, NOW + 2u);
-    TEST_ASSERT_EQUAL_INT(2, s_progress_calls);
-    TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_WRITING, s_progress_arg.stage);
-    TEST_ASSERT_EQUAL_UINT32(5u, s_progress_arg.done);
+    TEST_ASSERT_EQUAL_INT(2, r.progress_calls);
+    TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_WRITING, r.progress_arg.stage);
+    TEST_ASSERT_EQUAL_UINT32(5u, r.progress_arg.done);
     expect_snapshot_is_server();
     exchange(blk2, sizeof blk2, 0x76, NOW + 3u);
-    TEST_ASSERT_EQUAL_INT(3, s_progress_calls);
-    TEST_ASSERT_EQUAL_UINT32(8u, s_progress_arg.done);
+    TEST_ASSERT_EQUAL_INT(3, r.progress_calls);
+    TEST_ASSERT_EQUAL_UINT32(8u, r.progress_arg.done);
     expect_snapshot_is_server();
 
-    TEST_ASSERT_EQUAL_PTR(&s_marker, s_ctx_seen);
-    TEST_ASSERT_EQUAL_INT(0, s_lock_depth_in_hook);            /* the lock is never held while the app's hook runs */
-    TEST_ASSERT_EQUAL_UINT32(s_progress_arg.done, s_progress_read.done);   /* stored before the app's hook ran */
-    TEST_ASSERT_EQUAL_INT(s_progress_arg.stage, s_progress_read.stage);
-    TEST_ASSERT_EQUAL_PTR(&s_lock_depth, s_lock_ctx_seen);
-    TEST_ASSERT_EQUAL_INT(s_locks, s_unlocks);
-    TEST_ASSERT_EQUAL_INT(1, s_lock_max);
-    TEST_ASSERT_EQUAL_INT(0, s_lock_depth);
+    TEST_ASSERT_EQUAL_PTR(&s_marker, r.ctx_seen);
+    TEST_ASSERT_EQUAL_INT(0, r.lock_depth_in_hook);            /* the lock is never held while the app's hook runs */
+    TEST_ASSERT_EQUAL_UINT32(r.progress_arg.done, r.progress_read.done);   /* stored before the app's hook ran */
+    TEST_ASSERT_EQUAL_INT(r.progress_arg.stage, r.progress_read.stage);
+    TEST_ASSERT_EQUAL_PTR(&r.lock_depth, r.lock_ctx_seen);
+    TEST_ASSERT_EQUAL_INT(r.locks, r.unlocks);
+    TEST_ASSERT_EQUAL_INT(1, r.lock_max);
+    TEST_ASSERT_EQUAL_INT(0, r.lock_depth);
 
     udsota_esp32_ctl_request_end(&s_ctl);                      /* the session ends: IDLE, aborted */
     TEST_ASSERT_TRUE(udsota_esp32_ctl_run_end(&s_ctl, &s_srv, NOW + 4u));
-    TEST_ASSERT_EQUAL_INT(4, s_progress_calls);
+    TEST_ASSERT_EQUAL_INT(4, r.progress_calls);
     udsota_esp32_ctl_progress(&s_ctl, &snap);
     TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_IDLE, snap.stage);
     TEST_ASSERT_EQUAL_UINT32(0u, snap.done);
@@ -700,7 +668,7 @@ static void test_progress_snapshot_without_an_app_hook(void)
     exchange(prog, sizeof prog, 0x50, NOW);
     exchange(rd, sizeof rd, 0x74, NOW + 1u);
     expect_snapshot_is_server();
-    TEST_ASSERT_EQUAL_INT(0, s_progress_calls);
+    TEST_ASSERT_EQUAL_INT(0, r.progress_calls);
 
     udsota_esp32_ctl_set_lock(&s_ctl, fake_lock, fake_unlock, NULL);
     start(NULL);
@@ -709,7 +677,7 @@ static void test_progress_snapshot_without_an_app_hook(void)
     udsota_esp32_ctl_progress(&s_ctl, &snap);
     TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_IDLE, snap.stage);
     TEST_ASSERT_EQUAL_UINT32(0u, snap.total);
-    TEST_ASSERT_EQUAL_INT(0, s_locks);
+    TEST_ASSERT_EQUAL_INT(0, r.locks);
 }
 
 /* A 36 01 carrying the example image's first block with version v (up to 32 bytes) in its esp_app_desc_t. */
@@ -756,40 +724,40 @@ static void test_version_set_by_the_first_block_kept_after_the_end_and_cleared_b
 {
     const udsota_hooks_t app = { .progress = app_progress, .ctx = &s_marker };
     start(&app);
-    udsota_esp32_ctl_set_lock(&s_ctl, fake_lock, fake_unlock, &s_lock_depth);
+    udsota_esp32_ctl_set_lock(&s_ctl, fake_lock, fake_unlock, &r.lock_depth);
     uint8_t blk1[2u + UDSOTA_IMAGE_MIN_LEN];
     const uint8_t prog[] = {0x10, 0x02};
     const uint8_t rd[] = {0x34, 0x00, 0x44, 0, 0, 0, 0, 0, 0, 0x01, 0x48};   /* 328 bytes */
     const uint8_t blk2[] = {0x36, 0x02, 1, 2, 3, 4, 5, 6, 7, 8};
     exchange(prog, sizeof prog, 0x50, NOW);
     exchange(rd, sizeof rd, 0x74, NOW + 1u);
-    TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_ERASING, s_progress_arg.stage);
-    TEST_ASSERT_EQUAL_STRING("", s_version_in_hook);
+    TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_ERASING, r.progress_arg.stage);
+    TEST_ASSERT_EQUAL_STRING("", r.version_in_hook);
     block_with_version(blk1, "v0.3.1");
     exchange(blk1, sizeof blk1, 0x76, NOW + 2u);                   /* the first block passes: stored */
-    TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_WRITING, s_progress_arg.stage);
-    TEST_ASSERT_EQUAL_STRING("v0.3.1", s_version_in_hook);
+    TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_WRITING, r.progress_arg.stage);
+    TEST_ASSERT_EQUAL_STRING("v0.3.1", r.version_in_hook);
     exchange(blk2, sizeof blk2, 0x76, NOW + 3u);
     expect_version("v0.3.1");
     udsota_esp32_ctl_request_end(&s_ctl);                          /* the session ends: IDLE, aborted */
     TEST_ASSERT_TRUE(udsota_esp32_ctl_run_end(&s_ctl, &s_srv, NOW + 4u));
-    TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_IDLE, s_progress_arg.stage);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_ABORTED, s_progress_arg.last_reason);
-    TEST_ASSERT_EQUAL_STRING("v0.3.1", s_version_in_hook);          /* kept, so "v0.3.1 failed" can be drawn */
+    TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_IDLE, r.progress_arg.stage);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_ABORTED, r.progress_arg.last_reason);
+    TEST_ASSERT_EQUAL_STRING("v0.3.1", r.version_in_hook);          /* kept, so "v0.3.1 failed" can be drawn */
     expect_version("v0.3.1");
 
     exchange(prog, sizeof prog, 0x50, NOW + 5u);
-    const int locks = s_locks;
+    const int locks = r.locks;
     exchange(rd, sizeof rd, 0x74, NOW + 6u);
-    TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_ERASING, s_progress_arg.stage);
-    TEST_ASSERT_EQUAL_INT(locks + 3, s_locks);         /* the report's copy in, then the hook's two copies out */
-    TEST_ASSERT_EQUAL_STRING("", s_version_in_hook);
-    TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_ERASING, s_progress_read.stage);
+    TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_ERASING, r.progress_arg.stage);
+    TEST_ASSERT_EQUAL_INT(locks + 3, r.locks);         /* the report's copy in, then the hook's two copies out */
+    TEST_ASSERT_EQUAL_STRING("", r.version_in_hook);
+    TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_ERASING, r.progress_read.stage);
     block_with_version(blk1, "v0.3.2");
     exchange(blk1, sizeof blk1, 0x76, NOW + 7u);
     expect_version("v0.3.2");
 
-    s_refuse_first = true;                                         /* a refused first block stores nothing */
+    r.refuse_first = true;                                         /* a refused first block stores nothing */
     udsota_esp32_ctl_request_end(&s_ctl);
     TEST_ASSERT_TRUE(udsota_esp32_ctl_run_end(&s_ctl, &s_srv, NOW + 8u));
     exchange(prog, sizeof prog, 0x50, NOW + 9u);
@@ -798,9 +766,9 @@ static void test_version_set_by_the_first_block_kept_after_the_end_and_cleared_b
     block_with_version(blk1, "v0.3.3");
     exchange(blk1, sizeof blk1, 0x7F, NOW + 11u);
     expect_version("");
-    TEST_ASSERT_EQUAL_INT(s_locks, s_unlocks);
-    TEST_ASSERT_EQUAL_INT(1, s_lock_max);
-    TEST_ASSERT_EQUAL_INT(0, s_lock_depth_in_hook);
+    TEST_ASSERT_EQUAL_INT(r.locks, r.unlocks);
+    TEST_ASSERT_EQUAL_INT(1, r.lock_max);
+    TEST_ASSERT_EQUAL_INT(0, r.lock_depth_in_hook);
 }
 
 /* The rule the port runs on each judged first block: only an accepted one that holds the whole field stores,
@@ -836,7 +804,7 @@ static void test_version_from_a_compressed_download_and_cleared_by_a_refused_zbe
     udsota_esp32_ctl_init(&s_ctl, &app, default_reset, &s_hooks);
     const udsota_config_t cfg = {0};
     udsota_init(&s_srv, &cfg, &k_zengine, NULL, &s_hooks);
-    udsota_esp32_ctl_set_lock(&s_ctl, fake_lock, fake_unlock, &s_lock_depth);
+    udsota_esp32_ctl_set_lock(&s_ctl, fake_lock, fake_unlock, &r.lock_depth);
 
     static uint8_t img[Z_IMG_LEN];
     static uint8_t z[Z_IMG_LEN];
@@ -860,7 +828,7 @@ static void test_version_from_a_compressed_download_and_cleared_by_a_refused_zbe
     const uint8_t exit_req[] = {0x37};
     exchange(prog, sizeof prog, 0x50, NOW);
     exchange(rdz, sizeof rdz, 0x74, NOW + 1u);
-    TEST_ASSERT_EQUAL_STRING("", s_version_in_hook);
+    TEST_ASSERT_EQUAL_STRING("", r.version_in_hook);
     exchange(td, 2u + z_len, 0x76, NOW + 2u);                      /* inflated past 320 bytes: checked, stored */
     expect_version("v0.4.0");
     exchange(exit_req, sizeof exit_req, 0x77, NOW + 3u);
@@ -869,20 +837,20 @@ static void test_version_from_a_compressed_download_and_cleared_by_a_refused_zbe
     TEST_ASSERT_TRUE(udsota_esp32_ctl_run_end(&s_ctl, &s_srv, NOW + 4u));
     expect_version("v0.4.0");                                     /* kept after the end */
 
-    s_zbegin_fail = true;
+    r.zbegin_fail = true;
     exchange(prog, sizeof prog, 0x50, NOW + 5u);
-    const int calls = s_progress_calls;
+    const int calls = r.progress_calls;
     uint8_t resp[16];
     TEST_ASSERT_EQUAL_UINT(3u, udsota_on_request(&s_srv, rdz, sizeof rdz, resp, sizeof resp, NOW + 6u));
     TEST_ASSERT_EQUAL_HEX8(0x7F, resp[0]);
     TEST_ASSERT_EQUAL_HEX8(0x22, resp[2]);
-    TEST_ASSERT_EQUAL_INT(calls + 1, s_progress_calls);
-    TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_IDLE, s_progress_arg.stage);
-    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_NO_MEMORY, s_progress_arg.last_reason);
-    TEST_ASSERT_EQUAL_STRING("", s_version_in_hook);               /* cleared before the report ran */
+    TEST_ASSERT_EQUAL_INT(calls + 1, r.progress_calls);
+    TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_IDLE, r.progress_arg.stage);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_NO_MEMORY, r.progress_arg.last_reason);
+    TEST_ASSERT_EQUAL_STRING("", r.version_in_hook);               /* cleared before the report ran */
     expect_version("");
-    TEST_ASSERT_EQUAL_INT(s_locks, s_unlocks);
-    TEST_ASSERT_EQUAL_INT(1, s_lock_max);
+    TEST_ASSERT_EQUAL_INT(r.locks, r.unlocks);
+    TEST_ASSERT_EQUAL_INT(1, r.lock_max);
 }
 
 /* Reports straight to the wrapper: the move into ERASING from IDLE clears the version inside the one lock span
@@ -891,7 +859,7 @@ static void test_version_from_a_compressed_download_and_cleared_by_a_refused_zbe
 static void test_version_cleared_only_by_the_move_into_erasing(void)
 {
     start(NULL);
-    udsota_esp32_ctl_set_lock(&s_ctl, fake_lock, fake_unlock, &s_lock_depth);
+    udsota_esp32_ctl_set_lock(&s_ctl, fake_lock, fake_unlock, &r.lock_depth);
     const udsota_progress_t erasing = { .stage = UDSOTA_STAGE_ERASING, .done = 0u, .total = 8u };
     const udsota_progress_t writing1 = { .stage = UDSOTA_STAGE_WRITING, .done = 4u, .total = 8u };
     const udsota_progress_t writing2 = { .stage = UDSOTA_STAGE_WRITING, .done = 8u, .total = 8u };
@@ -899,13 +867,13 @@ static void test_version_cleared_only_by_the_move_into_erasing(void)
     const udsota_progress_t idle = { .stage = UDSOTA_STAGE_IDLE, .last_reason = UDSOTA_DL_VERIFY_FAILED };
 
     udsota_esp32_ctl_set_version(&s_ctl, "v0.3.1", UDSOTA_ESP32_CTL_VERSION_MAX);
-    const int locks = s_locks;
+    const int locks = r.locks;
     s_hooks.progress(s_hooks.ctx, &erasing);
-    TEST_ASSERT_EQUAL_INT(locks + 1, s_locks);
-    TEST_ASSERT_EQUAL_STRING("v0.3.1", s_version_at_lock);
-    TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_IDLE, s_stage_at_lock);
-    TEST_ASSERT_EQUAL_STRING("", s_version_at_unlock);
-    TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_ERASING, s_stage_at_unlock);
+    TEST_ASSERT_EQUAL_INT(locks + 1, r.locks);
+    TEST_ASSERT_EQUAL_STRING("v0.3.1", r.version_at_lock);
+    TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_IDLE, r.stage_at_lock);
+    TEST_ASSERT_EQUAL_STRING("", r.version_at_unlock);
+    TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_ERASING, r.stage_at_unlock);
 
     udsota_esp32_ctl_set_version(&s_ctl, "v0.3.2", UDSOTA_ESP32_CTL_VERSION_MAX);
     s_hooks.progress(s_hooks.ctx, &erasing);                  /* stays in ERASING */
@@ -920,8 +888,8 @@ static void test_version_cleared_only_by_the_move_into_erasing(void)
     s_hooks.progress(s_hooks.ctx, &writing1);                 /* WRITING after a 37 with the handle open */
     s_hooks.progress(s_hooks.ctx, &erasing);                  /* a 34 from WRITING clears too */
     expect_version("");
-    TEST_ASSERT_EQUAL_INT(s_locks, s_unlocks);
-    TEST_ASSERT_EQUAL_INT(1, s_lock_max);
+    TEST_ASSERT_EQUAL_INT(r.locks, r.unlocks);
+    TEST_ASSERT_EQUAL_INT(1, r.lock_max);
 }
 
 /* A 32-byte version with no NUL keeps its first 31 bytes; a NUL ends it early; max bounds the read; each byte
@@ -949,19 +917,19 @@ static void test_version_truncated_and_sanitised(void)
 static void test_version_copies_take_the_lock(void)
 {
     start(NULL);
-    udsota_esp32_ctl_set_lock(&s_ctl, fake_lock, fake_unlock, &s_lock_depth);
+    udsota_esp32_ctl_set_lock(&s_ctl, fake_lock, fake_unlock, &r.lock_depth);
     char v[UDSOTA_ESP32_CTL_VERSION_MAX];
     udsota_esp32_ctl_set_version(&s_ctl, "v0.3.1", UDSOTA_ESP32_CTL_VERSION_MAX);
-    TEST_ASSERT_EQUAL_INT(1, s_locks);
-    TEST_ASSERT_EQUAL_INT(1, s_unlocks);
-    TEST_ASSERT_EQUAL_STRING("", s_version_at_lock);          /* stored inside the span */
-    TEST_ASSERT_EQUAL_STRING("v0.3.1", s_version_at_unlock);
+    TEST_ASSERT_EQUAL_INT(1, r.locks);
+    TEST_ASSERT_EQUAL_INT(1, r.unlocks);
+    TEST_ASSERT_EQUAL_STRING("", r.version_at_lock);          /* stored inside the span */
+    TEST_ASSERT_EQUAL_STRING("v0.3.1", r.version_at_unlock);
     TEST_ASSERT_EQUAL_UINT(6u, udsota_esp32_ctl_version(&s_ctl, v));
-    TEST_ASSERT_EQUAL_INT(2, s_locks);
-    TEST_ASSERT_EQUAL_INT(2, s_unlocks);
-    TEST_ASSERT_EQUAL_PTR(&s_lock_depth, s_lock_ctx_seen);
-    TEST_ASSERT_EQUAL_INT(1, s_lock_max);
-    TEST_ASSERT_EQUAL_INT(0, s_lock_depth);
+    TEST_ASSERT_EQUAL_INT(2, r.locks);
+    TEST_ASSERT_EQUAL_INT(2, r.unlocks);
+    TEST_ASSERT_EQUAL_PTR(&r.lock_depth, r.lock_ctx_seen);
+    TEST_ASSERT_EQUAL_INT(1, r.lock_max);
+    TEST_ASSERT_EQUAL_INT(0, r.lock_depth);
 }
 
 /* Waits become ticks rounded down, never 0 for a real wait: 5 ms is 1 tick at 100 Hz (not 0, which spun the
