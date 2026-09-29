@@ -3,8 +3,9 @@
 Commands: info (identity, update state, the profile's DIDs), flash FILE (precheck to ConfirmImage),
 confirm (ConfirmImage after an update), reset (11 01, keyed when the profile has [security]), config show /
 config set NAME=VALUE... (the profile's writable DIDs: stage with 0x2E, --commit, --reset to apply and check),
-pack FILE (the payloads flash would send, with a manifest, for another flasher; no bus) and keygen (a key pair
-for the ecdsa mode; it needs no profile and no bus).
+dtc show [--ext CODE] / dtc clear (the device's DTCs: 0x19, and 0x14 unlocked as config set is), pack FILE (the
+payloads flash would send, with a manifest, for another flasher; no bus) and keygen (a key pair for the ecdsa mode;
+it needs no profile and no bus).
 The profile (--profile NAME or a .toml path) holds everything product-specific. Every frame goes out on
 the profile's req_id only, never on a deny_tx ID. Before sending, the tool listens LISTEN_S seconds and
 stops on the profile's busy value or on any resp_id frame, then pre-rolls a quiet bus if the profile asks.
@@ -20,6 +21,7 @@ import can
 from .profile import load as load_profile
 from .errors import Refused, ToolError
 from .config import config_set, config_show, parse_writes, writable_keys
+from .dtc import dtc_clear, dtc_ext, dtc_show, ext_code
 from .image import parse_image
 from .keys import keygen, load_master, load_private_key
 from .transport import Transport
@@ -78,6 +80,12 @@ def parse_args(argv):
     s.add_argument("--commit", action="store_true", help="run the profile's commit routine after staging")
     s.add_argument("--reset", action="store_true",
                    help="with --commit: keyed 11 01, then read every key back and check the config hash")
+    dt = sub.add_parser("dtc", help="read or clear the device's DTCs (0x19, 0x14)")
+    dsub = dt.add_subparsers(dest="dtc_cmd", required=True)
+    ds = dsub.add_parser("show", help="every DTC with a status bit set (19 02 FF), with the profile's descriptions")
+    ds.add_argument("--ext", metavar="CODE", help="one DTC's status and extended data records instead (19 06 CODE FF); "
+                                                  "CODE is U0073, U0073-1C or 0xC07300")
+    dsub.add_parser("clear", help="clear every DTC (14 FF FF FF) in the extended session, unlocked as config set is")
     pk = sub.add_parser("pack", help="write the download payloads for FILE and a JSON manifest, for a flasher that "
                                      "is not this client")
     pk.add_argument("file", type=pathlib.Path)
@@ -96,7 +104,8 @@ def parse_args(argv):
     return args
 
 
-# The profile's 0x27 secret for flash, reset and config set: the master key (mode hmac) or the private key (mode ecdsa).
+# The profile's 0x27 secret for flash, reset, config set and dtc clear: the master key (mode hmac) or the private key
+# (mode ecdsa).
 def load_secret(prof, args):
     if prof.security.mode == "ecdsa":
         if args.master:
@@ -166,7 +175,7 @@ def main(argv=None, transport=Transport):
         interface = args.interface or prof.interface
         if interface is None:
             raise Refused("profile %s names no CAN interface: pass --interface" % prof.name)
-        image = secret = writes = bases = None
+        image = secret = writes = bases = ext = None
         if args.cmd == "flash":
             try:
                 image = args.file.read_bytes()
@@ -185,7 +194,10 @@ def main(argv=None, transport=Transport):
             writes = parse_writes(prof, args.assignments, args.commit, args.reset)
         elif args.cmd == "config":
             writable_keys(prof)
-        if (args.cmd in ("flash", "reset") or writes is not None) and prof.security is not None:
+        if args.cmd == "dtc" and args.dtc_cmd == "show" and args.ext is not None:
+            ext = ext_code(args.ext)
+        keyed = args.cmd in ("flash", "reset") or writes is not None or (args.cmd == "dtc" and args.dtc_cmd == "clear")
+        if keyed and prof.security is not None:
             secret = load_secret(prof, args)
         with transport(prof, interface) as t:
             t.preflight()
@@ -203,6 +215,10 @@ def main(argv=None, transport=Transport):
                     return config_show(uds, prof)
                 return config_set(uds, prof, writes, secret, commit=args.commit, reset=args.reset,
                                   preroll=t.preroll)
+            if args.cmd == "dtc":
+                if args.dtc_cmd == "clear":
+                    return dtc_clear(uds, prof, secret)
+                return dtc_show(uds, prof) if ext is None else dtc_ext(uds, prof, ext, args.ext)
             return reset(uds, prof, secret)
     except ToolError as e:
         print("udsota: %s" % e, file=sys.stderr)

@@ -68,3 +68,9 @@ names = { 1 = "devkit" }              # board name for each hw_id; flash refuses
 # commit_rid = 0x1234                 # RoutineControl RID that commits the staged values; status 00 = stored
 # status_did = 0xF1B2                 # a DID reporting the device's config state, printed as hex
 # hash = { did = 0xF1B0, first = 0x0200, last = 0x02FF, schema = 1 }   # SHA-256 check, see the client README
+
+# [dtcs] gives `dtc show` a description for each DTC. A key is an SAE J2012 code, which names every failure-type
+# byte (U0073), a code with one failure-type byte (U0073-1C), which wins over it, or the 24-bit DTC (0xC07300).
+# [dtcs]
+# "U0073" = "Lost communication with ECM/PCM \"A\""
+# "P0562" = "System voltage low"

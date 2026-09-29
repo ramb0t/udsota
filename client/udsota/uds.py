@@ -105,6 +105,17 @@ class Uds:
             raise UpdateFailed("routine echo %s does not match 0x%04X" % (d[:3].hex(), rid))
         return d[3:]
 
+    # ReadDTCInformation sub-function sub with data; checks the sub-function echo and returns what follows it.
+    def read_dtc(self, sub, data=b""):
+        d = self.request(services.ReadDTCInformation, sub, data)
+        if d[:1] != bytes([sub]):
+            raise UpdateFailed("19 %02X answered with sub-function %s" % (sub, d[:1].hex() or "none"))
+        return d[1:]
+
+    # ClearDiagnosticInformation for the 3-byte groupOfDTC group (wire.DTC_GROUP_ALL: every DTC).
+    def clear_dtc(self, group):
+        self.request(services.ClearDiagnosticInformation, data=group.to_bytes(3, "big"))
+
     # TesterPresent 3E 00. Never 3E 80 here: a suppressed answer would leave the monitor waiting.
     def tester_present(self):
         self.request(services.TesterPresent, 0x00)

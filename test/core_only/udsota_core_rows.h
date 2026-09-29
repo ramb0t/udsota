@@ -1,6 +1,7 @@
-/* Groups A to G of the no-updater tests (docs/plans/2026-09-29-seam-tests.md): the server with no service registered,
- * so 34, 36 and 37 answer 0x11, the updater's RIDs and DIDs go to the app's hooks, 10 02 and 11 01 ask only the core's
- * worker rule and the gate, and nothing reaches a service. Two tests include these same rows: the no-engine test
+/* Groups A to G of the no-updater tests (docs/plans/2026-09-29-seam-tests.md), and I (19 and 14,
+ * docs/plans/2026-09-29-dtc-services.md): the server with no service registered, so 34, 36 and 37 answer 0x11, the
+ * updater's RIDs and DIDs go to the app's hooks, 10 02 and 11 01 ask only the core's worker rule and the gate, 19 and
+ * 14 are served through their hooks, and nothing reaches a service. Two tests include these same rows: the no-engine test
  * (udsota_init with a NULL engine) and the core-only test (udsota_core_init, built without the updater), which proves
  * the two paths answer alike. Core headers only, with its own mock hooks and security, so it compiles without any
  * updater header but udsota_update_state.h.
@@ -182,6 +183,9 @@ typedef struct {
     uint8_t         comm_control, comm_type;
     unsigned        dtc_calls;
     bool            dtc_on;
+    unsigned        dtc_gets, dtc_exts, dtc_clears;
+    uint32_t        clear_group;
+    udsota_access_t clear_access;
     uint32_t        tx_pending;        /* what the installed tx_pending returns */
 } app_t;
 
@@ -260,6 +264,42 @@ static void app_dtc(void *ctx, bool on)
     app.dtc_on = on;
 }
 
+/* The app's two DTCs: U0073 (status 2F) and P0562 (status 28). */
+static const udsota_dtc_t k_dtcs[2] = {{0xC07300u, 0x2Fu}, {0x056200u, 0x28u}};
+
+/* hooks.dtc_get: k_dtcs. */
+static bool app_dtc_get(void *ctx, size_t i, udsota_dtc_t *out)
+{
+    app.dtc_gets++;
+    if (i >= sizeof k_dtcs / sizeof k_dtcs[0]) {
+        return false;
+    }
+    *out = k_dtcs[i];
+    return true;
+}
+
+/* hooks.dtc_ext_data: record 01 is 01 07 for either DTC, any other 0x31. */
+static uint8_t app_dtc_ext(void *ctx, uint32_t dtc, uint8_t record, uint8_t *buf, size_t max, size_t *len)
+{
+    app.dtc_exts++;
+    if (record != 0x01u || max < 2u) {
+        return UDSOTA_NRC_REQUEST_OUT_OF_RANGE;
+    }
+    buf[0] = 0x01;
+    buf[1] = 0x07;
+    *len = 2u;
+    return 0u;
+}
+
+/* hooks.dtc_clear: records the group and access and clears. */
+static uint8_t app_dtc_clear(void *ctx, uint32_t group, udsota_access_t access)
+{
+    app.dtc_clears++;
+    app.clear_group = group;
+    app.clear_access = access;
+    return 0u;
+}
+
 /* hooks.did_write: accepts. */
 static uint8_t app_did_write(void *ctx, uint16_t did, const uint8_t *data, size_t len, udsota_access_t access)
 {
@@ -280,6 +320,9 @@ static void boot(bool serves)
     g_hooks.routine = serves ? app_routine : NULL;
     g_hooks.routine_poll = app_routine_poll;
     g_hooks.progress = app_progress;
+    g_hooks.dtc_get = app_dtc_get;
+    g_hooks.dtc_ext_data = app_dtc_ext;
+    g_hooks.dtc_clear = app_dtc_clear;
     TEST_ASSERT_TRUE(CORE_ROWS_INIT(&s, &g_cfg, rows_security(), &g_hooks));
     udsota_set_tx_pending(&s, app_tx_pending, NULL);
     now = T0;
@@ -855,6 +898,8 @@ static bool g_served(uint8_t sid)
     case UDSOTA_SID_ROUTINE:
     case UDSOTA_SID_TESTER_PRESENT:
     case UDSOTA_SID_DTC_SETTING:
+    case UDSOTA_SID_READ_DTC:
+    case UDSOTA_SID_CLEAR_DTC:
         return true;
     default:
         return false;
@@ -900,6 +945,43 @@ static void test_G_every_sid_every_state(void)
     }
 }
 
+/* ---- I: 19 and 14, core services that need no service ---- */
+
+/* I1: 19 02, 19 06 and 14 through their hooks in every state, with no service registered: 19 in every session (the
+ * availability read as 0xFF), 14 reaching the hook with the state's access. */
+static void test_I1_dtc_services_without_a_service(void)
+{
+    for (state_t st = ST_DEF; st < ST_N; st++) {
+        enter(st, false);
+        REQ(0x19, 0x02, 0x08);
+        EXPECT(0x59, 0x02, 0xFF, 0xC0, 0x73, 0x00, 0x2F, 0x05, 0x62, 0x00, 0x28);
+        REQ(0x19, 0x06, 0x05, 0x62, 0x00, 0x01);
+        EXPECT(0x59, 0x06, 0x05, 0x62, 0x00, 0x28, 0x01, 0x07);
+        REQ(0x14, 0xFF, 0xFF, 0xFF);
+        EXPECT(0x54);
+        TEST_ASSERT_EQUAL_UINT_MESSAGE(1, app.dtc_exts, msg);
+        TEST_ASSERT_EQUAL_UINT_MESSAGE(1, app.dtc_clears, msg);
+        TEST_ASSERT_EQUAL_HEX32_MESSAGE(0xFFFFFFu, app.clear_group, msg);
+        TEST_ASSERT_EQUAL_UINT8_MESSAGE(k_state_session[st], app.clear_access.session, msg);
+        TEST_ASSERT_EQUAL_UINT8_MESSAGE(s.security, app.clear_access.unlocked_level, msg);
+        TEST_ASSERT_FALSE_MESSAGE(udsota_download_active(&s), msg);
+    }
+}
+
+/* I2: without the DTC hooks, 19 and 14 answer 0x11 as any unserved SID. */
+static void test_I2_dtc_services_need_their_hooks(void)
+{
+    enter(ST_EXT, false);
+    g_hooks.dtc_get = NULL;
+    g_hooks.dtc_clear = NULL;
+    TEST_ASSERT_TRUE(CORE_ROWS_INIT(&s, &g_cfg, rows_security(), &g_hooks));
+    REQ(0x19, 0x02, 0xFF);
+    NRC(0x19, UDSOTA_NRC_SERVICE_NOT_SUPPORTED);
+    REQ(0x14, 0xFF, 0xFF, 0xFF);
+    NRC(0x14, UDSOTA_NRC_SERVICE_NOT_SUPPORTED);
+    TEST_ASSERT_EQUAL_UINT(0, app.dtc_gets + app.dtc_clears);
+}
+
 /* ---- The table and main ---- */
 
 typedef struct {
@@ -910,7 +992,7 @@ typedef struct {
 #define ROW(f) {#f, f, __LINE__}
 
 /* Groups A to G, in the order that ran the 0.8.0 tree furthest before its first crash: A, B without F002, C, then
- * F002, D, E, F, G. */
+ * F002, D, E, F, G; then I. */
 #define CORE_ROWS                                                                                                    \
     ROW(test_A1_request_download_not_supported), ROW(test_A2_not_supported_before_length_and_session),              \
     ROW(test_A3_no_download_side_effects), ROW(test_B1_updater_rids_without_app),                                   \
@@ -921,7 +1003,8 @@ typedef struct {
     ROW(test_D4_app_orphan_blocks_programming), ROW(test_D5_reenter_programming), ROW(test_E1_reset_locked),       \
     ROW(test_E2_reset_restarts), ROW(test_E3_reset_refusals), ROW(test_F1_security_access),                         \
     ROW(test_F2_app_services), ROW(test_F3_app_routine_job), ROW(test_F4_session_ends),                             \
-    ROW(test_F5_fc_check_and_progress), ROW(test_G_every_sid_every_state)
+    ROW(test_F5_fc_check_and_progress), ROW(test_G_every_sid_every_state),                                         \
+    ROW(test_I1_dtc_services_without_a_service), ROW(test_I2_dtc_services_need_their_hooks)
 
 /* Runs every test in tests[0..n), or only the one named in argv[1] (so a failure can be shown alone). */
 static int core_rows_main(int argc, char **argv, const test_row_t *tests, size_t n)

@@ -2,7 +2,7 @@
  * ISO-TP adapter run over SocketCAN or a stdin/stdout frame pipe (demo_can.h), with an update engine on
  * two file-backed A/B slots (demo_engine.h). ActivateImage and 11 01 "reboot" in-process: the engine runs
  * the boot slot, stays silent for --boot-ms, and a fresh server starts, so an activated image runs
- * PENDING_VERIFY until ConfirmImage and one reset before that rolls back.
+ * PENDING_VERIFY until ConfirmImage and one reset before that rolls back. A three-DTC table serves 19 and 14.
  *
  *   udsota_demo_server [--socketcan IFACE] [options]      serve (the pipe by default)
  *   udsota_demo_server --make-image OUT --version V         write an image for the configured identity
@@ -34,6 +34,9 @@
 #define DEMO_IMAGE_PAYLOAD  8192u       /* --make-image's default segment 0 size */
 #define DEMO_MASTER_LEN     32u         /* the client's master_file: 32 raw bytes */
 #define DID_BOARD           0xF191u     /* the example profile's board-name DID */
+#define DEMO_DTC_AVAIL      0x2Fu       /* the status bits the demo supports: 0-3 and 5, as CANDash */
+#define DTC_REC_COUNT       0x01u       /* extended data record 01: the occurrence count, 1 byte */
+#define DTC_REC_SEEN        0x10u       /* extended data record 10: first and last seen, two u32 seconds */
 
 /* Everything the command line sets. */
 typedef struct {
@@ -53,7 +56,18 @@ typedef struct {
     bool        self_test;
     uint32_t    withhold_fc_after;    /* --withhold-fc-after N: refuse the FC point after a message's Nth CF, once */
     uint32_t    drop_fc_after;        /* --drop-fc-after N: lose the FC sent after a message's Nth CF, once */
+    bool        no_dtc;               /* --no-dtc: the DTC hooks stay NULL, so 19 and 14 answer 0x11 */
 } opts_t;
+
+/* One of the demo's DTCs and its extended data. */
+typedef struct {
+    uint32_t dtc;                     /* the SAE J2012 code and a failure-type byte 00 (DTCFormatIdentifier 0x00) */
+    uint8_t  status;                  /* sent as status & DEMO_DTC_AVAIL */
+    bool     has_records;             /* records 01 and 10 are held */
+    bool     has_seen;                /* record 10 holds data (else it is held with none) */
+    uint8_t  count;                   /* record 01 */
+    uint32_t first_s, last_s;         /* record 10 */
+} demo_dtc_t;
 
 /* The one server instance: its options, engine, bus, and the state a restart replaces. */
 typedef struct {
@@ -81,6 +95,14 @@ typedef struct {
 
 static demo_t d;
 static volatile sig_atomic_t s_stop;
+
+/* The DTC table (see the README). It lives in RAM for the process, so a restart keeps a clear, as NVS would. */
+static demo_dtc_t s_dtcs[] = {
+    {0xC07300u, 0x2Fu, true, true, 3u, 120u, 3600u},   /* U0073: lost communication with ECM/PCM "A" */
+    {0x056200u, 0x68u, true, false, 1u, 0u, 0u},       /* P0562: system voltage low; 0x40 is off the wire */
+    {0x923400u, 0x00u, false, false, 0u, 0u, 0u},      /* B1234: no bit set, so only 19 0A lists it */
+};
+#define DEMO_DTC_N (sizeof s_dtcs / sizeof s_dtcs[0])
 
 /* Monotonic microseconds. */
 static uint64_t mono_us(void)
@@ -168,6 +190,92 @@ static bool on_reset(void *ctx)
     return true;
 }
 
+/* hooks.dtc_get: the i-th entry of s_dtcs. */
+static bool on_dtc_get(void *ctx, size_t i, udsota_dtc_t *out)
+{
+    (void)ctx;
+    if (i >= DEMO_DTC_N) {
+        return false;
+    }
+    out->dtc = s_dtcs[i].dtc;
+    out->status = s_dtcs[i].status;
+    return true;
+}
+
+/* Appends record rec of e at buf[*n]: 01 <count>, or 10 <first u32> <last u32> (nothing after the 10 while it holds
+ * no data); false when it doesn't fit max. */
+static bool dtc_record(const demo_dtc_t *e, uint8_t rec, uint8_t *buf, size_t max, size_t *n)
+{
+    const size_t need = (rec == DTC_REC_COUNT) ? 2u : e->has_seen ? 9u : 1u;
+    if (max - *n < need) {
+        return false;
+    }
+    buf[*n] = rec;
+    if (rec == DTC_REC_COUNT) {
+        buf[*n + 1u] = e->count;
+    } else if (e->has_seen) {
+        udsota_put_u32be(&buf[*n + 1u], e->first_s);
+        udsota_put_u32be(&buf[*n + 5u], e->last_s);
+    }
+    *n += need;
+    return true;
+}
+
+/* hooks.dtc_ext_data: 01 and 10 for U0073 and P0562 (P0562's 10 held with no data, so asked alone it answers the
+ * DTC and status alone, and FF leaves it out), none for B1234 (FF answers no records, any other 0x31). */
+static uint8_t on_dtc_ext_data(void *ctx, uint32_t dtc, uint8_t record, uint8_t *buf, size_t max, size_t *len)
+{
+    (void)ctx;
+    const demo_dtc_t *e = NULL;
+    for (size_t i = 0; i < DEMO_DTC_N && e == NULL; i++) {
+        e = (s_dtcs[i].dtc == dtc) ? &s_dtcs[i] : NULL;
+    }
+    *len = 0u;
+    if (e == NULL || (!e->has_records && record != UDSOTA_DTC_RECORD_ALL)) {
+        return UDSOTA_NRC_REQUEST_OUT_OF_RANGE;
+    }
+    if (!e->has_records) {
+        return 0u;
+    }
+    if (record == DTC_REC_SEEN && !e->has_seen) {
+        return 0u;                                  /* held, with no data */
+    }
+    bool ok = true;
+    if (record == UDSOTA_DTC_RECORD_ALL) {
+        ok = dtc_record(e, DTC_REC_COUNT, buf, max, len) &&
+             (!e->has_seen || dtc_record(e, DTC_REC_SEEN, buf, max, len));
+    } else if (record == DTC_REC_COUNT || record == DTC_REC_SEEN) {
+        ok = dtc_record(e, record, buf, max, len);
+    } else {
+        return UDSOTA_NRC_REQUEST_OUT_OF_RANGE;
+    }
+    return ok ? 0u : UDSOTA_NRC_RESPONSE_TOO_LONG;
+}
+
+/* hooks.dtc_clear, its rules in ISO order: the extended session (0x7F), then unlocked at the extended level when
+ * security is on (0x33; the demo leaves cfg.level_extended at 0x01), then group FFFFFF only (0x31). Zeroes every
+ * status, count and time. */
+static uint8_t on_dtc_clear(void *ctx, uint32_t group, udsota_access_t access)
+{
+    (void)ctx;
+    if (access.session != UDSOTA_SESSION_EXTENDED) {
+        return UDSOTA_NRC_SERVICE_NOT_SUPPORTED_IN_SESSION;
+    }
+    if (d.secured && access.unlocked_level != UDSOTA_SA_SEED_EXTENDED) {
+        return UDSOTA_NRC_SECURITY_ACCESS_DENIED;
+    }
+    if (group != UDSOTA_DTC_GROUP_ALL) {
+        return UDSOTA_NRC_REQUEST_OUT_OF_RANGE;
+    }
+    for (size_t i = 0; i < DEMO_DTC_N; i++) {
+        s_dtcs[i].status = 0u;
+        s_dtcs[i].count = 0u;
+        s_dtcs[i].first_s = s_dtcs[i].last_s = 0u;
+    }
+    fprintf(stderr, "udsota_demo_server: cleared every DTC\n");
+    return 0u;
+}
+
 /* security.rng16: 16 bytes from getrandom. */
 static bool on_rng16(void *ctx, uint8_t out[16])
 {
@@ -223,9 +331,15 @@ static int on_send(void *ctx, uint16_t id, const uint8_t data[8], uint8_t len)
 /* Starts a fresh server and adapter on the image now running, as a boot of the device would. */
 static void start_server(void)
 {
-    static const udsota_hooks_t hooks = {
+    static udsota_hooks_t hooks;                /* the server and the adapter copy what they need */
+    hooks = (udsota_hooks_t){
         .gate = on_gate, .phase = on_phase, .did_read = on_did_read, .reset = on_reset,
     };
+    if (!d.o.no_dtc) {
+        hooks.dtc_get = on_dtc_get;
+        hooks.dtc_ext_data = on_dtc_ext_data;
+        hooks.dtc_clear = on_dtc_clear;
+    }
     static const udsota_security_t sec = { .rng16 = on_rng16, .key = on_key };
     const udsota_can_t can = {
         .send = on_send, .now_us = can_now_us, .ctx = &d.can,   /* a written frame has left: no tx_pending */
@@ -339,6 +453,7 @@ static void usage(FILE *out)
           "slots:    --state-dir DIR, --fresh, --slot-size 0x1E0000, --running-version v0.1.0, --no-rollback,\n"
           "          --no-compress (refuse DFI 0x10, 0x20 and 0x30 downloads), --no-delta (refuse 0x20 and 0x30)\n"
           "security: --label LABEL [--master FILE (32 bytes)], --device-id 02:00:00:00:00:01, --skip-boot-delay\n"
+          "dtc:      --no-dtc (no DTC hooks: 19 and 14 answer 0x11)\n"
           "timing:   --boot-ms 500, --job-ms 0, --soak-ms 0, --stmin-us 2000, --block-size 64, --stmin-monitor\n"
           "faults:   --withhold-fc-after N (refuse the FC point after a message's Nth CF, then ignore the next FF),\n"
           "          --drop-fc-after N (lose the FC sent after a message's Nth CF); each once, N a multiple of the BS\n"
@@ -352,7 +467,7 @@ static bool parse_args(int argc, char **argv)
         O_SOCKETCAN = 256, O_REQ, O_RESP, O_PRODUCT, O_HW, O_LAYOUT, O_BOARD, O_CHIP, O_DIR, O_FRESH, O_SLOT, O_RUNNING,
         O_NO_ROLLBACK, O_LABEL, O_MASTER, O_DEVID, O_SKIP_DELAY, O_BOOT_MS, O_JOB_MS, O_SOAK_MS, O_STMIN, O_BS,
         O_MONITOR, O_MAKE, O_VERSION, O_PAYLOAD, O_SELF_TEST, O_HELP, O_REAL_BUS, O_NO_COMPRESS, O_WITHHOLD_FC,
-        O_DROP_FC, O_NO_DELTA,
+        O_DROP_FC, O_NO_DELTA, O_NO_DTC,
     };
     static const struct option longopts[] = {
         {"socketcan", required_argument, NULL, O_SOCKETCAN}, {"req-id", required_argument, NULL, O_REQ},
@@ -372,14 +487,15 @@ static bool parse_args(int argc, char **argv)
         {"allow-real-bus", no_argument, NULL, O_REAL_BUS}, {"no-compress", no_argument, NULL, O_NO_COMPRESS},
         {"withhold-fc-after", required_argument, NULL, O_WITHHOLD_FC},
         {"drop-fc-after", required_argument, NULL, O_DROP_FC},
-        {"no-delta", no_argument, NULL, O_NO_DELTA},
+        {"no-delta", no_argument, NULL, O_NO_DELTA}, {"no-dtc", no_argument, NULL, O_NO_DTC},
         {NULL, 0, NULL, 0},
     };
     d.o = (opts_t){
         .slot_size = DEMO_SLOT_SIZE, .running_version = "v0.1.0", .board = "devkit", .boot_ms = DEMO_BOOT_MS,
         .chip_id = UDSOTA_ESP32_CHIP_ID_S3, .payload = DEMO_IMAGE_PAYLOAD,
     };
-    d.cfg = (udsota_config_t){ .req_id = 0x710, .resp_id = 0x718, .product = "example", .hw_id = 1, .layout_id = 1 };
+    d.cfg = (udsota_config_t){ .req_id = 0x710, .resp_id = 0x718, .product = "example", .hw_id = 1, .layout_id = 1,
+                               .dtc_availability_mask = DEMO_DTC_AVAIL, .dtc_format = 0x00 };
     static const uint8_t default_id[] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};   /* a locally administered MAC */
     memcpy(d.device_id, default_id, sizeof default_id);
     d.cfg.device_id_len = sizeof default_id;
@@ -409,6 +525,7 @@ static bool parse_args(int argc, char **argv)
                             d.o.withhold_fc_after = (uint32_t)v; break;
         case O_DROP_FC:     ok = num("drop-fc-after", optarg, 1, 585, &v); d.o.drop_fc_after = (uint32_t)v; break;
         case O_NO_DELTA:    d.o.no_delta = true; break;
+        case O_NO_DTC:      d.o.no_dtc = true; break;
         case O_LABEL:       label = optarg; break;
         case O_MASTER:      d.o.master_file = optarg; break;
         case O_DEVID:       ok = parse_device_id(optarg); break;

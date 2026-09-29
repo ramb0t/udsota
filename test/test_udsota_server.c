@@ -308,7 +308,8 @@ static void test_read_did_errors(void)
     EXPECT_NRC(SEND(0x22, 0xF1, 0x89, 0xF1, 0x91), 0x22, 0x13);   /* two DIDs: more than UDSOTA_READ_DID_MAX */
 }
 
-/* Unsupported SIDs get 0x11, 0x2E included (not served with did_write NULL); an empty request gets nothing. */
+/* Unsupported SIDs get 0x11: 2E included (not served with did_write NULL), and 19 and 14 (not served with dtc_get and
+ * dtc_clear NULL); an empty request gets nothing. */
 static void test_unknown_sid(void)
 {
     EXPECT_NRC(SEND(0x19, 0x02, 0xFF), 0x19, 0x11);

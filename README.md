@@ -10,7 +10,7 @@ udsota puts a small UDS diagnostic server on your device, whose main service ins
 - **Safe A/B updates.** The running firmware is never overwritten. A new image that is never confirmed is dropped at the next reset.
 - **Checked before anything is erased.** The first block of an image is checked for product, board and version, and the whole image is verified before the device switches to it.
 - **Your product decides when.** Optional hooks let the app refuse any step, for example while a vehicle is moving.
-- **Your own diagnostics too.** The same server answers the app's own DIDs, writes and routines through hooks ([how](components/udsota/README.md#adding-dids-routines-and-services)).
+- **Your own diagnostics too.** The same server answers the app's own DIDs, writes, routines and fault codes (DTCs) through hooks ([how](components/udsota/README.md#adding-dids-routines-and-services)).
 - **Locked down.** Unlocking uses ECDSA signatures (the device holds only a public key) or HMAC keys.
 - **Portable.** The core is plain C11 with no platform headers. An ESP-IDF port for the ESP32 family is included.
 

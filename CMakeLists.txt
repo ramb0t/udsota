@@ -124,9 +124,9 @@ udsota_test(test_udsota_bootloop
 
 # ---- Server, over SERVER_SRCS alone. _write: 0x2E through hooks.did_write, and the access state and session epoch
 # every app hook gets. _progress: udsota_progress() and hooks.progress after each step of a download. _no_engine: the
-# server with no updater registered (udsota_init with a NULL engine).
+# server with no updater registered (udsota_init with a NULL engine). _dtc: 0x19 and 0x14 through the DTC hooks.
 foreach(t IN ITEMS server server_security server_routines server_matrix server_hooks server_write
-                   server_functional server_progress server_no_engine)
+                   server_functional server_progress server_no_engine server_dtc)
     udsota_test(test_udsota_${t} SOURCES test/test_udsota_${t}.c ${SERVER_SRCS})
 endforeach()
 target_include_directories(test_udsota_server_no_engine PRIVATE ${TEST_DIR}/core_only)   # the rows it shares
@@ -343,6 +343,9 @@ if(UDSOTA_FUZZ AND UDSOTA_FUZZ_SAN_OK)
     # isn't needed for: 34, 36 and 37 get only 0x11 (0x21 while an app routine runs), and the app hooks give 0x31
     # its positive answers.
     udsota_fuzz(fuzz_udsota_no_update 300 DIGEST 7e2cee56a31e126f DEFS UDSOTA_FUZZ_NO_UPDATE=1 UDSOTA_FUZZ_APP_HOOKS=1)
+    # The same harness with the DTC hooks set over a 90-DTC table: 19 01, 02, 06 and 0A and 14 served, lists past the
+    # response buffer (0x14), and every status sent a subset of the availability mask.
+    udsota_fuzz(fuzz_udsota_dtc 300 DIGEST 93368578353e39a1 DEFS UDSOTA_FUZZ_DTC=1)
     # The delta patch path on mutated patches (test/fuzz_udsota_patch.c): udsota_coded over the real detools and
     # tinfl, with AddressSanitizer where the toolchain has it, since the device parses these patches from the bus.
     set(FUZZ_PATCH_SAN ${FUZZ_SAN})

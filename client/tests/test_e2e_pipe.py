@@ -693,3 +693,95 @@ def test_flash_delta_from_a_wrong_base_falls_back_after_a_lost_answer(demo, tmp_
     assert flash(s, new_path, "--diff-from", image_file(tmp_path, reseal(other), "resigned.bin")) == 0
     assert len(s.dropped) == 1 and "not running the base this patch was made from" in capsys.readouterr().out
     assert read_state(s)[1:] == (elf_sha(new), "v0.3.0")
+
+
+# ---- DTCs: dtc show and dtc clear against the demo's table ----
+
+# The built-in example profile with a [dtcs] table naming U0073, written under tmp_path; its path for --profile.
+def dtc_profile(tmp_path):
+    table = '\n[dtcs]\n"U0073" = "Lost communication with ECM/PCM \\"A\\""\n'
+    return write_profile(tmp_path, (profile.PROFILE_DIR / "example.toml").read_text() + table, "dtcs")
+
+
+# cli.main `dtc *args` with the profile at path, over the pipe to server; returns (exit code, stdout, stderr).
+def dtc_cli(server, path, capsys, *args):
+    rc = run_cli(server, ["--profile", path, "--interface", "pipe", "dtc", *args])
+    out, err = capsys.readouterr()
+    return rc, out, err
+
+
+U0073_LINE = ("U0073  status 0x2F (testFailed, testFailedThisOperationCycle, pendingDTC, confirmedDTC, "
+              "testFailedSinceLastClear)  Lost communication with ECM/PCM \"A\"")
+P0562_LINE = "P0562  status 0x28 (confirmedDTC, testFailedSinceLastClear)"
+
+
+# Check the client against the demo's DTC table: show lists U0073 with the profile's text and P0562 with 0x40 masked
+# off, not B1234 (status 00); --ext prints each DTC's extended data records (U0073's count 3 and seconds 120 and
+# 3600, P0562's count alone as its record 10 holds no data, B1234's none) and a DTC the demo lacks exits 1. clear
+# in the extended session leaves nothing to show.
+def test_dtc_show_ext_and_clear(demo, tmp_path, capsys):
+    s, path = demo(), dtc_profile(tmp_path)
+    assert dtc_cli(s, path, capsys, "show") == (0, "\n".join(["2 DTCs (availability 0x2F, format 0x00)", U0073_LINE,
+                                                                P0562_LINE, ""]), "")
+    assert dtc_cli(s, path, capsys, "show", "--ext", "U0073")[:2] == (
+        0, U0073_LINE + "\nextended data: 01 03 10 00 00 00 78 00 00 0e 10\n")
+    assert dtc_cli(s, path, capsys, "show", "--ext", "0x056200")[:2] == (0, P0562_LINE + "\nextended data: 01 01\n")
+    assert dtc_cli(s, path, capsys, "show", "--ext", "b1234")[:2] == (
+        0, "B1234  status 0x00 (none)\nno extended data stored\n")
+    rc, _, err = dtc_cli(s, path, capsys, "show", "--ext", "U0073-01")
+    assert rc == 1 and ("U0073-01 is not a DTC the device supports, or holds no extended data records (19 06 "
+                        "answered NRC 0x31)") in err
+    assert dtc_cli(s, path, capsys, "clear") == (0, "cleared every DTC\n", "")
+    assert "cleared every DTC" in s.log()
+    assert dtc_cli(s, path, capsys, "show")[:2] == (0, "no DTCs match (availability 0x2F)\n")
+    assert dtc_cli(s, path, capsys, "show", "--ext", "U0073")[:2] == (
+        0, "U0073  status 0x00 (none)  Lost communication with ECM/PCM \"A\"\nextended data: 01 00 10 00 00 00 00 00 "
+           "00 00 00\n")
+
+
+# Check a keyed clear: with the demo's security on, dtc clear unlocks at level_extended with the key the server
+# derives from the same master, label and F18C; a wrong master fails on the key (0x35) and clears nothing.
+def test_dtc_clear_with_security(demo, tmp_path, capsys):
+    good, bad = tmp_path / "master.bin", tmp_path / "wrong.bin"
+    good.write_bytes(MASTER)
+    bad.write_bytes(bytes(32))
+    s = demo("--label", LABEL, "--master", str(good), "--skip-boot-delay")
+    path = write_profile(tmp_path, SECURED % (LABEL, good))
+    rc = run_cli(s, ["--profile", path, "--interface", "pipe", "--master", str(bad), "dtc", "clear"])
+    assert rc == 1 and "0x35" in capsys.readouterr().err
+    assert dtc_cli(s, path, capsys, "show")[:2] == (0, "\n".join(["2 DTCs (availability 0x2F, format 0x00)",
+                                                                  U0073_LINE.split("  Lost")[0], P0562_LINE, ""]))
+    assert dtc_cli(s, path, capsys, "clear")[:2] == (0, "cleared every DTC\n")
+    assert dtc_cli(s, path, capsys, "show")[:2] == (0, "no DTCs match (availability 0x2F)\n")
+
+
+# Check the demo hook's rules in its order, through Uds.clear_dtc with a group it doesn't clear: 0x7F in the default
+# session, 0x33 in the extended session while locked, and 0x31 once unlocked; the table is untouched.
+def test_dtc_clear_hook_order(demo, tmp_path, capsys):
+    master = tmp_path / "master.bin"
+    master.write_bytes(MASTER)
+    s = demo("--label", LABEL, "--master", str(master), "--skip-boot-delay")
+    path = write_profile(tmp_path, SECURED % (LABEL, master))
+    prof = profile.load(path)
+    with PipeTransport(prof, s) as t:
+        uds = t.uds()
+        with pytest.raises(Nrc) as default:
+            uds.clear_dtc(0x000001)
+        uds.session(wire.SESSION_EXTENDED)
+        with pytest.raises(Nrc) as locked:
+            uds.clear_dtc(0x000001)
+        uds.unlock(prof.security.level_extended, update.device_keys(uds, prof, MASTER))
+        with pytest.raises(Nrc) as unlocked:
+            uds.clear_dtc(0x000001)
+    assert (default.value.code, locked.value.code, unlocked.value.code) == (0x7F, 0x33, 0x31)
+    rc, out, _ = dtc_cli(s, path, capsys, "show")
+    assert rc == 0 and out.startswith("2 DTCs") and "cleared every DTC" not in s.log()
+
+
+# Check a demo built without the DTC hooks (--no-dtc): show, show --ext and clear all exit 2, saying the firmware has
+# no DTC services.
+def test_dtc_commands_without_dtc_services(demo, tmp_path, capsys):
+    s = demo("--no-dtc")
+    for args in (["show"], ["show", "--ext", "U0073"], ["clear"]):
+        rc, out, err = dtc_cli(s, "example", capsys, *args)
+        assert (rc, out) == (2, "") and "this firmware has no DTC services" in err, args

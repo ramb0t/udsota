@@ -14,6 +14,7 @@
 #define UDSOTA_IDLE_POLL_MS       100u      /* longest poll gap in a non-default session (S3) */
 #define UDSOTA_READ_DID_MAX       1u        /* DIDs per 0x22 request; more is NRC 0x13 (ISO 14229-1 0x22 NRC table) */
 #define UDSOTA_RESET_TX_WAIT_MS   100u      /* ActivateImage and 11 01: restart once tx_pending()==0, or after this long */
+#define UDSOTA_DTC_INDEX_MAX      0xFFFFu   /* hooks.dtc_get is asked for i below this only: 19 01 counts in a u16 */
 
 /* A handler of the registered service (udsota_service.h) whose work is still queued passes UDSOTA_PENDING to
  * udsota_job_start instead of a result; the server then waits on the service's poll (the updater's: engine.poll).
@@ -68,6 +69,13 @@ typedef struct {
                                  restarts it at 0, so an app must not keep staged state across a re-init */
 } udsota_access_t;
 
+/* One DTC as hooks.dtc_get reports it. */
+typedef struct {
+    uint32_t dtc;      /* the 3-byte DTC in the low 24 bits, the top byte ignored: for DTCFormatIdentifier 0x00 the
+                          2-byte SAE J2012 code and the failure-type byte, so U0073 with FTB 00 is 0xC07300 */
+    uint8_t  status;   /* its ISO 14229-1 statusOfDTC now; the core sends status & cfg.dtc_availability_mask */
+} udsota_dtc_t;
+
 typedef struct {   /* all optional */
     uint8_t  (*gate)(void *ctx, udsota_op_t op);   /* 0 = allow, else the NRC to send (0x22, 0x88, 0x21, ...) */
     void     (*phase)(void *ctx, udsota_phase_t p);/* on every change, from the server's context; it may read
@@ -119,6 +127,34 @@ typedef struct {   /* all optional */
                                                       the call. It
                                                       must not call udsota functions or block. NULL: nothing changes,
                                                       and udsota_progress() still reads the same values */
+    bool     (*dtc_get)(void *ctx, size_t i, udsota_dtc_t *out);
+                                                   /* 0x19: the i-th supported DTC and its status now; false past the
+                                                      last. i names the same DTC for as long as the server runs, and
+                                                      only its status may change. Asked from 0 up for each 19 01, 02,
+                                                      0A and 06, never for i at UDSOTA_DTC_INDEX_MAX or past it. The
+                                                      walk ends at false, at the DTC a 19 06 asks for, or at the first
+                                                      DTC that would overflow a 19 02 or 0A (0x14), so a hook must not
+                                                      rely on being asked until false. NULL: 19 answers 0x11, as
+                                                      before. It answers at once, may read udsota_phase() but must not
+                                                      call other udsota functions */
+    uint8_t  (*dtc_ext_data)(void *ctx, uint32_t dtc, uint8_t record, uint8_t *buf, size_t max, size_t *len);
+                                                   /* 19 06, for a DTC dtc_get reports (the core answers 0x31 for any
+                                                      other, and for record 00, without a call); dtc is the request's
+                                                      24 bits, top byte 0, whatever top byte dtc_get gave it; record
+                                                      01-FE, or FF for every one. Writes <record> <data>... into buf,
+                                                      at most max bytes (the room after 59 06 <DTC> <status>, possibly
+                                                      0; buf is valid only during the call), sets *len and returns 0;
+                                                      *len 0 is a record held with no data. Else returns the NRC: 0x31
+                                                      no such record, 0x14 the records don't fit max; never 0x78. A
+                                                      *len over max is 0x10. NULL: 19 06 answers 0x12. Called as
+                                                      dtc_get */
+    uint8_t  (*dtc_clear)(void *ctx, uint32_t group, udsota_access_t access);
+                                                   /* 0x14 with exactly a 3-byte groupOfDTC (else 0x13 without a
+                                                      call), physical only, in any session; group in the low 24 bits
+                                                      (UDSOTA_DTC_GROUP_ALL is every DTC). Returns 0 to answer 54, or
+                                                      the NRC, checked in ISO order: its session rule (0x7F), then its
+                                                      key rule (0x33), then 0x31 for a group it doesn't clear; never
+                                                      0x78. NULL: 14 answers 0x11, as before. Called as dtc_get */
 } udsota_hooks_t;
 
 typedef struct {
@@ -140,9 +176,10 @@ typedef struct {
     uint8_t     level_extended;        /* 27 requestSeed sub-function unlocking 11 01; 0 = 0x01 */
     uint8_t     level_programming;     /* unlocks 34/36/37, FF01, ActivateImage and 11 01; 0 = 0x03 */
                                        /* both levels: odd requestSeed values 0x01..0x7D (sendKey is level + 1), distinct */
-    /* The server never reads the fields below except device_id and device_id_len: it takes security from udsota_init's security
-     * argument and leaves the image rules to engine.check_first. The ESP32 port reads them: key_* for its
-     * udsota_security_t, product, hw_id and layout_id for the udsota_image_check rules its engine runs. */
+    /* The server never reads the fields below except device_id, device_id_len and the dtc_ fields: it takes security
+     * from udsota_init's security argument and leaves the image rules to engine.check_first. The ESP32 port reads
+     * them: key_* for its udsota_security_t, product, hw_id and layout_id for the udsota_image_check rules its engine
+     * runs. */
     const char *key_label;             /* port: security on; K_dev = HMAC(master, label || device_id) */
     const uint8_t *key_master;         /* port: with key_label set and this NULL, security is on and no key matches */
     size_t      key_master_len;        /* port */
@@ -156,6 +193,12 @@ typedef struct {
                                           key_master. udsota_esp32_start() refuses a malformed one (ESP_ERR_INVALID_ARG);
                                           one PSA refuses leaves security on with no key that matches */
     size_t      key_pubkey_len;        /* port: UDSOTA_KEYS_PUBKEY_LEN (65) */
+    /* Fields added after key_pubkey_len, so every earlier field keeps its offset. */
+    uint8_t     dtc_availability_mask; /* 19's DTCStatusAvailabilityMask, the status bits the app supports: every
+                                          status sent is ANDed with it, and a DTC matches a status mask when status &
+                                          mask & this is non-zero; 0 = 0xFF (cfg_resolve) */
+    uint8_t     dtc_format;            /* 59 01's DTCFormatIdentifier, sent as given: 0x00 SAE J2012-DA format 00
+                                          (OBD codes such as U0073 with a failure-type byte), 0x01 ISO 14229-1 */
 } udsota_config_t;
 
 struct udsota_server;
@@ -237,7 +280,7 @@ udsota_phase_t udsota_phase(const udsota_server_t *s);
 /* Handles one reassembled request; returns the response length written to resp (0 = no response). */
 size_t udsota_on_request(udsota_server_t *s, const uint8_t *req, size_t len, uint8_t *resp, size_t max, uint32_t now_ms);
 /* Handles one functionally addressed request (a single frame on cfg.func_id), answered on the response ID like
- * any other. Only 10 01, 10 03, 3E, 22, 28 and 85 are served that way; anything else, and anything while a job
+ * any other. Only 10 01, 10 03, 3E, 19, 22, 28 and 85 are served that way; anything else, and anything while a job
  * runs (3E aside), gets no answer. NRCs 0x11, 0x12, 0x31, 0x7E and 0x7F are suppressed, as ISO 14229-1 asks for
  * functional requests, and the suppress bit applies as usual. Returns the response length (0 = none). */
 size_t udsota_on_functional_request(udsota_server_t *s, const uint8_t *req, size_t len, uint8_t *resp, size_t max,

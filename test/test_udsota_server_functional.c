@@ -137,7 +137,7 @@ static void test_functional_unserved_services_are_silent(void)
     TEST_ASSERT_EQUAL_UINT(0, FUNC(0x27, 0x01));
     TEST_ASSERT_EQUAL_UINT(0, FUNC(0x31, 0x01, 0xF0, 0x02));
     TEST_ASSERT_EQUAL_UINT(0, FUNC(0x11, 0x01));
-    TEST_ASSERT_EQUAL_UINT(0, FUNC(0x19, 0x02, 0xFF));
+    TEST_ASSERT_EQUAL_UINT(0, FUNC(0x14, 0xFF, 0xFF, 0xFF));
     TEST_ASSERT_EQUAL_UINT(0, func(NULL, 2));
     TEST_ASSERT_EQUAL_UINT(6, PHYS(0x10, 0x02));
     TEST_ASSERT_EQUAL_UINT(0, FUNC(0x34, 0x00, 0x44, 0, 0, 0, 0, 0, 0, 0, 0x40));

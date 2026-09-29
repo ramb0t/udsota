@@ -10,6 +10,8 @@
 /* ---- Service IDs and response framing ---- */
 #define UDSOTA_SID_SESSION           0x10   /* DiagnosticSessionControl */
 #define UDSOTA_SID_RESET             0x11   /* ECUReset (keyed) */
+#define UDSOTA_SID_CLEAR_DTC         0x14   /* ClearDiagnosticInformation: served only with hooks.dtc_clear */
+#define UDSOTA_SID_READ_DTC          0x19   /* ReadDTCInformation: served only with hooks.dtc_get */
 #define UDSOTA_SID_READ_DID          0x22   /* ReadDataByIdentifier */
 #define UDSOTA_SID_SECURITY          0x27   /* SecurityAccess */
 #define UDSOTA_SID_COMM_CONTROL      0x28   /* CommunicationControl: served only with hooks.comm_control */
@@ -35,12 +37,20 @@
 #define UDSOTA_CC_TYPE_ALL      0x03        /* communicationType: normal and network-management messages, all subnets */
 #define UDSOTA_DTC_ON           0x01        /* 85 01 */
 #define UDSOTA_DTC_OFF          0x02        /* 85 02 */
+#define UDSOTA_RDTC_COUNT_BY_MASK   0x01    /* 19 01 reportNumberOfDTCByStatusMask: 59 01 <avail> <format> <count u16> */
+#define UDSOTA_RDTC_BY_MASK         0x02    /* 19 02 reportDTCByStatusMask: 59 02 <avail>, then <DTC 3 B> <status> each */
+#define UDSOTA_RDTC_EXT_DATA        0x06    /* 19 06 reportDTCExtDataRecordByDTCNumber: 59 06 <DTC> <status> <records> */
+#define UDSOTA_RDTC_SUPPORTED       0x0A    /* 19 0A reportSupportedDTC: 59 0A <avail>, then every DTC and its status */
+#define UDSOTA_DTC_RECORD_ALL       0xFF    /* 19 06: every extended data record; record 00 is reserved (0x31) */
+#define UDSOTA_DTC_GROUP_ALL        0xFFFFFFu   /* 14's groupOfDTC for every DTC */
+#define UDSOTA_CLEAR_DTC_LEN        4u      /* 14 and the 3-byte group, exactly; any other length is 0x13 */
 
 /* ---- Negative response codes (ISO 14229-1; values match iso14229 src/uds.h) ---- */
 #define UDSOTA_NRC_GENERAL_REJECT                  0x10
 #define UDSOTA_NRC_SERVICE_NOT_SUPPORTED           0x11
 #define UDSOTA_NRC_SUBFUNC_NOT_SUPPORTED           0x12
 #define UDSOTA_NRC_INCORRECT_LENGTH                0x13   /* incorrectMessageLengthOrInvalidFormat */
+#define UDSOTA_NRC_RESPONSE_TOO_LONG               0x14   /* responseTooLong: a 19 answer past the response buffer */
 #define UDSOTA_NRC_BUSY_REPEAT                     0x21   /* busyRepeatRequest: a request while a job runs */
 #define UDSOTA_NRC_CONDITIONS_NOT_CORRECT          0x22   /* interlocks: the app's gate refused */
 #define UDSOTA_NRC_REQUEST_SEQUENCE_ERROR          0x24

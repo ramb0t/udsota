@@ -138,6 +138,9 @@ Every struct carries its own `ctx`, which is passed back to its callbacks. A NUL
 | `comm_control(ctx, control, comm_type)` | for a 28 that passed the core's checks; returns 0 once the app has stopped or resumed its own frames as asked, else the NRC. Called again with 00 and 03 (enable everything) when the session returns to default after a change | 28 answers 0x11 |
 | `dtc_setting(ctx, on)` | after an accepted 85 01 or 85 02, and with `true` when the session returns to default after 85 02 | 85 answers 0x11, as before |
 | `progress(ctx, p)` | at the end of a request, poll or other server call that changed the download's stage or wrote a block, at most once per call ([Progress](#progress)); `p` is valid only during the call | nobody is told; `udsota_progress()` reads the same values |
+| `dtc_get(ctx, i, out)` | for each 19 that passes the core's own checks first, from `i` 0 up and never at 0xFFFF or past it. The walk ends at false, at the DTC a 19 06 asks for, or at the first DTC that would overflow a 19 02 or 0A (0x14), so the hook must not rely on being asked until false. It reports the i-th supported DTC, its 3 bytes in the low 24 bits of `out->dtc` (the top byte is ignored), and its status now. `i` must name the same DTC for as long as the server runs; only the status may change | 19 answers 0x11, as before |
+| `dtc_ext_data(ctx, dtc, record, buf, max, len)` | for a 19 06 once `dtc_get` has reported the DTC (record 00 and a DTC it doesn't report answer 0x31 without a call). `dtc` is the request's 24 bits, whatever top byte `dtc_get` gave it, and `record` is 01–FE, or FF for every record. Writes `<record> <data>...` into `buf`, at most `max` bytes, sets `*len` and returns 0, with `*len` 0 for a record held with no data; else returns 0x31 (no such record) or 0x14 (the records don't fit `max`) | 19 06 answers 0x12 |
+| `dtc_clear(ctx, group, access)` | for a 14 of exactly four bytes (the core answers 0x13 to any other length first), physical only, in any session; `group` is the 24-bit groupOfDTC, FFFFFF for every DTC. Returns 0 to answer `54`, else the NRC, checked in ISO order: its session rule (0x7F), its key rule (0x33), then 0x31 for a group it doesn't clear | 14 answers 0x11, as before |
 
 The gate returns 0 to allow, or the NRC to send: 0x22 conditionsNotCorrect in general, a specific code where one fits (0x88 vehicleSpeedTooHigh, 0x90 shifterLeverNotInPark, 0x92/0x93 voltage too high or too low, all ISO 14229-1), or 0x21 busyRepeatRequest for a condition that clears by itself shortly.
 
@@ -157,15 +160,15 @@ A deny during a transfer ends it, except 0x21 on a 36, which the client may retr
 
 The phase is IDLE in the default session, and EXTENDED or PROGRAMMING in those sessions. It is TRANSFERRING from an accepted 34 until 37, an abort or a session change, and ACTIVATING from a positive ActivateImage until the restart.
 
-`did_write` and `routine` get a `udsota_access_t` by value. `session` is the session in force, and `unlocked_level` is the requestSeed level unlocked in it, or 0 for none. `epoch` goes up by one on every session entry, whatever causes it: each accepted 10 0x (a repeat of the current session included), the S3 timeout, `udsota_end_session`, the 90 s cap, the restart, a 36 the gate or the STmin monitor refuses with anything but 0x21, and a withheld flow control. The core applies only the ISO session rule, so the app decides which session and level each write or routine needs. An app that keeps state across requests, such as writes staged for a later commit routine, records the epoch it started under and drops the state when the epoch changes, so a second tester never inherits the first one's session. `udsota_init` restarts the epoch at 0, so such state must not outlive a re-init either.
+`did_write`, `routine` and `dtc_clear` get a `udsota_access_t` by value. `session` is the session in force, and `unlocked_level` is the requestSeed level unlocked in it, or 0 for none. `epoch` goes up by one on every session entry, whatever causes it: each accepted 10 0x (a repeat of the current session included), the S3 timeout, `udsota_end_session`, the 90 s cap, the restart, a 36 the gate or the STmin monitor refuses with anything but 0x21, and a withheld flow control. The core applies only the ISO session rule, so the app decides which session and level each write or routine needs. An app that keeps state across requests, such as writes staged for a later commit routine, records the epoch it started under and drops the state when the epoch changes, so a second tester never inherits the first one's session. `udsota_init` restarts the epoch at 0, so such state must not outlive a re-init either.
 
 A routine that returns `UDSOTA_PENDING` is a job like FF01: the core answers 0x78 on the flash-job cadence and every other request but 3E with 0x21, and at 90 s answers 0x72 and ends the session. The routine is then orphaned. Until `routine_poll` stops returning `UDSOTA_PENDING`, every "no flash job runs" condition in the op table fails: 10 02 answers 0x22, and so do 11 01 and a 31 01 on an app RID in the extended session, the last without calling `routine`, so the programming session, and with it 34 and ActivateImage, is out of reach until the orphan ends. A routine that can outlast 90 s should leave its outcome where a client can read it, such as a DID.
 
-The hooks run in the server's context, which in the ESP32 port is the diag task. The gate is asked at flow-control points while frames stream in, so it must read a snapshot the app keeps current, return at once and never block. The phase hook must not wait on anything either, and neither may `did_write`, `routine`, `routine_poll` or `progress`: work that takes time runs elsewhere, and the routine reports it through `UDSOTA_PENDING` and `routine_poll`. The progress hook must not call any udsota function.
+The hooks run in the server's context, which in the ESP32 port is the diag task. The gate is asked at flow-control points while frames stream in, so it must read a snapshot the app keeps current, return at once and never block. The phase hook must not wait on anything either, and neither may `did_write`, `routine`, `routine_poll`, `progress` or the three DTC hooks: work that takes time runs elsewhere, and the routine reports it through `UDSOTA_PENDING` and `routine_poll`. The progress hook must not call any udsota function, and the DTC hooks none but `udsota_phase()`; they read the app's fault table under the app's own lock.
 
 ## Adding DIDs, routines and services
 
-An app adds its own diagnostics through the hooks, without touching udsota. A 22 on a DID the server doesn't serve goes to `did_read`, a 2E to `did_write`, and a 31 01 on a RID the server doesn't own to `routine`, which answers at once or returns `UDSOTA_PENDING` and finishes through `routine_poll` ([Hooks](#hooks)). `did_write` and `routine` get the session, unlocked level and epoch in `udsota_access_t`, so the app decides what each one needs; `gate` is its say over the server's own steps. Without the updater the updater's DIDs and RIDs reach the same hooks ([Data identifiers](#data-identifiers)).
+An app adds its own diagnostics through the hooks, without touching udsota. A 22 on a DID the server doesn't serve goes to `did_read`, a 2E to `did_write`, and a 31 01 on a RID the server doesn't own to `routine`, which answers at once or returns `UDSOTA_PENDING` and finishes through `routine_poll` ([Hooks](#hooks)). The app's fault codes reach any UDS tester through `dtc_get`, `dtc_ext_data` and `dtc_clear`, which serve 19 and 14 while the core owns their framing. `did_write` and `routine` get the session, unlocked level and epoch in `udsota_access_t`, so the app decides what each one needs; `gate` is its say over the server's own steps. Without the updater the updater's DIDs and RIDs reach the same hooks ([Data identifiers](#data-identifiers)).
 
 A new UDS service, a SID of its own, belongs in the server core on the pattern of 28 and 85: a handler in `server/udsota_server.c` that makes the core's checks (session, length, sub-function) and hands the app's part to a new hook in `udsota_hooks_t`, whose NULL answers 0x11, and a CHANGELOG entry, since the SID is on the wire. `udsota_service.h` is how the updater registers, one service per server; it is not an app API.
 
@@ -277,6 +280,8 @@ A server serves a coded DFI only when its engine names it in `engine.zformats` (
 |---|---|---|---|---|
 | 10 | DiagnosticSessionControl | 01 default, 02 programming, 03 extended; answers `50 xx` then P2 and P2*/10 as two big-endian words (`00 32 01 F4` by default) | any | – |
 | 11 | ECUReset | 01 hardReset: answers, then restarts through `reset` | extended, programming | either level |
+| 14 | ClearDiagnosticInformation (with `dtc_clear` only) | exactly a 3-byte groupOfDTC, FFFFFF for every DTC; answers `54` | the app's choice | the app's choice |
+| 19 | ReadDTCInformation (with `dtc_get` only) | 01 reportNumberOfDTCByStatusMask, 02 reportDTCByStatusMask, 06 reportDTCExtDataRecordByDTCNumber (with `dtc_ext_data` only), 0A reportSupportedDTC; answers `59 xx` | any | – |
 | 22 | ReadDataByIdentifier | one DID per request | any | – |
 | 27 | SecurityAccess | `level_extended` and the next sub-function in extended, `level_programming` and the next in programming; a sendKey carries exactly 16 key bytes, or 64 in the ECDSA mode | extended, programming | – |
 | 2E | WriteDataByIdentifier | one DID and at least one value byte, through `did_write`; answers `6E <did>` | extended, programming | the app's choice |
@@ -288,11 +293,13 @@ A server serves a coded DFI only when its engine names it in `engine.zformats` (
 | 28 | CommunicationControl (with `comm_control` only) | controlType 00–03 and a communicationType naming normal or network-management messages; answers `68 xx` | extended, programming | – |
 | 85 | ControlDTCSetting (with `dtc_setting` only) | 01 on, 02 off, with any option record; answers `C5 xx` | extended, programming | – |
 
-Any other SID answers 0x11, and so do 2E without `did_write` and, without the updater, 34, 36 and 37. While a flash job or a pending app routine runs, every request but 3E answers 0x21. The key column applies only with security on. A return to the default session, by 10 01, S3 or an end of session, undoes 28 and 85 through their hooks.
+Every status byte 19 sends is the DTC's status ANDed with `cfg.dtc_availability_mask` (0 = 0xFF), which 59 01, 02 and 0A also carry, and a DTC matches a status mask when status & mask & availability is non-zero. `cfg.dtc_format` is 59 01's DTCFormatIdentifier, sent as given: 0x00 for SAE J2012 OBD codes with a failure-type byte, 0x01 for ISO 14229-1's. A 19 answer that would pass the 256-byte response buffer (63 DTCs) answers 0x14 rather than a list cut short.
+
+Any other SID answers 0x11, and so do 2E without `did_write`, 19 without `dtc_get`, 14 without `dtc_clear` and, without the updater, 34, 36 and 37. While a flash job or a pending app routine runs, every request but 3E answers 0x21. The key column applies only with security on. A return to the default session, by 10 01, S3 or an end of session, undoes 28 and 85 through their hooks.
 
 ### Functional addressing
 
-With `cfg.func_id` set (OBD's broadcast ID is 0x7DF), the port hands single frames on that ID to `udsota_isotp_on_func_frame()`, and the answers go out on `cfg.resp_id` as usual. This lets a tester send 3E 80 to every device on the bus, or switch them all to the extended session and quiet them with 85 02 and 28 03 before it programs one of them. A functional request is served only when it is 10 01, 10 03, 3E, 22, 28 or 85, as a single frame, and while no other request or answer is in progress; anything else gets no answer at all, including a 10 02, since the programming session is entered physically on the one device being programmed. NRCs 0x11, 0x12, 0x31, 0x7E and 0x7F are suppressed for a functional request, as ISO 14229-1 asks, so a device that serves none of a request stays silent. While a flash job or a pending app routine runs only a functional 3E is answered.
+With `cfg.func_id` set (OBD's broadcast ID is 0x7DF), the port hands single frames on that ID to `udsota_isotp_on_func_frame()`, and the answers go out on `cfg.resp_id` as usual. This lets a tester send 3E 80 to every device on the bus, or switch them all to the extended session and quiet them with 85 02 and 28 03 before it programs one of them. A functional request is served only when it is 10 01, 10 03, 3E, 19, 22, 28 or 85, as a single frame, and while no other request or answer is in progress; anything else gets no answer at all, including a 10 02, since the programming session is entered physically on the one device being programmed. NRCs 0x11, 0x12, 0x31, 0x7E and 0x7F are suppressed for a functional request, as ISO 14229-1 asks, so a device that serves none of a request stays silent: a functional 19 06 is answered only by the devices that have the DTC. 14 stays physical, since clearing needs a per-device unlock. While a flash job or a pending app routine runs only a functional 3E is answered.
 
 ### Routines
 
@@ -323,14 +330,15 @@ Every other DID goes to `did_read`, and so does any of these whose source is NUL
 
 | NRC | Name | udsota sends it for |
 |---|---|---|
-| 0x10 | generalReject | a `routine` or `routine_poll` return that is not 0, an NRC or `UDSOTA_PENDING`, or an `out_len` over `out_max`; a pending routine with no `routine_poll`; a requestSeed whose answer has no room in the response buffer |
-| 0x11 | serviceNotSupported | an unknown SID; 27 with security off; 11 01 with no `reset` hook; 28 with no `comm_control` hook; 85 with no `dtc_setting` hook; 2E with no `did_write` hook |
-| 0x12 | subFunctionNotSupported | an unknown sub-function |
+| 0x10 | generalReject | a `routine` or `routine_poll` return that is not 0, an NRC or `UDSOTA_PENDING`, or an `out_len` over `out_max`; a `dtc_ext_data` `*len` over `max`; a pending routine with no `routine_poll`; a requestSeed whose answer has no room in the response buffer |
+| 0x11 | serviceNotSupported | an unknown SID; 27 with security off; 11 01 with no `reset` hook; 28 with no `comm_control` hook; 85 with no `dtc_setting` hook; 2E with no `did_write` hook; 19 with no `dtc_get`, 14 with no `dtc_clear` |
+| 0x12 | subFunctionNotSupported | an unknown sub-function, and 19 06 with no `dtc_ext_data` |
 | 0x13 | incorrectMessageLengthOrInvalidFormat | a wrong length, or more than one DID in a 22 |
+| 0x14 | responseTooLong | a 19 answer past the response buffer, or `dtc_ext_data`'s records past its `max` |
 | 0x21 | busyRepeatRequest | any request but 3E while a flash job or a pending app routine runs; or the gate's choice |
 | 0x22 | conditionsNotCorrect | a core-owned condition, the gate, or no memory, slot or worker for a coded download's decoder |
 | 0x24 | requestSequenceError | a step out of order: 36 with no download open, 37 before the last byte, FF01 before 37, F001 before FF01, or a key with no live seed |
-| 0x31 | requestOutOfRange | an unknown DID or RID, 34 parameters or size (a coded DFI the engine does not serve among them), a first block the image rules refuse, a coded block that is corrupt or decodes past the announced size, or a delta patch with the wrong magic, size or base |
+| 0x31 | requestOutOfRange | an unknown DID or RID, 34 parameters or size (a coded DFI the engine does not serve among them), a first block the image rules refuse, a coded block that is corrupt or decodes past the announced size, or a delta patch with the wrong magic, size or base; a 19 06 for a DTC `dtc_get` doesn't report or for record 00 |
 | 0x33 | securityAccessDenied | a keyed service while locked |
 | 0x35 | invalidKey | a wrong key |
 | 0x36 | exceedNumberOfAttempts | the third wrong key |
@@ -342,7 +350,7 @@ Every other DID goes to `did_read`, and so does any of these whose source is NUL
 | 0x7E | subFunctionNotSupportedInActiveSession | a 27 level that belongs to the other session |
 | 0x7F | serviceNotSupportedInActiveSession | 11, 27, 28, 31 or 85 in the default session, and 2E there when `did_write` is set; 34, 36 or 37 outside programming |
 
-`did_write`, `routine` and `routine_poll` may answer any NRC the app picks but 0x78.
+`did_write`, `routine`, `routine_poll`, `dtc_ext_data` and `dtc_clear` may answer any NRC the app picks but 0x78.
 
 ### Timing
 
