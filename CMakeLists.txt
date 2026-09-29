@@ -316,6 +316,10 @@ if(UDSOTA_FUZZ AND UDSOTA_FUZZ_SAN_OK)
     # hook set so that its checks hold on the compressed path too.
     udsota_fuzz(fuzz_udsota_z 600 DIGEST 2488a2952adadc9e SOURCES ${ZSTREAM_SRCS} INCLUDES ${ZSTREAM_INC}
                 DEFS UDSOTA_FUZZ_Z=1 UDSOTA_FUZZ_PROGRESS=1 ${MINIZ_TEST_DEFS})
+    # The same harness with no update service (udsota_init given a NULL engine), from the five states a download
+    # isn't needed for: 34, 36 and 37 get only 0x11 (0x21 while an app routine runs), and the app hooks give 0x31
+    # its positive answers.
+    udsota_fuzz(fuzz_udsota_no_update 300 DIGEST 7e2cee56a31e126f DEFS UDSOTA_FUZZ_NO_UPDATE=1 UDSOTA_FUZZ_APP_HOOKS=1)
     # The delta patch path on mutated patches (test/fuzz_udsota_patch.c): udsota_coded over the real detools and
     # tinfl, with AddressSanitizer where the toolchain has it, since the device parses these patches from the bus.
     set(FUZZ_PATCH_SAN ${FUZZ_SAN})
