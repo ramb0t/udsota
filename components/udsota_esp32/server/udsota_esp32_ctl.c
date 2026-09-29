@@ -113,6 +113,27 @@ static int w_routine_poll(void *ctx, uint8_t *out, size_t out_max, size_t *out_l
     return ctl->app.routine_poll(ctl->app.ctx, out, out_max, out_len);
 }
 
+/* dtc_get hook: the app's dtc_get with the app's ctx (installed only when the app has one). */
+static bool w_dtc_get(void *ctx, size_t i, udsota_dtc_t *out)
+{
+    const udsota_esp32_ctl_t *ctl = ctx;
+    return ctl->app.dtc_get(ctl->app.ctx, i, out);
+}
+
+/* dtc_ext_data hook: the app's dtc_ext_data with the app's ctx (installed only when the app has one). */
+static uint8_t w_dtc_ext_data(void *ctx, uint32_t dtc, uint8_t record, uint8_t *buf, size_t max, size_t *len)
+{
+    const udsota_esp32_ctl_t *ctl = ctx;
+    return ctl->app.dtc_ext_data(ctl->app.ctx, dtc, record, buf, max, len);
+}
+
+/* dtc_clear hook: the app's dtc_clear with the app's ctx (installed only when the app has one). */
+static uint8_t w_dtc_clear(void *ctx, uint32_t group, udsota_access_t access)
+{
+    const udsota_esp32_ctl_t *ctl = ctx;
+    return ctl->app.dtc_clear(ctl->app.ctx, group, access);
+}
+
 /* Copies the app's hooks and builds the wrapped set (see the header). */
 void udsota_esp32_ctl_init(udsota_esp32_ctl_t *ctl, const udsota_hooks_t *app,
                            bool (*default_reset)(void *ctx), udsota_hooks_t *out)
@@ -140,6 +161,9 @@ void udsota_esp32_ctl_init(udsota_esp32_ctl_t *ctl, const udsota_hooks_t *app,
         .routine      = (ctl->app.routine != NULL) ? w_routine : NULL,
         .routine_poll = (ctl->app.routine_poll != NULL) ? w_routine_poll : NULL,
         .progress     = w_progress,
+        .dtc_get      = (ctl->app.dtc_get != NULL) ? w_dtc_get : NULL,
+        .dtc_ext_data = (ctl->app.dtc_ext_data != NULL) ? w_dtc_ext_data : NULL,
+        .dtc_clear    = (ctl->app.dtc_clear != NULL) ? w_dtc_clear : NULL,
     };
 }
 

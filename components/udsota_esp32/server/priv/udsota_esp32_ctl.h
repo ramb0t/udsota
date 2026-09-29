@@ -27,9 +27,9 @@ typedef struct {
 
 /* Before the server exists: copies *app (NULL = no hooks), stores IDLE, an IDLE progress and an empty version,
  * clears any request and the lock, and fills *out with the hooks to give the server and the adapter. out->ctx is ctl.
- * out's gate, did_read, stmin_us, comm_control, dtc_setting, did_write, routine and routine_poll stay NULL
- * where the app's are, so the core's defaults hold; out's phase and progress are always set, and out's reset
- * is set when the app or default_reset gives one. */
+ * out's gate, did_read, stmin_us, comm_control, dtc_setting, did_write, routine, routine_poll, dtc_get,
+ * dtc_ext_data and dtc_clear stay NULL where the app's are, so the core's defaults hold; out's phase and progress
+ * are always set, and out's reset is set when the app or default_reset gives one. */
 void udsota_esp32_ctl_init(udsota_esp32_ctl_t *ctl, const udsota_hooks_t *app,
                            bool (*default_reset)(void *ctx), udsota_hooks_t *out);
 /* After udsota_esp32_ctl_init and before the server runs: the lock that guards the progress snapshot and the

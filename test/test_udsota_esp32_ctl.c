@@ -1,8 +1,8 @@
 /* Host tests for the ESP32 port's control block (components/udsota_esp32/server/udsota_esp32_ctl.c) with the
  * real udsota server: an app phase hook that calls back into the port neither deadlocks nor recurses,
  * an end-session it requests runs after the current request, one requested during a job runs after
- * that job's answer, the app's did_write, routine and routine_poll reach the app through the
- * port's wrappers with its ctx, the request's bytes and the session's access state, the progress
+ * that job's answer, the app's did_write, routine and routine_poll, and its three DTC hooks, reach the app through
+ * the port's wrappers with its ctx, the request's bytes and the session's access state, the progress
  * snapshot copies what the server reported, under the port's lock, before the app's own hook runs, and the
  * incoming version is read from an accepted first block, plain or inflated from a compressed download, kept
  * after the download ends, and cleared by the next accepted 34 in the same locked copy as its report or by a
@@ -45,6 +45,10 @@ static struct {
     uint8_t            routine_in0;     /* the first option byte of the last routine */
     udsota_access_t    write_access, routine_access;
     int                routine_poll_ret;   /* what app_routine_poll returns */
+    int                dtc_gets, dtc_exts, dtc_clears;   /* app DTC hook calls */
+    uint32_t           dtc_ext_dtc, dtc_clear_group;
+    uint8_t            dtc_ext_record;
+    udsota_access_t    dtc_clear_access;
     int                progress_calls;  /* app progress hook calls */
     udsota_progress_t  progress_arg;    /* what the app's progress hook last got */
     udsota_progress_t  progress_read;   /* what udsota_esp32_ctl_progress() returned inside it */
@@ -422,6 +426,45 @@ static void app_dtc_setting(void *ctx, bool on)
     r.ctx_seen = ctx;
 }
 
+/* The app's dtc_get: one DTC, U0073 with status 2F. */
+static bool app_dtc_get(void *ctx, size_t i, udsota_dtc_t *out)
+{
+    r.ctx_seen = ctx;
+    r.dtc_gets++;
+    if (i != 0u) {
+        return false;
+    }
+    out->dtc = 0xC07300u;
+    out->status = 0x2Fu;
+    return true;
+}
+
+/* The app's dtc_ext_data: records what arrived and answers record 01 as 01 03. */
+static uint8_t app_dtc_ext_data(void *ctx, uint32_t dtc, uint8_t record, uint8_t *buf, size_t max, size_t *len)
+{
+    r.ctx_seen = ctx;
+    r.dtc_exts++;
+    r.dtc_ext_dtc = dtc;
+    r.dtc_ext_record = record;
+    if (record != 0x01u || max < 2u) {
+        return 0x31u;
+    }
+    buf[0] = 0x01;
+    buf[1] = 0x03;
+    *len = 2u;
+    return 0u;
+}
+
+/* The app's dtc_clear: records what arrived and clears. */
+static uint8_t app_dtc_clear(void *ctx, uint32_t group, udsota_access_t access)
+{
+    r.ctx_seen = ctx;
+    r.dtc_clears++;
+    r.dtc_clear_group = group;
+    r.dtc_clear_access = access;
+    return 0u;
+}
+
 /* The wrapped hooks pass the app's ctx, keep a NULL gate, did_read or stmin_us NULL so the core's
  * default holds, and reset falls back to the port's default only when the app has none. */
 static void test_wrapped_hooks_forward_app_ctx_and_keep_nulls(void)
@@ -584,6 +627,56 @@ static void test_without_write_and_routine_hooks_the_core_answers_as_before(void
     TEST_ASSERT_EQUAL_HEX8(0x7F, resp[0]);
     TEST_ASSERT_EQUAL_HEX8(0x31, resp[1]);
     TEST_ASSERT_EQUAL_HEX8(0x31, resp[2]);
+}
+
+/* 19 02, 19 06 and 14 reach the app's dtc_get, dtc_ext_data and dtc_clear through the port and the real server,
+ * with the app's ctx, the request's DTC, record and group and the session's access state; each wrapper is installed
+ * only when the app sets its hook, so without them 19 and 14 answer 0x11 and 19 06 0x12, as before. */
+static void test_dtc_hooks_reach_the_app(void)
+{
+    const udsota_hooks_t app = {
+        .dtc_get = app_dtc_get, .dtc_ext_data = app_dtc_ext_data, .dtc_clear = app_dtc_clear, .ctx = &s_marker,
+    };
+    start(&app);
+    TEST_ASSERT_TRUE(s_hooks.dtc_get != NULL && s_hooks.dtc_ext_data != NULL && s_hooks.dtc_clear != NULL);
+    uint8_t resp[16];
+    const uint8_t rd[] = {0x19, 0x02, 0xFF};
+    TEST_ASSERT_EQUAL_UINT(7u, udsota_on_request(&s_srv, rd, sizeof rd, resp, sizeof resp, NOW));
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(((const uint8_t[]){0x59, 0x02, 0xFF, 0xC0, 0x73, 0x00, 0x2F}), resp, 7);
+    TEST_ASSERT_EQUAL_PTR(&s_marker, r.ctx_seen);
+    TEST_ASSERT_EQUAL_INT(2, r.dtc_gets);
+
+    r.ctx_seen = NULL;
+    const uint8_t ext[] = {0x19, 0x06, 0xC0, 0x73, 0x00, 0x01};
+    TEST_ASSERT_EQUAL_UINT(8u, udsota_on_request(&s_srv, ext, sizeof ext, resp, sizeof resp, NOW + 1u));
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(((const uint8_t[]){0x59, 0x06, 0xC0, 0x73, 0x00, 0x2F, 0x01, 0x03}), resp, 8);
+    TEST_ASSERT_EQUAL_PTR(&s_marker, r.ctx_seen);
+    TEST_ASSERT_EQUAL_HEX32(0xC07300u, r.dtc_ext_dtc);
+    TEST_ASSERT_EQUAL_HEX8(0x01, r.dtc_ext_record);
+
+    enter_extended(NOW + 2u);
+    r.ctx_seen = NULL;
+    const uint8_t clr[] = {0x14, 0xFF, 0xFF, 0xFF};
+    TEST_ASSERT_EQUAL_UINT(1u, udsota_on_request(&s_srv, clr, sizeof clr, resp, sizeof resp, NOW + 3u));
+    TEST_ASSERT_EQUAL_HEX8(0x54, resp[0]);
+    TEST_ASSERT_EQUAL_PTR(&s_marker, r.ctx_seen);
+    TEST_ASSERT_EQUAL_HEX32(0xFFFFFFu, r.dtc_clear_group);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_EXTENDED, r.dtc_clear_access.session);
+    TEST_ASSERT_EQUAL_UINT32(s_srv.session_epoch, r.dtc_clear_access.epoch);
+
+    const udsota_hooks_t only_get = { .dtc_get = app_dtc_get, .ctx = &s_marker };
+    start(&only_get);
+    TEST_ASSERT_TRUE(s_hooks.dtc_get != NULL && s_hooks.dtc_ext_data == NULL && s_hooks.dtc_clear == NULL);
+    TEST_ASSERT_EQUAL_UINT(3u, udsota_on_request(&s_srv, ext, sizeof ext, resp, sizeof resp, NOW));
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(((const uint8_t[]){0x7F, 0x19, 0x12}), resp, 3);
+    TEST_ASSERT_EQUAL_UINT(3u, udsota_on_request(&s_srv, clr, sizeof clr, resp, sizeof resp, NOW + 1u));
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(((const uint8_t[]){0x7F, 0x14, 0x11}), resp, 3);
+
+    start(NULL);
+    TEST_ASSERT_TRUE(s_hooks.dtc_get == NULL && s_hooks.dtc_ext_data == NULL && s_hooks.dtc_clear == NULL);
+    TEST_ASSERT_EQUAL_UINT(3u, udsota_on_request(&s_srv, rd, sizeof rd, resp, sizeof resp, NOW));
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(((const uint8_t[]){0x7F, 0x19, 0x11}), resp, 3);
+    TEST_ASSERT_EQUAL_INT(1, r.dtc_clears);
 }
 
 /* Sends req and asserts the answer's first byte. */
@@ -956,6 +1049,7 @@ int main(void)
     RUN_TEST(test_write_and_routine_hooks_reach_the_app);
     RUN_TEST(test_write_and_routine_wrappers_follow_each_app_hook);
     RUN_TEST(test_without_write_and_routine_hooks_the_core_answers_as_before);
+    RUN_TEST(test_dtc_hooks_reach_the_app);
     RUN_TEST(test_wait_ticks_never_round_a_wait_to_zero);
     RUN_TEST(test_progress_snapshot_copies_the_report_and_forwards_it);
     RUN_TEST(test_progress_snapshot_without_an_app_hook);
