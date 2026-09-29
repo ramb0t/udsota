@@ -158,6 +158,7 @@ typedef struct {
 } udsota_config_t;
 
 struct udsota_server;
+struct udsota_service;                   /* udsota_service.h */
 /* Builds the final answer of a worker job from its result (0 = ok); returns the response length, 0 for none. */
 typedef size_t (*udsota_job_done_fn)(struct udsota_server *s, int result, uint8_t *resp, size_t resp_max, uint32_t now_ms);
 
@@ -170,6 +171,7 @@ typedef struct udsota_server {
     udsota_hooks_t    hooks;             /* all NULL when init got NULL */
     uint32_t        (*tx_pending)(void *ctx);   /* udsota_set_tx_pending(); NULL = a restart waits the full 100 ms */
     void             *tx_pending_ctx;
+    const struct udsota_service *svc;    /* udsota_register_service(); NULL = no service, the core alone */
     /* Session, phase and S3. */
     uint8_t           session;           /* udsota_session_t */
     uint8_t           security;          /* 0 locked, else the unlocked requestSeed level */
@@ -188,11 +190,12 @@ typedef struct udsota_server {
     uint32_t          job_start_ms;      /* for the first 0x78 and the 90 s cap */
     uint32_t          last_pending_ms;   /* last 0x78 sent */
     uint32_t          job_arg;           /* handler data for job_done, e.g. a 36's block length or a routine's RID */
-    udsota_job_done_fn job_done;         /* builds the final answer when the job's poll (engine.poll, or
+    udsota_job_done_fn job_done;         /* builds the final answer when the job's poll (the service's, or
                                             hooks.routine_poll for an app routine) reports a result */
-    bool              worker_orphan;     /* a job the server stopped waiting on at the 90 s cap still runs */
+    bool              worker_orphan;     /* a service's job the server stopped waiting on at the 90 s cap still runs;
+                                            only the service's poll clears it */
     bool              job_app;           /* the running job is an app routine: polled through hooks.routine_poll,
-                                            never engine.poll */
+                                            never the service's poll */
     bool              app_orphan;        /* an app routine the server stopped waiting on at the 90 s cap still
                                             runs; only hooks.routine_poll clears it */
     size_t            job_out_len;       /* app routine: bytes of its out record, written at resp[4] */

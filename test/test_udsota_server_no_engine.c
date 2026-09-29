@@ -1,0 +1,847 @@
+/* Host tests for the server with no updater: udsota_init with a NULL engine registers no service, so 34, 36 and 37
+ * answer 0x11, the updater's RIDs and DIDs go to the app's hooks, 10 02 and 11 01 ask only the core's worker rule and
+ * the gate, and nothing reaches a NULL engine op. Groups A to G use only the 0.8.0 API; group H compares udsota_init
+ * with udsota_core_init. Pass a test's name to run it alone. */
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include "unity.h"
+#include "udsota.h"
+#include "udsota_mock.h"
+
+#define T0         60000u   /* past the 10 s post-boot 0x27 delay */
+#define NRC_SPEED  0x88u    /* vehicleSpeedTooHigh: an NRC only a gate sends */
+#define APP_RID    0x1234u  /* an app routine's RID */
+#define APP_BYTE   0x5Au    /* the app routine's one status byte */
+#define HI(v)      (uint8_t)((v) >> 8)
+#define LO(v)      (uint8_t)((v) & 0xFFu)
+
+/* The server states the groups run in. Programming is entered by writing s.session: 0.8.0's 10 02 reaches the NULL
+ * engine.poll without an engine, and D1 checks 10 02 itself. */
+typedef enum { ST_DEF, ST_EXT, ST_EXT01, ST_PROG, ST_PROG03, ST_N } state_t;
+static const char *const k_state_name[ST_N] = {"default", "extended", "extended+01", "programming", "programming+03"};
+static const uint8_t k_state_session[ST_N] = {UDSOTA_SESSION_DEFAULT, UDSOTA_SESSION_EXTENDED,
+                                              UDSOTA_SESSION_EXTENDED, UDSOTA_SESSION_PROGRAMMING,
+                                              UDSOTA_SESSION_PROGRAMMING};
+
+/* The updater's RIDs and DIDs, which the app serves or not. */
+static const uint16_t k_upd_rids[4] = {UDSOTA_RID_CHECK_PROG_DEPS, UDSOTA_RID_GET_RESUME_POINT,
+                                       UDSOTA_RID_ACTIVATE_IMAGE, UDSOTA_RID_CONFIRM_IMAGE};
+static const uint16_t k_upd_dids[4] = {UDSOTA_DID_SW_VERSION, UDSOTA_DID_STATUS, UDSOTA_DID_RESULT,
+                                       UDSOTA_DID_RUNNING_SHA};
+
+/* The app behind the hooks: none (did_read answers nothing, no routine hook) or serves (AA BB for the updater's DIDs,
+ * 71 01 <rid> 5A for any routine). */
+typedef struct {
+    bool            serves;
+    int             routine_rc;        /* what hooks.routine returns: 0, or UDSOTA_PENDING */
+    unsigned        routine_calls;
+    uint16_t        routine_rid;
+    size_t          routine_in_len;
+    udsota_access_t routine_access;
+    bool            poll_pending;      /* hooks.routine_poll keeps returning UDSOTA_PENDING */
+    unsigned        progress_calls;
+    unsigned        comm_calls;
+    uint8_t         comm_control, comm_type;
+    unsigned        dtc_calls;
+    bool            dtc_on;
+    uint32_t        tx_pending;        /* what the installed tx_pending returns */
+} app_t;
+
+static app_t           app;
+static udsota_mock_t   g_mock;
+static udsota_config_t g_cfg;
+static udsota_hooks_t  g_hooks;
+static udsota_server_t s;
+static uint8_t         resp[64];
+static size_t          rlen;
+static uint32_t        now;
+static char            msg[96];
+
+/* hooks.did_read's app part: AA BB for the updater's four DIDs while the app serves, else nothing. */
+static size_t app_did(uint16_t did, uint8_t *buf, size_t max)
+{
+    if (!app.serves || max < 2u) {
+        return 0;
+    }
+    for (size_t i = 0; i < 4u; i++) {
+        if (did == k_upd_dids[i]) {
+            buf[0] = 0xAA;
+            buf[1] = 0xBB;
+            return 2;
+        }
+    }
+    return 0;
+}
+
+/* hooks.routine: records the call; answers 5A now, or UDSOTA_PENDING when routine_rc says so. */
+static int app_routine(void *ctx, uint16_t rid, const uint8_t *in, size_t in_len, uint8_t *out, size_t out_max,
+                       size_t *out_len, udsota_access_t access)
+{
+    app.routine_calls++;
+    app.routine_rid = rid;
+    app.routine_in_len = in_len;
+    app.routine_access = access;
+    if (app.routine_rc == UDSOTA_PENDING) {
+        return UDSOTA_PENDING;
+    }
+    out[0] = APP_BYTE;
+    *out_len = 1;
+    return 0;
+}
+
+/* hooks.routine_poll: pending while poll_pending, then 5A. */
+static int app_routine_poll(void *ctx, uint8_t *out, size_t out_max, size_t *out_len)
+{
+    if (app.poll_pending) {
+        return UDSOTA_PENDING;
+    }
+    if (out_max < 1u) {
+        return UDSOTA_NRC_GENERAL_REJECT;
+    }
+    out[0] = APP_BYTE;
+    *out_len = 1;
+    return 0;
+}
+
+/* hooks.progress: counts; with no updater it must never run. */
+static void app_progress(void *ctx, const udsota_progress_t *p) { app.progress_calls++; }
+
+/* hooks.comm_control: records and accepts. */
+static uint8_t app_comm(void *ctx, uint8_t control, uint8_t comm_type)
+{
+    app.comm_calls++;
+    app.comm_control = control;
+    app.comm_type = comm_type;
+    return 0;
+}
+
+/* hooks.dtc_setting: records. */
+static void app_dtc(void *ctx, bool on)
+{
+    app.dtc_calls++;
+    app.dtc_on = on;
+}
+
+/* hooks.did_write: accepts. */
+static uint8_t app_did_write(void *ctx, uint16_t did, const uint8_t *data, size_t len, udsota_access_t access)
+{
+    return 0;
+}
+
+/* The transport's tx_pending source. */
+static uint32_t app_tx_pending(void *ctx) { return app.tx_pending; }
+
+/* Boots a server with no engine, the mock security and every hook (routine only while the app serves). */
+static void boot(bool serves)
+{
+    app.serves = serves;
+    g_hooks = udsota_mock_hooks(&g_mock);
+    g_hooks.comm_control = app_comm;
+    g_hooks.dtc_setting = app_dtc;
+    g_hooks.did_write = app_did_write;
+    g_hooks.routine = serves ? app_routine : NULL;
+    g_hooks.routine_poll = app_routine_poll;
+    g_hooks.progress = app_progress;
+    TEST_ASSERT_TRUE(udsota_init(&s, &g_cfg, NULL, udsota_mock_security(), &g_hooks));
+    udsota_set_tx_pending(&s, app_tx_pending, NULL);
+    now = T0;
+}
+
+/* Sends one request at now; the answer lands in resp[0..rlen). */
+static void req(const uint8_t *r, size_t n)
+{
+    rlen = udsota_on_request(&s, r, n, resp, sizeof resp, now);
+}
+
+/* One poll at now; the answer lands in resp[0..rlen). */
+static void poll_at(uint32_t t)
+{
+    now = t;
+    rlen = udsota_poll(&s, resp, sizeof resp, now);
+}
+
+/* Checks resp[0..rlen) is exactly e[0..n). */
+static void expect(const uint8_t *e, size_t n)
+{
+    TEST_ASSERT_EQUAL_size_t_MESSAGE(n, rlen, msg);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY_MESSAGE(e, resp, n, msg);
+}
+
+#define REQ(...)    do { const uint8_t r_[] = {__VA_ARGS__}; req(r_, sizeof r_); } while (0)
+#define EXPECT(...) do { const uint8_t e_[] = {__VA_ARGS__}; expect(e_, sizeof e_); } while (0)
+#define NRC(sid, n) EXPECT(0x7F, (sid), (n))
+
+/* 27 <level> then the mock's key: the level unlocks. */
+static void unlock(uint8_t level)
+{
+    REQ(0x27, level);
+    TEST_ASSERT_EQUAL_size_t_MESSAGE(2u + UDSOTA_SEED_LEN, rlen, msg);
+    uint8_t key[2u + UDSOTA_KEY_LEN] = {0x27, (uint8_t)(level + 1u)};
+    udsota_mock_key_for(&resp[2], level, &key[2]);
+    req(key, sizeof key);
+    EXPECT(0x67, (uint8_t)(level + 1u));
+}
+
+/* Unity hook: fresh mock and app, the mock's config. */
+void setUp(void)
+{
+    memset(&app, 0, sizeof app);
+    udsota_mock_clear(&g_mock);
+    g_mock.app_did = app_did;
+    g_cfg = udsota_mock_cfg();
+    msg[0] = '\0';
+}
+
+void tearDown(void) {}
+
+/* Starts afresh (setUp), boots (app none or serves) and brings the server to st. */
+static void enter(state_t st, bool serves)
+{
+    setUp();
+    boot(serves);
+    snprintf(msg, sizeof msg, "state %s", k_state_name[st]);
+    if (st == ST_EXT || st == ST_EXT01) {
+        REQ(0x10, 0x03);
+        EXPECT(0x50, 0x03, 0x00, 0x32, 0x01, 0xF4);
+        if (st == ST_EXT01) {
+            unlock(UDSOTA_SA_SEED_EXTENDED);
+        }
+    } else if (st == ST_PROG || st == ST_PROG03) {
+        s.session = UDSOTA_SESSION_PROGRAMMING;
+        if (st == ST_PROG03) {
+            unlock(UDSOTA_SA_SEED_PROGRAMMING);
+        }
+    }
+}
+
+/* Starts app routine 1234 pending in the extended session (app serves). */
+static void start_pending_app_routine(void)
+{
+    app.routine_rc = UDSOTA_PENDING;
+    app.poll_pending = true;
+    REQ(0x31, 0x01, HI(APP_RID), LO(APP_RID));
+    TEST_ASSERT_EQUAL_size_t(0, rlen);
+    TEST_ASSERT_TRUE(s.job_running);
+}
+
+/* Starts app routine 1234 in the extended session and lets it run into the 90 s cap: 7F 31 72, an app orphan. */
+static void orphan_app_routine(void)
+{
+    enter(ST_EXT, true);
+    start_pending_app_routine();
+    poll_at(now + UDSOTA_JOB_CAP_MS);
+    NRC(UDSOTA_SID_ROUTINE, UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE);
+    TEST_ASSERT_TRUE(s.app_orphan);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_DEFAULT, s.session);
+}
+
+/* 22 F1F2 into *c. */
+static void read_counters(udsota_counters_t *c)
+{
+    REQ(0x22, 0xF1, 0xF2);
+    TEST_ASSERT_EQUAL_size_t_MESSAGE(3u + UDSOTA_COUNTERS_LEN, rlen, msg);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY_MESSAGE(((const uint8_t[]){0x62, 0xF1, 0xF2}), resp, 3, msg);
+    TEST_ASSERT_TRUE(udsota_unpack_counters(&resp[3], rlen - 3u, c));
+}
+
+/* True when hooks.phase ever reported p. */
+static bool phase_seen(udsota_phase_t p)
+{
+    for (size_t i = 0; i < g_mock.phase_n; i++) {
+        if (g_mock.phases[i] == (int)p) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* ---- A: 34, 36, 37 ---- */
+
+/* A1: 34 is 0x11 in every session, keyed or not. */
+static void test_A1_request_download_not_supported(void)
+{
+    const state_t states[] = {ST_DEF, ST_EXT, ST_PROG, ST_PROG03};
+    for (size_t i = 0; i < sizeof states / sizeof states[0]; i++) {
+        enter(states[i], false);
+        REQ(0x34, 0x00, 0x44, 0, 0, 0, 0, 0, 0, 0, 0x40);
+        NRC(0x34, UDSOTA_NRC_SERVICE_NOT_SUPPORTED);
+    }
+}
+
+/* Sends A2's five requests and checks each is 0x11. */
+static void a2_requests(void)
+{
+    REQ(0x34);
+    NRC(0x34, UDSOTA_NRC_SERVICE_NOT_SUPPORTED);
+    REQ(0x36, 0x01, 0xAA);
+    NRC(0x36, UDSOTA_NRC_SERVICE_NOT_SUPPORTED);
+    REQ(0x36);
+    NRC(0x36, UDSOTA_NRC_SERVICE_NOT_SUPPORTED);
+    REQ(0x37);
+    NRC(0x37, UDSOTA_NRC_SERVICE_NOT_SUPPORTED);
+    REQ(0x37, 0x00);
+    NRC(0x37, UDSOTA_NRC_SERVICE_NOT_SUPPORTED);
+}
+
+/* A2: 0x11 before the length and session checks. */
+static void test_A2_not_supported_before_length_and_session(void)
+{
+    for (state_t st = ST_DEF; st < ST_N; st++) {
+        enter(st, false);
+        a2_requests();
+    }
+}
+
+/* A3: after A1 and A2, nothing of a download happened: no gate question, no counter, no TRANSFERRING, no transfer. */
+static void test_A3_no_download_side_effects(void)
+{
+    for (state_t st = ST_DEF; st < ST_N; st++) {
+        enter(st, false);
+        REQ(0x34, 0x00, 0x44, 0, 0, 0, 0, 0, 0, 0, 0x40);
+        a2_requests();
+        TEST_ASSERT_EQUAL_UINT_MESSAGE(0, g_mock.gate_calls[UDSOTA_OP_START_DOWNLOAD], msg);
+        TEST_ASSERT_EQUAL_UINT_MESSAGE(0, g_mock.gate_calls[UDSOTA_OP_CONTINUE_TRANSFER], msg);
+        udsota_counters_t c;
+        read_counters(&c);
+        TEST_ASSERT_EQUAL_UINT16(0, c.seq_errors);
+        TEST_ASSERT_EQUAL_UINT16(0, c.repeated_blocks);
+        TEST_ASSERT_EQUAL_UINT16(0, c.aborts);
+        TEST_ASSERT_EQUAL_UINT16(0, c.withheld_fcs);
+        TEST_ASSERT_EQUAL_UINT16(0, c.stmin_violations);
+        TEST_ASSERT_FALSE_MESSAGE(phase_seen(UDSOTA_PHASE_TRANSFERRING), msg);
+        TEST_ASSERT_FALSE_MESSAGE(udsota_download_active(&s), msg);
+    }
+}
+
+/* ---- B: the updater's RIDs ---- */
+
+/* B6: the gate is never asked ACTIVATE or CONFIRM. */
+static void assert_no_updater_gate(void)
+{
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(0, g_mock.gate_calls[UDSOTA_OP_ACTIVATE], msg);
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(0, g_mock.gate_calls[UDSOTA_OP_CONFIRM], msg);
+}
+
+/* 31 01 <rid> with no app routine: 0x31. */
+static void b1_row(state_t st, uint16_t rid)
+{
+    enter(st, false);
+    snprintf(msg, sizeof msg, "state %s, 31 01 %04X", k_state_name[st], rid);
+    REQ(0x31, 0x01, HI(rid), LO(rid));
+    NRC(UDSOTA_SID_ROUTINE, UDSOTA_NRC_REQUEST_OUT_OF_RANGE);
+    assert_no_updater_gate();
+}
+
+/* 31 01 <rid> with the app serving: its answer, and the hook saw the RID and the session. */
+static void b2_row(state_t st, uint16_t rid)
+{
+    enter(st, true);
+    snprintf(msg, sizeof msg, "state %s, 31 01 %04X", k_state_name[st], rid);
+    REQ(0x31, 0x01, HI(rid), LO(rid));
+    EXPECT(0x71, 0x01, HI(rid), LO(rid), APP_BYTE);
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(1, app.routine_calls, msg);
+    TEST_ASSERT_EQUAL_HEX16_MESSAGE(rid, app.routine_rid, msg);
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(k_state_session[st], app.routine_access.session, msg);
+    TEST_ASSERT_EQUAL_size_t_MESSAGE(0, app.routine_in_len, msg);
+    assert_no_updater_gate();
+}
+
+/* B1: FF01, F000 and F001 in extended and programming+03, and F002 in programming+03, with no app routine: 0x31. */
+static void test_B1_updater_rids_without_app(void)
+{
+    const state_t states[] = {ST_EXT, ST_PROG03};
+    for (size_t i = 0; i < 2u; i++) {
+        for (size_t r = 0; r < 3u; r++) {
+            b1_row(states[i], k_upd_rids[r]);
+        }
+    }
+    b1_row(ST_PROG03, UDSOTA_RID_CONFIRM_IMAGE);
+}
+
+/* B2: FF01, F000 and F001 in extended, programming locked and programming+03, and F002 in both programming states,
+ * reach the app routine; no 0x33 from the core while locked. */
+static void test_B2_updater_rids_reach_app(void)
+{
+    const state_t states[] = {ST_EXT, ST_PROG, ST_PROG03};
+    for (size_t i = 0; i < 3u; i++) {
+        for (size_t r = 0; r < 3u; r++) {
+            b2_row(states[i], k_upd_rids[r]);
+        }
+    }
+    b2_row(ST_PROG, UDSOTA_RID_CONFIRM_IMAGE);
+    b2_row(ST_PROG03, UDSOTA_RID_CONFIRM_IMAGE);
+}
+
+/* B3: FF01 with an option byte reaches the app with it, in extended. */
+static void test_B3_option_record_reaches_app(void)
+{
+    enter(ST_EXT, true);
+    REQ(0x31, 0x01, 0xFF, 0x01, 0x07);
+    EXPECT(0x71, 0x01, 0xFF, 0x01, APP_BYTE);
+    TEST_ASSERT_EQUAL_size_t(1, app.routine_in_len);
+    TEST_ASSERT_EQUAL_HEX16(UDSOTA_RID_CHECK_PROG_DEPS, app.routine_rid);
+    assert_no_updater_gate();
+}
+
+/* B4: the core's session check comes first: F002 in default is 0x7F. */
+static void test_B4_session_check_first(void)
+{
+    enter(ST_DEF, true);
+    REQ(0x31, 0x01, 0xF0, 0x02);
+    NRC(UDSOTA_SID_ROUTINE, UDSOTA_NRC_SERVICE_NOT_SUPPORTED_IN_SESSION);
+    TEST_ASSERT_EQUAL_UINT(0, app.routine_calls);
+    assert_no_updater_gate();
+}
+
+/* B5: a sub-function other than 01 is 0x12. */
+static void test_B5_subfunction_check(void)
+{
+    enter(ST_EXT, true);
+    REQ(0x31, 0x03, 0xFF, 0x01);
+    NRC(UDSOTA_SID_ROUTINE, UDSOTA_NRC_SUBFUNC_NOT_SUPPORTED);
+    TEST_ASSERT_EQUAL_UINT(0, app.routine_calls);
+    assert_no_updater_gate();
+}
+
+/* B1 and B2's F002 in extended (0.8.0 reaches the NULL engine.confirm here). */
+static void test_B_F002_in_extended(void)
+{
+    b1_row(ST_EXT, UDSOTA_RID_CONFIRM_IMAGE);
+    b2_row(ST_EXT, UDSOTA_RID_CONFIRM_IMAGE);
+}
+
+/* ---- C: DIDs ---- */
+
+/* C1: the updater's DIDs with nothing serving them: 0x31, after one did_read with that DID. */
+static void test_C1_updater_dids_without_app(void)
+{
+    for (state_t st = ST_DEF; st < ST_N; st++) {
+        for (size_t d = 0; d < 4u; d++) {
+            enter(st, false);
+            snprintf(msg, sizeof msg, "state %s, 22 %04X", k_state_name[st], k_upd_dids[d]);
+            REQ(0x22, HI(k_upd_dids[d]), LO(k_upd_dids[d]));
+            NRC(UDSOTA_SID_READ_DID, UDSOTA_NRC_REQUEST_OUT_OF_RANGE);
+            TEST_ASSERT_EQUAL_UINT_MESSAGE(1, g_mock.did_reads, msg);
+            TEST_ASSERT_EQUAL_HEX16_MESSAGE(k_upd_dids[d], g_mock.last_did, msg);
+        }
+    }
+}
+
+/* C2: the updater's DIDs served by the app. */
+static void test_C2_updater_dids_from_app(void)
+{
+    for (state_t st = ST_DEF; st < ST_N; st++) {
+        for (size_t d = 0; d < 4u; d++) {
+            enter(st, true);
+            snprintf(msg, sizeof msg, "state %s, 22 %04X", k_state_name[st], k_upd_dids[d]);
+            REQ(0x22, HI(k_upd_dids[d]), LO(k_upd_dids[d]));
+            EXPECT(0x62, HI(k_upd_dids[d]), LO(k_upd_dids[d]), 0xAA, 0xBB);
+        }
+    }
+}
+
+/* C3: F1F2 is the core's: never the app's hook; the updater's counters stay 0, the core's still count. */
+static void test_C3_counters_are_the_cores(void)
+{
+    orphan_app_routine();                      /* resp_pending_caps 1 */
+    udsota_on_rx_timeout(&s, now);             /* ncr_timeouts 1 */
+    const unsigned reads = g_mock.did_reads;
+    udsota_counters_t c;
+    read_counters(&c);
+    TEST_ASSERT_EQUAL_UINT(reads, g_mock.did_reads);
+    TEST_ASSERT_EQUAL_UINT16(0, c.seq_errors);
+    TEST_ASSERT_EQUAL_UINT16(1, c.ncr_timeouts);
+    TEST_ASSERT_EQUAL_UINT16(0, c.repeated_blocks);
+    TEST_ASSERT_EQUAL_UINT16(0, c.aborts);
+    TEST_ASSERT_EQUAL_UINT16(0, c.withheld_fcs);
+    TEST_ASSERT_EQUAL_UINT16(0, c.stmin_violations);
+    TEST_ASSERT_EQUAL_UINT16(1, c.resp_pending_caps);
+    TEST_ASSERT_EQUAL_UINT16(0, c.resp_frames_dropped);
+}
+
+/* C4: F186 and F18C are the core's. */
+static void test_C4_session_and_serial(void)
+{
+    for (state_t st = ST_DEF; st < ST_N; st++) {
+        enter(st, true);
+        REQ(0x22, 0xF1, 0x86);
+        EXPECT(0x62, 0xF1, 0x86, k_state_session[st]);
+        REQ(0x22, 0xF1, 0x8C);
+        EXPECT(0x62, 0xF1, 0x8C, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01);
+        TEST_ASSERT_EQUAL_UINT_MESSAGE(0, g_mock.did_reads, msg);
+    }
+}
+
+/* ---- D: 10 02 ---- */
+
+/* D1: 10 02 from default asks the gate once and enters programming. */
+static void test_D1_enter_programming(void)
+{
+    enter(ST_DEF, false);
+    REQ(0x10, 0x02);
+    EXPECT(0x50, 0x02, 0x00, 0x32, 0x01, 0xF4);
+    TEST_ASSERT_EQUAL_UINT(1, g_mock.gate_calls[UDSOTA_OP_ENTER_PROGRAMMING]);
+    TEST_ASSERT_EQUAL_INT(UDSOTA_PHASE_PROGRAMMING, udsota_phase(&s));
+}
+
+/* D2: the gate's NRC verbatim. */
+static void test_D2_gate_nrc(void)
+{
+    enter(ST_DEF, false);
+    g_mock.gate_nrc[UDSOTA_OP_ENTER_PROGRAMMING] = NRC_SPEED;
+    REQ(0x10, 0x02);
+    NRC(UDSOTA_SID_SESSION, NRC_SPEED);
+}
+
+/* D3: an app routine pending: 0x21. */
+static void test_D3_busy_while_app_routine_runs(void)
+{
+    enter(ST_EXT, true);
+    start_pending_app_routine();
+    REQ(0x10, 0x02);
+    NRC(UDSOTA_SID_SESSION, UDSOTA_NRC_BUSY_REPEAT);
+}
+
+/* D4: an app orphan after the 90 s cap: 0x22 without asking the gate, until routine_poll finishes it. */
+static void test_D4_app_orphan_blocks_programming(void)
+{
+    orphan_app_routine();
+    REQ(0x10, 0x02);
+    NRC(UDSOTA_SID_SESSION, UDSOTA_NRC_CONDITIONS_NOT_CORRECT);
+    TEST_ASSERT_EQUAL_UINT(0, g_mock.gate_calls[UDSOTA_OP_ENTER_PROGRAMMING]);
+    app.poll_pending = false;
+    poll_at(now + UDSOTA_JOB_POLL_MS);
+    TEST_ASSERT_FALSE(s.app_orphan);
+    REQ(0x10, 0x02);
+    EXPECT(0x50, 0x02, 0x00, 0x32, 0x01, 0xF4);
+}
+
+/* D5: 10 02 in programming re-enters it: the epoch advances. */
+static void test_D5_reenter_programming(void)
+{
+    enter(ST_DEF, false);
+    REQ(0x10, 0x02);
+    EXPECT(0x50, 0x02, 0x00, 0x32, 0x01, 0xF4);
+    const uint32_t epoch = s.session_epoch;
+    REQ(0x10, 0x02);
+    EXPECT(0x50, 0x02, 0x00, 0x32, 0x01, 0xF4);
+    TEST_ASSERT_EQUAL_UINT32(epoch + 1u, s.session_epoch);
+}
+
+/* ---- E: 11 01 ---- */
+
+/* E1: locked: 0x33. */
+static void test_E1_reset_locked(void)
+{
+    enter(ST_EXT, false);
+    REQ(0x11, 0x01);
+    NRC(UDSOTA_SID_RESET, UDSOTA_NRC_SECURITY_ACCESS_DENIED);
+}
+
+/* E2: unlocked: 51 01, the restart is armed and fires once the answer has left, back in default. */
+static void test_E2_reset_restarts(void)
+{
+    const state_t states[] = {ST_EXT01, ST_PROG03};
+    for (size_t i = 0; i < 2u; i++) {
+        enter(states[i], false);
+        REQ(0x11, 0x01);
+        EXPECT(0x51, 0x01);
+        TEST_ASSERT_TRUE_MESSAGE(udsota_restart_armed(&s), msg);
+        app.tx_pending = 0;
+        poll_at(now + 1u);
+        TEST_ASSERT_EQUAL_UINT_MESSAGE(1, g_mock.resets, msg);
+        TEST_ASSERT_EQUAL_UINT8_MESSAGE(UDSOTA_SESSION_DEFAULT, s.session, msg);
+    }
+}
+
+/* E3: an app orphan is 0x22; the gate's NRC verbatim; a failed reset re-opens default without ACTIVATING; no reset
+ * hook is 0x11. */
+static void test_E3_reset_refusals(void)
+{
+    orphan_app_routine();
+    REQ(0x10, 0x03);
+    EXPECT(0x50, 0x03, 0x00, 0x32, 0x01, 0xF4);
+    unlock(UDSOTA_SA_SEED_EXTENDED);
+    REQ(0x11, 0x01);
+    NRC(UDSOTA_SID_RESET, UDSOTA_NRC_CONDITIONS_NOT_CORRECT);
+    TEST_ASSERT_EQUAL_UINT(0, g_mock.gate_calls[UDSOTA_OP_RESET]);
+
+    enter(ST_EXT01, false);
+    g_mock.gate_nrc[UDSOTA_OP_RESET] = NRC_SPEED;
+    REQ(0x11, 0x01);
+    NRC(UDSOTA_SID_RESET, NRC_SPEED);
+
+    enter(ST_EXT01, false);
+    g_mock.reset_ok = false;
+    REQ(0x11, 0x01);
+    EXPECT(0x51, 0x01);
+    poll_at(now + UDSOTA_RESET_TX_WAIT_MS);
+    TEST_ASSERT_EQUAL_UINT(1, g_mock.resets);
+    TEST_ASSERT_FALSE(udsota_restart_armed(&s));
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_DEFAULT, s.session);
+    TEST_ASSERT_FALSE(phase_seen(UDSOTA_PHASE_ACTIVATING));
+    REQ(0x3E, 0x00);
+    EXPECT(0x7E, 0x00);
+
+    setUp();
+    boot(false);
+    g_hooks.reset = NULL;
+    TEST_ASSERT_TRUE(udsota_init(&s, &g_cfg, NULL, udsota_mock_security(), &g_hooks));
+    REQ(0x10, 0x03);
+    EXPECT(0x50, 0x03, 0x00, 0x32, 0x01, 0xF4);
+    REQ(0x11, 0x01);
+    NRC(UDSOTA_SID_RESET, UDSOTA_NRC_SERVICE_NOT_SUPPORTED);
+}
+
+/* ---- F: the rest of the core, unchanged ---- */
+
+/* F1: 27 unlocks both levels in their sessions; 0x7F in default. */
+static void test_F1_security_access(void)
+{
+    enter(ST_DEF, false);
+    REQ(0x27, 0x01);
+    NRC(UDSOTA_SID_SECURITY, UDSOTA_NRC_SERVICE_NOT_SUPPORTED_IN_SESSION);
+    enter(ST_EXT01, false);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_SA_SEED_EXTENDED, s.security);
+    enter(ST_PROG03, false);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_SA_SEED_PROGRAMMING, s.security);
+}
+
+/* F2: 28, 85, 2E and 3E through their hooks; 28 and 85 undone back in default. */
+static void test_F2_app_services(void)
+{
+    enter(ST_EXT, false);
+    REQ(0x28, 0x03, 0x03);
+    EXPECT(0x68, 0x03);
+    REQ(0x85, 0x02);
+    EXPECT(0xC5, 0x02);
+    REQ(0x2E, 0x12, 0x34, 0xAA);
+    EXPECT(0x6E, 0x12, 0x34);
+    REQ(0x3E, 0x00);
+    EXPECT(0x7E, 0x00);
+    TEST_ASSERT_EQUAL_UINT(1, app.comm_calls);
+    TEST_ASSERT_EQUAL_UINT(1, app.dtc_calls);
+    REQ(0x10, 0x01);
+    EXPECT(0x50, 0x01, 0x00, 0x32, 0x01, 0xF4);
+    TEST_ASSERT_EQUAL_UINT(2, app.comm_calls);
+    TEST_ASSERT_EQUAL_HEX8(UDSOTA_CC_ENABLE_RX_TX, app.comm_control);
+    TEST_ASSERT_EQUAL_HEX8(UDSOTA_CC_TYPE_ALL, app.comm_type);
+    TEST_ASSERT_EQUAL_UINT(2, app.dtc_calls);
+    TEST_ASSERT_TRUE(app.dtc_on);
+}
+
+/* F3: an app routine pending: 0x78 at 40 ms, its answer on the poll after it finishes; at 90 s 0x72 and an orphan. */
+static void test_F3_app_routine_job(void)
+{
+    enter(ST_EXT, true);
+    start_pending_app_routine();
+    const uint32_t t = now;
+    poll_at(t + 39u);
+    TEST_ASSERT_EQUAL_size_t(0, rlen);
+    poll_at(t + 40u);
+    NRC(UDSOTA_SID_ROUTINE, UDSOTA_NRC_RESPONSE_PENDING);
+    app.poll_pending = false;
+    poll_at(t + 45u);
+    EXPECT(0x71, 0x01, HI(APP_RID), LO(APP_RID), APP_BYTE);
+    TEST_ASSERT_FALSE(s.job_running);
+
+    start_pending_app_routine();
+    poll_at(now + UDSOTA_JOB_CAP_MS);
+    NRC(UDSOTA_SID_ROUTINE, UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE);
+    TEST_ASSERT_TRUE(s.app_orphan);
+    TEST_ASSERT_EQUAL_UINT32(UDSOTA_JOB_POLL_MS, udsota_ms_to_deadline(&s, now));
+}
+
+/* F4: S3 and udsota_end_session, at once and latched during a job, end in default with the phase IDLE. */
+static void test_F4_session_ends(void)
+{
+    enter(ST_PROG, false);
+    REQ(0x3E, 0x00);                           /* answered: S3 runs */
+    EXPECT(0x7E, 0x00);
+    TEST_ASSERT_EQUAL_INT(UDSOTA_PHASE_PROGRAMMING, udsota_phase(&s));
+    poll_at(now + UDSOTA_S3_MS);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_DEFAULT, s.session);
+    TEST_ASSERT_EQUAL_INT(UDSOTA_PHASE_IDLE, udsota_phase(&s));
+
+    enter(ST_EXT, false);
+    udsota_end_session(&s, now);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_DEFAULT, s.session);
+    TEST_ASSERT_EQUAL_INT(UDSOTA_PHASE_IDLE, udsota_phase(&s));
+
+    enter(ST_EXT, true);
+    start_pending_app_routine();
+    udsota_end_session(&s, now);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_EXTENDED, s.session);   /* latched: the job still answers */
+    app.poll_pending = false;
+    poll_at(now + UDSOTA_JOB_POLL_MS);
+    EXPECT(0x71, 0x01, HI(APP_RID), LO(APP_RID), APP_BYTE);
+    poll_at(now + UDSOTA_JOB_POLL_MS);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_DEFAULT, s.session);
+    TEST_ASSERT_EQUAL_INT(UDSOTA_PHASE_IDLE, udsota_phase(&s));
+}
+
+/* F5: the transport's FC check allows and counts nothing; progress reads IDLE 0 of 0 and hooks.progress never ran. */
+static void test_F5_fc_check_and_progress(void)
+{
+    const state_t states[] = {ST_DEF, ST_PROG03};
+    for (size_t i = 0; i < 2u; i++) {
+        enter(states[i], false);
+        TEST_ASSERT_TRUE(udsota_fc_check(&s, 100, 2000, now));
+        TEST_ASSERT_EQUAL_UINT16(0, s.counters.withheld_fcs);
+        udsota_progress_t p;
+        memset(&p, 0xFF, sizeof p);
+        udsota_progress(&s, &p);
+        TEST_ASSERT_EQUAL_INT(UDSOTA_STAGE_IDLE, p.stage);
+        TEST_ASSERT_EQUAL_UINT32(0, p.done);
+        TEST_ASSERT_EQUAL_UINT32(0, p.total);
+        TEST_ASSERT_EQUAL_UINT8(0, p.last_reason);
+        TEST_ASSERT_EQUAL_UINT(0, app.progress_calls);
+    }
+}
+
+/* ---- G: every SID in every state ---- */
+
+/* True for a SID this server serves with every hook set and security on. */
+static bool g_served(uint8_t sid)
+{
+    switch (sid) {
+    case UDSOTA_SID_SESSION:
+    case UDSOTA_SID_RESET:
+    case UDSOTA_SID_READ_DID:
+    case UDSOTA_SID_SECURITY:
+    case UDSOTA_SID_COMM_CONTROL:
+    case UDSOTA_SID_WRITE_DID:
+    case UDSOTA_SID_ROUTINE:
+    case UDSOTA_SID_TESTER_PRESENT:
+    case UDSOTA_SID_DTC_SETTING:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* Checks one answer: empty, positive for sid, or 7F sid <nrc>, within resp_max; exactly 7F sid 11 for an unserved
+ * SID when it answers a request. */
+static void g_check(uint8_t sid, bool is_request)
+{
+    TEST_ASSERT_TRUE_MESSAGE(rlen <= sizeof resp, msg);
+    if (rlen == 0u) {
+        TEST_ASSERT_TRUE_MESSAGE(!is_request || g_served(sid), msg);
+        return;
+    }
+    if (resp[0] == UDSOTA_NEG_RESPONSE) {
+        TEST_ASSERT_EQUAL_size_t_MESSAGE(3, rlen, msg);
+        TEST_ASSERT_EQUAL_HEX8_MESSAGE(sid, resp[1], msg);
+    } else {
+        TEST_ASSERT_EQUAL_HEX8_MESSAGE(UDSOTA_POS(sid), resp[0], msg);
+    }
+    if (is_request && !g_served(sid)) {
+        NRC(sid, UDSOTA_NRC_SERVICE_NOT_SUPPORTED);
+    }
+}
+
+/* G: 5 states x SID 00-FF x length {1, 2, 3, 4, 11}, each on a fresh server, then a poll 100 ms later. */
+static void test_G_every_sid_every_state(void)
+{
+    static const size_t lens[] = {1, 2, 3, 4, 11};
+    for (state_t st = ST_DEF; st < ST_N; st++) {
+        for (unsigned sid = 0; sid <= 0xFFu; sid++) {
+            for (size_t l = 0; l < sizeof lens / sizeof lens[0]; l++) {
+                enter(st, false);
+                uint8_t r[11] = {(uint8_t)sid, 0x01, 0xF1, 0x86, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07};
+                snprintf(msg, sizeof msg, "state %s, SID %02X, length %u", k_state_name[st], sid, (unsigned)lens[l]);
+                req(r, lens[l]);
+                g_check((uint8_t)sid, true);
+                poll_at(now + 100u);
+                g_check((uint8_t)sid, false);
+            }
+        }
+    }
+}
+
+#ifndef UDSOTA_NO_ENGINE_WITHOUT_H   /* defined only to run A to G against the step-1 tree, which has no core init */
+/* ---- H: udsota_init without an engine is udsota_core_init ---- */
+
+static udsota_server_t s1, s2;
+
+/* Security with no rng16: init refuses it. */
+static const udsota_security_t k_broken_security = {.rng16 = NULL, .key = udsota_mock_key};
+
+/* H: the same context and the same return, byte for byte, for good, NULL and broken security. */
+static void test_H_init_without_engine_is_core_init(void)
+{
+    const udsota_security_t *secs[] = {udsota_mock_security(), NULL, &k_broken_security};
+    const bool rets[] = {true, true, false};
+    g_hooks = udsota_mock_hooks(&g_mock);
+    for (size_t i = 0; i < 3u; i++) {
+        memset(&s1, 0xA5, sizeof s1);
+        memset(&s2, 0x5A, sizeof s2);
+        const bool r1 = udsota_init(&s1, &g_cfg, NULL, secs[i], &g_hooks);
+        const bool r2 = udsota_core_init(&s2, &g_cfg, secs[i], &g_hooks);
+        TEST_ASSERT_EQUAL(rets[i], r1);
+        TEST_ASSERT_EQUAL(r1, r2);
+        TEST_ASSERT_EQUAL_MEMORY(&s1, &s2, sizeof s1);
+    }
+}
+#endif
+
+typedef struct {
+    const char *name;
+    void      (*fn)(void);
+    int         line;
+} test_row_t;
+#define ROW(f) {#f, f, __LINE__}
+
+/* In the order that runs the 0.8.0 tree furthest before its first crash: A, B without F002, C, then F002, D, E. */
+static const test_row_t k_tests[] = {
+    ROW(test_A1_request_download_not_supported),
+    ROW(test_A2_not_supported_before_length_and_session),
+    ROW(test_A3_no_download_side_effects),
+    ROW(test_B1_updater_rids_without_app),
+    ROW(test_B2_updater_rids_reach_app),
+    ROW(test_B3_option_record_reaches_app),
+    ROW(test_B4_session_check_first),
+    ROW(test_B5_subfunction_check),
+    ROW(test_C1_updater_dids_without_app),
+    ROW(test_C2_updater_dids_from_app),
+    ROW(test_C3_counters_are_the_cores),
+    ROW(test_C4_session_and_serial),
+    ROW(test_B_F002_in_extended),
+    ROW(test_D1_enter_programming),
+    ROW(test_D2_gate_nrc),
+    ROW(test_D3_busy_while_app_routine_runs),
+    ROW(test_D4_app_orphan_blocks_programming),
+    ROW(test_D5_reenter_programming),
+    ROW(test_E1_reset_locked),
+    ROW(test_E2_reset_restarts),
+    ROW(test_E3_reset_refusals),
+    ROW(test_F1_security_access),
+    ROW(test_F2_app_services),
+    ROW(test_F3_app_routine_job),
+    ROW(test_F4_session_ends),
+    ROW(test_F5_fc_check_and_progress),
+    ROW(test_G_every_sid_every_state),
+#ifndef UDSOTA_NO_ENGINE_WITHOUT_H
+    ROW(test_H_init_without_engine_is_core_init),
+#endif
+};
+
+/* Runs every test, or only the one named in argv[1] (so a crash can be shown alone). */
+int main(int argc, char **argv)
+{
+    UNITY_BEGIN();
+    unsigned ran = 0;
+    for (size_t i = 0; i < sizeof k_tests / sizeof k_tests[0]; i++) {
+        if (argc < 2 || strcmp(argv[1], k_tests[i].name) == 0) {
+            UnityDefaultTestRun(k_tests[i].fn, k_tests[i].name, k_tests[i].line);
+            ran++;
+        }
+    }
+    if (ran == 0u) {
+        printf("no test named %s\n", argv[1]);
+        return 1;
+    }
+    return UNITY_END();
+}

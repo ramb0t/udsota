@@ -104,9 +104,10 @@ udsota_test(test_udsota_bootloop
     SOURCES  test/test_udsota_bootloop.c ${UDSOTA_BOOTLOOP_SRCS})
 
 # ---- Server, over SERVER_SRCS alone. _write: 0x2E through hooks.did_write, and the access state and session epoch
-# every app hook gets. _progress: udsota_progress() and hooks.progress after each step of a download.
+# every app hook gets. _progress: udsota_progress() and hooks.progress after each step of a download. _no_engine: the
+# server with no updater registered (udsota_init with a NULL engine).
 foreach(t IN ITEMS server server_security server_routines server_matrix server_hooks server_write
-                   server_functional server_progress)
+                   server_functional server_progress server_no_engine)
     udsota_test(test_udsota_${t} SOURCES test/test_udsota_${t}.c ${SERVER_SRCS})
 endforeach()
 
