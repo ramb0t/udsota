@@ -27,7 +27,7 @@ udsota_esp32 is the ESP-IDF port of [udsota](../udsota/README.md). It runs the U
 
 The device ID is `cfg.device_id` (1 to 16 bytes) when set, else the 6-byte base MAC. Start copies it once, serves the copy as F18C and derives or checks the 0x27 keys over the same bytes, so the key a client makes from F18C always matches. A set `device_id` of any other length makes start return `ESP_ERR_INVALID_ARG`. A custom ID must be unique per device, or devices share K_dev (HMAC) or accept each other's signatures (ECDSA).
 
-Start passes every hook in `udsota_hooks_t` to the core with the app's own `ctx`, `did_write`, `routine`, `routine_poll` and `progress` included, and a hook the app leaves NULL stays NULL, so the core's default holds. The port adds only its phase copy, its progress snapshot and the `esp_restart()` default for `reset`. It wraps `phase` and `progress` to keep those copies, storing each before the app's own hook runs and holding no lock while it does, so that hook may read them back.
+Start passes every hook in `udsota_hooks_t` to the core with the app's own `ctx`, `did_write`, `routine`, `routine_poll`, `progress`, `dtc_get`, `dtc_ext_data` and `dtc_clear` included, and a hook the app leaves NULL stays NULL, so the core's default holds. The port adds only its phase copy, its progress snapshot and the `esp_restart()` default for `reset`. It wraps `phase` and `progress` to keep those copies, storing each before the app's own hook runs and holding no lock while it does, so that hook may read them back.
 
 ### Security config
 
