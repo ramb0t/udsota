@@ -4,6 +4,8 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-29
+
 A cleanup pass over the whole tree: two smaller adapter structs, a few fixes in the client and the demo server, and a wider CI build. Nothing changes on the wire.
 - **Breaking**, core: `udsota_isotp_t` and `udsota_rxwatch_t` change layout. The rxwatch sequence number and interval ring now follow from `cf_count`, and the isotp-c send buffer holds one answer (`UDSOTA_ISOTP_TX_MAX` = `UDSOTA_ISOTP_RESP_MAX`, 256 B, was 512 B), so `udsota_isotp_bufs_t` drops from 9,214 to 8,958 bytes. Callers that allocate with `sizeof` need no change.
 - Core: `udsota_isotp_init` takes BS, the default STmin and the download receive limit from the server's resolved `s->cfg`, not the caller's raw cfg, so the ISO-TP receive limit is always the maxNumberOfBlockLength that 0x74 announces. `resp_id` and `fc_retry_ms` still come from its `cfg` argument.
