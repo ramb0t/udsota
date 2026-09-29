@@ -6,6 +6,16 @@ Rollback is emulated. ActivateImage and 11 01 end in the reset hook, and the pro
 
 By default it matches the client's built-in `example` profile: IDs 0x710 and 0x718, product `example`, hw_id 1, layout 1, board `devkit` on F191, and 1.875 MB slots. A fresh slot 0 is seeded with a valid `v0.1.0` release image. Security is off.
 
+It also serves three DTCs through the DTC hooks, with availability 0x2F and DTCFormatIdentifier 0x00 (SAE J2012 codes), so the client's `dtc` commands have faults to read:
+
+| DTC | Status | Extended data records |
+|---|---|---|
+| U0073 (C07300) | 2F | 01, the occurrence count (1 B); 10, first and last seen (two u32 seconds) |
+| P0562 (056200) | 68, so 28 on the wire | 01; 10 held with no data |
+| B1234 (923400) | 00, so only 19 0A lists it | none |
+
+`14 FF FF FF` clears them in the extended session, unlocked at the extended level when security is on, and zeroes every status, count and time. Otherwise its hook answers 0x7F, then 0x33, then 0x31 for any other group. The table lives as long as the process, so a clear survives a restart.
+
 ## Build
 
 It is built from the root `CMakeLists.txt` on Linux only:
@@ -54,6 +64,7 @@ A pipe carries no timing, so each frame's arrival stamp is the time the server r
 | `--running-version V` | v0.1.0 | the version of the image seeded into an empty running slot |
 | `--no-compress` | off | a build without coded downloads: a 34 with DFI 0x10, 0x20 or 0x30 answers 0x31 |
 | `--no-delta` | off | a build without delta downloads: 0x20 and 0x30 answer 0x31, and 0x10 is still served |
+| `--no-dtc` | off | a build without DTC services: the three DTC hooks stay NULL, so 19 and 14 answer 0x11 |
 | `--no-rollback` | off | a build without rollback: an activated image boots UNDEFINED and ConfirmImage changes nothing |
 | `--label LABEL`, `--master FILE` | off | security on: `udsota_keys.c`'s derivation over the host HMAC-SHA256 with this label and the 32-byte master. A label without a master keeps security on and refuses every key, as the ESP32 port does |
 | `--device-id HEX` | 02:00:00:00:00:01 | F18C, and the device ID the keys are derived from |
