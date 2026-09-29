@@ -11,6 +11,8 @@ from .wire import DL_DFI_DELTA, DL_DFI_DELTA_DEFLATE
 MAGIC = 0xFCCDDE10                   # the header's first 4 bytes, little-endian (esp_delta_ota's magic)
 HEADER_LEN, HASH_LEN = 64, 32        # magic, the base's validation hash, 28 reserved bytes
 IMG_MAGIC, SEG_MAX = 0xE9, 16        # esp_image_header_t magic; ESP_IMAGE_MAX_SEGMENTS
+DETOOLS_HINT = ('delta downloads need detools: pip install "./client[diff]" from the udsota repository (it builds '
+                "from source, so it needs a C and C++ compiler)")
 
 
 # The validation hash of an ESP-IDF app image: the SHA-256 appended after its checksum byte, which

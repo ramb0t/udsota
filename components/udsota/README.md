@@ -412,6 +412,18 @@ The FF01 status byte and F1F1 byte 0.
 | 12 | `flags` | bit 0: release build; other bits 0 |
 | 13 | `reserved` | 19 zero bytes |
 
+### Flashing without the client
+
+A flasher that is not the client, such as an edge device that fetches updates from a server, sends the payloads `udsota pack` writes (client README) in this sequence, with every value it needs in their manifest. The client's `update.flash` is the reference implementation, with every recovery path; `flash_packed` in `client/tests/test_e2e_pipe.py` is a minimal one. The 0x27 key is not in the manifest. In the ECDSA mode the flasher sends each seed, the level and the F18C device ID to the product's signing service and sends back the 64-byte signature it returns ([Security](#security)), keeping the session open with 3E 00 while it waits; in the HMAC mode it needs the master key.
+
+**Precheck**, in the default session. If F1F3 already reads the manifest's `image_elf_sha256`, there is nothing to send, or only ConfirmImage when F1F0 says the running image is pending verify. Any other pending-verify image must be confirmed or rolled back first. The board DID (`board_did`) must read `board`. If F1F0's other slot is verified (since the last boot) and its SHA prefix is the first 8 bytes of `image_elf_sha256`, skip the payloads and FF01: after 10 02 and the unlock, go straight to ActivateImage.
+
+**Download.** 10 02 and the programming unlock, then the payloads in manifest order until one is taken, skipping a delta whose `base_elf_sha256` is not F1F3. Each goes as a 34 with the entry's `dfi`, ALFID 44, address 0 and `memory_size`; then 36 blocks of the 74's maxNumberOfBlockLength less 2 bytes, the counter from 01 wrapping FF to 00; then a 37. A 34 answered 0x31, or 0x22 with F1F1 reason 14 (`DL_NO_MEMORY`), means the device cannot take that mode now: try the next entry. A 36 answered 0x31 with F1F1 reason 15 (`DL_BAD_BASE`) has ended the download before any erase: skip the other deltas and go on to the full entries. Any other refusal stops the update, and F1F1 names why.
+
+**Lost answers.** A 36, 37 or FF01 that gets no answer may be sent once more unchanged; a repeated block is answered without being written twice. 0x21 to a resend means the first copy is still being served: wait for its answer. A resent 37 answered 0x24 has succeeded when F1F1 reads reason 0 with `payload_size` bytes; a resent 36 refused with F1F1 reason 15 is the `DL_BAD_BASE` case, whether it answers 0x24 or, when longer than the 256 bytes the ended download's ISO-TP now takes, gets no flow control; a resent FF01 repeats status 00 after a pass, and answers 0x24 after a failure, which F1F1 names.
+
+**Verify, activate, confirm.** FF01 must answer status 00. ActivateImage (F001) answers and restarts the device, so wait about 3 s, then poll F1F3 until the device answers (the client allows 60 s). Any value but `image_elf_sha256` means it rolled back or never switched: stop. Finally 10 03 and ConfirmImage (F002), sent again every 2 s while it answers 0x22 and the product's own checks run; the client allows 120 s.
+
 ## Third-party code
 
 Vendored libraries, their versions and licences are in [THIRD_PARTY.md](../../THIRD_PARTY.md). The UDS server is udsota's own: driftregion's iso14229 (MIT) was the model for the fuzz harness and the 0x78 cadence, but none of its code is copied. udsota itself is MIT-licensed; see the repository's `LICENSE`.

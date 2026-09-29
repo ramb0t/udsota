@@ -16,6 +16,7 @@ udsota --profile example reset                   # 11 01; an unconfirmed image r
 udsota --profile example config show             # the writable DIDs, the config status and hash
 udsota --profile example config set timeout_ms=3000 --commit --reset   # write, commit, restart, check
 udsota keygen --out keys                         # a new ecdsa-mode key pair; no profile, no bus
+udsota --profile example pack build/example.bin --out dist --diff-from releases/v1.bin   # payloads for another flasher; no bus
 ```
 
 `--profile` is required by every command but `keygen`. It takes a built-in name (profiles ship in `client/udsota/profiles/`) or a path to a `.toml` file. `--interface` overrides the profile's SocketCAN interface and is required when the profile names none. `--master` overrides its master-key file (mode hmac), `--private-key` its private-key file (mode ecdsa), and `-v` logs every request and response.
@@ -31,6 +32,17 @@ udsota keygen --out keys                         # a new ecdsa-mode key pair; no
 `flash --diff-from PATH` sends only a patch from the image the device runs, so a small code change costs kilobytes on the bus instead of the whole image. It needs a device that serves delta downloads (the ESP32 port with `UDSOTA_ESP32_DELTA`) and detools, the optional extra `diff` (`pip install "./client[diff]"` from the repository, quoted for the shell); PyPI has only detools' source distribution, so installing it needs a C and C++ compiler. `PATH` is one base `.bin` or a directory of them, such as past release images, and the tool uses the one file carrying the device's running app_elf_sha256 (F1F3). The base must be the very `.bin` that was flashed: a rebuild of the same source generally differs, and the device checks the patch against its image's appended SHA-256. With no matching file, several different ones, or one without an appended SHA-256, the tool says why and sends the full download.
 
 A delta goes as DFI 0x20, an Espressif `esp_delta_ota` patch compressed with heatshrink, or DFI 0x30, the same patch uncompressed and then raw DEFLATE, which is usually much smaller. The tool tries each mode whose patch is smaller than the full download, smallest first; `--no-compress` rules out 0x30, and `--diff-format heatshrink` or `deflate` allows only 0x20 or only 0x30 (default `auto`). A device that answers 0x31 to one mode, or 0x22 for lack of memory, gets the next. `--drop-76` does not combine with `--diff-from`. A device running another build with the same app_elf_sha256, a re-signed one for example, refuses the patch before it erases anything (F1F1 `DL_BAD_BASE`), and the tool then sends the full download.
+
+`pack FILE --out DIR` writes the payloads `flash` sends, byte for byte (the two share their encoder), for a flasher that is not this tool, such as an edge device that gets its updates from a server. It needs no bus. It checks FILE against the profile, and a `--diff-from` base against FILE's product and board, then writes one payload per mode: by default 0x10 and 0x00, plus 0x20 and 0x30 from the one base `--diff-from` names (a file, since there is no device to choose one by). `--dfi 0x30`, repeatable, writes only the modes named. Each payload is `<stem>.dfiXX.bin`, and `<stem>.manifest.json` lists them in the order `flash --compress-auto` tries them: the deltas smaller than the 0x10 payload, smallest first, then 0x10. A delta no smaller than that, which `flash` would not send, still follows, with `smaller_than_dfi_10` false, for the server to decide on (it needs less device memory than 0x10), and 0x00 comes last. `pack` never overwrites, so give each image and base its own `--out`. The manifest records the client's `udsota_version` and the `profile`, and each entry has:
+
+| Field | For |
+|---|---|
+| `dfi`, `memory_size` | the 34: the mode, and the new image's size, which every mode announces |
+| `file`, `payload_size`, `payload_sha256` | the payload file, and a check that it arrived whole |
+| `req_id`, `resp_id`, `board_did`, `board`, `image_elf_sha256`, `image_version`, `hw_id` | the IDs to talk on, the precheck, and F1F3 after the restart |
+| `base_elf_sha256`, `base_validation_sha256` (deltas) | send a delta only when F1F3 reads the first; the second is the hash its header names, which the device checks (`DL_BAD_BASE`) |
+
+The core README's [Flashing without the client](../components/udsota/README.md#flashing-without-the-client) gives the sequence and its fallbacks. The 0x27 key is not in the manifest: in the ECDSA mode the flasher asks the product's signing service to sign each seed ([Key management](../README.md#key-management)).
 
 The tool transmits only on the profile's request ID and never on a `deny_tx` ID. Before its first frame it listens for 2 s and stops if it hears the response ID or the profile's busy value. During a run it stops if a response arrives that it did not ask for.
 

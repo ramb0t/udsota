@@ -3,9 +3,11 @@ guard and pre-roll, the TX-ID hard limit, profiles, and a run with a minimal pro
 and no vcan: the UDS layer runs over a stub udsoncan connection, the pre-flight over python-can virtual buses.
 Most tests run with FULL (P), a profile that turns every optional feature on."""
 import argparse
+import dataclasses
 import errno
 import hashlib
 import io
+import json
 import os
 import pathlib
 import re
@@ -30,7 +32,8 @@ from udsoncan.client import Client
 from udsoncan.connections import BaseConnection, IsoTPSocketConnection
 from udsoncan.exceptions import TimeoutException
 
-from udsota import cli, config, delta, errors, keys, profile, transport, update, wire
+import udsota
+from udsota import cli, config, delta, errors, keys, pack, profile, transport, update, wire
 from udsota.image import parse_image
 from udsota.uds import KEEPALIVE_S, SA_DELAY_S, Uds
 
@@ -2360,7 +2363,7 @@ def test_config_set_commit_sequence_error():
 
 # ---- compressed downloads (DFI 0x10) ----
 
-# The raw DEFLATE stream at level 9, made here rather than by update.deflate, so a change of level there shows.
+# The raw DEFLATE stream at level 9, made here rather than by delta.deflate, so a change of level there shows.
 def deflate9(image):
     c = zlib.compressobj(9, zlib.DEFLATED, -15)
     return c.compress(image) + c.flush()
@@ -2473,7 +2476,7 @@ def test_compressed_drop_76_past_the_last_block_is_refused():
 
 # Check a stream the server cannot inflate to the announced size fails at 37 (0x72), and the error names F1F1's reason.
 def test_compressed_stream_failure_names_the_reason(monkeypatch):
-    monkeypatch.setattr(update, "deflate", lambda image: zlib.compress(image)[2:-10])   # cut short
+    monkeypatch.setattr(pack, "deflate", lambda image: zlib.compress(image)[2:-10])   # cut short
     d = FakeServer(compress=True)
     with pytest.raises(errors.UpdateFailed, match="0x72.*DL_BAD_STREAM"):
         run_flash(d, compress="deflate")
@@ -2605,9 +2608,9 @@ def test_choose_base_skips_the_new_image():
     ("none", {0x20: "full", 0x30: 50}, [0x20]),     # bigger than the DEFLATE stream, smaller than the image
 ])
 def test_plan_deltas_compares_sizes(monkeypatch, compress, sizes, planned):
-    full = len(update.deflate(DELTA_NEW))
+    full = len(delta.deflate(DELTA_NEW))
     n = {"full": full, "image": len(DELTA_NEW)}
-    monkeypatch.setattr(update, "build_delta", lambda base, new, dfi: bytes(n.get(sizes[dfi], sizes[dfi])))
+    monkeypatch.setattr(pack, "build_delta", lambda base, new, dfi: bytes(n.get(sizes[dfi], sizes[dfi])))
     plan = update.plan_deltas([("a.bin", DELTA_BASE)], DELTA_NEW, elf_sha(DELTA_BASE), compress, "auto",
                               log=lambda *a: None)
     assert [dfi for dfi, _ in plan] == planned
@@ -2658,7 +2661,7 @@ def test_flash_drop_76_with_bases_is_refused():
 def test_flash_delta_patch_build_failures(monkeypatch, raised, error, text):
     def boom(base, new, dfi):
         raise raised
-    monkeypatch.setattr(update, "build_delta", boom)
+    monkeypatch.setattr(pack, "build_delta", boom)
     d = delta_server()
     with pytest.raises(error, match=re.escape(text)):
         run_flash(d, DELTA_NEW, bases=[("a.bin", DELTA_BASE)])
@@ -2733,7 +2736,7 @@ def test_flash_delta_other_refusals_stop(monkeypatch):
     assert (e.value.sid, e.value.code) == (0x34, 0x22)
     assert [x for x in d.log if x[0] == 0x34] == [(0x34, None)]
     good = delta.build
-    monkeypatch.setattr(update, "build_delta", lambda base, new, dfi: good(base, new, 0x20)[:-8])
+    monkeypatch.setattr(pack, "build_delta", lambda base, new, dfi: good(base, new, 0x20)[:-8])
     d = delta_server()
     with pytest.raises(errors.UpdateFailed, match="0x72.*DL_BAD_STREAM"):
         run_delta(d, [("a.bin", DELTA_BASE)], compress="none")
@@ -2782,3 +2785,197 @@ def test_main_diff_from_a_directory(tmp_path, full_path, capsys, monkeypatch):
     assert cli.main(["--profile", full_path, "--master", str(master), "flash", str(img), "--diff-from",
                      str(tmp_path / "absent.bin")], transport=no_transport) == 2
     assert "cannot read" in capsys.readouterr().err
+
+
+# ---- pack: the payloads and manifest for another flasher ----
+
+# Runs `udsota --profile example pack new.bin --out tmp_path/out *args` with new (and base, as base.bin) written
+# under tmp_path; returns the exit code and the manifest, or None when none was written.
+def run_pack(tmp_path, new, *args, base=None):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "new.bin").write_bytes(new)
+    if base is not None:
+        (tmp_path / "base.bin").write_bytes(base)
+        args = (*args, "--diff-from", str(tmp_path / "base.bin"))
+    rc = cli.main(["--profile", "example", "pack", str(tmp_path / "new.bin"), "--out", str(tmp_path / "out"), *args])
+    m = tmp_path / "out" / "new.manifest.json"
+    return rc, json.loads(m.read_text()) if m.exists() else None
+
+
+# Check pack without a base writes 0x10 then 0x00, each file what its manifest entry says, the 0x10 one the image as
+# raw DEFLATE, and every entry announcing the image's own size and identity; and that it needs no Linux (no bus).
+def test_pack_writes_the_full_modes_and_their_manifest(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "darwin")
+    image = make_image()
+    rc, m = run_pack(tmp_path, image)
+    assert rc == 0 and (m["udsota_version"], m["profile"]) == (udsota.__version__, "example")
+    assert [e["dfi"] for e in m["payloads"]] == [0x10, 0x00]
+    info_ = parse_image(profile.load("example"), image)
+    for e in m["payloads"]:
+        data = (tmp_path / "out" / e["file"]).read_bytes()
+        assert (e["payload_size"], e["payload_sha256"]) == (len(data), hashlib.sha256(data).hexdigest())
+        assert (e["memory_size"], e["image_elf_sha256"], e["image_version"], e["hw_id"]) == \
+            (len(image), info_.elf_sha.hex(), info_.version, info_.hw_id)
+        assert "base_elf_sha256" not in e and "smaller_than_dfi_10" not in e
+        assert (zlib.decompress(data, -15) if e["dfi"] == 0x10 else data) == image
+
+
+# Check pack with a base writes both delta modes first, smallest first, naming the base two ways, and that each patch
+# rebuilds the new image from the base: its header names the base's validation hash, and detools applies the rest.
+def test_pack_deltas_round_trip_against_the_base(tmp_path):
+    detools = pytest.importorskip("detools")
+    rc, m = run_pack(tmp_path, DELTA_NEW, base=DELTA_BASE)
+    assert rc == 0
+    dfis = [e["dfi"] for e in m["payloads"]]
+    assert dfis[2:] == [0x10, 0x00] and sorted(dfis[:2]) == [0x20, 0x30]
+    sizes = [e["payload_size"] for e in m["payloads"][:2]]
+    assert sizes == sorted(sizes)
+    for e in m["payloads"][:2]:
+        assert e["smaller_than_dfi_10"] is True
+        assert e["base_elf_sha256"] == DELTA_BASE[176:208].hex()
+        assert e["base_validation_sha256"] == delta.validation_hash(DELTA_BASE).hex()
+        data = (tmp_path / "out" / e["file"]).read_bytes()
+        body = zlib.decompress(data, -15) if e["dfi"] == 0x30 else data
+        assert body[:delta.HEADER_LEN] == delta.header(delta.validation_hash(DELTA_BASE))
+        out = io.BytesIO()
+        detools.apply_patch(io.BytesIO(DELTA_BASE), io.BytesIO(body[delta.HEADER_LEN:]), out)
+        assert out.getvalue() == DELTA_NEW
+
+
+# Check a delta no smaller than the 0x10 payload, which flash would not send, is still written, flagged for the
+# server to decide on and listed after 0x10; and that --dfi writes only the modes it names, once each.
+def test_pack_flags_a_delta_no_smaller_than_deflate(tmp_path, monkeypatch):
+    monkeypatch.setattr(pack, "build_delta", lambda base, new, dfi: bytes(len(new)))
+    rc, m = run_pack(tmp_path, DELTA_NEW, "--dfi", "0x20", "--dfi", "0x10", "--dfi", "20", "--dfi", "0",
+                     base=DELTA_BASE)
+    assert rc == 0 and [(e["dfi"], e.get("smaller_than_dfi_10")) for e in m["payloads"]] == \
+        [(0x10, None), (0x20, False), (0x00, None)]
+    assert sorted(p.name for p in (tmp_path / "out").iterdir()) == ["new.dfi00.bin", "new.dfi10.bin",
+                                                                    "new.dfi20.bin", "new.manifest.json"]
+
+
+# Check flash sends exactly the bytes pack writes, for a compressed and a delta download: the two share encode(),
+# and this pins it.
+def test_flash_sends_what_pack_writes(tmp_path):
+    pytest.importorskip("detools")
+    d = FakeServer(compress=True)
+    assert run_flash(d, compress="deflate")[0] == 0
+    _, m = run_pack(tmp_path / "z", make_image(), "--dfi", "0x10")
+    assert bytes(d.zin) == (tmp_path / "z" / "out" / m["payloads"][0]["file"]).read_bytes()
+    d = delta_server(delta=(0x30,))
+    assert run_delta(d, [("base", DELTA_BASE)])[0] == 0 and d.dfi == 0x30
+    _, m = run_pack(tmp_path / "d", DELTA_NEW, "--dfi", "0x30", base=DELTA_BASE)
+    assert bytes(d.zin) == (tmp_path / "d" / "out" / m["payloads"][0]["file"]).read_bytes()
+
+
+# DELTA_BASE rebuilt for another product, or another board, and resealed.
+def other_base(project=None, hw_id=None):
+    b = bytearray(DELTA_BASE)
+    if project is not None:
+        b[80:112] = project.ljust(32, b"\0")
+    if hw_id is not None:
+        b[294] = hw_id
+    return reseal(b)
+
+
+# Check what pack refuses (exit 2, nothing written): a delta mode without a base, a base with no delta mode, the new
+# image as its own base, a base for another product or board, a base the device could not be matched to.
+@pytest.mark.parametrize("args, base, why", [
+    (("--dfi", "0x20"), None, "need --diff-from"),
+    (("--dfi", "0x10"), DELTA_BASE, "--diff-from is for DFI 0x20 and 0x30"),
+    ((), DELTA_NEW, "the base is the new image itself"),
+    ((), other_base(project=b"widget"), "the base: image project is 'widget'"),
+    ((), other_base(hw_id=2), "the base: image hw_id 2"),
+    ((), DELTA_BASE[:-32] + bytes(32), "no valid appended SHA-256"),
+])
+def test_pack_refuses(tmp_path, capsys, args, base, why):
+    rc, m = run_pack(tmp_path, DELTA_NEW, *args, base=base)
+    assert (rc, m) == (2, None) and why in capsys.readouterr().err
+    assert not (tmp_path / "out").exists()
+
+
+# Check a base for another of the profile's boards is refused: no device of the image's board runs it.
+def test_pack_refuses_a_base_for_another_board(tmp_path):
+    prof = dataclasses.replace(profile.load("example"), hw_ids=(1, 2))
+    with pytest.raises(errors.Refused, match="the base is example for hw_id 2, the image example for hw_id 1"):
+        pack.pack(prof, DELTA_NEW, "new", tmp_path / "out", base=other_base(hw_id=2))
+    assert not (tmp_path / "out").exists()
+
+
+# Check pack refuses an image the profile refuses, an unreadable file, an --out it cannot write in, and an --out
+# already holding this stem's files, which it never overwrites.
+def test_pack_refuses_a_bad_image_or_file(tmp_path, capsys):
+    assert run_pack(tmp_path, make_image(project=b"widget"))[0] == 2
+    assert "not 'example'" in capsys.readouterr().err
+    assert cli.main(["--profile", "example", "pack", str(tmp_path / "missing.bin"), "--out", str(tmp_path)]) == 2
+    assert "cannot read" in capsys.readouterr().err
+    (tmp_path / "out").write_text("a file, not a directory")
+    assert run_pack(tmp_path, make_image())[0] == 2 and "is not a directory" in capsys.readouterr().err
+    (tmp_path / "out").unlink()
+    assert run_pack(tmp_path, make_image())[0] == 0
+    before = {p.name: p.read_bytes() for p in (tmp_path / "out").iterdir()}
+    assert run_pack(tmp_path, make_image(size=5000))[0] == 2
+    assert "already holds new.dfi00.bin, new.dfi10.bin, new.manifest.json" in capsys.readouterr().err
+    assert {p.name: p.read_bytes() for p in (tmp_path / "out").iterdir()} == before
+
+
+# Check the no-overwrite rule reads names literally and without case: a stem with glob characters, and a file whose
+# name differs only in case (one file on macOS or Windows), both block a second run.
+@pytest.mark.parametrize("stem, other", [("fw[rc1]", "fw[rc1].dfi10.bin"), ("new", "NEW.DFI10.BIN")])
+def test_pack_never_overwrites_by_name(tmp_path, stem, other):
+    (tmp_path / "out").mkdir()
+    (tmp_path / "out" / other).write_bytes(b"earlier")
+    with pytest.raises(errors.Refused, match="already holds"):
+        pack.pack(profile.load("example"), make_image(), stem, tmp_path / "out")
+    assert [p.name for p in (tmp_path / "out").iterdir()] == [other]
+
+
+# Check a base for another product is refused even when the profile names no product to check either against.
+def test_pack_refuses_a_base_for_another_product_without_a_profile_product(tmp_path):
+    prof = dataclasses.replace(profile.load("example"), product=None)
+    with pytest.raises(errors.Refused, match="the base is widget for hw_id 1, the image example"):
+        pack.pack(prof, DELTA_NEW, "new", tmp_path / "out", base=other_base(project=b"widget"))
+
+
+# Check a write that fails part-way leaves nothing in --out, so the run can simply be repeated.
+def test_pack_leaves_nothing_after_a_failed_write(tmp_path, monkeypatch):
+    real, calls = pathlib.Path.write_bytes, []
+
+    def flaky(self, data):
+        calls.append(self.name)
+        if len(calls) == 2:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real(self, data)
+
+    monkeypatch.setattr(pathlib.Path, "write_bytes", flaky)
+    with pytest.raises(errors.Refused, match="cannot write in .*No space left"):
+        pack.pack(profile.load("example"), make_image(), "new", tmp_path / "out")
+    assert list((tmp_path / "out").iterdir()) == []
+    monkeypatch.setattr(pathlib.Path, "write_bytes", real)
+    assert [e["dfi"] for e in pack.pack(profile.load("example"), make_image(), "new", tmp_path / "out")["payloads"]] \
+        == [0x10, 0x00]
+
+
+# Check --diff-from with a directory, which flash takes, is refused with the reason: pack has no device to choose by.
+def test_pack_refuses_a_base_directory(tmp_path, capsys):
+    (tmp_path / "releases").mkdir()
+    (tmp_path / "new.bin").write_bytes(make_image())
+    assert cli.main(["--profile", "example", "pack", str(tmp_path / "new.bin"), "--out", str(tmp_path / "out"),
+                     "--diff-from", str(tmp_path / "releases")]) == 2
+    assert "takes one base file" in capsys.readouterr().err
+
+
+# Check --dfi 0x00 alone never deflates the image: without a delta there is nothing to rank against 0x10.
+def test_pack_plain_mode_does_not_deflate(tmp_path, monkeypatch):
+    monkeypatch.setattr(pack, "deflate", lambda data: pytest.fail("deflated"))
+    assert run_pack(tmp_path, make_image(), "--dfi", "0x00")[0] == 0
+
+
+# Check pack lists the deltas flash --compress-auto would send, in the order it would send them: both rank with
+# rank_deltas against the 0x10 payload.
+def test_pack_orders_deltas_as_flash_does(tmp_path):
+    pytest.importorskip("detools")
+    _, m = run_pack(tmp_path, DELTA_NEW, base=DELTA_BASE)
+    planned = update.plan_deltas([("base", DELTA_BASE)], DELTA_NEW, DELTA_BASE[176:208], "auto", "auto",
+                                 log=lambda *a: None)
+    assert [e["dfi"] for e in m["payloads"] if e.get("smaller_than_dfi_10")] == [d for d, _ in planned]
