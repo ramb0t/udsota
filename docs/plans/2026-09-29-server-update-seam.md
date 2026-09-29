@@ -35,7 +35,7 @@ Four commits, each building and passing:
 2. `git mv` 35 files into `server/`, `update/` and `bootloop/`, and in the same commit fix `sources.cmake`, `ci.yml:95-96` (the esp32 job's `image_check` gcc line names paths) and five comment citations. Moved files stay byte-identical, so all 35 record as 100% renames. `Kconfig`, `project_include.cmake`, `components/udsota/test/`, both READMEs, `udsota.h`, `udsota_wire.h`, `udsota_esp32.h` and `udsota_esp32_priv.h` stay at the component root. No include list may name `udsota/priv` or `udsota_esp32/server/include`: after the move they are empty or absent, and ESP-IDF fails on a missing include dir.
 3. Docs: the `server/`/`update/` layout and the `sources.cmake` variables in `components/udsota/README.md`; CHANGELOG `[Unreleased]`.
 
-Verify: same ctest count and all pass; `git show -M --summary` shows 35 renames at 100%; the stale-path greps print nothing; the six ESP32 builds have no warnings and `idf.py size` totals equal 0.8.0's. Detail: [move](2026-09-29-seam-step1-move.md).
+Verify: same ctest count and all pass; `git show -M --summary` shows 35 renames at 100%; the stale-path greps print nothing; the six ESP32 builds have no warnings and `idf.py size` totals equal 0.8.0's when both are built at the same absolute path (see Baselines). Detail: [move](2026-09-29-seam-step1-move.md).
 
 ## PR 2: seam (step 2)
 
@@ -74,4 +74,4 @@ The exact text is in the [move](2026-09-29-seam-step1-move.md) appendix.
 
 ## Baselines to record before PR 1
 
-At `08cb5b0` from a fresh build directory: the ctest count (the local `build/` is stale), the four fuzz digests (from 0.8.0 plus PR 1's digest commit, which changes no server code), `idf.py size` and `size-components` for {esp32, esp32s3} × {default, compression, delta}, and `sizeof(udsota_server_t)`. ESP-IDF v6.1 is installed at `~/.espressif` (`. ~/.espressif/tools/activate_idf_v6.1.sh`); `idf.py` is not on PATH by default.
+Recorded: 40 host tests; fuzz digests `fuzz_udsota` c2a27ece321ea94d, `_app_hooks` 835eca2454905330, `_progress` c2a27ece321ea94d, `_z` 2488a2952adadc9e, pinned in CTest (`PASS_REGULAR_EXPRESSION`) while the seam lands, so a changed answer fails `ctest`; `s_srv` 364 B on both targets; `sizeof(udsota_server_t)` 568 B on 64-bit host. Size comparisons build the baseline and the candidate at the same absolute path, because isotp-c's `assert()` embeds `__FILE__` from outside the project dir, which `CONFIG_COMPILER_HIDE_PATHS_MACROS` doesn't map: a different path length moves Flash Data by tens of bytes. Use the `udsota-pr1` worktree for both (0.8.0 into `build/base-<target>-<config>`, the candidate into `build/<target>-<config>`), and read the `libudsota.a` and `libudsota_esp32.a` rows of `size-components`, which the path doesn't reach. ESP-IDF v6.1 is installed at `~/.espressif` (`. ~/.espressif/tools/activate_idf_v6.1.sh`); `idf.py` is not on PATH by default.

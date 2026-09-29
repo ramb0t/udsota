@@ -43,6 +43,12 @@ function(udsota_check_srcs dir listed)
 endfunction()
 udsota_check_srcs(${ROOT}/components/udsota "${UDSOTA_SRCS}")
 udsota_check_srcs(${ROOT}/components/udsota_esp32 "${UDSOTA_ESP32_SRCS}")
+# ESP-IDF stops on an include dir that doesn't exist and a plain CMake build doesn't notice one: stop here too.
+foreach(d IN LISTS UDSOTA_INCLUDE_DIRS UDSOTA_PRIV_INCLUDE_DIRS UDSOTA_ESP32_INCLUDE_DIRS UDSOTA_ESP32_PRIV_INCLUDE_DIRS)
+    if(NOT IS_DIRECTORY "${d}")
+        message(FATAL_ERROR "sources.cmake names an include dir that doesn't exist: ${d}")
+    endif()
+endforeach()
 
 # ---- Libraries: isotp (vendored isotp-c v1.9.3, unpatched, plus the per-link BS/STmin port) and
 # udsota_core, the portability target. udsota_core is every core .c, compiled with nothing on its
@@ -237,29 +243,34 @@ if(UDSOTA_FUZZ AND UDSOTA_FUZZ_SAN_OK)
     # udsota_fuzz(<name> <timeout> [SOURCES..] [INCLUDES..] [DEFS..]): fuzz_udsota.c over the server, with FUZZ_SAN
     # on the link line too, or gcc wants libubsan.
     function(udsota_fuzz name timeout)
-        cmake_parse_arguments(F "" "" "SOURCES;INCLUDES;DEFS" ${ARGN})
+        cmake_parse_arguments(F "" "DIGEST" "SOURCES;INCLUDES;DEFS" ${ARGN})
         udsota_test(${name} SOURCES ${CORE_TEST}/fuzz_udsota.c ${SERVER_SRCS} ${F_SOURCES}
                             INCLUDES ${CORE_PRIV} ${F_INCLUDES})
         target_compile_options(${name} PRIVATE ${FUZZ_SAN})
         target_link_options(${name} PRIVATE ${FUZZ_SAN})
         target_compile_definitions(${name} PRIVATE UDSOTA_FUZZ_UBSAN_TRAP=1 ${F_DEFS})
         set_tests_properties(${name} PROPERTIES TIMEOUT ${timeout})
+        # DIGEST pins the answers while the server/updater seam lands (docs/plans): a changed answer fails the
+        # test even where every count on the PASS line is the same. Update the pin only for an intended change.
+        if(F_DIGEST)
+            set_tests_properties(${name} PROPERTIES PASS_REGULAR_EXPRESSION "fuzz_udsota: PASS .* digest=${F_DIGEST}")
+        endif()
     endfunction()
-    udsota_fuzz(fuzz_udsota 300)
+    udsota_fuzz(fuzz_udsota 300 DIGEST c2a27ece321ea94d)
     if(UDSOTA_FUZZ_CORPUS)
         add_test(NAME fuzz_udsota_corpus COMMAND fuzz_udsota ${UDSOTA_FUZZ_CORPUS})
         set_tests_properties(fuzz_udsota_corpus PROPERTIES TIMEOUT 1800)
     endif()
     # The same harness with did_write, routine and routine_poll set: 0x2E served, app routines answered at once,
     # after 0x78s and orphaned at the 90 s cap, each with exactly one owner.
-    udsota_fuzz(fuzz_udsota_app_hooks 300 DEFS UDSOTA_FUZZ_APP_HOOKS=1)
+    udsota_fuzz(fuzz_udsota_app_hooks 300 DIGEST 835eca2454905330 DEFS UDSOTA_FUZZ_APP_HOOKS=1)
     # The same harness with the progress hook set: done never passes total nor shrinks within a download, and the
     # hook runs at most once per call and reports every change of stage. Its PASS line matches fuzz_udsota's.
-    udsota_fuzz(fuzz_udsota_progress 300 DEFS UDSOTA_FUZZ_PROGRESS=1)
+    udsota_fuzz(fuzz_udsota_progress 300 DIGEST c2a27ece321ea94d DEFS UDSOTA_FUZZ_PROGRESS=1)
     # The same harness with compressed downloads served: the z ops over udsota_zstream and the real tinfl, a
     # compressed preamble, and generated DEFLATE streams (miniz built with deflate on, to make them), with the progress
     # hook set so that its checks hold on the compressed path too.
-    udsota_fuzz(fuzz_udsota_z 600 SOURCES ${ZSTREAM_SRCS} INCLUDES ${ZSTREAM_INC}
+    udsota_fuzz(fuzz_udsota_z 600 DIGEST 2488a2952adadc9e SOURCES ${ZSTREAM_SRCS} INCLUDES ${ZSTREAM_INC}
                 DEFS UDSOTA_FUZZ_Z=1 UDSOTA_FUZZ_PROGRESS=1 ${MINIZ_TEST_DEFS})
     # The delta patch path on mutated patches (test/fuzz_udsota_patch.c): udsota_coded over the real detools and
     # tinfl, with AddressSanitizer where the toolchain has it, since the device parses these patches from the bus.
