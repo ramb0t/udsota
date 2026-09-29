@@ -85,6 +85,7 @@ jobs:
           b="$PWD/examples/esp32/build/${{ matrix.target }}"
           d="$PWD/examples/esp32/sdkconfig.defaults"
           [ "${{ matrix.config }}" = default ] || d="$d;$PWD/examples/esp32/sdkconfig.${{ matrix.config }}"
+          mkdir -p "${b%/*}"   # tee opens $b.log before idf.py has made the build tree
           idf.py -C examples/esp32 -B "$b" -D SDKCONFIG="$b/sdkconfig" -D SDKCONFIG_DEFAULTS="$d" set-target ${{ matrix.target }} build 2>&1 | tee "$b.log"
           if grep -E 'warning:' "$b.log"; then exit 1; fi   # a bare `! grep` gates the step only while it is the last line
       - name: Check the built image passes udsota's first-block check
