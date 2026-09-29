@@ -30,9 +30,11 @@
  *
  * A sixth build, fuzz_udsota_dtc (UDSOTA_FUZZ_DTC=1), sets dtc_get, dtc_ext_data and dtc_clear over a table of
  * FUZZ_DTC_N DTCs with junk top bytes, so 19 and 14 are served: 19 02 FF and 19 0A outgrow the response buffer
- * (0x14) while 19 02 01 and 02 08 fit, the mocks fail on an index at the cap, an unknown DTC, a top byte or record 00
- * handed to dtc_ext_data, or an access state that is not the server's, and the positive shapes check every status
- * sent is a subset of the availability mask. The other five builds compile to what they were without it.
+ * (0x14, which the oracle takes from a 19 in this build alone) while 19 02 01 and 02 08 fit, the mocks fail on an
+ * unknown DTC, a top byte or record 00 handed to dtc_ext_data, or an access state that is not the server's, and the
+ * positive shapes check every status sent is a subset of the availability mask. Every walk ends at FUZZ_DTC_N, so
+ * the index cap is test_index_cap's to pin, not this build's. The other five builds leave the DTC hooks NULL and
+ * answer as they did without it.
  *
  * The PASS line ends with digest=, an FNV-1a hash of every request fed to the server and every answer it gave
  * (empty ones too), so an answer that changes shows there even where the counts don't. It draws no rnd().
@@ -663,8 +665,9 @@ static uint32_t fuzz_dtc24(size_t i)
     return 0xC00000u | ((uint32_t)i << 8) | ((i % 3u == 0u) ? 0u : (uint32_t)i);
 }
 
-/* hooks.dtc_get: FUZZ_DTC_N DTCs with a junk top byte, statuses cycling through 00, 01, 2F, 08, 40, 09, FF and 28;
- * an index at the cap is a defect. */
+/* hooks.dtc_get: FUZZ_DTC_N DTCs with a junk top byte, statuses cycling through 00, 01, 2F, 08, 40, 09, FF and 28.
+ * An index at the cap is a defect, but the core's walks stop at FUZZ_DTC_N first, so only a walk that skipped ahead
+ * would reach it; test_index_cap pins the cap itself. */
 static bool mock_dtc_get(void *ctx, size_t i, udsota_dtc_t *out)
 {
     static const uint8_t STATUS[8] = {0x00, 0x01, 0x2F, 0x08, 0x40, 0x09, 0xFF, 0x28};
@@ -930,12 +933,13 @@ static bool sid_served(uint8_t sid)
     }
 }
 
-/* True for the 20 NRCs udsota.h defines; anything else on the wire is a server defect. */
+/* True for the NRCs udsota.h defines but 0x14, which dtc_nrc_ok takes from a 19 alone; anything else on the wire is
+ * a server defect. */
 static bool nrc_known(uint8_t nrc)
 {
     switch (nrc) {
     case UDSOTA_NRC_GENERAL_REJECT: case UDSOTA_NRC_SERVICE_NOT_SUPPORTED: case UDSOTA_NRC_SUBFUNC_NOT_SUPPORTED:
-    case UDSOTA_NRC_INCORRECT_LENGTH: case UDSOTA_NRC_RESPONSE_TOO_LONG: case UDSOTA_NRC_BUSY_REPEAT:
+    case UDSOTA_NRC_INCORRECT_LENGTH: case UDSOTA_NRC_BUSY_REPEAT:
     case UDSOTA_NRC_CONDITIONS_NOT_CORRECT:
     case UDSOTA_NRC_REQUEST_SEQUENCE_ERROR: case UDSOTA_NRC_REQUEST_OUT_OF_RANGE:
     case UDSOTA_NRC_SECURITY_ACCESS_DENIED: case UDSOTA_NRC_INVALID_KEY: case UDSOTA_NRC_EXCEEDED_ATTEMPTS:
@@ -953,6 +957,19 @@ static bool nrc_known(uint8_t nrc)
 static bool nrc_ok(uint8_t nrc)
 {
     return nrc_known(nrc) || (M.live && M.variant == 2u && nrc == FUZZ_GATE_NRC);
+}
+
+/* True for 0x14 responseTooLong to a 19 in the DTC build, the only answer the core sends it in; the other five
+ * builds never serve 19, so there it is a defect anywhere, as it is from a poll. */
+static bool dtc_nrc_ok(uint8_t sid, uint8_t nrc)
+{
+#if UDSOTA_FUZZ_DTC
+    return sid == UDSOTA_SID_READ_DTC && nrc == UDSOTA_NRC_RESPONSE_TOO_LONG;
+#else
+    (void)sid;
+    (void)nrc;
+    return false;
+#endif
 }
 
 #if UDSOTA_FUZZ_DTC
@@ -1053,7 +1070,7 @@ static void check_request_answer(const uint8_t *req, size_t rl, const uint8_t *r
         fail("answered an empty request", req, rl, r, n);
     }
     if (r[0] == UDSOTA_NEG_RESPONSE) {
-        if (n != 3 || r[1] != req[0] || !nrc_ok(r[2])) {
+        if (n != 3 || r[1] != req[0] || !(nrc_ok(r[2]) || dtc_nrc_ok(req[0], r[2]))) {
             fail("malformed negative response (want 7F <request SID> <known NRC>)", req, rl, r, n);
         }
         if (count) {

@@ -99,7 +99,8 @@ def chatter(channel, msg, stop):
 MAC = bytes.fromhex("020000000001")
 SEED = bytes(range(0x10, 0x20))
 KEYS = {0x01: bytes.fromhex("5de67156ccb30a17846a4cac31c9db8f"),
-        0x03: bytes.fromhex("b2344840011fcfaca2e74724e9c6ef0c")}
+        0x03: bytes.fromhex("b2344840011fcfaca2e74724e9c6ef0c"),
+        0x05: bytes.fromhex("fe238f20c97ce0908ff93b524fe74071")}   # a product's level_extended other than 01
 OLD_SHA = bytes([0x11]) * 32
 NEW_SHA = bytes(range(0xA0, 0xC0))
 STATUS_FIXTURE = bytes([0x01, 0x02, 0x01, 0x03, 0x00, 0x02, 0x07,
@@ -183,7 +184,8 @@ class FakeServer:
                  nrc_once=None, activate_refusals=0, ff01_status=0, config=None, lose_77_once=False,
                  lose_ff01_once=False, activate_nrcs=None, activate_fail=None, no_fc=None, security=True,
                  pubkey=None, cfg_keys=None, commit_status=0, compress=False, z_nomem=False, delta=(), base=None,
-                 no_memory=(), lose_bad_base=False, dtcs=None, dtc_ext=None, dtc_avail=0x2F, dtc_format=0x00):
+                 no_memory=(), lose_bad_base=False, dtcs=None, dtc_ext=None, dtc_avail=0x2F, dtc_format=0x00,
+                 level_extended=0x01):
         self.max_block, self.boot_silence, self.confirm_refusals = max_block, boot_silence, confirm_refusals
         self.running_state, self.sha, self.board = running_state, sha, board
         self.other_state, self.other_sha = other_state, other_sha
@@ -216,6 +218,7 @@ class FakeServer:
         self.dtcs = None if dtcs is None else list(dtcs)   # [(dtc, status)]; None: no DTC hooks
         self.dtc_ext = dtc_ext                  # {dtc: its records for record FF}; None: no dtc_ext_data (19 06: 0x12)
         self.dtc_avail, self.dtc_format = dtc_avail, dtc_format   # cfg.dtc_availability_mask and cfg.dtc_format
+        self.level_extended = level_extended    # the requestSeed level 14's hook needs unlocked
 
     # Answer one request payload with a list of response payloads ([] = no answer).
     def handle(self, req):
@@ -495,7 +498,8 @@ class FakeServer:
         return self.nrc(0x19, 0x14) if len(answer) > 256 else [answer]
 
     # 0x14 ClearDiagnosticInformation: 0x11 without dtcs and 0x13 for any length but 4 (the core), then the demo
-    # server's hook: 0x7F outside the extended session, 0x33 without the level-1 unlock, 0x31 for a group but FFFFFF.
+    # server's hook: 0x7F outside the extended session, 0x33 without the level_extended unlock, 0x31 for a group but
+# FFFFFF.
     # Zeroes every status and answers 54.
     def s14(self, req, group):
         if self.dtcs is None:
@@ -504,7 +508,7 @@ class FakeServer:
             return self.nrc(0x14, 0x13)
         if self.session != 3:
             return self.nrc(0x14, 0x7F)
-        if self.security and self.unlocked != 1:
+        if self.security and self.unlocked != self.level_extended:
             return self.nrc(0x14, 0x33)
         if group != 0xFFFFFF:
             return self.nrc(0x14, 0x31)
@@ -606,8 +610,8 @@ def test_k_dev_vector():
         "cbe10490e36487e3ea9805288ac4bcead717aafdcefa30cd1f4668e9fa1cfa52"
 
 
-# Check the level-1 and level-3 keys for seed 0x10..0x1F.
-@pytest.mark.parametrize("level", [0x01, 0x03])
+# Check the level-1, level-3 and level-5 keys for seed 0x10..0x1F.
+@pytest.mark.parametrize("level", [0x01, 0x03, 0x05])
 def test_seed_key_vectors(level):
     assert keys.seed_key(keys.derive_k_dev(MASTER, P.security.label, MAC), SEED, level, MAC) == KEYS[level]
 
@@ -2522,7 +2526,8 @@ def test_dtc_show_too_many_and_malformed():
 
 
 # Check --ext sends 19 01 FF then 19 06 <DTC> FF and prints the DTC's line and its records as hex, unsplit; a DTC
-# holding none says so; a DTC the device doesn't report (0x31) fails with exit 1 naming the code as given.
+# holding none says so; 0x31, a DTC the device doesn't report or a hook with no record for it, fails with exit 1
+# naming the code as given.
 def test_dtc_show_ext():
     d = FakeServer(dtcs=DTCS, dtc_ext=DTC_EXT)
     rc, lines = run_dtc(d, dtc.dtc_ext, 0xC07300, "U0073")
@@ -2531,8 +2536,8 @@ def test_dtc_show_ext():
     rc, lines = run_dtc(FakeServer(dtcs=DTCS, dtc_ext=DTC_EXT), dtc.dtc_ext, 0x056200, "p0562")
     assert rc == 0 and lines == ["P0562  status 0x28 (confirmedDTC, testFailedSinceLastClear)",
                                  "no extended data stored"]
-    with pytest.raises(errors.UpdateFailed, match=r"^u0074 is not a DTC the device supports \(19 06 answered NRC "
-                                                  r"0x31\)$") as e:
+    with pytest.raises(errors.UpdateFailed, match=r"^u0074 is not a DTC the device supports, or holds no extended "
+                                                  r"data records \(19 06 answered NRC 0x31\)$") as e:
         run_dtc(FakeServer(dtcs=DTCS, dtc_ext=DTC_EXT), dtc.dtc_ext, 0xC07400, "u0074")
     assert e.value.exit_code == 1
 
@@ -2562,6 +2567,18 @@ def test_dtc_clear():
     d = FakeServer(dtcs=DTCS, security=False)
     rc, _ = run_dtc(d, dtc.dtc_clear, None, prof=profile.from_dict("nosec", tomllib.loads(CAN + DTC_TABLE)))
     assert rc == 0 and d.log == [(0x10, 3), (0x14, 0xFFFFFF)] and not any(st for _, st in d.dtcs)
+
+
+# Check dtc clear unlocks at the profile's level_extended, not level 1: a device whose extended level is 05 clears
+# after 27 05 and 27 06.
+def test_dtc_clear_unlocks_at_level_extended():
+    prof = profile.from_dict("level-05", tomllib.loads(FULL.replace("device_id_did = 0xF18C\n", "device_id_did = "
+                                                                    "0xF18C\nlevel_extended = 0x05\n") + DTC_TABLE))
+    d = FakeServer(dtcs=DTCS, level_extended=0x05)
+    rc, lines = run_dtc(d, dtc.dtc_clear, MASTER, prof=prof)
+    assert rc == 0 and lines == ["cleared every DTC"]
+    assert d.log == [(0x22, 0xF18C), (0x10, 3), (0x27, 5), (0x27, 6), (0x14, 0xFFFFFF)]
+    assert not any(st for _, st in d.dtcs)
 
 
 # Check a clear the device refuses fails with exit 1 naming the NRC, nothing cleared, and firmware without DTC

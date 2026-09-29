@@ -374,6 +374,37 @@ static void test_functional_single_frame_only(void)
     TEST_ASSERT_EQUAL_UINT32(0, udsota_isotp_resp_lost(&s_tp));
 }
 
+/* hooks.dtc_get: three DTCs, 10 00 0i with status 09. */
+static bool hook_dtc_get(void *ctx, size_t i, udsota_dtc_t *out)
+{
+    if (i >= 3u) {
+        return false;
+    }
+    out->dtc = 0x100000u + (uint32_t)i;
+    out->status = 0x09u;
+    return true;
+}
+
+/* A functional 19 02 whose answer outgrows a frame goes out multi-frame on the response ID: the FF, the client's FC
+ * on the request ID, then the CFs. */
+static void test_functional_multi_frame_answer(void)
+{
+    s_hooks.dtc_get = hook_dtc_get;
+    init_all();
+    const unsigned first = s_log_n;
+    static const uint8_t sf[] = {0x03, 0x19, 0x02, 0xFF};
+    feed_func(sf, sizeof sf);
+    TEST_ASSERT_TRUE(run_until_response(20));
+    static const uint8_t want[] = {0x59, 0x02, 0xFF, 0x10, 0x00, 0x00, 0x09, 0x10, 0x00, 0x01, 0x09,
+                                   0x10, 0x00, 0x02, 0x09};
+    TEST_ASSERT_EQUAL_UINT32(sizeof want, s_resp_len);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(want, s_resp, sizeof want);
+    TEST_ASSERT_EQUAL_UINT(3, s_log_n - first);          /* FF and two CFs */
+    TEST_ASSERT_EQUAL_HEX8(0x10, s_log[first][0]);
+    TEST_ASSERT_EQUAL_HEX8(0x21, s_log[first + 1u][0]);
+    TEST_ASSERT_EQUAL_UINT32(0, udsota_isotp_resp_lost(&s_tp));
+}
+
 /* A functional request while a physical one is mid-message is dropped, and the physical one completes. */
 static void test_functional_dropped_during_a_physical_request(void)
 {
@@ -832,6 +863,7 @@ int main(void)
     RUN_TEST(test_single_frame_request_and_response);
     RUN_TEST(test_functional_single_frame_only);
     RUN_TEST(test_functional_dropped_during_a_physical_request);
+    RUN_TEST(test_functional_multi_frame_answer);
     RUN_TEST(test_4095_byte_block_with_fc_every_64_cfs);
     RUN_TEST(test_receive_limit_256_outside_a_download);
     RUN_TEST(test_parked_response_retried_after_tx_retry);

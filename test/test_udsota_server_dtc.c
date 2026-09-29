@@ -404,8 +404,9 @@ static void test_lengths_and_subfunctions(void)
 }
 
 /* Room is judged on resp_max: 63 DTCs fit 256 B and 64 answer 0x14; resp_max 3 + 4k fits k and one less answers
- * 0x14; 19 01 needs 6; 19 06 needs 6 for 59 06 <DTC> <status>, and short of it asks no hook; below 3 the 0x14
- * doesn't fit and nothing is sent. The walk stops at the DTC that overflows. */
+ * 0x14; 19 01 needs 6; 19 06 needs 6 for 59 06 <DTC> <status>, and short of it asks no hook, though an unknown DTC
+ * still answers 0x31, found first; below 3 the 0x14 doesn't fit and nothing is sent. The walk stops at the DTC that
+ * overflows. */
 static void test_response_too_long(void)
 {
     g.gen = 63u;
@@ -446,6 +447,8 @@ static void test_response_too_long(void)
     const unsigned calls = g.ext_calls;
     REQ_MAX(5u, 0x19, 0x06, 0x92, 0x34, 0x00, 0x02);
     NRC(0x19, 0x14);
+    REQ_MAX(5u, 0x19, 0x06, 0x12, 0x34, 0x56, 0x01);
+    NRC(0x19, 0x31);                                   /* the DTC walk before the room check */
     TEST_ASSERT_EQUAL_UINT(calls, g.ext_calls);
     REQ_MAX(2u, 0x19, 0x02, 0xFF);
     TEST_ASSERT_EQUAL_UINT(0, rlen);
@@ -470,7 +473,8 @@ static void test_index_cap(void)
 }
 
 /* SPRMIB drops only a positive answer: 19 82 FF and 19 8A are silent after the walk, while 19 86 for an unknown DTC
- * still answers 0x31 and a 19 82 FF too long for resp_max still answers 0x14. */
+ * still answers 0x31, 19 86 the hook refuses still answers the hook's NRC, and a 19 82 FF too long for resp_max
+ * still answers 0x14. */
 static void test_sprmib(void)
 {
     REQ(0x19, 0x82, 0xFF);
@@ -485,6 +489,11 @@ static void test_sprmib(void)
     TEST_ASSERT_EQUAL_UINT(1, g.ext_calls);
     REQ(0x19, 0x86, 0x12, 0x34, 0x56, 0x01);
     NRC(0x19, 0x31);
+    g.ext_nrc = NRC_APP;
+    REQ(0x19, 0x86, 0xC0, 0x73, 0x00, 0x01);
+    NRC(0x19, NRC_APP);
+    TEST_ASSERT_EQUAL_UINT(2, g.ext_calls);
+    g.ext_nrc = 0u;
     REQ_MAX(10u, 0x19, 0x82, 0xFF);
     NRC(0x19, 0x14);
     REQ(0x19, 0x84);
@@ -574,15 +583,24 @@ static void test_busy(void)
     TEST_ASSERT_TRUE(s.job_running);
 }
 
-/* Functionally: 19 02 is answered; 19 06 for a DTC the node lacks, 19 04 and a node without dtc_get are silent; a
- * bare 19 still answers 0x13 and a 19 0A too long for the buffer 0x14; 14 is dropped before the server, asking no
+/* Functionally: 19 02 and a 19 06 for a DTC the node has are answered; 19 06 for a DTC the node lacks or a record
+ * the hook doesn't hold (0x31), 19 04 and a node without dtc_get are silent; a bare 19 still answers 0x13, and a
+ * 19 0A too long for the buffer or a 19 06 whose records don't fit 0x14; 14 is dropped before the server, asking no
  * hook. */
 static void test_functional(void)
 {
     TEST_ASSERT_EQUAL_UINT(11, FUNC(0x19, 0x02, 0x01));
     EXPECT(0x59, 0x02, AVAIL, 0xC0, 0x73, 0x00, 0x2F, 0xD1, 0x0F, 0x1C, 0x09);
     TEST_ASSERT_EQUAL_UINT(6, FUNC(0x19, 0x01, 0xFF));
+    TEST_ASSERT_EQUAL_UINT(8, FUNC(0x19, 0x06, 0xC0, 0x73, 0x00, 0x01));
+    EXPECT(0x59, 0x06, 0xC0, 0x73, 0x00, 0x2F, 0x01, 0x05);
     TEST_ASSERT_EQUAL_UINT(0, FUNC(0x19, 0x06, 0x12, 0x34, 0x56, 0x01));
+    TEST_ASSERT_EQUAL_UINT(0, FUNC(0x19, 0x06, 0xC0, 0x73, 0x00, 0x03));
+    TEST_ASSERT_EQUAL_UINT(2, g.ext_calls);            /* the hook's 0x31, suppressed */
+    g.ext_nrc = UDSOTA_NRC_RESPONSE_TOO_LONG;
+    TEST_ASSERT_EQUAL_UINT(3, FUNC(0x19, 0x06, 0xC0, 0x73, 0x00, 0xFF));
+    NRC(0x19, 0x14);
+    g.ext_nrc = 0u;
     TEST_ASSERT_EQUAL_UINT(0, FUNC(0x19, 0x04));
     TEST_ASSERT_EQUAL_UINT(3, FUNC(0x19));
     NRC(0x19, 0x13);

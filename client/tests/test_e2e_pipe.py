@@ -729,7 +729,8 @@ def test_dtc_show_ext_and_clear(demo, tmp_path, capsys):
     assert dtc_cli(s, path, capsys, "show", "--ext", "b1234")[:2] == (
         0, "B1234  status 0x00 (none)\nno extended data stored\n")
     rc, _, err = dtc_cli(s, path, capsys, "show", "--ext", "U0073-01")
-    assert rc == 1 and "U0073-01 is not a DTC the device supports (19 06 answered NRC 0x31)" in err
+    assert rc == 1 and ("U0073-01 is not a DTC the device supports, or holds no extended data records (19 06 "
+                        "answered NRC 0x31)") in err
     assert dtc_cli(s, path, capsys, "clear") == (0, "cleared every DTC\n", "")
     assert "cleared every DTC" in s.log()
     assert dtc_cli(s, path, capsys, "show")[:2] == (0, "no DTCs match (availability 0x2F)\n")

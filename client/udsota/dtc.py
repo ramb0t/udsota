@@ -107,12 +107,13 @@ def dtc_show(uds, profile, log=print):
 
 # `dtc show --ext CODE`: 19 01 FF for the format, then 19 06 <dtc> FF, and the DTC's line and its extended data
 # records as hex; their lengths are the product's, so the client doesn't split them. code is CODE as given. 0x12 is
-# firmware without extended data (exit 2); 0x31 a DTC the device doesn't report and 0x14 records past its answer
-# buffer (exit 1).
+# firmware without extended data (exit 2); 0x31 a DTC the device doesn't report, or the hook's "no such record" for
+# one that holds none, and 0x14 records past its answer buffer (exit 1).
 def dtc_ext(uds, profile, dtc, code, log=print):
     fmt = read_format(uds)
     nrcs = {**READ_NRCS, NRC_SUBFUNCTION_NOT_SUPPORTED: (Refused, "this firmware has no DTC extended data"),
-            NRC_OUT_OF_RANGE: (UpdateFailed, "%s is not a DTC the device supports" % code),
+            NRC_OUT_OF_RANGE: (UpdateFailed, "%s is not a DTC the device supports, or holds no extended data "
+                                             "records" % code),
             NRC_RESPONSE_TOO_LONG: (UpdateFailed, "%s's extended data is more than the device can send in one "
                                                   "answer" % code)}
     d = read(uds, RDTC_EXT_DATA, dtc.to_bytes(3, "big") + bytes([DTC_RECORD_ALL]), nrcs)
