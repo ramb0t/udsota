@@ -2,8 +2,9 @@
 
 Commands: info (identity, update state, the profile's DIDs), flash FILE (precheck to ConfirmImage),
 confirm (ConfirmImage after an update), reset (11 01, keyed when the profile has [security]), config show /
-config set NAME=VALUE... (the profile's writable DIDs: stage with 0x2E, --commit, --reset to apply and check)
-and keygen (a key pair for the ecdsa mode; it needs no profile and no bus).
+config set NAME=VALUE... (the profile's writable DIDs: stage with 0x2E, --commit, --reset to apply and check),
+pack FILE (the payloads flash would send, with a manifest, for another flasher; no bus) and keygen (a key pair
+for the ecdsa mode; it needs no profile and no bus).
 The profile (--profile NAME or a .toml path) holds everything product-specific. Every frame goes out on
 the profile's req_id only, never on a deny_tx ID. Before sending, the tool listens LISTEN_S seconds and
 stops on the profile's busy value or on any resp_id frame, then pre-rolls a quiet bus if the profile asks.
@@ -22,7 +23,20 @@ from .config import config_set, config_show, parse_writes, writable_keys
 from .image import parse_image
 from .keys import keygen, load_master, load_private_key
 from .transport import Transport
-from .update import DETOOLS_HINT, DIFF_DFIS, confirm_cmd, flash, info, reset
+from .delta import DETOOLS_HINT
+from .pack import DFIS, pack
+from .update import DIFF_DFIS, confirm_cmd, flash, info, reset
+
+
+# A --dfi value: one of pack's DFIs, written 0x00, 0x10, 0x20 or 0x30.
+def dfi_arg(text):
+    try:
+        dfi = int(text, 16)
+    except ValueError:
+        dfi = None
+    if dfi not in DFIS:
+        raise argparse.ArgumentTypeError("%s is not one of %s" % (text, ", ".join("0x%02X" % d for d in DFIS)))
+    return dfi
 
 
 # Command-line arguments; every command but keygen needs --profile.
@@ -64,6 +78,16 @@ def parse_args(argv):
     s.add_argument("--commit", action="store_true", help="run the profile's commit routine after staging")
     s.add_argument("--reset", action="store_true",
                    help="with --commit: keyed 11 01, then read every key back and check the config hash")
+    pk = sub.add_parser("pack", help="write the download payloads for FILE and a JSON manifest, for a flasher that "
+                                     "is not this client")
+    pk.add_argument("file", type=pathlib.Path)
+    pk.add_argument("--out", type=pathlib.Path, required=True, metavar="DIR", help="directory to write them in")
+    pk.add_argument("--dfi", type=dfi_arg, action="append", metavar="DFI",
+                    help="a download mode to write: 0x00 (plain), 0x10 (raw DEFLATE), 0x20 or 0x30 (delta, with "
+                         "--diff-from); repeat for several (default: every mode the arguments allow)")
+    pk.add_argument("--diff-from", type=pathlib.Path, metavar="PATH",
+                    help="the image the device runs, for DFI 0x20 and 0x30 (needs detools: pip install "
+                         "\"./client[diff]\")")
     k = sub.add_parser("keygen", help="write a new ecdsa-mode key pair: udsota_private.pem and udsota_pubkey.h")
     k.add_argument("--out", type=pathlib.Path, required=True, metavar="DIR", help="directory to write them in")
     args = p.parse_args(argv)
@@ -108,12 +132,24 @@ def keygen_cmd(out):
     return 0
 
 
+# `pack`: reads FILE and the --diff-from base, and writes the payloads and manifest (pack.pack).
+def pack_cmd(prof, args):
+    try:
+        image = args.file.read_bytes()
+        base = None if args.diff_from is None else args.diff_from.read_bytes()
+    except OSError as e:
+        raise Refused("cannot read %s: %s" % (e.filename, e.strerror))
+    pack(prof, image, args.file.stem, args.out, dfis=None if args.dfi is None else tuple(dict.fromkeys(args.dfi)),
+         base=base)
+    return 0
+
+
 # Entry point; returns the exit code (0 ok, 1 failed, 2 refused, 3 server busy, 4 second tester).
 def main(argv=None, transport=Transport):
     args = parse_args(sys.argv[1:] if argv is None else argv)
-    if args.cmd == "keygen":
+    if args.cmd in ("keygen", "pack"):   # no bus, so any platform
         try:
-            return keygen_cmd(args.out)
+            return keygen_cmd(args.out) if args.cmd == "keygen" else pack_cmd(load_profile(args.profile), args)
         except ToolError as e:
             print("udsota: %s" % e, file=sys.stderr)
             return e.exit_code

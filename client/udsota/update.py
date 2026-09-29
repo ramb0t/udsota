@@ -3,10 +3,11 @@ the keyed reset. Every product-specific step comes from the profile."""
 import contextlib
 import time
 
-from .delta import build as build_delta, deflate, validation_hash
+from .delta import DETOOLS_HINT, validation_hash
 from .errors import NoResponse, Nrc, Refused, SendFailed, UpdateFailed
 from .image import parse_image
 from .keys import DeviceKeys, SigningKeys
+from .pack import encode
 from .wire import (DID_COUNTERS, DID_DEVICE_ID, DID_RESULT, DID_RUNNING_SHA, DID_SESSION, DID_STATUS, DID_VERSION,
                    DL_DFI, DL_DFI_DEFLATE, DL_DFI_DELTA, DL_DFI_DELTA_DEFLATE, IMG_PENDING_VERIFY, IMG_STATES,
                    NRC_CONDITIONS, NRC_OUT_OF_RANGE, NRC_PROGRAMMING_FAILURE, NRC_SEQUENCE, OTHER_VERIFIED,
@@ -22,8 +23,6 @@ CONFIRM_TIMEOUT_S = 120.0   # a product's soak plus its health check, with margi
 DIFF_DFIS = {"auto": (DL_DFI_DELTA, DL_DFI_DELTA_DEFLATE), "heatshrink": (DL_DFI_DELTA,),
              "deflate": (DL_DFI_DELTA_DEFLATE,)}
 DELTA_NAMES = {DL_DFI_DELTA: "heatshrink patch", DL_DFI_DELTA_DEFLATE: "patch as raw DEFLATE"}
-DETOOLS_HINT = ('delta downloads need detools: pip install "./client[diff]" from the udsota repository (it builds '
-                "from source, so it needs a C and C++ compiler)")
 
 # The server-owned DIDs `info` reads first, with their labels and renderers.
 CORE_DIDS = ((DID_SESSION, "active session", DECODE["hex"]),
@@ -117,7 +116,7 @@ def compressed_refusal(uds, nrc):
 def open_download(uds, image, compress, log=print):
     if compress == "none":
         return image, uds.request_download(len(image))
-    payload = deflate(image)
+    payload = encode(image, DL_DFI_DEFLATE)
     try:
         max_data = uds.request_download(len(image), DL_DFI_DEFLATE)
     except Nrc as e:
@@ -241,11 +240,11 @@ def plan_deltas(bases, image, running_sha, compress, diff_format, log=print, def
     if not dfis:
         log("no delta: DFI 0x30 is raw DEFLATE, which --no-compress rules out")
         return []
-    full = len(image) if compress == "none" else len(deflate(image))
+    full = len(encode(image, DL_DFI if compress == "none" else DL_DFI_DEFLATE))
     out = []
     for dfi in dfis:
         try:
-            payload = build_delta(base, image, dfi)
+            payload = encode(image, dfi, base)
         except ImportError:
             raise Refused(DETOOLS_HINT) from None
         except Exception as e:                  # detools' own errors, which have no common base worth importing

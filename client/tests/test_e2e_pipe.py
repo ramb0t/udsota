@@ -1,6 +1,9 @@
 """End-to-end tests: the client (cli.main, update.flash and the Uds layer, over can-isotp's Python ISO-TP stack)
 against the real server core in tools/linux_server's udsota_demo_server, whose frames travel over its stdin and
 stdout. No vcan or kernel ISO-TP needed; skipped when the demo is not built."""
+import hashlib
+import json
+import pathlib
 import random
 import subprocess
 import threading
@@ -8,7 +11,7 @@ import time
 
 import pytest
 
-from udsota import delta, profile, transport, update, wire
+from udsota import cli, delta, profile, transport, update, wire
 from udsota.errors import NoResponse, Nrc
 
 from .demo_server import (EXAMPLE, LABEL, MASTER, PIPE_P2_S, SECURED, DemoServer, PipeTransport, binary_or_skip,
@@ -574,3 +577,95 @@ def test_flash_delta_on_slow_jobs(demo, tmp_path):
     assert flash(s, new_path, "--diff-from", base_path) == 0
     assert 0x37 in {m.data[2] for m in s.sent if m.data[1] == 0x7F and m.data[3] == 0x78}
     assert read_state(s)[2] == "v0.3.0"
+
+
+# ---- pack: another flasher, from the payloads and manifest alone ----
+
+# `udsota pack new --out tmp_path/pack *args`; returns the output directory and the manifest.
+def packed(tmp_path, new, *args):
+    out = tmp_path / "pack"
+    assert cli.main(["--profile", "example", "pack", new, "--out", str(out), *args]) == 0
+    return out, json.loads((out / (pathlib.Path(new).stem + ".manifest.json")).read_text())
+
+
+# A flasher that is not this client, as the core README's "Flashing without the client" has it: it knows only the
+# manifest and payload files, and makes the Uds calls flash makes. The precheck, then each payload in manifest order
+# (a delta only when F1F3 is its base) until one is taken: 0x31, or 0x22 with DL_NO_MEMORY, at the 34 and a 36 refused
+# with DL_BAD_BASE move on to the next. Then FF01, ActivateImage, F1F3 showing the new image, ConfirmImage. Returns
+# the DFIs whose 34 was sent.
+def flash_packed(server, out, manifest):
+    tried, first = [], manifest["payloads"][0]
+    with PipeTransport(EXAMPLE, server) as t:
+        uds = t.uds()
+        reason = lambda: wire.decode_result(uds.read_did(wire.DID_RESULT))[0]
+        state = wire.decode_status(uds.read_did(wire.DID_STATUS))
+        running = uds.read_did(wire.DID_RUNNING_SHA).hex()
+        assert running != first["image_elf_sha256"] and state["running_state"] != PENDING
+        if first["board_did"] is not None:
+            assert wire.cstr(uds.read_did(first["board_did"])) == first["board"]
+        uds.session(wire.SESSION_PROGRAMMING)
+        for e in manifest["payloads"]:
+            if e.get("base_elf_sha256", running) != running:
+                continue
+            data = (out / e["file"]).read_bytes()
+            assert hashlib.sha256(data).hexdigest() == e["payload_sha256"]
+            tried.append(e["dfi"])
+            try:
+                max_data = uds.request_download(e["memory_size"], e["dfi"])
+            except Nrc as x:
+                if x.code == wire.NRC_OUT_OF_RANGE or (x.code == wire.NRC_CONDITIONS and reason() == "DL_NO_MEMORY"):
+                    continue
+                raise
+            try:
+                for n, off in enumerate(range(0, len(data), max_data), 1):
+                    uds.transfer(n & 0xFF, data[off:off + max_data])
+            except Nrc as x:
+                if x.code == wire.NRC_OUT_OF_RANGE and reason() == "DL_BAD_BASE":
+                    continue
+                raise
+            uds.transfer_exit()
+            break
+        assert uds.routine(wire.RID_CHECK_DEPS)[:1] == b"\x00"
+        uds.routine(wire.RID_ACTIVATE)
+        update.wait_for_image(uds, bytes.fromhex(e["image_elf_sha256"]), t.preroll)
+        update.confirm(uds, log=lambda *_: None)
+    return tried
+
+
+# F1F0, F1F3, the version and F1F1 of server: what an update leaves behind.
+def end_state(server):
+    with PipeTransport(EXAMPLE, server) as t:
+        return (*read_state(server), wire.decode_result(t.uds().read_did(wire.DID_RESULT)))
+
+
+# Check each mode pack writes, sent by the flasher above, leaves the server as `flash` of the same image does: the
+# new image running, confirmed, and the same last result.
+@pytest.mark.parametrize("dfi", [wire.DL_DFI, wire.DL_DFI_DEFLATE, wire.DL_DFI_DELTA, wire.DL_DFI_DELTA_DEFLATE])
+def test_packed_payload_updates_as_flash_does(demo, tmp_path, dfi):
+    by_flash, by_pack = demo(), demo()
+    for s in (by_flash, by_pack):
+        base, new, base_path, new_path = running_base(s, tmp_path)
+    delta_args = ["--diff-from", base_path] if dfi in (wire.DL_DFI_DELTA, wire.DL_DFI_DELTA_DEFLATE) else []
+    out, manifest = packed(tmp_path, new_path, "--dfi", "0x%02x" % dfi, *delta_args)
+    assert flash_packed(by_pack, out, manifest) == [dfi]
+    flash_args = {wire.DL_DFI: ["--no-compress"], wire.DL_DFI_DEFLATE: ["--compress"],
+                  wire.DL_DFI_DELTA: ["--diff-format", "heatshrink"],
+                  wire.DL_DFI_DELTA_DEFLATE: ["--diff-format", "deflate"]}[dfi]
+    assert flash(by_flash, new_path, *flash_args, *delta_args) == 0
+    state = end_state(by_pack)
+    assert state == end_state(by_flash)
+    assert (state[0]["running_state"], state[1], state[2]) == (VALID, elf_sha(new), "v0.3.0")
+
+
+# Check the fallbacks the manifest allows: a base re-signed after the running one was built has the running
+# app_elf_sha256 but other bytes, so the server refuses the first delta's 36 with DL_BAD_BASE, and the flasher
+# goes on through the manifest to the full download.
+def test_packed_delta_from_a_wrong_base_falls_back(demo, tmp_path):
+    s = demo()
+    base, new, _, new_path = running_base(s, tmp_path)
+    other = bytearray(base)
+    other[1000] ^= 0xFF
+    out, manifest = packed(tmp_path, new_path, "--diff-from", image_file(tmp_path, reseal(other), "resigned.bin"))
+    tried = flash_packed(s, out, manifest)
+    assert tried[-1] == wire.DL_DFI_DEFLATE and set(tried[:-1]) <= {wire.DL_DFI_DELTA, wire.DL_DFI_DELTA_DEFLATE}
+    assert len(tried) >= 2 and read_state(s)[1:] == (elf_sha(new), "v0.3.0")
