@@ -4,6 +4,11 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ## [Unreleased]
 
+- Core: `udsota.h` names the release it belongs to, as `UDSOTA_VERSION` ("X.Y.Z") and `UDSOTA_VERSION_MAJOR`, `_MINOR` and `_PATCH`, for an `#if` on the release a feature arrived in. `tools/release.py bump` sets all four with the CHANGELOG and `__version__`, so a cut's commit now changes `udsota.h` too, and `check`, which the release workflow runs, fails when they disagree with the tag.
+- Host builds: `sources.cmake` gains `UDSOTA_SERVER_CORE_SRCS`, the server with neither the updater nor the transport (`udsota_server.c`, `udsota_codec.c` and `udsota_keys.c`), for a host build that brings its own isotp-c and so can't link `udsota_isotp.c`, which defines isotp-c's `isotp_user_*` callbacks. The existing lists are unchanged.
+- Internal: a new CI job, `sanitize`, runs the whole host suite under clang with AddressSanitizer and UBSan, where any report fails its test: `-DUDSOTA_SANITIZE=ON`, off by default, builds every host target so (`tools/run_tests.sh build -DUDSOTA_SANITIZE=ON`). The fuzz harness's pinned digests are the same under it, and its guard pages still catch what they did, since it leaves SIGSEGV to them (ASan's `handle_segv=0`). `fuzz_udsota_no_update` builds from `UDSOTA_SERVER_CORE_SRCS` and starts the server with `udsota_core_init`, so it links no updater; its digest is unchanged.
+- Fixed, core: the compressed-download stream no longer adds a zero offset to a NULL input pointer when it is flushed with no input, which C17 leaves undefined; the sanitize job's clang reported it. No compiler udsota targets miscompiled it, and nothing changes on the wire.
+
 ## [0.10.0] - 2026-09-29
 
 udsota serves ReadDTCInformation (0x19: 01, 02, 06, 0A) and ClearDiagnosticInformation (0x14) through three new app hooks, so any UDS tool can read and clear a device's faults, and the client gains `udsota dtc show` and `udsota dtc clear`. Not breaking: with the hooks unset nothing changes on the wire.

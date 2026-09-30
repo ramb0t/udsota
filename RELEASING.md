@@ -13,7 +13,7 @@ udsota uses [semantic versioning](https://semver.org). While it is 0.x:
 
 From 1.0 the usual rules apply: major for breaking, minor for additive, patch for fixes.
 
-**One version, in three places that agree:** the tag `vX.Y.Z`, the dated CHANGELOG heading `## [X.Y.Z] - YYYY-MM-DD`, and `__version__` in `client/udsota/__init__.py`. `python tools/release.py check vX.Y.Z` checks all three, and the release workflow runs it before it publishes anything.
+**One version, in four places that agree:** the tag `vX.Y.Z`, the dated CHANGELOG heading `## [X.Y.Z] - YYYY-MM-DD`, `__version__` in `client/udsota/__init__.py`, and `UDSOTA_VERSION` with `UDSOTA_VERSION_MAJOR`, `_MINOR` and `_PATCH` in `components/udsota/include/udsota.h`. `python tools/release.py check vX.Y.Z` checks all four, and the release workflow runs it before it publishes anything.
 
 The example's `PROJECT_VER` in `examples/esp32/CMakeLists.txt` is something else: the firmware image's version, which the device's anti-downgrade rule compares. It does not follow the library's version.
 
@@ -23,17 +23,17 @@ Add a line to `## [Unreleased]` in `CHANGELOG.md` for anything a user would noti
 
 ## Making a release
 
-**Right after merging, run Actions → cut release → Run workflow** on `main`, with **minor** or **patch** from the table above. It takes the next version from the latest tag, moves `[Unreleased]`'s entries under `## [X.Y.Z] - today` with a new empty `[Unreleased]` above them, sets `__version__`, commits that to `main` as "Release X.Y.Z", and pushes an annotated tag. It refuses when `[Unreleased]` is empty or `main`'s CI hasn't passed on the commit. Release after each user-visible merge, or after several.
+**Right after merging, run Actions → cut release → Run workflow** on `main`, with **minor** or **patch** from the table above. It takes the next version from the latest tag, moves `[Unreleased]`'s entries under `## [X.Y.Z] - today` with a new empty `[Unreleased]` above them, sets `__version__` and the header's macros, commits that to `main` as "Release X.Y.Z", and pushes an annotated tag. It refuses when `[Unreleased]` is empty or `main`'s CI hasn't passed on the commit. Release after each user-visible merge, or after several.
 
 It then runs the [release workflow](.github/workflows/release.yml) on the tag. That checks the tag, builds the client's wheel and sdist and the example's app image for esp32 and esp32s3 at the tag, and publishes a GitHub Release. The notes are the version's section of `main`'s CHANGELOG, with its links made absolute at the tag. Releases are not marked as pre-releases, even at 0.x, so the newest one is GitHub's Latest and `/releases/latest` finds it.
 
 The cut pushes to `main` directly. That works while `main` has no branch protection; with protection on, it needs a bypass, or a release PR instead.
 
-To release by hand instead, merge a PR that makes the same two edits (`python tools/release.py bump minor --latest <latest tag>` makes them), then tag its merge commit with `git tag -a vX.Y.Z -m "udsota X.Y.Z"` and push the tag. The tag push runs the release workflow. If its check fails, nothing is published: fix `main` and release the next patch version.
+To release by hand instead, merge a PR that makes the same three edits (`python tools/release.py bump minor --latest <latest tag>` makes them), then tag its merge commit with `git tag -a vX.Y.Z -m "udsota X.Y.Z"` and push the tag. The tag push runs the release workflow. If its check fails, nothing is published: fix `main` and release the next patch version.
 
 ## Rules
 
-- Tag only commits on `main` whose CI is green. The cut's own commit changes only the CHANGELOG and `__version__`, on top of one whose CI passed.
+- Tag only commits on `main` whose CI is green. The cut's own commit changes only the CHANGELOG, `__version__` and `udsota.h`'s version macros, on top of one whose CI passed.
 - Never move or delete a published tag, or replace a published Release's files. Fix a bad release with a new patch release.
 
 ## Releasing an older tag

@@ -1,5 +1,5 @@
-# Host unit tests, the Python client's tests, the end-to-end tests against the Linux demo server and the ESP-IDF
-# example build, on every push and pull request.
+# Host unit tests (also under clang's ASan and UBSan), the Python client's tests, the end-to-end tests against the
+# Linux demo server and the ESP-IDF example build, on every push and pull request.
 name: ci
 
 on:
@@ -17,6 +17,15 @@ jobs:
       - name: Build and run the host tests (core, isotp, port logic, seam checks, fuzz corpus)
         run: tools/run_tests.sh
 
+  sanitize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: The same host tests under clang with AddressSanitizer and UBSan, where any report fails its test
+        env:
+          CC: clang
+        run: tools/run_tests.sh build -DUDSOTA_SANITIZE=ON
+
   client:
     runs-on: ubuntu-latest
     steps:
@@ -28,7 +37,7 @@ jobs:
         run: python -m pip install "./client[diff]" pytest
       - name: Run the client tests
         run: python -m pytest -q client/tests
-      - name: Run the release tool's tests (they fail if the current __version__ has no dated CHANGELOG section)
+      - name: Run the release tool's tests (they fail unless CHANGELOG and udsota.h agree with the current __version__)
         run: python -m pytest -q tools/test_release.py
       - name: Smoke-test the installed wheel from outside the tree
         run: |

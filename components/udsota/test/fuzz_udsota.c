@@ -3,10 +3,12 @@
  * req_len, never writes past resp_max or into the request, and always answers with a well-formed
  * positive response, a known NRC, or nothing.
  *
- * This host has no libasan or clang, so guard pages (mmap + PROT_NONE) stand in for ASan: every
+ * Guard pages (mmap + PROT_NONE) are the bounds detector, so the default build needs no ASan: every
  * request sits flush against a guard page on one side, and every response buffer ends at one. UBSan
- * runs in trap mode (the top-level CMakeLists.txt), which needs no runtime library. A fork()ed self-test
- * proves each detector really kills the process before any replay counts as a pass.
+ * runs in trap mode (the top-level CMakeLists.txt), which needs no runtime library. Under
+ * -DUDSOTA_SANITIZE=ON ASan runs as well, with handle_segv=0 so a guard page still faults as a plain
+ * signal. A fork()ed self-test proves each detector really kills the process before any replay counts
+ * as a pass.
  *
  * Inputs: built-in seeds, deterministic mutations of them, then every file named on the command line
  * (for example iso14229's libFuzzer corpus, used here only as arbitrary bytes). Sequence mode borrows
@@ -23,8 +25,9 @@
  * streams of random images, intact and mutated, sent as whole 34/36/37/FF01 sequences, and the progress checks
  * hold on the compressed path too.
  *
- * A fifth build, fuzz_udsota_no_update (UDSOTA_FUZZ_NO_UPDATE=1 with UDSOTA_FUZZ_APP_HOOKS=1), gives udsota_init a
- * NULL engine, so no update service is registered: it replays from the five states a download isn't needed for,
+ * A fifth build, fuzz_udsota_no_update (UDSOTA_FUZZ_NO_UPDATE=1 with UDSOTA_FUZZ_APP_HOOKS=1), starts the server with
+ * udsota_core_init, which is udsota_init given a NULL engine, and links no updater (UDSOTA_SERVER_CORE_SRCS), so no
+ * update service is registered: it replays from the five states a download isn't needed for,
  * 34, 36 and 37 count as unserved and must only ever get NRC 0x11 (0x21 while an app routine runs), and its
  * coverage floor needs the reset and app hooks only.
  *
@@ -75,7 +78,7 @@
 #define UDSOTA_FUZZ_PROGRESS 0    /* 1: FUZZ_HOOKS also sets progress */
 #endif
 #ifndef UDSOTA_FUZZ_NO_UPDATE
-#define UDSOTA_FUZZ_NO_UPDATE 0   /* 1: udsota_init gets a NULL engine, so no update service answers */
+#define UDSOTA_FUZZ_NO_UPDATE 0   /* 1: udsota_core_init, no engine, so no update service answers */
 #endif
 #ifndef UDSOTA_FUZZ_DTC
 #define UDSOTA_FUZZ_DTC 0         /* 1: FUZZ_HOOKS also sets dtc_get, dtc_ext_data and dtc_clear */
@@ -1437,7 +1440,7 @@ static uint32_t start_run(state_t st, unsigned variant, bool async)
     }
 #if UDSOTA_FUZZ_NO_UPDATE
     (void)engine;
-    udsota_init(&S, &FUZZ_CFG, NULL, &FUZZ_SECURITY, &FUZZ_HOOKS);   /* the server alone: no update service */
+    udsota_core_init(&S, &FUZZ_CFG, &FUZZ_SECURITY, &FUZZ_HOOKS);   /* udsota_init with a NULL engine, unlinked */
 #else
     udsota_init(&S, &FUZZ_CFG, &engine, &FUZZ_SECURITY, &FUZZ_HOOKS);
 #endif
@@ -1552,6 +1555,23 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     return 0;
 }
 #else  /* the ctest program: self-tests, seeds, mutants, corpus replay */
+
+/* Built with AddressSanitizer (-DUDSOTA_SANITIZE=ON), a guard-page fault must stay a plain SIGSEGV, as the self-test
+ * and on_fatal expect: ASan's own SEGV handler would report it and exit 1. ASan still checks what it instruments. */
+#if defined(__SANITIZE_ADDRESS__)
+#define FUZZ_ASAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define FUZZ_ASAN 1
+#endif
+#endif
+#ifdef FUZZ_ASAN
+const char *__asan_default_options(void);
+const char *__asan_default_options(void)
+{
+    return "handle_segv=0:handle_sigbus=0";
+}
+#endif
 
 /* Writes s to stderr from a signal handler (async-signal-safe). */
 static void say(const char *s)

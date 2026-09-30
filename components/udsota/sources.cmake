@@ -4,9 +4,10 @@
 # By directory: UDSOTA_SERVER_SRCS, UDSOTA_UPDATE_SRCS, UDSOTA_BOOTLOOP_SRCS, and UDSOTA_SRCS (all three), with their
 # include dirs; UDSOTA_INCLUDE_DIRS (every public one) and UDSOTA_PRIV_INCLUDE_DIRS (empty: kept so a list that names it
 # still expands). By unit, for a host test that
-# links only part: UDSOTA_SERVICES_SRCS is udsota_init() and every service, no transport; UDSOTA_ZSTREAM_SRCS needs a
-# udsota_inflate_t (udsota_tinfl.c) beside it, and UDSOTA_CODED_SRCS the zstream list and a udsota_patch_t
-# (udsota_detools.c).
+# links only part: UDSOTA_SERVICES_SRCS is udsota_init() and every service, no transport; UDSOTA_SERVER_CORE_SRCS is
+# server/ without the transport, udsota_core_init() and the 0x27 keys with no updater, for a build that brings its own
+# isotp-c (udsota_isotp.c defines isotp-c's isotp_user_* callbacks); UDSOTA_ZSTREAM_SRCS needs a udsota_inflate_t
+# (udsota_tinfl.c) beside it, and UDSOTA_CODED_SRCS the zstream list and a udsota_patch_t (udsota_detools.c).
 set(_udsota_d ${CMAKE_CURRENT_LIST_DIR})
 
 set(UDSOTA_SERVER_SRCS   ${_udsota_d}/server/udsota_server.c ${_udsota_d}/server/udsota_codec.c
@@ -28,6 +29,8 @@ set(UDSOTA_PRIV_INCLUDE_DIRS     "")
 
 set(UDSOTA_SERVICES_SRCS ${_udsota_d}/server/udsota_server.c ${_udsota_d}/server/udsota_codec.c
                          ${_udsota_d}/update/udsota_update.c ${_udsota_d}/update/udsota_update_codec.c)
+set(UDSOTA_SERVER_CORE_SRCS ${_udsota_d}/server/udsota_server.c ${_udsota_d}/server/udsota_codec.c
+                            ${_udsota_d}/server/udsota_keys.c)
 set(UDSOTA_CODEC_SRCS    ${_udsota_d}/server/udsota_codec.c ${_udsota_d}/update/udsota_update_codec.c)
 set(UDSOTA_RXWATCH_SRCS  ${_udsota_d}/server/udsota_rxwatch.c)
 set(UDSOTA_KEYS_SRCS     ${_udsota_d}/server/udsota_keys.c)

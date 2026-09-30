@@ -1,10 +1,9 @@
-# Publishes a GitHub Release (see RELEASING.md). Pushing a vX.Y.Z tag on main checks that the tag, the dated
-# CHANGELOG section and the client's __version__ agree, builds the client and the example's app images at the
-# tag, and publishes them with that version's section of main's CHANGELOG as the notes. Run it by hand
-# (workflow_dispatch) to release an existing tag that has no Release yet; with backfill set it skips the version
-# check. cut-release.yml calls it (workflow_call) for the tag it pushes, since a tag pushed with a
-# workflow's token starts no workflow. It never creates or moves a tag. Actions are pinned by commit, since this
-# job publishes.
+# Publishes a GitHub Release (see RELEASING.md). Pushing a vX.Y.Z tag on main checks that the tag, the dated CHANGELOG
+# section, the client's __version__ and udsota.h's UDSOTA_VERSION agree, builds the client and the example's app images
+# at the tag, and publishes them with that version's section of main's CHANGELOG as the notes. Run it by hand
+# (workflow_dispatch) to release an existing tag that has no Release yet; with backfill set it skips the version check.
+# cut-release.yml calls it (workflow_call) for the tag it pushes, since a tag pushed with a workflow's token starts no
+# workflow. It never creates or moves a tag. Actions are pinned by commit, since this job publishes.
 name: release
 
 on:
@@ -60,7 +59,7 @@ jobs:
           [ -n "$sha" ] || { echo "::error::$TAG is not an annotated tag on origin"; exit 1; }
           git merge-base --is-ancestor "$sha" origin/main || { echo "::error::$sha is not on main"; exit 1; }
           { echo "tag=$TAG"; echo "version=$version"; echo "sha=$sha"; } >> "$GITHUB_OUTPUT"
-      - name: Check the tag, the CHANGELOG and the client's __version__ agree at the tagged commit
+      - name: Check the tag, the CHANGELOG, the client's __version__ and udsota.h agree at the tagged commit
         if: ${{ !inputs.backfill }}
         env:
           TAG: ${{ steps.resolve.outputs.tag }}
@@ -68,7 +67,9 @@ jobs:
         run: |
           git show "$SHA:CHANGELOG.md" > "$RUNNER_TEMP/CHANGELOG.md"
           git show "$SHA:client/udsota/__init__.py" > "$RUNNER_TEMP/__init__.py"
-          python tools/release.py check "$TAG" --changelog "$RUNNER_TEMP/CHANGELOG.md" --init "$RUNNER_TEMP/__init__.py"
+          git show "$SHA:components/udsota/include/udsota.h" > "$RUNNER_TEMP/udsota.h"
+          python tools/release.py check "$TAG" --changelog "$RUNNER_TEMP/CHANGELOG.md" \
+            --init "$RUNNER_TEMP/__init__.py" --header "$RUNNER_TEMP/udsota.h"
       - name: Release notes from main's CHANGELOG
         env:
           TAG: ${{ steps.resolve.outputs.tag }}
