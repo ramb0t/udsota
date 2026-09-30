@@ -93,5 +93,6 @@ uint32_t udsota_isotp_service(udsota_isotp_t *t, uint32_t now_ms);
 /* Answers dropped: refused outright by can.send, still refused after UDSOTA_ISOTP_PARK_MAX_MS, or replaced before they left. */
 uint32_t udsota_isotp_resp_lost(const udsota_isotp_t *t);
 /* Flow-control frames dropped: refused outright, still refused after the cfg.fc_retry_ms window, superseded by a
- * newer FC, or dropped with their message (link re-init, withheld message). */
+ * newer FC, or dropped with their message (link re-init, withheld message, or a message an SF replaced, a wrong SN
+ * abandoned, its last CF completed or N_Cr ended while the FC waited). */
 uint32_t udsota_isotp_fc_lost(const udsota_isotp_t *t);
