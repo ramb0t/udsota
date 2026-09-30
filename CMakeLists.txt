@@ -366,6 +366,24 @@ if(UDSOTA_FUZZ AND UDSOTA_FUZZ_SAN_OK)
     # The same harness with the DTC hooks set over a 90-DTC table: 19 01, 02, 06 and 0A and 14 served, lists past the
     # response buffer (0x14), and every status sent a subset of the availability mask.
     udsota_fuzz(fuzz_udsota_dtc 300 DIGEST e05a7138b28a2a22 DEFS UDSOTA_FUZZ_DTC=1)
+    # The ISO-TP frame path (components/udsota/test/fuzz_udsota_frames.c): raw CAN frames through udsota_isotp.c, the
+    # receive mirror and isotp-c into the server and updater, with fake_engine's file-backed slots behind them. isotp-c
+    # is compiled in, force-including isotp_force.h as components/isotp does, so FUZZ_SAN covers the whole path.
+    set(ISOTP_C ${ROOT}/components/isotp/isotp-c/isotp.c)
+    set(FRAMES_SRCS ${UDSOTA_SERVER_SRCS} ${SERVER_SRCS} ${UDSOTA_IMAGE_SRCS} ${CORE_TEST}/fake_engine.c
+                    ${CORE_TEST}/sha256_host.c ${ISOTP_C} ${ROOT}/components/isotp/isotp_port.c)
+    list(REMOVE_DUPLICATES FRAMES_SRCS)
+    set_source_files_properties(${ISOTP_C} PROPERTIES
+                                COMPILE_OPTIONS "-include;${ROOT}/components/isotp/isotp_force.h")
+    udsota_test(fuzz_udsota_frames SOURCES ${CORE_TEST}/fuzz_udsota_frames.c ${FRAMES_SRCS}
+                INCLUDES ${CORE_TEST} $<TARGET_PROPERTY:isotp,INTERFACE_INCLUDE_DIRECTORIES>)
+    target_compile_definitions(fuzz_udsota_frames PRIVATE UDSOTA_FUZZ_UBSAN_TRAP=1
+                               $<TARGET_PROPERTY:isotp,INTERFACE_COMPILE_DEFINITIONS>
+                               FUZZ_FRAMES_OTA_DIR="${CMAKE_CURRENT_BINARY_DIR}/fuzz_frames_ota")
+    target_compile_options(fuzz_udsota_frames PRIVATE ${FUZZ_SAN})
+    target_link_options(fuzz_udsota_frames PRIVATE ${FUZZ_SAN})
+    set_tests_properties(fuzz_udsota_frames PROPERTIES TIMEOUT 120
+                         PASS_REGULAR_EXPRESSION "fuzz_udsota_frames: PASS .* digest=0279b8d7535d8ef1")
     # The delta patch path on mutated patches (test/fuzz_udsota_patch.c): udsota_coded over the real detools and
     # tinfl, with AddressSanitizer where the toolchain has it, since the device parses these patches from the bus.
     set(FUZZ_PATCH_SAN ${FUZZ_SAN})

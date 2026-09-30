@@ -856,6 +856,59 @@ static void test_orphan_drops_parked_fc(void)
     TEST_ASSERT_EQUAL_INT(UDSOTA_PHASE_IDLE, s_phase);
 }
 
+/* A parked CTS dies with its message when a frame ends it: a new SF replaces it, a CF with the wrong SN abandons it, or
+ * its last CF completes it (the client did not wait for the FC). None of those CTSs may reach the bus afterwards,
+ * each is counted lost, and the SF and the completed request are still answered. Found by fuzz_udsota_frames. */
+static void test_parked_cts_dropped_when_its_message_ends(void)
+{
+    static const uint8_t sf[4] = {0x03, 0x22, 0xF1, 0x86};
+    s_refuse = 1u;
+    feed(FF20, sizeof FF20);                             /* its CTS refused: parked */
+    feed(sf, sizeof sf);                                 /* an SF replaces the message */
+    run_ms(UDSOTA_ISOTP_FC_RETRY_MS + 5u);
+    TEST_ASSERT_EQUAL_UINT(0, s_fc_n);
+    TEST_ASSERT_TRUE(s_resp_done);
+    TEST_ASSERT_EQUAL_HEX8(0x62, s_resp[0]);
+    TEST_ASSERT_EQUAL_UINT32(1, udsota_isotp_fc_lost(&s_tp));
+
+    s_refuse = 1u;
+    feed(FF20, sizeof FF20);
+    static const uint8_t bad_sn[8] = {0x23, 0, 0, 0, 0, 0, 0, 0};
+    feed(bad_sn, sizeof bad_sn);                         /* isotp-c abandons the message */
+    run_ms(UDSOTA_ISOTP_FC_RETRY_MS + 5u);
+    TEST_ASSERT_EQUAL_UINT(0, s_fc_n);
+    TEST_ASSERT_EQUAL_UINT32(2, udsota_isotp_fc_lost(&s_tp));
+
+    static const uint8_t ff8[8] = {0x10, 0x08, 0x22, 0xF1, 0x86, 0x00, 0x00, 0x00};   /* 22 F1 86 + 5 bytes: 0x13 */
+    static const uint8_t cf[3] = {0x21, 0x00, 0x00};
+    s_refuse = 1u;
+    resp_clear();
+    feed(ff8, sizeof ff8);
+    feed(cf, sizeof cf);                                 /* the last CF, sent without waiting for the FC */
+    run_ms(UDSOTA_ISOTP_FC_RETRY_MS + 5u);
+    TEST_ASSERT_EQUAL_UINT(0, s_fc_n);
+    TEST_ASSERT_TRUE(s_resp_done);
+    static const uint8_t nrc[] = {0x7F, 0x22, 0x13};
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(nrc, s_resp, sizeof nrc);
+    TEST_ASSERT_EQUAL_UINT32(3, udsota_isotp_fc_lost(&s_tp));
+}
+
+/* A parked CTS dies with its message at N_Cr too: with a 2 s retry window (cfg.fc_retry_ms), a bus that frees after
+ * isotp-c has timed the message out must not carry the stale CTS. The N_Cr is counted as before. */
+static void test_parked_cts_dropped_at_ncr(void)
+{
+    s_fc_retry_ms = 2000u;
+    init_all();
+    s_refuse = 100000u;
+    feed(FF20, sizeof FF20);
+    run_ms(1100u);                                       /* N_Cr (1 s) ends the message; the window is still open */
+    s_refuse = 0u;
+    run_ms(20u);
+    TEST_ASSERT_EQUAL_UINT(0, s_fc_n);
+    TEST_ASSERT_EQUAL_UINT32(1, udsota_isotp_fc_lost(&s_tp));
+    TEST_ASSERT_EQUAL_UINT16(1, read_counters().ncr_timeouts);
+}
+
 /* Unity runner. */
 int main(void)
 {
@@ -883,5 +936,7 @@ int main(void)
     RUN_TEST(test_parked_fc_never_sent_after_newer_fc);
     RUN_TEST(test_link_init_drops_parked_fc);
     RUN_TEST(test_orphan_drops_parked_fc);
+    RUN_TEST(test_parked_cts_dropped_when_its_message_ends);
+    RUN_TEST(test_parked_cts_dropped_at_ncr);
     return UNITY_END();
 }
