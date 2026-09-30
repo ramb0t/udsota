@@ -4,6 +4,8 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ## [Unreleased]
 
+- Client: `[config] groups` makes `config set` stage and commit each group of keys in turn, with one `--reset` after the last, for a device that takes one namespace per commit. A writable blob key's `len` refuses a value of another length before the bus opens. Profiles without them behave as before. Not breaking.
+
 ## [0.12.0] - 2026-09-30
 
 - Core: `udsota_config_t.allow_downgrade` (port) and `udsota_image_ctx_t.allow_older` let a build accept an older or same-version image; every other first-block check still applies. Off by default, and nothing changes on the wire with it off. Not breaking.

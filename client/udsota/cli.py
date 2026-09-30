@@ -20,7 +20,7 @@ import can
 
 from .profile import load as load_profile
 from .errors import Refused, ToolError
-from .config import config_set, config_show, parse_writes, writable_keys
+from .config import config_set, config_show, group_writes, parse_writes, writable_keys
 from .dtc import dtc_clear, dtc_ext, dtc_show, ext_code
 from .image import parse_image
 from .keys import keygen, load_master, load_private_key
@@ -192,6 +192,7 @@ def main(argv=None, transport=Transport):
                 bases = load_bases(args.diff_from)
         if args.cmd == "config" and args.config_cmd == "set":
             writes = parse_writes(prof, args.assignments, args.commit, args.reset)
+            group_writes(prof, writes, args.commit)     # stage-only across groups: refused here
         elif args.cmd == "config":
             writable_keys(prof)
         if args.cmd == "dtc" and args.dtc_cmd == "show" and args.ext is not None:

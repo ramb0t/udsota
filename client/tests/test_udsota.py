@@ -171,7 +171,8 @@ class FakeTime:
 # and 10 02 is refused (0x22) while the boot slot is not the running one.
 # With cfg_keys it serves config writes: 0x2E stages a value, the commit routine CFG_COMMIT_RID stores the staged
 # set (answering 0x78 first), a restart serves the stored values, a session change drops the staged set, and
-# CFG_HASH_DID and CFG_STATUS_DID answer the config hash and status. Without cfg_keys, 0x2E answers 0x11.
+# CFG_HASH_DID and CFG_STATUS_DID answer the config hash and status. Without cfg_keys, 0x2E answers 0x11. With
+# cfg_groups it takes one namespace per staged set, as CANDash does: a 0x2E outside the staged set's range answers 0x22.
 # With delta (DFIs 0x20 and/or 0x30) it serves delta downloads from base, its running image: the 36 that completes
 # the patch header answers 0x31 with F1F1 DL_BAD_BASE when the header names another base, and the 37 applies the
 # patch with detools.
@@ -185,7 +186,7 @@ class FakeServer:
                  lose_ff01_once=False, activate_nrcs=None, activate_fail=None, no_fc=None, security=True,
                  pubkey=None, cfg_keys=None, commit_status=0, compress=False, z_nomem=False, delta=(), base=None,
                  no_memory=(), lose_bad_base=False, dtcs=None, dtc_ext=None, dtc_avail=0x2F, dtc_format=0x00,
-                 level_extended=0x01):
+                 level_extended=0x01, cfg_groups=()):
         self.max_block, self.boot_silence, self.confirm_refusals = max_block, boot_silence, confirm_refusals
         self.running_state, self.sha, self.board = running_state, sha, board
         self.other_state, self.other_sha = other_state, other_sha
@@ -202,6 +203,7 @@ class FakeServer:
         self.cfg_keys = None if cfg_keys is None else dict(cfg_keys)   # {DID: running value}; None: no config writes
         self.nvs = None if cfg_keys is None else dict(cfg_keys)        # the stored values a restart serves
         self.staged, self.commit_status, self.last_commit = {}, commit_status, 0
+        self.cfg_groups = tuple(cfg_groups)     # [(first, last)]: one namespace per staged set
         self.compress = compress                # serves DFI 0x10: the blocks carry raw DEFLATE, inflated at 37
         self.z_nomem = z_nomem                  # a DFI 0x10 34 finds no memory: 0x22, F1F1 DL_NO_MEMORY
         self.dfi, self.zin = 0x00, bytearray()  # the open download's format, and its compressed bytes
@@ -301,7 +303,8 @@ class FakeServer:
 
     # 0x2E WriteDataByIdentifier: 0x11 without config keys; else 0x7F in the default session and 0x13 under 4 bytes
     # (the core), then 0x31 outside the extended session or for a DID that is no key, 0x33 without the level-1
-    # unlock and 0x13 for a wrong length (the app); stages the value and answers 6E <did>.
+    # unlock, 0x13 for a wrong length and 0x22 for a DID outside the staged set's cfg_groups range (the app); stages
+    # the value and answers 6E <did>.
     def s2e(self, req, did):
         if self.cfg_keys is None:
             return self.nrc(0x2E, 0x11)
@@ -315,6 +318,9 @@ class FakeServer:
             return self.nrc(0x2E, 0x33)
         if len(req) - 3 != len(self.cfg_keys[did]):
             return self.nrc(0x2E, 0x13)
+        group = [g for g in self.cfg_groups if g[0] <= did <= g[1]]
+        if self.staged and group and not all(group[0][0] <= d <= group[0][1] for d in self.staged):
+            return self.nrc(0x2E, 0x22)
         self.staged[did] = bytes(req[3:])
         return [b"\x6E" + req[1:3]]
 
@@ -2339,6 +2345,220 @@ def test_main_config_show_end_to_end(conf_path, capsys):
     assert cli.main(["--profile", conf_path, "config", "show"], transport=FakeTransport.on(d)) == 0
     assert "0201 timeout_ms: 2000 (1000..5000)" in capsys.readouterr().out
 
+
+
+# ---- config writes: groups and len ----
+
+# CONF split into two [config] groups, device (0x0200-0x0201: mode, timeout_ms) and prefs (0x0202-0x020F: tag,
+# spare), with tag a 2-byte blob; FAKE_GROUPS gives FakeServer the same namespaces.
+GROUPS = ('groups = [{ name = "device", first = 0x0200, last = 0x0201 }, '
+          '{ name = "prefs", first = 0x0202, last = 0x020F }]\n')
+CONF_GROUPS = CONF.replace("commit_rid = 0x1234\n", "commit_rid = 0x1234\n" + GROUPS).replace(
+    'type = "blob", writable = true }', 'type = "blob", writable = true, len = 2 }')
+G = profile.from_dict("groups", tomllib.loads(CONF_GROUPS))
+FAKE_GROUPS = [(0x0200, 0x0201), (0x0202, 0x020F)]
+
+
+# Check groups and len load, and a profile without groups (C) has none and no len.
+def test_config_groups_and_len_load():
+    assert G.config.groups == (profile.ConfigGroup("device", 0x0200, 0x0201),
+                               profile.ConfigGroup("prefs", 0x0202, 0x020F))
+    assert {e.name: e.len for e in G.dids if e.writable} == {"mode": None, "timeout_ms": None, "tag": 2, "spare": None}
+    assert C.config.groups == () and all(e.len is None for e in C.dids)
+    big = profile.from_dict("big", tomllib.loads(CAN + KEY + 'type = "blob", writable = true, len = 4092 }\n'))
+    assert big.dids[0].len == 4092
+
+
+# Check group_writes: groups in profile order, keys in argument order, a group without a write dropped; without
+# groups, one unnamed group.
+def test_group_writes():
+    writes = config.parse_writes(G, ["tag=ccdd", "timeout_ms=3000", "mode=2"], commit=True, reset=True)
+    assert [(n, [e.name for e, _ in ws]) for n, ws in config.group_writes(G, writes)] == \
+        [("device", ["timeout_ms", "mode"]), ("prefs", ["tag"])]
+    writes = config.parse_writes(G, ["mode=2"], commit=True, reset=True)
+    assert [(n, [e.name for e, _ in ws]) for n, ws in config.group_writes(G, writes)] == [("device", ["mode"])]
+    writes = config.parse_writes(C, ["tag=ccdd", "mode=2"], commit=True, reset=True)
+    assert config.group_writes(C, writes) == [(None, writes)]
+
+
+# A profile with one writable key, mode (0x0200), and a [config] table open for a groups line.
+GBASE = CAN + KEY + 'type = "u8", writable = true }\n[config]\ncommit_rid = 0x1234\n'
+
+
+# Check a broken groups entry or len is refused with its reason: each case breaks one rule.
+@pytest.mark.parametrize("text,why", [
+    (GBASE + "groups = 1\n", "groups must be a list"),
+    (GBASE + 'groups = [{ name = "a", first = 0x0200, last = 0x0200, x = 1 }]\n', "groups entries must be"),
+    (GBASE + 'groups = [{ name = "a", first = 0x0200 }]\n', "missing last"),
+    (GBASE + 'groups = [{ name = "a b", first = 0x0200, last = 0x0200 }]\n', "group name 'a b'"),
+    (GBASE + 'groups = [{ name = "a", first = 0x0200, last = 0x0200 }, '
+             '{ name = "a", first = 0x0300, last = 0x0300 }]\n', "two groups are named a"),
+    (GBASE + 'groups = [{ name = "a", first = 0x0201, last = 0x0200 }]\n', "group a first 0x0201 is above last 0x0200"),
+    (GBASE + 'groups = [{ name = "a", first = 0x0200, last = 0x0210 }, '
+             '{ name = "b", first = 0x0210, last = 0x0220 }]\n', "groups a and b overlap"),
+    (GBASE + 'groups = [{ name = "a", first = 0x0300, last = 0x0310 }]\n',
+     r"writable key mode \(0x0200\) lies in no group"),
+    (CAN + KEY + 'type = "u8", writable = true, len = 1 }\n', "len needs type blob"),
+    (CAN + KEY + "len = 1 }\n", "len needs type blob"),
+    (CAN + KEY + 'type = "blob", writable = true, len = 0 }\n', "len must be an integer from 0x1 to 0xFFC"),
+    (CAN + KEY + 'type = "blob", writable = true, len = 4093 }\n', "len must be an integer from 0x1 to 0xFFC"),
+])
+def test_bad_groups_and_len_are_refused(text, why):
+    with pytest.raises(errors.Refused, match=why):
+        profile.from_dict("bad", tomllib.loads(text))
+
+
+# Check the fake enforces one namespace per staged set (the known positive): the two-group call on CONF, which has
+# no groups, stages device's key, then the 2E of prefs' key answers 0x22 and nothing is committed.
+def test_fake_takes_one_namespace_per_staged_set():
+    d = FakeServer(cfg_keys=CFG_VALUES, cfg_groups=FAKE_GROUPS)
+    with pytest.raises(errors.UpdateFailed, match=r"writing tag \(0x0202\) answered NRC 0x22") as e:
+        run_config_set(d, ["mode=2", "tag=ccdd"])
+    assert e.value.exit_code == 1 and d.log[-1] == (0x2E, 0x0202) and d.nvs == CFG_VALUES
+
+
+# Check a two-group set --commit --reset: device's 2Es and its commit, prefs' 2E and its commit, then one keyed 11 01,
+# the read-back of every key in argument order and one hash check.
+def test_config_set_two_groups_commit_each_then_reset_once():
+    d = FakeServer(cfg_keys=CFG_VALUES, cfg_groups=FAKE_GROUPS)
+    rc, lines, _ = run_config_set(d, ["tag=ccdd", "mode=2", "timeout_ms=3000"], prof=G)
+    assert rc == 0
+    assert d.log == (UNLOCK_EXT + [(0x2E, 0x0200), (0x2E, 0x0201), (0x31, CFG_COMMIT_RID), (0x2E, 0x0202),
+                                   (0x31, CFG_COMMIT_RID), (0x11, 1)]
+                     + [(0x22, 0xF1F3)] * 3 + [(0x22, 0x0202), (0x22, 0x0200), (0x22, 0x0201)] + HASH_READS)
+    assert d.cfg_keys == {**CFG_VALUES, 0x0200: b"\x02", 0x0201: b"\x0b\xb8", 0x0202: b"\xcc\xdd"}
+    assert lines[:9] == ["staged mode = 2", "staged timeout_ms = 3000", "committed device: 2 key(s)",
+                         "staged tag = cc dd", "committed prefs: 1 key(s)", "committed; the server restarts",
+                         "0202 tag: cc dd", "0200 mode: 2", "0201 timeout_ms: 3000"]
+    assert lines[9].startswith("F1B0 config hash: ") and lines[9].endswith(" matches the values read")
+    assert len(lines) == 10
+
+
+# Check a call inside one group of a profile with groups is today's exchange: one commit, the same wire as
+# test_config_set_commit_reset_reads_back_and_checks_the_hash.
+def test_config_set_one_group_is_one_commit():
+    d = FakeServer(cfg_keys=CFG_VALUES, cfg_groups=FAKE_GROUPS)
+    rc, lines, _ = run_config_set(d, ["timeout_ms=3000", "mode=2"], prof=G)
+    assert rc == 0
+    assert d.log == (UNLOCK_EXT + [(0x2E, 0x0201), (0x2E, 0x0200), (0x31, CFG_COMMIT_RID), (0x11, 1)]
+                     + [(0x22, 0xF1F3)] * 3 + [(0x22, 0x0201), (0x22, 0x0200)] + HASH_READS)
+    assert lines[:4] == ["staged timeout_ms = 3000", "staged mode = 2", "committed device: 2 key(s)",
+                         "committed; the server restarts"]
+
+
+# Check the example's commented groups line loads with the rest of its [config] uncommented.
+def test_example_groups_comment_loads():
+    text = (profile.PROFILE_DIR / "example.toml").read_text()
+    live = re.sub(r'(?m)^# (?=(?:"0x020[01]" |\[config\]$|commit_rid |status_did |hash |groups ))', "", text)
+    assert [g.name for g in profile.from_dict("example", tomllib.loads(live)).config.groups] == ["device", "prefs"]
+
+
+# CONF_GROUPS and the master key in tmp_path; returns the profile path.
+@pytest.fixture
+def groups_path(tmp_path):
+    (tmp_path / "master.bin").write_bytes(MASTER)
+    p = tmp_path / "groups.toml"
+    p.write_text(CONF_GROUPS)
+    return str(p)
+
+
+# Check stage-only writes in two groups and a blob of the wrong len are refused (exit 2) before any bus opens.
+@pytest.mark.parametrize("args,why", [
+    (["mode=1", "tag=ccdd"], "without --commit, one call stages one group: mode is in device, tag is in prefs"),
+    (["tag=ccddee", "--commit"], "tag takes 2 bytes; got 3"),
+])
+def test_main_config_groups_refuse_before_opening_the_bus(groups_path, capsys, args, why):
+    master = str(pathlib.Path(groups_path).parent / "master.bin")
+    assert cli.main(["--profile", groups_path, "--master", master, "config", "set"] + args,
+                    transport=no_transport) == 2
+    assert why in capsys.readouterr().err
+
+
+# A FakeServer whose second commit answers 0x72; the first runs as usual.
+def second_commit_fails():
+    d, calls = FakeServer(cfg_keys=CFG_VALUES, cfg_groups=FAKE_GROUPS), []
+    real = d.s31
+
+    # Count the commits and fail the second.
+    def s31(req, rid):
+        calls.append(rid)
+        return d.nrc(0x31, 0x72) if rid == CFG_COMMIT_RID and calls.count(rid) == 2 else real(req, rid)
+
+    d.s31 = s31
+    return d
+
+
+# Check a failure in the second group (its commit answers 0x72, or its first 2E 0x22 or 0x33, as a device that
+# relocked would) exits 1 naming device as committed and prefs as not, with no 11 01 and no retry.
+@pytest.mark.parametrize("server,why", [
+    (second_commit_fails, r"the commit \(routine 0x1234\) answered NRC 0x72"),
+    (lambda: FakeServer(cfg_keys=CFG_VALUES, cfg_groups=FAKE_GROUPS, nrc_once={(0x2E, 0x0202): 0x22}),
+     r"writing tag \(0x0202\) answered NRC 0x22"),
+    (lambda: FakeServer(cfg_keys=CFG_VALUES, cfg_groups=FAKE_GROUPS, nrc_once={(0x2E, 0x0202): 0x33}),
+     r"writing tag \(0x0202\) answered NRC 0x33"),
+])
+def test_config_set_later_group_fails(server, why):
+    d = server()
+    with pytest.raises(errors.UpdateFailed, match=why + r"; committed device \(the values apply at the next "
+                       r"restart\); not committed: prefs$") as e:
+        run_config_set(d, ["mode=2", "tag=ccdd"], prof=G)
+    assert e.value.exit_code == 1 and (0x11, 1) not in d.log
+    assert d.log.count((0x2E, 0x0202)) == 1
+    assert d.nvs == {**CFG_VALUES, 0x0200: b"\x02"}
+
+
+# Check another tester appearing during the second group keeps exit 4 (SecondTester), with what landed.
+def test_config_set_later_group_second_tester():
+    d = FakeServer(cfg_keys=CFG_VALUES, cfg_groups=FAKE_GROUPS)
+    real = d.s2e
+
+    # The 2E of prefs' key meets another tester's frame.
+    def s2e(req, did):
+        if did == 0x0202:
+            raise errors.SecondTester("heard 0x718 from another tester")
+        return real(req, did)
+
+    d.s2e = s2e
+    with pytest.raises(errors.SecondTester, match=r"another tester; committed device \(the values apply at the next "
+                       r"restart\); not committed: prefs$") as e:
+        run_config_set(d, ["mode=2", "tag=ccdd"], prof=G)
+    assert e.value.exit_code == 4 and (0x11, 1) not in d.log
+
+
+# Check silence in the second group: an unanswered commit (the device stores the set but never answers) names prefs
+# as possibly committed, while an unanswered 2E still names it as not committed. Both exit 1 with no 11 01.
+@pytest.mark.parametrize("silent_commit,why", [
+    (True, r"; committed device \(the values apply at the next restart\); prefs got no answer to its commit and "
+           r"may have committed$"),
+    (False, r"; committed device \(the values apply at the next restart\); not committed: prefs$"),
+])
+def test_config_set_later_group_no_answer(silent_commit, why):
+    d, commits = FakeServer(cfg_keys=CFG_VALUES, cfg_groups=FAKE_GROUPS), []
+    real31, real2e = d.s31, d.s2e
+
+    # The second commit stores the set and never answers; with silent_commit False, prefs' 2E never answers.
+    def s31(req, rid):
+        commits.append(rid)
+        answer = real31(req, rid)
+        return [] if silent_commit and commits.count(CFG_COMMIT_RID) >= 2 else answer
+
+    def s2e(req, did):
+        return [] if not silent_commit and did == 0x0202 else real2e(req, did)
+
+    d.s31, d.s2e = s31, s2e
+    with pytest.raises(errors.UpdateFailed, match=why) as e:
+        run_config_set(d, ["mode=2", "tag=ccdd"], prof=G)
+    assert e.value.exit_code == 1 and (0x11, 1) not in d.log
+    assert d.nvs[0x0202] == (b"\xcc\xdd" if silent_commit else CFG_VALUES[0x0202])
+
+
+# Check config_set with no writes is Refused before it sends anything, with groups or without.
+def test_config_set_without_writes_is_refused():
+    for prof in (C, G):
+        d = FakeServer(cfg_keys=CFG_VALUES)
+        with pytest.raises(errors.Refused, match="at least one NAME=VALUE"):
+            config.config_set(uds_for(d, FakeTime()), prof, [], MASTER, commit=True, reset=True)
+        assert d.log == []
 
 
 # ---- config writes: review follow-ups ----

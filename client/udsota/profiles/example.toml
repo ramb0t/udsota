@@ -55,7 +55,8 @@ names = { 1 = "devkit" }              # board name for each hw_id; flash refuses
 # [dids] lists extra DIDs `info` reads after the server's own, decoded as hex, ascii, version3, u8 or u16 (u8
 # and u16 print as decimal). A range stops at its first absent DID. An entry with writable = true is a key
 # `config set` can write: one DID with a type (u8, u16 or blob) and, for u8 and u16, a write range min..max
-# (default the whole type). Its name is letters, digits and _, and is what `config set NAME=VALUE` takes.
+# (default the whole type). Its name is letters, digits and _, and is what `config set NAME=VALUE` takes. A blob
+# can set len, the exact number of bytes a write must have.
 [dids]
 "0xF191" = { name = "board", decode = "ascii" }       # the board name, shown by info
 # "0x0200-0x02FF" = { name = "calibration", decode = "hex" }   # a range: read until the first absent DID
@@ -63,11 +64,13 @@ names = { 1 = "devkit" }              # board name for each hw_id; flash refuses
 # "0x0201" = { name = "timeout_ms", decode = "u16", type = "u16", writable = true, min = 1000, max = 5000 }
 
 # [config] turns on `config set --commit`: the routine that stores the staged values and, optionally, a status
-# DID and a hash of the config DIDs that `config set --reset` checks after the restart.
+# DID and a hash of the config DIDs that `config set --reset` checks after the restart. groups is for a device that
+# takes one range of keys per commit: config set commits each group in turn, and every writable key must lie in one.
 # [config]
 # commit_rid = 0x1234                 # RoutineControl RID that commits the staged values; status 00 = stored
 # status_did = 0xF1B2                 # a DID reporting the device's config state, printed as hex
 # hash = { did = 0xF1B0, first = 0x0200, last = 0x02FF, schema = 1 }   # SHA-256 check, see the client README
+# groups = [{ name = "device", first = 0x0200, last = 0x027F }, { name = "prefs", first = 0x0280, last = 0x02FF }]
 
 # [dtcs] gives `dtc show` a description for each DTC. A key is an SAE J2012 code, which names every failure-type
 # byte (U0073), a code with one failure-type byte (U0073-1C), which wins over it, or the 24-bit DTC (0xC07300).
