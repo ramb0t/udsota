@@ -80,8 +80,10 @@ udsota_reason_t udsota_zstream_feed(udsota_zstream_t *z, const uint8_t *in, size
         if (rc == UDSOTA_INFLATE_ERROR || used > n || made > room) {
             return fail(z, UDSOTA_DL_BAD_STREAM);
         }
-        in += used;
-        n -= used;
+        if (used > 0u) {                                       /* a flush passes in == NULL: NULL + 0 is UB */
+            in += used;
+            n -= used;
+        }
         z->produced += (uint32_t)made;
         z->ended = (rc == UDSOTA_INFLATE_END);
         udsota_reason_t r = UDSOTA_DL_OK;
