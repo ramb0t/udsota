@@ -1,11 +1,11 @@
 """The config commands. `config show` reads the profile's writable DIDs, its status DID and its hash check.
-`config set` stages new values with 0x2E in the extended session, commits them with the profile's routine, and
-after a keyed reset reads them back and checks the device's config hash. Everything product-specific comes from
-the profile's [dids] and [config]."""
+`config set` stages new values with 0x2E in the extended session, commits them with the profile's routine (one
+commit per [config] group), and after a keyed reset reads them back and checks the device's config hash. Everything
+product-specific comes from the profile's [dids] and [config]."""
 import hashlib
 import time
 
-from .errors import Nrc, Refused, ToolError, UpdateFailed
+from .errors import NoResponse, Nrc, Refused, SecondTester, ToolError, UpdateFailed
 from .update import device_keys, read_record, wait_for_boot
 from .wire import DECODE, NRC_CONDITIONS, NRC_NOT_SUPPORTED, NRC_OUT_OF_RANGE, NRC_SEQUENCE, SESSION_EXTENDED
 
@@ -20,7 +20,8 @@ def writable_keys(profile):
     return keys
 
 
-# text as entry's wire bytes: u8 and u16 as an integer (decimal or 0x hex) in min..max, big-endian; blob as hex digits.
+# text as entry's wire bytes: u8 and u16 as an integer (decimal or 0x hex) in min..max, big-endian; blob as hex digits,
+# exactly len bytes when the entry has a len.
 def encode_value(entry, text):
     if entry.type == "blob":
         try:
@@ -29,6 +30,8 @@ def encode_value(entry, text):
             data = b""
         if not data:
             raise Refused("%s takes hex bytes, e.g. 0a1b; got %r" % (entry.name, text))
+        if entry.len is not None and len(data) != entry.len:
+            raise Refused("%s takes %d bytes; got %d" % (entry.name, entry.len, len(data)))
         return data
     try:
         v = int(text, 0)
@@ -58,6 +61,24 @@ def parse_writes(profile, assignments, commit, reset):
         seen.add(name)
         writes.append((keys[name], encode_value(keys[name], text)))
     return writes
+
+
+# parse_writes' writes split by the profile's [config] groups, as [(group name, [(entry, bytes)])]: groups in profile
+# order, keys in argument order, and no group without a write. Without groups it is [(None, writes)]. No writes, or
+# without commit writes in two groups, are Refused (exit 2): the device takes one group per staged set, and staged
+# values are dropped at the session's end.
+def group_writes(profile, writes, commit=True):
+    if not writes:
+        raise Refused("config set needs at least one NAME=VALUE")
+    groups = () if profile.config is None else profile.config.groups
+    if not groups:
+        return [(None, list(writes))]
+    out = [(g.name, [w for w in writes if g.first <= w[0].first <= g.last]) for g in groups]
+    out = [(n, ws) for n, ws in out if ws]
+    if not commit and len(out) > 1:
+        raise Refused("without --commit, one call stages one group: %s"
+                      % ", ".join("%s is in %s" % (ws[0][0].name, n) for n, ws in out))
+    return out
 
 
 # One DID's record decoded with decode, or "not supported" when the server answers 0x31.
@@ -164,23 +185,50 @@ def read_back(uds, writes, log=print):
         raise UpdateFailed("after the restart " + "; ".join(wrong))
 
 
+# A failure in group index i of groups after earlier ones committed, naming the groups committed and those not:
+# UpdateFailed (exit 1), or SecondTester (exit 4) when another tester appeared mid-call. A commit that got no answer
+# (at_commit and NoResponse) may still have landed after its 0x78s, so group i is named as that, not as not committed.
+def later_group_failed(groups, i, e, at_commit):
+    names = [n for n, _ in groups]
+    msg = "%s; committed %s (the values apply at the next restart)" % (e, ", ".join(names[:i]))
+    if at_commit and isinstance(e, NoResponse):
+        msg += "; %s got no answer to its commit and may have committed" % names[i]
+        i += 1
+    if names[i:]:
+        msg += "; not committed: %s" % ", ".join(names[i:])
+    return SecondTester(msg) if isinstance(e, SecondTester) else UpdateFailed(msg)
+
+
 # `config set`: 10 03 and the extended unlock (when the profile has [security]), a 2E per key; with commit the
-# commit routine; with reset the keyed 11 01, the restart, the read-back and the hash check. writes comes from
-# parse_writes, and secret is the master or private key (update.make_keys), unused without [security]. Returns 0
-# or raises ToolError.
+# commit routine, once per [config] group in turn (group_writes); with reset, after the last commit, the keyed
+# 11 01, the restart, the read-back and the hash check. A group after the first that fails raises naming what
+# landed, with no reset and no retry: the device keeps a failed commit's set staged. writes comes from parse_writes,
+# and secret is the master or private key (update.make_keys), unused without [security]. Returns 0 or raises
+# ToolError.
 def config_set(uds, profile, writes, secret, commit=False, reset=False, preroll=lambda: None,
                sleep=time.sleep, clock=time.monotonic, log=print):
+    groups = group_writes(profile, writes, commit)
     keys = device_keys(uds, profile, secret)
     uds.session(SESSION_EXTENDED)
     if keys is not None:
         uds.unlock(profile.security.level_extended, keys)
-    for entry, data in writes:
-        stage(uds, entry, data)
-        log("staged %s = %s" % (entry.name, DECODE[entry.decode](data)))
-    if not commit:
-        log("not committed: the staged values are dropped when the session ends")
-        return 0
-    commit_config(uds, profile.config, log=log)
+    for i, (name, group) in enumerate(groups):
+        at_commit = False
+        try:
+            for entry, data in group:
+                stage(uds, entry, data)
+                log("staged %s = %s" % (entry.name, DECODE[entry.decode](data)))
+            if not commit:
+                log("not committed: the staged values are dropped when the session ends")
+                return 0
+            at_commit = True
+            commit_config(uds, profile.config, log=log)
+        except ToolError as e:
+            if i == 0:
+                raise
+            raise later_group_failed(groups, i, e, at_commit) from e
+        if name is not None:
+            log("committed %s: %d key(s)" % (name, len(group)))
     if not reset:
         log("committed: the new values apply at the next restart")
         return 0
