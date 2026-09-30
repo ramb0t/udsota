@@ -175,6 +175,7 @@ static UDSServer_t s_srv;
 static UDSTp_t    *s_tester;
 static int         s_resets;
 static uint8_t     s_gate_36;             /* the gate's answer to CONTINUE_TRANSFER */
+static bool        s_allow_downgrade;     /* cfg.allow_downgrade at the next boot */
 
 static UDSErr_t app_fn(UDSServer_t *srv, UDSEvent_t ev, void *arg)
 {
@@ -220,7 +221,7 @@ static void boot(void)
     s_srv.tp = server_tp;
     s_srv.fn = app_fn;
     const udsota_cfg_t cfg = {.key_label = k_label, .key_master = k_master, .key_master_len = sizeof k_master,
-                              .gate = gate, .reset = do_reset};
+                              .gate = gate, .reset = do_reset, .allow_downgrade = s_allow_downgrade};
     assert(udsota_init(&cfg) == 0);
     g_now += 1500u;                               /* past iso14229's 1 s boot delay for 0x27 */
 }
@@ -533,6 +534,26 @@ int main(void)
         tick();
     }
     EXPECT(B(0x22, 0xF1, 0x86), B(0x62, 0xF1, 0x86, 0x01));
+
+    /* allow_downgrade: an older dev build installs; the release-flag and board rules still refuse. */
+    s_allow_downgrade = true;
+    P.st = (udsota_status_t){.running_slot = 0, .boot_slot = 0, .running_state = UDSOTA_IMG_VALID};
+    boot();
+    EXPECT(B(0x10, 0x02), B(0x50, 0x02));
+    unlock(0x03);
+    memcpy(other, img, sizeof other);
+    stamp_as(other, "0.3.0", "udsota-test", 1, 1, TESTER, 0);
+    refused(other, UDSOTA_DL_BAD_HEADER);            /* a clean version without the release flag */
+    stamp_as(other, "0.4.0-lite.9", "udsota-test", 2, 1, TESTER, 0);
+    refused(other, UDSOTA_DL_BAD_BOARD);
+    stamp(other, "0.4.0-lite.9", "udsota-test");
+    P.expect = other;
+    P.expect_len = sizeof other;
+    request_download(sizeof other, 0x00);
+    send_all(other, sizeof other);
+    EXPECT(B(0x37), B(0x77));
+    EXPECT(B(0x31, 0x01, 0xFF, 0x01), B(0x71, 0x01, 0xFF, 0x01, 0x00));
+    EXPECT(B(0x22, 0xF1, 0xF1), B(0x62, 0xF1, 0xF1, UDSOTA_DL_OK, 0, 0, 0x20, 0x00));
 
     if (g_failures != 0) {
         fprintf(stderr, "%d check(s) failed\n", g_failures);

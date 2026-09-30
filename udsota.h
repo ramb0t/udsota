@@ -115,6 +115,8 @@ typedef struct {
     const uint8_t *device_id;               /* F18C, and what the keys bind to; NULL = the base MAC */
     size_t         device_id_len;           /* 1..16 */
     const char    *product;                 /* the project name an image must carry; NULL = this image's own */
+    bool           allow_downgrade;         /* take an older or same-version image too (a dev unit's choice; a release
+                                               build leaves it off); every other image rule still applies */
     uint8_t      (*gate)(void *ctx, udsota_op_t op);                  /* nullable: 0 = allow, else the NRC */
     void         (*progress)(void *ctx, const udsota_progress_t *p);  /* nullable; from the server's task */
     void         (*reset)(void *ctx);       /* restarts after 11 01 or F001; NULL = esp_restart() */

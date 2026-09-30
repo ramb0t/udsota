@@ -32,7 +32,8 @@ target_include_directories(test_udsota PRIVATE . iso14229 test/miniz)
 target_compile_definitions(test_udsota PRIVATE UDS_SYS=UDS_SYS_UNIX UDS_AUTOSELECT_TP=0 UDS_TP_ISOTP_MOCK
                                                UDS_CUSTOM_MILLIS _DEFAULT_SOURCE UDSOTA_TEST MINIZ_NO_STDIO MINIZ_NO_TIME
                                                MINIZ_NO_ARCHIVE_APIS MINIZ_NO_ZLIB_APIS)
-target_compile_options(test_udsota PRIVATE -fsanitize=address,undefined)
-target_link_options(test_udsota PRIVATE -fsanitize=address,undefined)
+# ASan and UBSan, the first report ending the test.
+target_compile_options(test_udsota PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer)
+target_link_options(test_udsota PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=all)
 set_source_files_properties(udsota.c test/test_udsota.c PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror")
 add_test(NAME test_udsota COMMAND test_udsota)

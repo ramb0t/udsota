@@ -182,7 +182,8 @@ static udsota_reason_t check_first(const uint8_t *b, size_t len, uint32_t size)
         return UDSOTA_DL_BAD_DIAG_IDS;
     }
     /* SemVer: a release must be newer than the running image, or the same core when that is a dev build; a dev
-     * build needs a core at least equal. The release flag must agree with the version string. */
+     * build needs a core at least equal. The release flag must agree with the version string. allow_downgrade skips
+     * the newer rule and nothing else. */
     uint8_t ver[3];
     bool clean;
     const bool release = (d[12] & 0x01u) != 0u;
@@ -190,7 +191,7 @@ static udsota_reason_t check_first(const uint8_t *b, size_t len, uint32_t size)
         return UDSOTA_DL_BAD_HEADER;
     }
     const int c = memcmp(ver, U.running_version, 3);
-    if (!(release ? (c > 0 || (c == 0 && !U.running_release)) : c >= 0)) {
+    if (!U.cfg.allow_downgrade && !(release ? (c > 0 || (c == 0 && !U.running_release)) : c >= 0)) {
         return UDSOTA_DL_NOT_NEWER;
     }
     return (size > udsota_plat_slot_size()) ? UDSOTA_DL_TOO_BIG : UDSOTA_DL_OK;
@@ -1094,7 +1095,9 @@ int udsota_init(const udsota_cfg_t *cfg)
         }
         wipe(msg, sizeof msg);
     }
-    if (U.sec_on && !U.key_ok) {
+    if (!U.sec_on) {
+        LOGW("security off: no key, so 0x27 is the app's and any node can download");
+    } else if (!U.key_ok) {
         LOGW("0x27 keys unusable: nothing unlocks");
     }
     U.started = true;

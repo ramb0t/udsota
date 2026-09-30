@@ -66,7 +66,7 @@ Copy this directory into your project's `components/` as `udsota` (or add it wit
 - Set `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y`, and give the partition table two OTA slots.
 - Pick 0x27 keys. With `key_pubkey`, the tester signs each seed and the device holds only the public key (`udsota keygen` makes the pair). With `key_label` and `key_master`, each device's key is derived from a master that every image carries. With neither, 0x27 is the app's and downloads need no key, so any node on the bus can update the unit. Turn on ESP-IDF's app signing too, so the verify step refuses an image you did not sign.
 
-A version is `PROJECT_VER`. A clean `X.Y.Z` is a release, which a device takes only when it is newer than the one it runs. Anything with a suffix is a dev build, taken when its `X.Y.Z` is at least the running one's. [`examples/candash_ws43`](examples/candash_ws43/README.md) is a complete app.
+A version is `PROJECT_VER`. A clean `X.Y.Z` is a release, which a device takes only when it is newer than the one it runs. Anything with a suffix is a dev build, taken when its `X.Y.Z` is at least the running one's. `cfg.allow_downgrade` lifts this rule alone, for a dev unit; a release build leaves it off. [`examples/candash_ws43`](examples/candash_ws43/README.md) is a complete app.
 
 ## Known limits
 
