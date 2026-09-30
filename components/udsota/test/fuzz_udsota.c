@@ -45,6 +45,15 @@
  * oracle takes from each exactly the answer the contract gives (71 <sub> <rid>, 0x10 for a hook fault, the updater's
  * RIDs as without the hook). The other builds leave both hooks NULL.
  *
+ * An eighth build, fuzz_udsota_request (UDSOTA_FUZZ_REQUEST=1 with UDSOTA_FUZZ_APP_EX=1), also sets request: its mock
+ * serves a few SIDs of its own (REQ_SID_*) with positives of the request's length and of none, NRCs, NO_ANSWER for
+ * SPRMIB, an out_len over out_max, a bad return and pending jobs that routine_poll finishes, orphans or ends in
+ * NO_ANSWER, and answers 0x11 for any other SID it is handed. It fails on a call for a SID the core or the updater
+ * serves, a response SID, or while an app job is outstanding, and the oracle takes from each request exactly what the
+ * contract gives: the response SID and the mock's record, 0x10 for a hook fault, 0x11 without a call for a response
+ * SID, 0x22 without one while an app orphan runs, and silence only for NO_ANSWER or a pending job. The other seven
+ * builds leave request NULL, so their digests are unchanged.
+ *
  * The PASS line ends with digest=, an FNV-1a hash of every request fed to the server and every answer it gave
  * (empty ones too), so an answer that changes shows there even where the counts don't. It draws no rnd().
  *
@@ -98,6 +107,12 @@
 #if UDSOTA_FUZZ_APP_EX && (!UDSOTA_FUZZ_APP_HOOKS || UDSOTA_FUZZ_NO_UPDATE)
 #error "UDSOTA_FUZZ_APP_EX needs UDSOTA_FUZZ_APP_HOOKS (routine_poll) and the update service (its RIDs' answers)"
 #endif
+#ifndef UDSOTA_FUZZ_REQUEST
+#define UDSOTA_FUZZ_REQUEST 0     /* 1: FUZZ_HOOKS also sets request */
+#endif
+#if UDSOTA_FUZZ_REQUEST && !UDSOTA_FUZZ_APP_EX
+#error "UDSOTA_FUZZ_REQUEST needs UDSOTA_FUZZ_APP_EX (routine_ex shares the app job with request)"
+#endif
 
 /* Every engine and hook callback is mocked; these trip if the API structs gain a callback. */
 _Static_assert(offsetof(udsota_engine_t, slot_size) == 12u * sizeof(void (*)(void)),
@@ -111,12 +126,13 @@ _Static_assert(offsetof(udsota_hooks_t, ctx) == 7u * sizeof(void (*)(void)),
 _Static_assert(HOOK_AFTER(did_write, ctx) && HOOK_AFTER(routine, did_write) && HOOK_AFTER(routine_poll, routine) &&
                HOOK_AFTER(progress, routine_poll) && HOOK_AFTER(dtc_get, progress) &&
                HOOK_AFTER(dtc_ext_data, dtc_get) && HOOK_AFTER(dtc_clear, dtc_ext_data) &&
-               HOOK_AFTER(did_read_ex, dtc_clear) && HOOK_AFTER(routine_ex, did_read_ex),
-               "udsota_hooks_t gained or moved a member between ctx and routine_ex: add it after routine_ex instead, "
+               HOOK_AFTER(did_read_ex, dtc_clear) && HOOK_AFTER(routine_ex, did_read_ex) &&
+               HOOK_AFTER(request, routine_ex),
+               "udsota_hooks_t gained or moved a member between ctx and request: add it after request instead, "
                "so every earlier field keeps its offset, then mock it in FUZZ_HOOKS and extend this chain");
 #undef HOOK_AFTER
-_Static_assert(offsetof(udsota_hooks_t, routine_ex) + sizeof(void (*)(void)) == sizeof(udsota_hooks_t),
-               "udsota_hooks_t gained a member after routine_ex: mock it in FUZZ_HOOKS and move this check");
+_Static_assert(offsetof(udsota_hooks_t, request) + sizeof(void (*)(void)) == sizeof(udsota_hooks_t),
+               "udsota_hooks_t gained a member after request: mock it in FUZZ_HOOKS and move this check");
 
 #define REQ_MAX          UDSOTA_DL_MAX_BLOCK_LEN  /* the ISO-TP link never delivers a longer request */
 #define RESP_FULL        256u                  /* UDSOTA_ISOTP_RESP_MAX: the transport's response buffer */
@@ -178,6 +194,10 @@ typedef struct {                               /* the mock platform behind the e
     uint8_t  app_sub;                          /* the sub-function and RID of the routine_ex call that last pended */
     uint16_t app_rid;
 #endif
+#if UDSOTA_FUZZ_REQUEST
+    uint8_t  req_sid;                          /* the SID of the request that last pended; 0: a routine did */
+    unsigned req_calls;                        /* hooks.request calls in the run */
+#endif
 #if UDSOTA_FUZZ_PROGRESS
     unsigned progress_calls;                   /* hooks.progress calls in the current server call */
     udsota_progress_t progress;                /* what hooks.progress last got (IDLE, 0 of 0 after init) */
@@ -194,6 +214,9 @@ typedef enum {                                 /* platform ops whose fuzz-phase 
 #endif
 #if UDSOTA_FUZZ_APP_EX
     OP_DID_READ_EX, OP_ROUTINE_EX,
+#endif
+#if UDSOTA_FUZZ_REQUEST
+    OP_REQUEST,
 #endif
 #ifdef UDSOTA_FUZZ_Z
     OP_ZBEGIN, OP_ZWRITE, OP_ZEND,
@@ -219,6 +242,11 @@ typedef struct {                               /* counted outside the preamble o
     bool ex_pos_sub[4];                        /* routine_ex answered 71 01, 02 and 03 */
     bool ex_default_pos;                       /* and positively in the default session */
     bool ex_reject22, ex_reject31;             /* a hook fault drew 0x10 from a 22 and from a 31 */
+#endif
+#if UDSOTA_FUZZ_REQUEST
+    bool req_pos, req_bare, req_silent;        /* request answered its record, its SID alone, and nothing (SPRMIB) */
+    bool req_fault, req_resp_sid, req_orphan;  /* 0x10 for a fault, 0x11 to a response SID, 0x22 during an orphan */
+    bool req_polled, req_poll_fault;           /* a pending request finished from routine_poll, positive and 0x10 */
 #endif
 #if UDSOTA_FUZZ_PROGRESS
     bool stage_seen[UDSOTA_STAGE_ACTIVATING + 1];   /* stages hooks.progress reported from fuzzed calls */
@@ -672,8 +700,32 @@ static int mock_routine(void *ctx, uint16_t rid, const uint8_t *in, size_t in_le
     }
 }
 
+#if UDSOTA_FUZZ_REQUEST
+#define REQ_SID_ECHO       0xBAu   /* <sub> [data]: FA and the rest echoed; 0x14 past out_max, NO_ANSWER with SPRMIB */
+#define REQ_SID_BARE       0xBBu   /* FB alone: *out_len 0 */
+#define REQ_SID_REFUSE     0xBCu   /* NRC 0x22, whatever SPRMIB says */
+#define REQ_SID_PENDING    0xBEu   /* pending for JOB_MS, then FE 5A A5 from routine_poll */
+#define REQ_SID_HOLD       0xBFu   /* pending for APP_HOLD_MS: past the 90 s cap, so the core orphans it */
+#define REQ_SID_OVERLONG   0x80u   /* *out_len out_max + 1: the core's 0x10 */
+#define REQ_SID_BAD_RC     0x81u   /* returns 0x100, neither 0, an NRC, NO_ANSWER nor pending: the core's 0x10 */
+#define REQ_SID_POLL_NONE  0x82u   /* pending for JOB_MS, then UDSOTA_NO_ANSWER from routine_poll: the core's 0x10 */
+
+/* routine_poll's end of a pending request: NO_ANSWER for REQ_SID_POLL_NONE (a hook fault), else 5A A5, as much of it
+ * as out_max holds. */
+static int req_finish(uint8_t *out, size_t out_max, size_t *out_len)
+{
+    static const uint8_t rec[2] = {0x5A, 0xA5};
+    if (M.req_sid == REQ_SID_POLL_NONE) {
+        return UDSOTA_NO_ANSWER;
+    }
+    *out_len = out_max < sizeof rec ? out_max : sizeof rec;
+    memcpy(out, rec, *out_len);
+    return 0;
+}
+#endif
+
 /* Mock hooks.routine_poll: writes all of out_max, then UDSOTA_PENDING until app_until, else finishes with status
- * 00. Only ever called while an app routine is outstanding. */
+ * 00 (a request: req_finish). Only ever called while an app job is outstanding. */
 static int mock_routine_poll(void *ctx, uint8_t *out, size_t out_max, size_t *out_len)
 {
     count_op(OP_ROUTINE_POLL);
@@ -685,6 +737,11 @@ static int mock_routine_poll(void *ctx, uint8_t *out, size_t out_max, size_t *ou
         return UDSOTA_PENDING;
     }
     M.app_outstanding = false;
+#if UDSOTA_FUZZ_REQUEST
+    if (M.req_sid != 0u) {
+        return req_finish(out, out_max, out_len);
+    }
+#endif
     *out_len = app_status(out, out_max);
     return 0;
 }
@@ -792,6 +849,9 @@ static int mock_routine_ex(void *ctx, uint8_t sub, uint16_t rid, const uint8_t *
         M.app_outstanding = true;
         M.app_sub = sub;
         M.app_rid = rid;
+#if UDSOTA_FUZZ_REQUEST
+        M.req_sid = 0u;
+#endif
         M.app_until = M.now + (rid == APP_RID_HOLD ? APP_HOLD_MS : JOB_MS);
         return UDSOTA_PENDING;
     case APP_RID_REFUSE:
@@ -809,6 +869,86 @@ static int mock_routine_ex(void *ctx, uint8_t sub, uint16_t rid, const uint8_t *
         return 0x100;
     default:
         return UDSOTA_NRC_REQUEST_OUT_OF_RANGE;
+    }
+}
+#endif
+
+#if UDSOTA_FUZZ_REQUEST
+/* True for a SID dispatch serves itself, its hook NULL or not, and the updater's 34, 36 and 37: none reaches
+ * request. */
+static bool core_sid(uint8_t sid)
+{
+    switch (sid) {
+    case UDSOTA_SID_SESSION: case UDSOTA_SID_TESTER_PRESENT: case UDSOTA_SID_READ_DID: case UDSOTA_SID_SECURITY:
+    case UDSOTA_SID_ROUTINE: case UDSOTA_SID_RESET: case UDSOTA_SID_COMM_CONTROL: case UDSOTA_SID_DTC_SETTING:
+    case UDSOTA_SID_WRITE_DID: case UDSOTA_SID_READ_DTC: case UDSOTA_SID_CLEAR_DTC:
+    case UDSOTA_SID_REQUEST_DOWNLOAD: case UDSOTA_SID_TRANSFER_DATA: case UDSOTA_SID_TRANSFER_EXIT:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* True for a response SID, 40-7F or C0-FF: the core answers 0x11 without asking request. */
+static bool response_sid(uint8_t sid)
+{
+    return (sid & UDSOTA_POS_BIT) != 0u;
+}
+
+/* True for the SIDs the mock leaves pending, whose 0x78s and final answer come from a poll. */
+static bool req_pend_sid(uint8_t sid)
+{
+    return sid == REQ_SID_PENDING || sid == REQ_SID_HOLD || sid == REQ_SID_POLL_NONE;
+}
+
+/* Mock hooks.request: never for a core or updater SID, a response SID or while an app job is outstanding; reads the
+ * whole request and writes all of out_max (an oversized one faults on a guard page), then answers by SID as REQ_SID_*
+ * say, and 0x11 for any other. */
+static int mock_request(void *ctx, const uint8_t *req, size_t len, uint8_t *out, size_t out_max, size_t *out_len,
+                        udsota_access_t access)
+{
+    count_op(OP_REQUEST);
+    M.req_calls++;
+    check_access_any(access);
+    if (M.app_outstanding) {
+        fail("request called while an app job was outstanding", req, len, NULL, 0);
+    }
+    if (len == 0u || core_sid(req[0]) || response_sid(req[0])) {
+        fail("request handed an empty request, a SID the core or the updater serves, or a response SID", req, len,
+             NULL, 0);
+    }
+    touch(req, len);
+    memset(out, 0xDD, out_max);
+    switch (req[0]) {
+    case REQ_SID_ECHO:
+        if (len - 1u > out_max) {
+            return UDSOTA_NRC_RESPONSE_TOO_LONG;
+        }
+        if (len >= 2u && (req[1] & UDSOTA_SPRMIB) != 0u) {
+            return UDSOTA_NO_ANSWER;
+        }
+        memcpy(out, &req[1], len - 1u);
+        *out_len = len - 1u;
+        return 0;
+    case REQ_SID_BARE:
+        *out_len = 0u;
+        return 0;
+    case REQ_SID_REFUSE:
+        return UDSOTA_NRC_CONDITIONS_NOT_CORRECT;
+    case REQ_SID_PENDING:
+    case REQ_SID_HOLD:
+    case REQ_SID_POLL_NONE:
+        M.app_outstanding = true;
+        M.req_sid = req[0];
+        M.app_until = M.now + (req[0] == REQ_SID_HOLD ? APP_HOLD_MS : JOB_MS);
+        return UDSOTA_PENDING;
+    case REQ_SID_OVERLONG:
+        *out_len = out_max + 1u;
+        return 0;
+    case REQ_SID_BAD_RC:
+        return 0x100;
+    default:
+        return UDSOTA_NRC_SERVICE_NOT_SUPPORTED;
     }
 }
 #endif
@@ -1079,6 +1219,9 @@ static const udsota_hooks_t FUZZ_HOOKS = {
 #if UDSOTA_FUZZ_APP_EX
     .did_read_ex = mock_did_read_ex, .routine_ex = mock_routine_ex,
 #endif
+#if UDSOTA_FUZZ_REQUEST
+    .request = mock_request,
+#endif
 };
 
 #if UDSOTA_FUZZ_NO_UPDATE
@@ -1109,6 +1252,9 @@ static bool sid_served(uint8_t sid)
 #endif
 #if UDSOTA_FUZZ_DTC
     case UDSOTA_SID_READ_DTC: case UDSOTA_SID_CLEAR_DTC:
+#endif
+#if UDSOTA_FUZZ_REQUEST
+    case REQ_SID_ECHO: case REQ_SID_BARE:
 #endif
         return true;
     default:
@@ -1143,7 +1289,8 @@ static bool nrc_ok(uint8_t nrc)
 }
 
 /* True for 0x14 responseTooLong to a 22 (a DID longer than the answer buffer) or, in the DTC build, a 19, the only
- * answers the core sends it in; the other five builds never serve 19, and it is a defect from a poll. */
+ * answers the core sends it in, or in the request build the echo mock's; the others never serve 19, and it is a
+ * defect from a poll. */
 static bool too_long_ok(uint8_t sid, uint8_t nrc)
 {
     if (nrc != UDSOTA_NRC_RESPONSE_TOO_LONG) {
@@ -1151,6 +1298,8 @@ static bool too_long_ok(uint8_t sid, uint8_t nrc)
     }
 #if UDSOTA_FUZZ_DTC
     return sid == UDSOTA_SID_READ_DID || sid == UDSOTA_SID_READ_DTC;
+#elif UDSOTA_FUZZ_REQUEST
+    return sid == UDSOTA_SID_READ_DID || sid == REQ_SID_ECHO;   /* the echo mock's own 0x14 */
 #else
     return sid == UDSOTA_SID_READ_DID;
 #endif
@@ -1263,6 +1412,12 @@ static bool positive_shape_ok(const uint8_t *req, size_t rl, const uint8_t *r, s
     case UDSOTA_SID_CLEAR_DTC:          /* 54, for exactly 14 and a 3-byte group */
         return n == 1 && rl == UDSOTA_CLEAR_DTC_LEN;
 #endif
+#if UDSOTA_FUZZ_REQUEST
+    case REQ_SID_ECHO:                  /* FA and the request after its SID, never with SPRMIB */
+        return n == rl && (rl < 2u || (req[1] & UDSOTA_SPRMIB) == 0u) && memcmp(&r[1], &req[1], rl - 1u) == 0;
+    case REQ_SID_BARE:                  /* FB alone */
+        return n == 1;
+#endif
     default:
         return false;
     }
@@ -1326,15 +1481,23 @@ static void check_poll_answer(const uint8_t *r, size_t n, size_t resp_max)
     }
     g_stats.poll_answers += !g_in_preamble;
     if (r[0] == UDSOTA_NEG_RESPONSE) {
-        if (n != 3 || !sid_served(r[1]) || !nrc_ok(r[2])) {
+#if UDSOTA_FUZZ_REQUEST
+        const bool served = sid_served(r[1]) || req_pend_sid(r[1]);   /* a pending request's 0x78 and 0x10 */
+#else
+        const bool served = sid_served(r[1]);
+#endif
+        if (n != 3 || !served || !nrc_ok(r[2])) {
             fail("malformed negative poll response", NULL, 0, r, n);
         }
         return;
     }
     const uint8_t sid = (uint8_t)(r[0] & (uint8_t)~UDSOTA_POS_BIT);
-    const bool ok = (r[0] & UDSOTA_POS_BIT) != 0 &&
-                    ((sid == UDSOTA_SID_TRANSFER_DATA && n == 2) ||
-                     (sid == UDSOTA_SID_ROUTINE && (n == 4 || n == 5) && poll_routine_ok(r)));
+    bool ok = (r[0] & UDSOTA_POS_BIT) != 0 &&
+              ((sid == UDSOTA_SID_TRANSFER_DATA && n == 2) ||
+               (sid == UDSOTA_SID_ROUTINE && (n == 4 || n == 5) && poll_routine_ok(r)));
+#if UDSOTA_FUZZ_REQUEST
+    ok = ok || (r[0] == UDSOTA_POS(M.req_sid) && req_pend_sid(M.req_sid));   /* check_req_poll pins the rest */
+#endif
 #if UDSOTA_FUZZ_NO_UPDATE
     if (sid == UDSOTA_SID_TRANSFER_DATA) {
         fail("a 36 answered from a poll with no update service", NULL, 0, r, n);
@@ -1582,6 +1745,106 @@ static void check_app_ex(const ex_before_t *b, const uint8_t *req, size_t rl, co
 }
 #endif
 
+#if UDSOTA_FUZZ_REQUEST
+/* Fails unless r[0..n) is 7F <req SID> nrc, or nothing when resp_max has no room for it. */
+static void want_req_nrc(const uint8_t *req, size_t rl, const uint8_t *r, size_t n, size_t resp_max, uint8_t nrc)
+{
+    if (resp_max >= 3u ? (n != 3u || r[0] != UDSOTA_NEG_RESPONSE || r[1] != req[0] || r[2] != nrc) : n != 0u) {
+        fail("a request the core left to hooks.request answered other than its contract gives", req, rl, r, n);
+    }
+}
+
+/* The request contract on one answer, given the server's state before it (b) and the hook's calls before it: no call
+ * while a job runs or a restart is armed, nor for a core or updater SID; 0x11 without a call for a response SID or
+ * with no room for the response SID, and 0x22 without one while an app orphan runs; else exactly one call, and the
+ * mock's answer for the SID framed by the core. */
+static void check_request_hook(const ex_before_t *b, unsigned calls_before, const uint8_t *req, size_t rl,
+                               const uint8_t *r, size_t n, size_t resp_max)
+{
+    const unsigned calls = M.req_calls - calls_before;
+    if (!b->idle || rl == 0u || core_sid(req[0])) {
+        if (calls != 0u) {
+            fail("request called for a core SID, or while a job ran or a restart was armed", req, rl, r, n);
+        }
+        return;
+    }
+    const uint8_t sid = req[0];
+    if (response_sid(sid) || b->orphan || resp_max < 1u) {
+        if (calls != 0u) {
+            fail("request called for a response SID, during an app orphan or with no room to answer", req, rl, r, n);
+        }
+        const bool eleven = response_sid(sid) || resp_max < 1u;
+        want_req_nrc(req, rl, r, n, resp_max, eleven ? UDSOTA_NRC_SERVICE_NOT_SUPPORTED
+                                                     : UDSOTA_NRC_CONDITIONS_NOT_CORRECT);
+        g_stats.req_resp_sid = g_stats.req_resp_sid || (response_sid(sid) && n != 0u && !g_in_preamble);
+        g_stats.req_orphan = g_stats.req_orphan || (!eleven && n != 0u && !g_in_preamble);
+        return;
+    }
+    if (calls != 1u) {
+        fail("request not called exactly once for a SID the core leaves to it", req, rl, r, n);
+    }
+    switch (sid) {
+    case REQ_SID_ECHO:
+        if (rl - 1u > resp_max - 1u) {
+            want_req_nrc(req, rl, r, n, resp_max, UDSOTA_NRC_RESPONSE_TOO_LONG);
+        } else if (rl >= 2u && (req[1] & UDSOTA_SPRMIB) != 0u) {
+            if (n != 0u) {
+                fail("request's UDSOTA_NO_ANSWER was answered", req, rl, r, n);
+            }
+            g_stats.req_silent = g_stats.req_silent || !g_in_preamble;
+        } else if (n != rl || r[0] != UDSOTA_POS(sid) || memcmp(&r[1], &req[1], rl - 1u) != 0) {
+            fail("request's positive answer is not the response SID and the hook's record", req, rl, r, n);
+        } else {
+            g_stats.req_pos = g_stats.req_pos || !g_in_preamble;
+        }
+        return;
+    case REQ_SID_BARE:
+        if (n != 1u || r[0] != UDSOTA_POS(sid)) {
+            fail("request's empty record did not answer the response SID alone", req, rl, r, n);
+        }
+        g_stats.req_bare = g_stats.req_bare || !g_in_preamble;
+        return;
+    case REQ_SID_REFUSE:
+        want_req_nrc(req, rl, r, n, resp_max, UDSOTA_NRC_CONDITIONS_NOT_CORRECT);
+        return;
+    case REQ_SID_PENDING:
+    case REQ_SID_HOLD:
+    case REQ_SID_POLL_NONE:
+        if (n != 0u || !S.job_running || !S.job_app) {
+            fail("a pending request was answered at once, or no app job runs", req, rl, r, n);
+        }
+        return;
+    case REQ_SID_OVERLONG:
+    case REQ_SID_BAD_RC:
+        want_req_nrc(req, rl, r, n, resp_max, UDSOTA_NRC_GENERAL_REJECT);
+        g_stats.req_fault = g_stats.req_fault || (n != 0u && !g_in_preamble);
+        return;
+    default:
+        want_req_nrc(req, rl, r, n, resp_max, UDSOTA_NRC_SERVICE_NOT_SUPPORTED);
+        return;
+    }
+}
+
+/* A pending request's final answer from a poll: FE 5A A5, cut to resp_max, or 0x10 for REQ_SID_POLL_NONE's
+ * NO_ANSWER; nothing where neither fits. */
+static void check_req_poll(uint8_t sid, const uint8_t *r, size_t n, size_t resp_max)
+{
+    if (sid == REQ_SID_POLL_NONE) {
+        if (resp_max >= 3u ? (n != 3u || r[0] != UDSOTA_NEG_RESPONSE || r[1] != sid ||
+                              r[2] != UDSOTA_NRC_GENERAL_REJECT) : n != 0u) {
+            fail("routine_poll's UDSOTA_NO_ANSWER answered other than 0x10", NULL, 0, r, n);
+        }
+        g_stats.req_poll_fault = g_stats.req_poll_fault || (n != 0u && !g_in_preamble);
+        return;
+    }
+    const size_t want = resp_max < 1u ? 0u : 1u + (resp_max - 1u < 2u ? resp_max - 1u : 2u);
+    if (n != want || (n >= 1u && r[0] != UDSOTA_POS(sid)) || (n >= 2u && r[1] != 0x5Au) || (n >= 3u && r[2] != 0xA5u)) {
+        fail("a pending request's final answer is not its response SID and routine_poll's record", NULL, 0, r, n);
+    }
+    g_stats.req_polled = g_stats.req_polled || (n != 0u && !g_in_preamble);
+}
+#endif
+
 /* Returns the guarded response buffer for resp_max, with its canary armed. */
 static uint8_t *resp_buf(size_t resp_max)
 {
@@ -1624,6 +1887,9 @@ static size_t fuzz_request(const uint8_t *in, size_t len, layout_t lay, size_t r
     const ex_before_t ex = {.idle = !S.job_running && !udsota_restart_armed(&S) && M.resets == 0u,
                             .orphan = S.app_orphan, .session = S.session, .security = S.security};
 #endif
+#if UDSOTA_FUZZ_REQUEST
+    const unsigned req_calls = M.req_calls;
+#endif
     const size_t n = udsota_on_request(&S, req, len, resp, resp_max, now);
     check_canary(resp, req, len);
     check_request_answer(req, len, resp, n, resp_max);
@@ -1633,6 +1899,9 @@ static size_t fuzz_request(const uint8_t *in, size_t len, layout_t lay, size_t r
 #endif
 #if UDSOTA_FUZZ_APP_EX
     check_app_ex(&ex, req, len, resp, n, resp_max);
+#endif
+#if UDSOTA_FUZZ_REQUEST
+    check_request_hook(&ex, req_calls, req, len, resp, n, resp_max);
 #endif
     digest_fold('Q', req, len);
     digest_fold('A', resp, n);
@@ -1659,9 +1928,17 @@ static void fuzz_poll(size_t resp_max, uint32_t now)
 #endif
     const bool app_job = S.job_running && S.job_app;
     const bool svc_job = S.job_running && !S.job_app && !S.worker_orphan;
+#if UDSOTA_FUZZ_REQUEST
+    const uint8_t req_sid = app_job ? M.req_sid : 0u;   /* the pending request's SID; 0: none, or a routine's job */
+#endif
     const size_t n = udsota_poll(&S, resp, resp_max, now);
     check_canary(resp, NULL, 0);
     check_poll_answer(resp, n, resp_max);
+#if UDSOTA_FUZZ_REQUEST
+    if (req_sid != 0u && !S.job_running && !S.app_orphan) {   /* it finished in this poll */
+        check_req_poll(req_sid, resp, n, resp_max);
+    }
+#endif
     /* The 90 s cap orphans the job it stops waiting on: 0x10 for an app routine, 0x72 for the service's. */
     const bool capped = (app_job && S.app_orphan) || (svc_job && S.worker_orphan);
     if (capped && resp_max >= 3u && (n != 3u || resp[2] != (app_job ? UDSOTA_NRC_GENERAL_REJECT
@@ -2063,6 +2340,12 @@ static const seed_t SEEDS[] = {
     SEED(0x31, 0x04, 0x12, 0x34), SEED(0x31, 0x00, 0x12, 0x34), SEED(0x31, 0x02, 0xF0, 0x01),
     SEED(0x31, 0x03, 0xF0, 0x02), SEED(0x31, 0x04, 0xFF, 0x01), SEED(0x31, 0x01, 0x12),
 #endif
+#if UDSOTA_FUZZ_REQUEST
+    SEED(0xBA, 0x01, 0x42, 0x43), SEED(0xBA, 0x81, 0x42), SEED(0xBA, 0x01), SEED(0xBA, 0x81), SEED(0xBA),
+    SEED(0xBB), SEED(0xBB, 0x00), SEED(0xBC, 0x01), SEED(0xBC, 0x81), SEED(0xBE, 0x01), SEED(0xBF), SEED(0x80),
+    SEED(0x81, 0x01), SEED(0x82), SEED(0x2F, 0x02, 0x00, 0x03), SEED(0x23, 0x24, 0x00, 0x10, 0x00, 0x04),
+    SEED(0x87, 0x01, 0x10), SEED(0x7E, 0x00), SEED(0xFA, 0x01), SEED(0xC0), SEED(0x40),
+#endif
 #ifdef UDSOTA_FUZZ_Z
     SEED(0x34, 0x10, 0x44, 0, 0, 0, 0, 0, 0, 0, 0x40), SEED(0x34, 0x10, 0x44, 0, 0, 0, 0, 0, 0, 0x01, 0x40),
     SEED(0x34, 0x10, 0x44, 0, 0, 0, 0, 0, 0, 0, 0x01), SEED(0x34, 0x90, 0x44, 0, 0, 0, 0, 0, 0, 0, 0x40),
@@ -2218,6 +2501,36 @@ static void replay_generated(void)
     n = rec(seq, n, 0, keyed, sizeof keyed);
     replay_input("seq-app-ex", seq, n, true);
 #endif
+#if UDSOTA_FUZZ_REQUEST
+    /* request's echo at the ISO-TP limit (0x14) and at 34 bytes (FA and 33 of them), then its app jobs: one pending
+     * (0x78, then FE 5A A5 from a poll) with a request and a routine during it (0x21, no call), one ending in
+     * routine_poll's NO_ANSWER (0x10), an echo with SPRMIB (silent), and one past the cap (0x10) with a request and a
+     * routine during its orphan (0x22, no call), then a request once routine_poll has finished it (FB). */
+    b[0] = REQ_SID_ECHO;
+    b[1] = 0x01;
+    replay_input("request-max-length", b, REQ_MAX, true);
+    replay_input("request-short", b, 34u, true);
+    const uint8_t r_pend[] = {REQ_SID_PENDING, 0x01};
+    const uint8_t r_bare[] = {REQ_SID_BARE};
+    const uint8_t r_none[] = {REQ_SID_POLL_NONE};
+    const uint8_t r_quiet[] = {REQ_SID_ECHO, 0x81, 0x42};
+    const uint8_t r_hold[] = {REQ_SID_HOLD};
+    n = 0;
+    n = rec(seq, n, 0, r_pend, sizeof r_pend);
+    n = rec(seq, n, 0, r_bare, sizeof r_bare);
+    n = rec(seq, n, 0, sync, sizeof sync);
+    n = rec(seq, n, 4, r_none, sizeof r_none);                 /* 100 ms: the first has answered */
+    n = rec(seq, n, 4, r_quiet, sizeof r_quiet);
+    n = rec(seq, n, 0, r_hold, sizeof r_hold);
+    for (unsigned k = 0; k < 15u; k++) {
+        n = rec(seq, n, 255, tp, sizeof tp);                   /* 95.6 s: past the cap */
+    }
+    n = rec(seq, n, 0, r_bare, sizeof r_bare);
+    n = rec(seq, n, 0, sync, sizeof sync);
+    n = rec(seq, n, 255, tp, sizeof tp);                       /* 102 s: routine_poll finishes it */
+    n = rec(seq, n, 0, r_bare, sizeof r_bare);
+    replay_input("seq-request", seq, n, true);
+#endif
 #if UDSOTA_FUZZ_NO_UPDATE
     /* 34, 36 and 37 while an app routine runs (0x21, the core's busy answer), then after it finishes (0x11). */
     const uint8_t pend[] = {UDSOTA_SID_ROUTINE, UDSOTA_RC_START, 0x12, 0x35};
@@ -2303,6 +2616,9 @@ static size_t mutate(const uint8_t *seed, size_t len, uint8_t *out)
     static const uint8_t INTERESTING[] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x7F, 0x80, 0x81, 0xFE, 0xFF};
 #if UDSOTA_FUZZ_DTC
     static const uint8_t SIDS[] = {0x10, 0x11, 0x14, 0x19, 0x22, 0x27, 0x2E, 0x31, 0x34, 0x36, 0x37, 0x3E};
+#elif UDSOTA_FUZZ_REQUEST   /* and request's: its mock's SIDs, one it doesn't serve, and response SIDs */
+    static const uint8_t SIDS[] = {0x10, 0x11, 0x22, 0x27, 0x2E, 0x31, 0x34, 0x36, 0x37, 0x3E, 0xBA, 0xBB, 0xBC,
+                                   0xBE, 0x80, 0x81, 0x2F, 0x7F, 0xFA};
 #else
     static const uint8_t SIDS[] = {0x10, 0x11, 0x22, 0x27, 0x2E, 0x31, 0x34, 0x36, 0x37, 0x3E};
 #endif
@@ -2354,6 +2670,9 @@ static const char *const OP_NAME[OP_COUNT] = {   /* op_id_t names for the covera
 #endif
 #if UDSOTA_FUZZ_APP_EX
     "did_read_ex", "routine_ex",
+#endif
+#if UDSOTA_FUZZ_REQUEST
+    "request",
 #endif
 #ifdef UDSOTA_FUZZ_Z
     "zbegin", "zwrite", "zend",
@@ -2429,6 +2748,16 @@ static void check_coverage(void)
         fprintf(stderr, "fuzz_udsota: COVERAGE: routine_ex 71 01/02/03 %d%d%d, in default %d; 0x10 from 22 %d, 31 %d\n",
                 g_stats.ex_pos_sub[1], g_stats.ex_pos_sub[2], g_stats.ex_pos_sub[3], g_stats.ex_default_pos,
                 g_stats.ex_reject22, g_stats.ex_reject31);
+        ok = false;
+    }
+#endif
+#if UDSOTA_FUZZ_REQUEST
+    if (!g_stats.req_pos || !g_stats.req_bare || !g_stats.req_silent || !g_stats.req_fault || !g_stats.req_resp_sid ||
+        !g_stats.req_orphan || !g_stats.req_polled || !g_stats.req_poll_fault) {
+        fprintf(stderr, "fuzz_udsota: COVERAGE: request record %d, SID alone %d, NO_ANSWER %d, 0x10 %d, response SID "
+                "%d, orphan 0x22 %d; from a poll %d, 0x10 %d\n", g_stats.req_pos, g_stats.req_bare,
+                g_stats.req_silent, g_stats.req_fault, g_stats.req_resp_sid, g_stats.req_orphan, g_stats.req_polled,
+                g_stats.req_poll_fault);
         ok = false;
     }
 #endif

@@ -703,7 +703,7 @@ void udsota_update_init(udsota_server_t *s, const udsota_engine_t *engine)
 }
 
 /* See udsota_update.h: udsota_core_init, then, with an engine, udsota_update_init. Without one the server runs
- * without the updater: 34, 36 and 37 answer 0x11 and its RIDs and DIDs go to the app's hooks. */
+ * without the updater: its SIDs (34, 36 and 37), RIDs and DIDs go to the app's hooks, request among them. */
 bool udsota_init(udsota_server_t *s, const udsota_config_t *cfg, const udsota_engine_t *engine,
                  const udsota_security_t *security, const udsota_hooks_t *hooks)
 {

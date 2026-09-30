@@ -3,7 +3,8 @@
  * two file-backed A/B slots (demo_engine.h). ActivateImage and 11 01 "reboot" in-process: the engine runs
  * the boot slot, stays silent for --boot-ms, and a fresh server starts, so an activated image runs
  * PENDING_VERIFY until ConfirmImage and one reset before that rolls back. A three-DTC table serves 19 and 14, a keyed
- * DID the app's did_read_ex and a self-test routine its routine_ex; --no-updater runs the server alone.
+ * DID the app's did_read_ex, a self-test routine its routine_ex and an echo service, SID BA, its request;
+ * --no-updater runs the server alone.
  *
  *   udsota_demo_server [--socketcan IFACE] [options]      serve (the pipe by default)
  *   udsota_demo_server --make-image OUT --version V         write an image for the configured identity
@@ -40,6 +41,10 @@
 #define SELF_TEST_IDLE      0x00u       /* results: never started */
 #define SELF_TEST_RUNNING   0x01u
 #define SELF_TEST_STOPPED   0x02u
+#define SID_ECHO            0xBAu       /* the demo's own service (request): echoes its bytes, now or after a wait */
+#define ECHO_NOW            0x01u       /* BA 01 <bytes>: FA 01 <bytes>; BA 81 answers nothing */
+#define ECHO_SLOW           0x02u       /* BA 02 <bytes>: 0x78, then FA 02 <bytes> after ECHO_SLOW_MS */
+#define ECHO_SLOW_MS        300u
 #define DEMO_DTC_AVAIL      0x2Fu       /* the status bits the demo supports: 0-3 and 5, as CANDash */
 #define DTC_REC_COUNT       0x01u       /* extended data record 01: the occurrence count, 1 byte */
 #define DTC_REC_SEEN        0x10u       /* extended data record 10: first and last seen, two u32 seconds */
@@ -99,6 +104,9 @@ typedef struct {
     uint32_t            cfs;          /* CFs of the request message now arriving (fault injection counts them) */
     bool                ignore_ff;    /* the FF after a withheld FC is dropped unanswered */
     uint8_t             self_test;    /* RID_SELF_TEST's state, SELF_TEST_*; a restart keeps it, as the DTCs */
+    uint8_t             echo[UDSOTA_ISOTP_RESP_MAX];   /* a slow echo's answer after FA, copied from its request */
+    size_t              echo_len;
+    uint64_t            echo_until;   /* when routine_poll answers it (monotonic ms) */
 } demo_t;
 
 static demo_t d;
@@ -235,6 +243,64 @@ static int on_routine_ex(void *ctx, uint8_t sub, uint16_t rid, const uint8_t *in
     }
     d.self_test = start ? SELF_TEST_RUNNING : SELF_TEST_STOPPED;
     fprintf(stderr, "udsota_demo_server: self-test %s\n", start ? "started" : "stopped");
+    return 0;
+}
+
+/* hooks.request: SID_ECHO, in every session: a request with no sub-function is 0x13, and one with a sub-function
+ * other than ECHO_NOW or ECHO_SLOW 0x12. ECHO_NOW answers FA 01 and the bytes after it at once, and nothing with
+ * SPRMIB (UDSOTA_NO_ANSWER); ECHO_SLOW copies its answer and returns UDSOTA_PENDING, which on_routine_poll finishes
+ * after ECHO_SLOW_MS whatever SPRMIB says. An echo longer than out_max is 0x14. Any other SID the core hands over,
+ * 34, 36 and 37 among them with --no-updater, is logged and answered 0x11, as the core would. */
+static int on_request(void *ctx, const uint8_t *req, size_t len, uint8_t *out, size_t out_max, size_t *out_len,
+                      udsota_access_t access)
+{
+    (void)ctx;
+    (void)access;
+    if (req[0] != SID_ECHO) {
+        fprintf(stderr, "udsota_demo_server: request hook: SID 0x%02X is not served (0x11)\n", req[0]);
+        return UDSOTA_NRC_SERVICE_NOT_SUPPORTED;
+    }
+    if (len < 2u) {
+        return UDSOTA_NRC_INCORRECT_LENGTH;
+    }
+    const uint8_t sub = req[1] & (uint8_t)~UDSOTA_SPRMIB;
+    if (sub != ECHO_NOW && sub != ECHO_SLOW) {
+        return UDSOTA_NRC_SUBFUNC_NOT_SUPPORTED;
+    }
+    if (len - 1u > out_max || len - 1u > sizeof d.echo) {
+        return UDSOTA_NRC_RESPONSE_TOO_LONG;
+    }
+    if (sub == ECHO_SLOW) {
+        d.echo[0] = sub;                            /* routine_poll never sees the request: keep what it needs */
+        memcpy(&d.echo[1], &req[2], len - 2u);
+        d.echo_len = len - 1u;
+        d.echo_until = mono_us() / 1000u + ECHO_SLOW_MS;
+        fprintf(stderr, "udsota_demo_server: slow echo pending\n");
+        return UDSOTA_PENDING;
+    }
+    if ((req[1] & UDSOTA_SPRMIB) != 0u) {
+        return UDSOTA_NO_ANSWER;
+    }
+    out[0] = sub;
+    memcpy(&out[1], &req[2], len - 2u);
+    *out_len = len - 1u;
+    return 0;
+}
+
+/* hooks.routine_poll, the app job's poll: the slow echo is the demo's only pending job, answered once ECHO_SLOW_MS
+ * has passed (0x14 should the room have shrunk). */
+static int on_routine_poll(void *ctx, uint8_t *out, size_t out_max, size_t *out_len)
+{
+    (void)ctx;
+    if (mono_us() / 1000u < d.echo_until) {
+        return UDSOTA_PENDING;
+    }
+    if (d.echo_len > out_max) {
+        return UDSOTA_NRC_RESPONSE_TOO_LONG;
+    }
+    memcpy(out, d.echo, d.echo_len);
+    *out_len = d.echo_len;
+    fprintf(stderr, "udsota_demo_server: slow echo answered\n");
     return 0;
 }
 
@@ -390,7 +456,7 @@ static void start_server(void)
     static udsota_hooks_t hooks;                /* the server and the adapter copy what they need */
     hooks = (udsota_hooks_t){
         .gate = on_gate, .phase = on_phase, .reset = on_reset, .did_read_ex = on_did_read_ex,
-        .routine_ex = on_routine_ex,
+        .routine_ex = on_routine_ex, .routine_poll = on_routine_poll, .request = on_request,
     };
     if (!d.o.no_dtc) {
         hooks.dtc_get = on_dtc_get;
