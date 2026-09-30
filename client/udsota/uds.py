@@ -11,24 +11,32 @@ from .wire import DL_ALFID, DL_DFI, DL_MAX_DATA, NRC_BUSY, NRC_PENDING, NRC_TIME
 
 BUSY_BACKOFF_S = (0.05, 0.1, 0.2, 0.4, 0.8, 1.6)   # waits before each retry after NRC 0x21
 SA_DELAY_S = 10.0        # the server's 0x27 delay after boot or after three wrong keys
-KEEPALIVE_S = 2.0        # 3E 00 interval while waiting in a session (at least every 2 s)
+KEEPALIVE_S = 2.0        # 3E 00 interval in a session: iso14229 restarts S3 (5.1 s) only on 10 and 3E
 P2_STAR_S = 5.5          # client P2*: the wait for a late answer, or a running job's next 0x78 (sent every 1.5 s)
 
 
 # One request method per service the update uses.
 class Uds:
-    # client: an open udsoncan Client; sleep is injectable for tests.
-    def __init__(self, client, sleep=time.sleep):
-        self.client, self.sleep = client, sleep
+    # client: an open udsoncan Client; sleep and clock are injectable for tests.
+    def __init__(self, client, sleep=time.sleep, clock=time.monotonic):
+        self.client, self.sleep, self.clock = client, sleep, clock
+        self.in_session, self.kept = False, clock()
 
     # Send one request; return the positive response after its SID. Retries NRC 0x21 with backoff;
     # raises Nrc on other NRCs, NoResponse on a timeout, SendFailed when the send fails twice, and
     # UpdateFailed on an answer udsoncan cannot parse or that belongs to another service.
+    # In a non-default session, a 3E 00 goes first when the last 10 or 3E is more than KEEPALIVE_S old.
     def request(self, service, sub=None, data=b""):
+        sid = service.request_id()
+        if sid not in (0x10, 0x3E) and self.in_session and self.clock() - self.kept > KEEPALIVE_S:
+            self.tester_present()
         req = Request(service=service, subfunction=sub, data=bytes(data))
         for delay in BUSY_BACKOFF_S + (None,):
             try:
                 resp = self.send_resending(req)
+                if sid in (0x10, 0x3E):
+                    self.kept = self.clock()
+                    self.in_session = self.in_session if sid == 0x3E else sub != 0x01
                 return bytes(resp.data or b"")
             except NegativeResponseException as e:
                 if e.response.code == NRC_BUSY and delay is not None:
@@ -133,10 +141,11 @@ class Uds:
                 self.sleep(KEEPALIVE_S)
                 self.tester_present()
             seed = self.request(services.SecurityAccess, seed_level)[1:]
+        if not any(seed):
+            return                                   # already unlocked: iso14229 answers a 2-byte zero seed
         if len(seed) != SEED_LEN:
             raise UpdateFailed("seed is %d bytes, expected %d" % (len(seed), SEED_LEN))
-        if any(seed):
-            self.request(services.SecurityAccess, seed_level + 1, keys.key(seed, seed_level))
+        self.request(services.SecurityAccess, seed_level + 1, keys.key(seed, seed_level))
 
     # RequestDownload of size bytes at address 0, in data format dfi (DL_DFI_DEFLATE: the blocks carry a raw DEFLATE
     # stream of those size bytes); returns the data bytes per 0x36 block.

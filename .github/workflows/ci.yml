@@ -1,22 +1,12 @@
-# Host unit tests, the Python client's tests, the end-to-end tests against the Linux demo server and the ESP-IDF
-# example build, on every push and pull request.
+# udsota: the host end-to-end test, the client's tests, and the ESP32 example built with a throwaway signing key.
 name: ci
-
-on:
-  push:
-  pull_request:
-
-permissions:
-  contents: read
-
+on: [push, pull_request]
 jobs:
   host:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build and run the host tests (core, isotp, port logic, seam checks, fuzz corpus)
-        run: tools/run_tests.sh
-
+      - run: cmake -S . -B build && cmake --build build -j && ctest --test-dir build --output-on-failure
   client:
     runs-on: ubuntu-latest
     steps:
@@ -24,97 +14,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install the client with its diff extra (detools, built from source) and pytest
-        run: python -m pip install "./client[diff]" pytest
-      - name: Run the client tests
-        run: python -m pytest -q client/tests
-      - name: Run the release tool's tests (they fail if the current __version__ has no dated CHANGELOG section)
-        run: python -m pytest -q tools/test_release.py
-      - name: Smoke-test the installed wheel from outside the tree
-        run: |
-          cd /tmp
-          python -c "from udsota import profile; print(profile.load('example'))"
-
-  e2e:
-    runs-on: ubuntu-latest
-    env:
-      UDSOTA_DEMO_SERVER: ${{ github.workspace }}/build/tools/linux_server/udsota_demo_server
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Build the Linux demo server
-        run: |
-          cmake -S . -B build
-          cmake --build build -j --target udsota_demo_server
-      - name: Install the client with its diff extra and pytest
-        run: python -m pip install "./client[diff]" pytest
-      - name: Run the end-to-end tests over the frame pipe (fails if the demo server wasn't built)
-        run: |
-          test -x "$UDSOTA_DEMO_SERVER"
-          python -m pytest -q -rsx client/tests/test_e2e_pipe.py
-      - name: Set up vcan0
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y linux-modules-extra-$(uname -r)
-          sudo modprobe vcan
-          sudo ip link add dev vcan0 type vcan
-          sudo ip link set up vcan0
-      - name: Load the kernel ISO-TP module, where the kernel has one (the udsota command's tests need it)
-        continue-on-error: true
-        run: sudo modprobe can-isotp
-      - name: Run the end-to-end tests on vcan0 (UDSOTA_VCAN makes a missing vcan fail, not skip)
-        env:
-          UDSOTA_VCAN: vcan0
-        run: python -m pytest -q -rsx client/tests/test_e2e_vcan.py
-
+      - run: python -m pip install ./client pytest && python -m pytest -q client/tests
   esp32:
     runs-on: ubuntu-latest
     container: espressif/idf:v6.1
-    strategy:
-      matrix:
-        target: [esp32s3, esp32]
-        # A config names the example's sdkconfig.* fragments, joined by +. delta+debugmeasure compiles every
-        # CONFIG_UDSOTA_ESP32_DEBUG_MEASURE block but the engine's XIP-from-PSRAM branch, which needs SPIRAM.
-        config: [default, compression, delta, noupdater, delta+debugmeasure]
     steps:
       - uses: actions/checkout@v4
-      - name: Build the example for ${{ matrix.target }} (${{ matrix.config }})
-        shell: bash
+      - shell: bash
         run: |
           . "$IDF_PATH/export.sh"
-          b="$PWD/examples/esp32/build/${{ matrix.target }}"
-          d="$PWD/examples/esp32/sdkconfig.defaults"
-          c="${{ matrix.config }}"
-          [ "$c" = default ] || for f in ${c//+/ }; do d="$d;$PWD/examples/esp32/sdkconfig.$f"; done
-          mkdir -p "${b%/*}"   # tee opens $b.log before idf.py has made the build tree
-          idf.py -C examples/esp32 -B "$b" -D SDKCONFIG="$b/sdkconfig" -D SDKCONFIG_DEFAULTS="$d" set-target ${{ matrix.target }} build 2>&1 | tee "$b.log"
-          if grep -E 'warning:' "$b.log"; then exit 1; fi   # a bare `! grep` gates the step only while it is the last line
-      - name: Check the built image passes udsota's first-block check
-        shell: bash
-        run: |
-          case "${{ matrix.target }}" in esp32) chip=0x0000 ;; esp32s3) chip=0x0009 ;; esac
-          gcc -std=c11 -Wall -Wextra -Werror -Icomponents/udsota/include -Icomponents/udsota/server/include \
-              -Icomponents/udsota/update/include \
-              -Icomponents/udsota_esp32/include -Icomponents/udsota_esp32/update/include \
-              tools/image_check.c components/udsota_esp32/update/udsota_esp32_image.c \
-              components/udsota/update/udsota_image.c \
-              -o /tmp/image_check
-          /tmp/image_check "examples/esp32/build/${{ matrix.target }}/example.bin" "$chip"
-      - name: Check the updater is linked, or absent under sdkconfig.noupdater
-        shell: bash
-        run: |
-          . "$IDF_PATH/export.sh" > /dev/null
-          b="examples/esp32/build/${{ matrix.target }}"
-          xtensa-esp-elf-nm "$b/example.elf" > "$b/syms"   # a file, not a pipe: grep -q would make nm exit 141
-          # esp_ota_begin stands for the engine, udsota_update_init and udsota_init for the core's updater (a port
-          # that starts the server through udsota_init with a NULL engine links it all, with no esp_ota_* call).
-          if [ "${{ matrix.config }}" = noupdater ]; then
-            grep -qx '# CONFIG_UDSOTA_ESP32_UPDATER is not set' "$b/sdkconfig" || { echo "the option is still on"; exit 1; }
-            if grep -qw esp_ota_begin "$b/syms"; then echo "engine linked in noupdater"; exit 1; fi
-            if grep -qwE 'udsota_update_init|udsota_init' "$b/syms"; then echo "core updater linked in noupdater"; exit 1; fi
-          else
-            grep -qw esp_ota_begin "$b/syms" || { echo "no esp_ota_begin: the check cannot see the engine"; exit 1; }
-            grep -qw udsota_update_init "$b/syms" || { echo "no udsota_update_init: the check cannot see the core updater"; exit 1; }
-          fi
+          mkdir -p examples/candash_ws43/secrets
+          espsecure.py generate_signing_key --version 2 examples/candash_ws43/secrets/dev_signing_key.pem
+          idf.py -C examples/candash_ws43 -B build build

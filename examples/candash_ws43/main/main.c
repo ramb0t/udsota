@@ -1,7 +1,6 @@
-/* Proof of concept: udsota's firmware updater on iso14229's UDS server, on the CANDash ws43 (Waveshare
- * ESP32-S3-Touch-LCD-4.3). The app owns everything iso14229 needs, as an iso14229 user already does: the TWAI node,
- * the server task that feeds isotp-c and calls UDSServerPoll, and the event callback. The callback hands each event
- * to udsota_iso14229_event() first and serves the rest (here, F191). Nothing of udsota's own server remains. */
+/* udsota on iso14229, on the CANDash ws43 (Waveshare ESP32-S3-Touch-LCD-4.3). The app owns everything iso14229
+ * needs, as an iso14229 user already does: the TWAI node, the server task that feeds isotp-c and calls UDSServerPoll,
+ * and the event callback. The callback hands each event to udsota_event() first and serves the rest (here, F191). */
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -21,8 +20,6 @@
 #include "freertos/task.h"
 #include "iso14229.h"
 #include "udsota.h"
-#include "udsota_esp32.h"
-#include "udsota_iso14229.h"
 
 static const char *TAG = "poc";
 
@@ -34,8 +31,6 @@ static const char *TAG = "poc";
 #define BOARD_NAME    "ws43"      /* F191, which CANDash's client profile checks */
 #define DID_BOARD     0xF191u
 #define KEY_LABEL     "CANDash-SA-v1"
-#define LEVEL_EXT     0x01u
-#define LEVEL_PROG    0x03u
 
 /* The ws43's CAN: TWAI on GPIO20/19, 250 kbit/s at CANDash's timing (80 MHz / 16, 1 + 15 + 4 quanta, SJW 2). The
  * transceiver shares its pins with USB: CH422G EXIO5 high selects CAN. */
@@ -53,7 +48,7 @@ static const char *TAG = "poc";
 #define SERVER_PRIO   6
 #define HEALTHY_MS    10000u
 
-UDSOTA_ESP32_IMAGE_DESC(HW_ID, LAYOUT_ID, REQ_ID, RESP_ID);
+UDSOTA_IMAGE_DESC(HW_ID, LAYOUT_ID, REQ_ID, RESP_ID);
 
 #if defined(POC_HAVE_MASTER)
 extern const uint8_t _binary_poc_master_start[];
@@ -75,7 +70,6 @@ static atomic_bool        s_bus_off;            /* set by the ISR; the server ta
 
 static UDSServer_t        s_srv;
 static UDSTpISOTpC_t      s_tp;
-static udsota_iso14229_t  s_upd;
 
 /* ---- TWAI ---- */
 
@@ -202,7 +196,7 @@ void isotp_user_debug(const char *message, ...)
 static UDSErr_t on_event(UDSServer_t *srv, UDSEvent_t ev, void *arg)
 {
     UDSErr_t rc;
-    if (udsota_iso14229_event(&s_upd, srv, ev, arg, &rc)) {
+    if (udsota_event(srv, ev, arg, &rc)) {
         return rc;
     }
     switch (ev) {
@@ -223,7 +217,7 @@ static UDSErr_t on_event(UDSServer_t *srv, UDSEvent_t ev, void *arg)
     }
 }
 
-/* udsota_iso14229_cfg_t.reset: iso14229 has sent the answer (11 01 or ActivateImage); let its frames leave. */
+/* udsota_cfg_t.reset: iso14229 has sent the answer (11 01 or ActivateImage); let its frames leave. */
 static void do_reset(void *ctx)
 {
     (void)ctx;
@@ -234,14 +228,14 @@ static void do_reset(void *ctx)
     esp_restart();
 }
 
-/* udsota_iso14229_cfg_t.progress: a log line per stage and per tenth of the image. */
+/* udsota_cfg_t.progress: a log line per stage and per tenth of the image. */
 static void on_progress(void *ctx, const udsota_progress_t *p)
 {
     (void)ctx;
     static const char *const stages[] = {"idle", "erasing", "writing", "verifying", "activating"};
     static int last_stage = -1;
     static unsigned last_tenth;
-    const unsigned tenth = udsota_progress_permille(p) / 100u;
+    const unsigned tenth = (p->total != 0u) ? (unsigned)((uint64_t)p->done * 10u / p->total) : 0u;
     if ((int)p->stage != last_stage || tenth != last_tenth) {
         ESP_LOGI(TAG, "update: %s %u/%u (last reason %u)", stages[p->stage % 5u], (unsigned)p->done,
                  (unsigned)p->total, (unsigned)p->last_reason);
@@ -266,35 +260,22 @@ static void server_task(void *arg)
             ESP_LOGW(TAG, "bus-off: recovering");
             (void)twai_node_recover(s_node);
         }
-        udsota_iso14229_poll(&s_upd, &s_srv);
         UDSServerPoll(&s_srv);
     }
 }
 
 static esp_err_t server_start(void)
 {
-    size_t master_len = 0;
-    const uint8_t *master = NULL;
+    const udsota_cfg_t cfg = {
 #if defined(POC_HAVE_MASTER)
-    master = _binary_poc_master_start;
-    master_len = (size_t)(_binary_poc_master_end - _binary_poc_master_start);
+        .key_label = KEY_LABEL, .key_master = _binary_poc_master_start,
+        .key_master_len = (size_t)(_binary_poc_master_end - _binary_poc_master_start),
 #endif
-    const udsota_config_t cfg = {
-        .req_id = REQ_ID, .resp_id = RESP_ID, .level_extended = LEVEL_EXT, .level_programming = LEVEL_PROG,
-        .key_label = (master != NULL) ? KEY_LABEL : NULL, .key_master = master, .key_master_len = master_len,
-        .product = "candash", .hw_id = HW_ID, .layout_id = LAYOUT_ID,
+        .progress = on_progress, .reset = do_reset,
     };
-    udsota_esp32_updater_t port;
-    ESP_RETURN_ON_ERROR(udsota_esp32_updater_start(&cfg, NULL, &port), TAG, "updater");
-
-    const udsota_iso14229_cfg_t bind = {
-        .engine = port.engine, .security = port.security,
-        .device_id = port.device_id, .device_id_len = port.device_id_len,
-        .level_extended = LEVEL_EXT, .level_programming = LEVEL_PROG,
-        .max_block_len = 4095u, .progress = on_progress, .reset = do_reset,
-    };
-    udsota_iso14229_init(&s_upd, &bind);
-
+    if (udsota_init(&cfg) != 0) {
+        ESP_LOGW(TAG, "udsota: no inactive slot or worker; downloads refused");
+    }
     ESP_RETURN_ON_FALSE(UDSServerInit(&s_srv) == UDS_OK, ESP_FAIL, TAG, "UDSServerInit");
     ESP_RETURN_ON_FALSE(UDSServerTpISOTpCInit(&s_tp, REQ_ID, RESP_ID, UDS_TP_NOOP_ADDR) == UDS_OK, ESP_FAIL, TAG,
                         "isotp");
@@ -302,15 +283,14 @@ static esp_err_t server_start(void)
     s_srv.fn = on_event;
     ESP_RETURN_ON_FALSE(xTaskCreatePinnedToCore(server_task, "uds", SERVER_STACK, NULL, SERVER_PRIO, NULL, 0) == pdPASS,
                         ESP_ERR_NO_MEM, TAG, "task");
-    ESP_LOGI(TAG, "iso14229 %s serving udsota's updater on 0x%03X/0x%03X, 0x27 %s", UDS_LIB_VERSION,
-             (unsigned)REQ_ID, (unsigned)RESP_ID, (port.security != NULL) ? "on (HMAC)" : "OFF");
+    ESP_LOGI(TAG, "iso14229 %s serving udsota on 0x%03X/0x%03X, 0x27 %s", UDS_LIB_VERSION, (unsigned)REQ_ID,
+             (unsigned)RESP_ID, (cfg.key_master != NULL) ? "on (HMAC)" : "OFF");
     return ESP_OK;
 }
 
 void app_main(void)
 {
-    udsota_esp32_bootloop_init();
-    ESP_LOGI(TAG, "udsota on iso14229, proof of concept (%s)", esp_app_get_description()->version);
+    ESP_LOGI(TAG, "udsota on iso14229 (%s)", esp_app_get_description()->version);
     esp_err_t err = select_can();
     if (err == ESP_OK) {
         err = can_start();
@@ -323,9 +303,5 @@ void app_main(void)
         return;
     }
     vTaskDelay(pdMS_TO_TICKS(HEALTHY_MS));
-    udsota_esp32_bootloop_mark_healthy();
-    udsota_status_t st;
-    udsota_esp32_status(&st);
-    ESP_LOGI(TAG, "healthy; running slot %u, boot slot %u%s", (unsigned)st.running_slot, (unsigned)st.boot_slot,
-             udsota_esp32_image_unconfirmed() ? ", image not yet confirmed: a reset rolls it back" : "");
+    ESP_LOGI(TAG, "running%s", udsota_unconfirmed() ? "; image not yet confirmed: a reset rolls it back" : "");
 }
