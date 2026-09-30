@@ -43,6 +43,7 @@ typedef struct udsota_updater {
     udsota_upd_config_t cfg;          /* max_block_len resolved */
     udsota_update_t     st;           /* engine, last result and the open download */
     bool                activating;   /* ActivateImage answered positive: the host restarts once the answer is out */
+    bool                end_session;  /* the gate refused a 36: the host ends the session (udsota_upd_take_end_session) */
     bool                job_running;  /* a worker job owns the pending answer; udsota_upd_resume finishes it */
     uint32_t            job_arg;      /* the job's data, e.g. a 36's block length */
     udsota_upd_done_fn  job_done;
@@ -70,8 +71,14 @@ size_t   udsota_upd_read_did(udsota_updater_t *u, uint16_t did, uint8_t *out, si
 
 /* 10 xx: 0 to allow entering session, else the NRC (10 02: slots settled, no job and no transfer, then the gate). */
 uint8_t  udsota_upd_session_nrc(const udsota_updater_t *u, uint8_t session);
-/* Every session entry and S3 timeout: aborts an open download (slot_verified survives). */
+/* Every session entry and S3 timeout: aborts an open download (slot_verified survives) and stops waiting on a
+ * running job, whose worker still finishes it (udsota_upd_busy stays true until then). */
 void     udsota_upd_on_session(udsota_updater_t *u);
+/* The host's cap on a job's wait passed (udsota's server answered 0x72 at 90 s): stops waiting, aborts the download,
+ * and F1F1 records UDSOTA_DL_WORKER_TIMEOUT for a download or an FF01 that was running. */
+void     udsota_upd_job_expired(udsota_updater_t *u);
+/* True once after the gate refused a 36 with anything but 0x21: the host ends the session, as udsota's server did. */
+bool     udsota_upd_take_end_session(udsota_updater_t *u);
 /* The host server ended the transfer on its own (iso14229 does after any 36 or 37 NRC): aborts it if still open. */
 void     udsota_upd_transfer_ended(udsota_updater_t *u);
 /* 11 01's condition: 0x22 while a job or worker runs, else the gate's answer for RESET. */

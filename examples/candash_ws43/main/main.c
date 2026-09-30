@@ -71,6 +71,7 @@ static QueueHandle_t      s_rxq;
 static twai_frame_t       s_tx[TX_SLOTS];       /* the driver keeps each frame until its tx-done event */
 static uint8_t            s_tx_data[TX_SLOTS][8];
 static atomic_uint        s_tx_busy;            /* bit i: s_tx[i] is with the driver */
+static atomic_bool        s_bus_off;            /* set by the ISR; the server task starts the recovery */
 
 static UDSServer_t        s_srv;
 static UDSTpISOTpC_t      s_tp;
@@ -106,6 +107,16 @@ static IRAM_ATTR bool on_tx_done(twai_node_handle_t node, const twai_tx_done_eve
     return false;
 }
 
+static IRAM_ATTR bool on_state_change(twai_node_handle_t node, const twai_state_change_event_data_t *e, void *ctx)
+{
+    (void)node;
+    (void)ctx;
+    if (e->new_sta == TWAI_ERROR_BUS_OFF) {
+        atomic_store(&s_bus_off, true);
+    }
+    return false;
+}
+
 static esp_err_t can_start(void)
 {
     s_rxq = xQueueCreate(RX_QUEUE_LEN, sizeof(rx_frame_t));
@@ -119,7 +130,8 @@ static esp_err_t can_start(void)
         .tx_queue_depth = TX_SLOTS,
     };
     ESP_RETURN_ON_ERROR(twai_new_node_onchip(&cfg, &s_node), TAG, "twai_new_node_onchip");
-    const twai_event_callbacks_t cbs = { .on_rx_done = on_rx_done, .on_tx_done = on_tx_done };
+    const twai_event_callbacks_t cbs = { .on_rx_done = on_rx_done, .on_tx_done = on_tx_done,
+                                         .on_state_change = on_state_change };
     ESP_RETURN_ON_ERROR(twai_node_register_event_callbacks(s_node, &cbs, NULL), TAG, "callbacks");
     const twai_timing_advanced_config_t timing = { .brp = 16, .tseg_1 = 15, .tseg_2 = 4, .sjw = 2 };
     ESP_RETURN_ON_ERROR(twai_node_reconfig_timing(s_node, &timing, NULL), TAG, "bit timing");
@@ -201,6 +213,8 @@ static UDSErr_t on_event(UDSServer_t *srv, UDSEvent_t ev, void *arg)
         }
         return UDS_NRC_RequestOutOfRange;
     }
+    case UDS_EVT_DiagSessCtrl:
+        return UDS_NRC_SubFunctionNotSupported;          /* a session the updater doesn't know */
     case UDS_EVT_SessionTimeout:
     case UDS_EVT_Err:
         return UDS_OK;
@@ -236,17 +250,8 @@ static void on_progress(void *ctx, const udsota_progress_t *p)
     }
 }
 
-static TaskHandle_t s_server_task;
-
-/* The engine's wake: a finished flash job ends the server task's wait at once. */
-static void worker_wake(void)
-{
-    if (s_server_task != NULL) {
-        xTaskNotifyGive(s_server_task);
-    }
-}
-
-/* The server task: request frames into isotp-c, then UDSServerPoll, at least every millisecond. */
+/* The server task: request frames into isotp-c, then UDSServerPoll, at least every millisecond, so a finished
+ * flash job is answered within one; bus-off is recovered here, since the driver refuses to send until then. */
 static void server_task(void *arg)
 {
     (void)arg;
@@ -257,7 +262,11 @@ static void server_task(void *arg)
                 isotp_on_can_message(&s_tp.phys_link, f.data, f.dlc);
             } while (xQueueReceive(s_rxq, &f, 0) == pdTRUE);
         }
-        (void)ulTaskNotifyTake(pdTRUE, 0);
+        if (atomic_exchange(&s_bus_off, false)) {
+            ESP_LOGW(TAG, "bus-off: recovering");
+            (void)twai_node_recover(s_node);
+        }
+        udsota_iso14229_poll(&s_upd, &s_srv);
         UDSServerPoll(&s_srv);
     }
 }
@@ -276,7 +285,7 @@ static esp_err_t server_start(void)
         .product = "candash", .hw_id = HW_ID, .layout_id = LAYOUT_ID,
     };
     udsota_esp32_updater_t port;
-    ESP_RETURN_ON_ERROR(udsota_esp32_updater_start(&cfg, worker_wake, &port), TAG, "updater");
+    ESP_RETURN_ON_ERROR(udsota_esp32_updater_start(&cfg, NULL, &port), TAG, "updater");
 
     const udsota_iso14229_cfg_t bind = {
         .engine = port.engine, .security = port.security,
@@ -291,8 +300,8 @@ static esp_err_t server_start(void)
                         "isotp");
     s_srv.tp = &s_tp.hdl;
     s_srv.fn = on_event;
-    ESP_RETURN_ON_FALSE(xTaskCreatePinnedToCore(server_task, "uds", SERVER_STACK, NULL, SERVER_PRIO, &s_server_task,
-                                                0) == pdPASS, ESP_ERR_NO_MEM, TAG, "task");
+    ESP_RETURN_ON_FALSE(xTaskCreatePinnedToCore(server_task, "uds", SERVER_STACK, NULL, SERVER_PRIO, NULL, 0) == pdPASS,
+                        ESP_ERR_NO_MEM, TAG, "task");
     ESP_LOGI(TAG, "iso14229 %s serving udsota's updater on 0x%03X/0x%03X, 0x27 %s", UDS_LIB_VERSION,
              (unsigned)REQ_ID, (unsigned)RESP_ID, (port.security != NULL) ? "on (HMAC)" : "OFF");
     return ESP_OK;

@@ -354,6 +354,7 @@ int udsota_upd_transfer_data(udsota_updater_t *u, udsota_upd_access_t a, uint8_t
     if (cond != 0u) {
         if (cond != UDSOTA_NRC_BUSY_REPEAT) {
             abort_download(u);
+            u->end_session = true;                       /* ends the session and relocks, as before */
             progress_sync(u);
         }
         return cond;
@@ -608,8 +609,27 @@ uint8_t udsota_upd_session_nrc(const udsota_updater_t *u, uint8_t session)
 
 void udsota_upd_on_session(udsota_updater_t *u)
 {
+    u->job_running = false;
     abort_download(u);
     progress_sync(u);
+}
+
+void udsota_upd_job_expired(udsota_updater_t *u)
+{
+    const bool was = u->st.download_active || u->st.ota_open;
+    u->job_running = false;
+    abort_download(u);
+    if (was) {
+        u->st.last_dl.reason_code = UDSOTA_DL_WORKER_TIMEOUT;   /* an FF01's placeholder already reads it */
+    }
+    progress_sync(u);
+}
+
+bool udsota_upd_take_end_session(udsota_updater_t *u)
+{
+    const bool end = u->end_session;
+    u->end_session = false;
+    return end;
 }
 
 void udsota_upd_transfer_ended(udsota_updater_t *u)

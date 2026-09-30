@@ -30,6 +30,7 @@ typedef struct {
     udsota_iso14229_cfg_t cfg;                /* levels resolved */
     udsota_updater_t      upd;
     uint8_t               job_sid;            /* the SID a pending updater job answers */
+    uint32_t              job_ms;             /* when it started: the wait ends in 0x72 after 90 s */
     bool                  seed_valid;         /* a seed is outstanding (single use, UDSOTA_SA_SEED_VALID_MS) */
     uint8_t               seed_level;
     uint8_t               seed[UDSOTA_SEED_LEN];
@@ -41,5 +42,9 @@ void     udsota_iso14229_init(udsota_iso14229_t *b, const udsota_iso14229_cfg_t 
 /* From the server's fn, before the app's own handling: true when the updater answered the event, with *rc for fn
  * to return; false when the event is the app's (UDS_EVT_SessionTimeout is seen here and still passed). */
 bool     udsota_iso14229_event(udsota_iso14229_t *b, UDSServer_t *srv, UDSEvent_t ev, void *arg, UDSErr_t *rc);
+/* Before every UDSServerPoll, on the server's task. Keeps passed deadlines passed, since iso14229 compares them
+ * with a signed 32-bit difference (without this, 0x27 answers 0x37 from 24.9 to 49.7 days of uptime, and a server
+ * silent that long holds its next answer), and widens iso14229's transfer size to a coded download's bound. */
+void     udsota_iso14229_poll(udsota_iso14229_t *b, UDSServer_t *srv);
 /* The download's progress (udsota_progress_t), for a display. The server's task only. */
 void     udsota_iso14229_progress(const udsota_iso14229_t *b, udsota_progress_t *out);
