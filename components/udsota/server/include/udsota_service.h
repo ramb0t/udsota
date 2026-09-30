@@ -34,8 +34,8 @@ void    udsota_register_service(udsota_server_t *s, const udsota_service_t *svc)
 /* Writes 7F <sid> <nrc>; returns 3, or 0 without writing when resp_max < 3. */
 size_t  udsota_nrc(uint8_t *resp, size_t resp_max, uint8_t sid, uint8_t nrc);
 /* Finishes a handler whose op may have queued worker work. rc == UDSOTA_PENDING starts the wait
- * (poll sends 0x78 from 4/5 of the session's P2, answers 0x72 at 90 s, 0x10 for an app routine, and calls done
- * once the service's poll, or routine_poll for an app routine, reports a result) and returns 0; any other rc calls
+ * (poll sends 0x78 from 4/5 of the session's P2, answers 0x72 at 90 s, 0x10 for an app job, and calls done
+ * once the service's poll, or routine_poll for an app job, reports a result) and returns 0; any other rc calls
  * done(rc) now and returns its answer. arg is stored for done (udsota_job_arg).
  * suppress_pos drops a positive final answer unless a 0x78 went out first. */
 size_t  udsota_job_start(udsota_server_t *s, uint8_t sid, bool suppress_pos, int rc, udsota_job_done_fn done,

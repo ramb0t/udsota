@@ -20,6 +20,14 @@ add_test(NAME udsota_demo_server_no_updater
          COMMAND sh -c "printf '710#021002\\n710#043103A001\\n' | '$<TARGET_FILE:udsota_demo_server>' --no-updater")
 set_tests_properties(udsota_demo_server_no_updater PROPERTIES
                      PASS_REGULAR_EXPRESSION "718#037F1012AAAAAAAA.*718#057103A00100AAAA")
+# The echo service through hooks.request: BA 01 42 answers FA 01 42, BA 81 42 nothing, and BB, which it doesn't serve,
+# 7F BB 11 right after; with --no-updater 34 reaches the hook too (7F 34 11, logged).
+add_test(NAME udsota_demo_server_request
+         COMMAND sh -c "printf '710#03BA0142\\n710#03BA8142\\n710#01BB\\n' | \
+'$<TARGET_FILE:udsota_demo_server>' 2>/dev/null && printf '710#0134\\n' | \
+'$<TARGET_FILE:udsota_demo_server>' --no-updater 2>&1")
+set_tests_properties(udsota_demo_server_request PROPERTIES
+                     PASS_REGULAR_EXPRESSION "718#03FA0142AAAAAAAA\n718#037FBB11AAAAAAAA.*SID 0x34 is not served")
 # --socketcan refuses an interface that is not vcan, before it opens any socket: lo, and a name that does not exist.
 add_test(NAME udsota_demo_server_refuses_real_bus
          COMMAND sh -c "! '$<TARGET_FILE:udsota_demo_server>' --socketcan lo && \

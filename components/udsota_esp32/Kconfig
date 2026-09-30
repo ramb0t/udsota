@@ -7,8 +7,8 @@ menu "udsota ESP32 port"
             On: the port serves firmware updates. RequestDownload, TransferData and RequestTransferExit
             (0x34, 0x36, 0x37), the routines FF01 and F000-F002 and the DIDs F189, F1F0, F1F1 and F1F3
             are udsota's, and a flash worker writes each download to the inactive OTA slot.
-            Off: a UDS server alone. 0x34, 0x36 and 0x37 answer 0x11, and those routines and DIDs go to
-            the app's hooks (0x31 when the app serves none of them; F189 included, which the app can
+            Off: a UDS server alone. 0x34, 0x36 and 0x37, those routines and those DIDs go to the app's
+            hooks (0x11 or 0x31 when the app serves none of them; F189 included, which the app can
             serve from esp_app_get_description()). Everything else works as before. There is no flash
             worker (its stack and 4 KB buffer), no engine, no core updater and no OTA write path
             (esp_ota_begin, write, end and set_boot_partition; ESP-IDF's own esp_partition still links
