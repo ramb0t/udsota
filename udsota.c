@@ -792,7 +792,8 @@ static size_t read_did(const UDSServer_t *srv, uint16_t did, uint8_t *out)
 
 /* ==== 6. iso14229's events ==== */
 
-/* Every session entry and S3 timeout: the download ends on both sides and the seed dies. */
+/* Every session entry and S3 timeout: the download ends on both sides, the seed dies and the lock returns (iso14229
+ * itself relocks only on S3, so an unlock would otherwise outlive 10 01 for good). */
 static void session_changed(UDSServer_t *srv)
 {
     const bool waited = U.job_running && (U.dl_active || U.ota_open || U.job_done == verify_done);   /* the cap, or S3 */
@@ -804,6 +805,7 @@ static void session_changed(UDSServer_t *srv)
     U.seed_valid = false;
     wipe(U.seed, sizeof U.seed);
     srv->xferIsActive = false;
+    srv->securityLevel = 0;
     progress_sync();
 }
 
@@ -812,7 +814,6 @@ static void end_session(UDSServer_t *srv)
 {
     session_changed(srv);
     srv->sessionType = UDS_LEV_DS_DS;
-    srv->securityLevel = 0;
 }
 
 /* Once ActivateImage is positive, the device restarts as its own 11 01 would, once the answer has left. */

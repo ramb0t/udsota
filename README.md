@@ -23,7 +23,7 @@ static UDSErr_t on_event(UDSServer_t *srv, UDSEvent_t ev, void *arg)   // iso142
 }
 ```
 
-The app keeps iso14229 entirely. udsota claims only what an update needs: `10 01/02/03`, `11 01`, `27` levels 01/02 and 03/04 (when keys are set), DIDs F186, F189, F18C and F1F0–F1F3, routines FF01 and F000–F002, a `34` to address 0, and the `36`s and `37` of its own transfer. Every other service, DID, routine, session, security level and transfer (a `34` elsewhere, `35`, `38`) passes back to the app, so it can serve its own fault codes, config writes and file transfers. `udsota_busy()` tells the app when an update is running, and the optional `gate` callback lets it refuse any step, for example while the vehicle moves.
+The app keeps iso14229 entirely. udsota claims only what an update needs: `10 01/02/03`, `11 01`, `27` levels 01/02 and 03/04 (when keys are set), DIDs F186, F189, F18C, F1F0, F1F1 and F1F3, routines FF01 and F000–F002, a `34` to address 0, and the `36`s and `37` of its own transfer. Every other service, DID, routine, session, security level and transfer (a `34` elsewhere, `35`, `38`) passes back to the app, so it can serve its own fault codes, config writes and file transfers. Every `10` relocks every level, the app's included, because iso14229 on its own keeps an unlock across a `10`. `udsota_busy()` tells the app when an update is running, and the optional `gate` callback lets it refuse any step, for example while the vehicle moves.
 
 ## How it fits together
 
@@ -73,7 +73,6 @@ A version is `PROJECT_VER`. A clean `X.Y.Z` is a release, which a device takes o
 iso14229 is used as it is, and these follow from it. They are candidates for upstream fixes.
 
 - S3 restarts only on `10` and `3E`, not on every request, so a tester keeps the session with `3E` (the client sends one whenever 2 s have passed). The one exception udsota makes: while its own flash job runs, it holds the session, for up to 90 s.
-- The security level survives a session change, so `10 01` then `10 02` stays unlocked.
 - iso14229 answers no 0x78 to `27`, and counts one as a failed key. An ECDSA key takes about 0.45 s to check on an ESP32-S3 (P-256 in software), so its answer comes after P2; the client waits 2 s for it.
 - Timers compare as signed 32-bit differences: after 24.9 days of uptime, 0x27 answers 0x37 until day 49.7, and a server idle that long holds its next answer.
 - A `36` resent after its `76` was lost gets 0x24 and ends the transfer; a resent `37` gets 0x70. The positive answer to `10` carries iso14229's client P2 defaults.

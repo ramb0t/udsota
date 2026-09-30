@@ -408,6 +408,7 @@ int main(void)
     EXPECT(B(0x10, 0x02), B(0x50, 0x02));        /* the next event brings udsota in step */
     CHECK(!udsota_busy() && P.aborts == aborts + 1);
     EXPECT(B(0x22, 0xF1, 0xF1), B(0x62, 0xF1, 0xF1, UDSOTA_DL_ABORTED, 0, 0, 0x0F, 0xFD));
+    unlock(0x03);                                 /* every 10 relocks */
 
     /* 10 02 is refused while a transfer is open; 37 before every byte is 0x24 and ends it. */
     request_download(sizeof img, 0x00);
@@ -506,7 +507,10 @@ int main(void)
 
     /* A worker that never finishes: udsota holds the session through FF01's 0x78s until its 90 s cap answers 0x72;
      * F1F1 says why, and the programming session stays refused until the worker is idle again. */
-    EXPECT(B(0x10, 0x02), B(0x50, 0x02));        /* still unlocked: iso14229 keeps the level across 10 02 */
+    EXPECT(B(0x10, 0x01), B(0x50, 0x01));        /* every 10 relocks: the level-03 unlock above ends at 10 01 */
+    EXPECT(B(0x10, 0x02), B(0x50, 0x02));
+    EXPECT(B(0x34, 0x00, 0x44, 0, 0, 0, 0, 0, 0, 0x10, 0), B(0x7F, 0x34, 0x33));
+    unlock(0x03);
     request_download(sizeof img, 0x00);
     send_all(img, sizeof img);
     EXPECT(B(0x37), B(0x77));
