@@ -259,3 +259,14 @@ uint32_t udsota_esp32_ctl_ticks(uint32_t ms, uint32_t tick_hz)
     }
     return (t > UINT32_MAX) ? UINT32_MAX : (uint32_t)t;
 }
+
+/* 11-bit and distinct IDs, the functional one only when set; see udsota_esp32_ctl.h. */
+bool udsota_esp32_ctl_ids_ok(const udsota_config_t *cfg)
+{
+    if (cfg->req_id > UDSOTA_ESP32_CTL_ID_MAX || cfg->resp_id > UDSOTA_ESP32_CTL_ID_MAX ||
+        cfg->req_id == cfg->resp_id) {
+        return false;
+    }
+    return cfg->func_id == 0u || (cfg->func_id <= UDSOTA_ESP32_CTL_ID_MAX && cfg->func_id != cfg->req_id &&
+                                  cfg->func_id != cfg->resp_id);
+}

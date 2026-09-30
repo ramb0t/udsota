@@ -44,6 +44,19 @@ _Static_assert(UDSOTA_ESP32_VERSION_MAX == UDSOTA_ESP32_CTL_VERSION_MAX, "the co
 #else
 #define STACK_CAPS (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
 #endif
+#if defined(CONFIG_UDSOTA_ESP32_DEBUG_MEASURE)
+/* Where BUF_CAPS and STACK_CAPS put the buffers and the stack, for the start log. */
+#if defined(CONFIG_UDSOTA_ESP32_BUFS_PSRAM)
+#define BUF_WHERE   "PSRAM"
+#else
+#define BUF_WHERE   "internal"
+#endif
+#if defined(CONFIG_UDSOTA_ESP32_TASK_STACK_PSRAM)
+#define STACK_WHERE "PSRAM"
+#else
+#define STACK_WHERE "internal"
+#endif
+#endif
 
 /* One received request frame and the microsecond the app received it, or a wake from the flash worker. */
 typedef struct {
@@ -246,7 +259,7 @@ esp_err_t udsota_esp32_start(const udsota_config_t *cfg, const udsota_hooks_t *h
     if (cfg == NULL || can == NULL || can->can_send == NULL ||
         !udsota_esp32_devid_len_ok(cfg->device_id, cfg->device_id_len) ||
         (cfg->key_pubkey != NULL && !udsota_esp32_sa_pubkey_ok(cfg->key_pubkey, cfg->key_pubkey_len)) ||
-        (cfg->func_id != 0u && (cfg->func_id == cfg->req_id || cfg->func_id == cfg->resp_id))) {
+        !udsota_esp32_ctl_ids_ok(cfg)) {
         return ESP_ERR_INVALID_ARG;
     }
     if (s_started) {
@@ -288,6 +301,9 @@ esp_err_t udsota_esp32_start(const udsota_config_t *cfg, const udsota_hooks_t *h
                                                                  s_cfg.key_master_len, s_cfg.device_id,
                                                                  s_cfg.device_id_len)
         : NULL;
+    if (sec == NULL) {
+        ESP_LOGW(TAG, "security off: no cfg.key_pubkey or cfg.key_label, so 0x27 answers 0x11 and nothing needs a key");
+    }
     udsota_esp32_devid_serve(dev, &s_cfg);       /* F18C serves the stored bytes the key hashes */
 #if configTICK_RATE_HZ < 1000
     ESP_LOGW(TAG, "CONFIG_FREERTOS_HZ=%d: the diag task wakes in %d ms steps; 1000 keeps the first 0x78 well "
@@ -313,12 +329,12 @@ esp_err_t udsota_esp32_start(const udsota_config_t *cfg, const udsota_hooks_t *h
     const udsota_engine_t *eng = udsota_esp32_engine();   /* NULL without the updater: no worker and no slot */
     if (eng != NULL) {
         ESP_LOGI(TAG, "on 0x%03" PRIX32 "/0x%03" PRIX32 ": internal heap -%d B (worker and keys included), "
-                 "PSRAM %u B buffers + %d B stack, slot %" PRIu32 " B",
+                 "%u B buffers in " BUF_WHERE " + %d B stack in " STACK_WHERE ", slot %" PRIu32 " B",
                  (uint32_t)s_cfg.req_id, (uint32_t)s_cfg.resp_id, (int)int_before - (int)int_after,
                  (unsigned)sizeof *bufs, CONFIG_UDSOTA_ESP32_TASK_STACK, eng->slot_size);
     } else {
         ESP_LOGI(TAG, "on 0x%03" PRIX32 "/0x%03" PRIX32 ": internal heap -%d B (keys included; no updater, so no "
-                 "worker), PSRAM %u B buffers + %d B stack",
+                 "worker), %u B buffers in " BUF_WHERE " + %d B stack in " STACK_WHERE,
                  (uint32_t)s_cfg.req_id, (uint32_t)s_cfg.resp_id, (int)int_before - (int)int_after,
                  (unsigned)sizeof *bufs, CONFIG_UDSOTA_ESP32_TASK_STACK);
     }
