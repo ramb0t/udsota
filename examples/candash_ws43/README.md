@@ -10,11 +10,13 @@ Over PCAN at 250 kbit/s, with this branch's client and CANDash's profile (HMAC 0
 
 | Update | Server that took it | Result |
 |---|---|---|
-| CANDash v0.4.1-21 → lite.1, DEFLATE | udsota's own, in CANDash | 197 KB in 61.2 s; lite answered F1F0 and F002 confirmed it |
-| lite.1 → lite.2, DEFLATE | lite on iso14229 | 197 KB in 23.6 s, activated, restarted, confirmed |
+| CANDash v0.4.1-21 → lite.1, DEFLATE | udsota's own, in CANDash | 198 KB in 61.4 s; lite answered F1F0 and F002 confirmed it |
+| lite.1 → lite.2, plain (DFI 00) | lite on iso14229 | 332 KB, activated, restarted, confirmed |
+| lite.2 → lite.1, DEFLATE | lite | 198 KB in 23.6 s, confirmed |
 | `info`, and a keyed `reset` (10 03, 27 01/02, 11 01) | lite | Served; the device restarted |
-| lite.2 → lite.1, DEFLATE; then lite.1 → lite.2, plain (DFI 00) | lite | Both activated and confirmed |
-| lite.2 → CANDash v0.4.1-21 (rebuilt), DEFLATE | lite | 1.25 MB as 690 KB in 82.2 s. CANDash confirmed, and its config hash was unchanged |
+| lite.1 → CANDash v0.4.1-21 (rebuilt), DEFLATE | lite | 1.25 MB as 692 KB in 83.2 s. CANDash confirmed, and its config hash was unchanged |
+
+The same round trip had passed on the code before its review, which went through CANDash's updater, lite in both formats, and back.
 
 ## Build and run
 
