@@ -1,36 +1,32 @@
-# udsota on iso14229: proof of concept
+# CANDash ws43 example
 
-This branch reduces udsota to its firmware updater and runs it on [iso14229](https://github.com/driftregion/iso14229)'s UDS server in place of udsota's own. This example is a CANDash ws43 image: CANDash's own updater installs it over CAN, and it installs CANDash back. An iso14229 user adopts the updater by calling `udsota_iso14229_event()` first from the event callback they already have.
+This is udsota's updater and iso14229's server in one ESP-IDF project, for the CANDash ws43 (Waveshare ESP32-S3-Touch-LCD-4.3). It uses CANDash's image identity: project `candash`, hw_id 1, layout 1, CAN IDs 0x7E6/0x7EE. So CANDash's own updater installs it, and it installs CANDash back. The [top-level README](../../README.md) explains how the pieces fit.
 
-## What ran on the bench (2026-09-30)
+Besides the integration, `main/main.c` sets up the board's CAN. It runs TWAI on GPIO20/19 at 250 kbit/s, and the CAN transceiver shares those pins with USB, so it sets the CH422G expander's EXIO5 to select CAN.
 
-On a CANDash ws43 over PCAN at 250 kbit/s, with the unmodified udsota 0.10 client and CANDash's profile (HMAC 0x27, signed images, rollback on):
+## Bench results (2026-09-30)
 
-| Step | Server | Result |
+These ran over PCAN at 250 kbit/s, using the unchanged udsota 0.10 client and CANDash's profile (HMAC 0x27, signed images, rollback on):
+
+| Update | Server that took it | Result |
 |---|---|---|
-| CANDash v0.4.1-16 → PoC .1, DEFLATE | udsota's own (CANDash) | installed; the PoC's iso14229 server answered F1F3 and F1F0 and confirmed with F002 |
-| PoC .1 → PoC .2, DEFLATE | iso14229 | 207 KB in 23.4 s, activated, restarted, confirmed |
-| `info`, keyed `reset` (10 03, 27 01/02, 11 01) | iso14229 | served; restarted |
-| PoC .2 → PoC .1, plain (DFI 00) | iso14229 | activated, confirmed |
-| PoC .1 → CANDash v0.4.1-16, DEFLATE | iso14229 | 689 KB in 77.6 s; CANDash confirmed, its config hash unchanged |
+| CANDash v0.4.1-16 → this example (.1), DEFLATE | udsota's own, in CANDash | Installed. The iso14229 server answered F1F3 and F1F0, and F002 confirmed the image |
+| .1 → .2, DEFLATE | iso14229 | 207 KB in 23.4 s, activated, restarted, confirmed |
+| `info`, and a keyed `reset` (10 03, 27 01/02, 11 01) | iso14229 | Served; the device restarted |
+| .2 → .1, plain (DFI 00) | iso14229 | Activated, confirmed |
+| .1 → CANDash v0.4.1-16, DEFLATE | iso14229 | 689 KB in 77.6 s. CANDash confirmed, and its config hash was unchanged |
 
-After a review, the same round trip ran again with the fixed binding (PoC .3 and .4, a keyed reset, CANDash restored). Delta downloads (DFI 0x20/0x30) were not run: the client's `--diff-from` needs `detools`, which the bench host lacks. `test/test_poc_e2e.c` covers the rest on the host: iso14229 on its mock transport with a RAM engine and a clock the test sets (`cmake -S . -B build && cmake --build build && ctest --test-dir build`).
-
-## How it fits together
-
-`components/iso14229` is the upstream amalgamation as a submodule. `components/udsota_iso14229` maps iso14229's events onto the updater (`udsota_update.h`, which no longer knows any server) and adds what iso14229 leaves to the app: relock and abort on every session change, the 10 02 slot rule, the 0x27 key check, the 90 s job cap, and S3 restarted by every request. The app calls `udsota_iso14229_poll()` before each `UDSServerPoll()`: iso14229 compares deadlines with a signed 32-bit difference and sets its 0x27 boot delay once, so without it 0x27 answers 0x37 from 24.9 to 49.7 days of uptime and a server idle that long holds its next answer. `components/udsota_esp32` keeps the engine, security and boot-loop counter, and `udsota_esp32_updater_start()` hands them to the binding. `main/main.c` owns the TWAI node, the server task and the callback, as any iso14229 app does.
-
-## What a tester sees that differs from udsota's own server
-
-Every 36 answers 7F 36 78 before 76, since a queued flash write is iso14229's pending case. A resent 36 whose 76 was lost gets 0x24 and the transfer ends, where udsota answered 76 again, and any NRC to a 36 or 37 ends the transfer. A 36 or 37 with no transfer open gets 0x70, not 0x24, so a resent 37 whose 77 was lost now fails the client's update. A suppressed-response 31 81 FF01 loses its verdict even after a 0x78, iso14229 answers 0x36 rather than 0x37 inside its 0x27 delay, and its 0x38 handler resends the previous answer on a refusal. The 0x27 boot delay is 1 s and each wrong key costs 1 s, in place of 10 s and a lockout after three. F1F2's counters, the STmin monitor, functional addressing and the app hooks (19, 14, 28, 85, 2E, app routines) are gone; an app serves those in its own callback. The binding papers over three iso14229 gaps: its S3 restarts only on 10 and 3E, its 10 xx answer carries its client's P2 defaults, and it keeps the security level across a session change.
+After a review, the same round trip ran again with the fixed binding (.3 and .4, then a keyed reset, then CANDash restored). Delta downloads were not run, because the client's `--diff-from` needs `detools` and the bench host doesn't have it. The host end-to-end test covers the rest.
 
 ## Build and run
 
-Link or copy CANDash's git-ignored `secrets/` here (the signing key and the 0x27 master), then:
+Link or copy CANDash's git-ignored `secrets/` here: the signing key and the 0x27 master. Without the master, 0x27 is off. Then:
 
 ```sh
 git submodule update --init
-idf.py -B build build                                    # PoC 0.4.1-iso14229.1
+idf.py -B build build                                    # version 0.4.1-iso14229.1
 idf.py -B build-v2 -DPOC_VER=0.4.1-iso14229.2 build      # a second image to update to
 python -m udsota --profile <CANDash>/tools/udsota-candash.toml flash build/candash.bin
 ```
+
+On the bench, CANDash installed the first image over CAN. The version keeps CANDash's `0.4.1` core because a device takes a dev build only when its core is at least the running one's.
