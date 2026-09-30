@@ -31,7 +31,6 @@
 #include "esp_private/flash_mmap.h"   /* MMAP_EXECUTABLES_FROM_FLASH, flash_mmap_remain(): logged only */
 #endif
 
-#include "udsota_esp32_ctl.h"
 #include "udsota_esp32_image.h"
 #include "udsota_esp32_priv.h"
 #if CONFIG_UDSOTA_ESP32_COMPRESSION
@@ -55,8 +54,6 @@ _Static_assert(offsetof(esp_image_segment_header_t, data_len) == 4u, "segment 0 
 _Static_assert(offsetof(esp_app_desc_t, version) == 16u && offsetof(esp_app_desc_t, project_name) == 48u,
                "esp_app_desc_t version and project_name");
 _Static_assert(sizeof(((esp_app_desc_t *)0)->version) == UDSOTA_ESP32_VERSION_MAX, "the incoming version's size");
-_Static_assert(sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t) + offsetof(esp_app_desc_t, version) ==
-               UDSOTA_ESP32_CTL_VERSION_OFF, "where the control block reads the incoming version");
 _Static_assert(ESP_IMAGE_HEADER_MAGIC == 0xE9 && ESP_IMAGE_MAX_SEGMENTS == 16 &&
                ESP_IMAGE_SPI_MODE_SLOW_READ == 5 && ESP_APP_DESC_MAGIC_WORD == 0xABCD5432u,
                "the constants udsota_esp32_image.c copies");
@@ -1156,11 +1153,9 @@ static void engine_start(const udsota_config_t *cfg)
              s_ctx.hw_id);
 }
 
-/* See udsota_esp32_priv.h: the one call the diag task's start makes into the updater. */
-bool udsota_esp32_server_init(udsota_server_t *srv, const udsota_config_t *cfg, const udsota_security_t *sec,
-                              const udsota_hooks_t *hooks, void (*wake)(void))
+/* See udsota_esp32_priv.h: starts the engine once for whatever server drives it. */
+void udsota_esp32_engine_start(const udsota_config_t *cfg, void (*wake)(void))
 {
     engine_set_wake(wake);
     engine_start(cfg);                          /* logs its own failures; the engine then refuses downloads */
-    return udsota_init(srv, cfg, udsota_esp32_engine(), sec, hooks);
 }

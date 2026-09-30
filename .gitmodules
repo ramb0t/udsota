@@ -1,0 +1,3 @@
+[submodule "components/iso14229/iso14229"]
+	path = components/iso14229/iso14229
+	url = https://github.com/driftregion/iso14229

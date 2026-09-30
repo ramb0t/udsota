@@ -1,6 +1,6 @@
-/* The updater's types the server context embeds or names: its state (udsota_update_t), the engine, the download
- * reason codes, the F1F0 and F1F1 records and the progress report. Self-contained (only stdint, stddef and stdbool), so a server-only build
- * can take this one updater header alone. udsota_update_wire.h holds the rest of the updater's wire contract. */
+/* The updater's types: its download state (udsota_update_t), the engine, the download reason codes, the F1F0 and
+ * F1F1 records and the progress report. Self-contained (only stdint, stddef and stdbool). udsota_update_wire.h holds
+ * the rest of the updater's wire contract. */
 #pragma once
 #include <stdbool.h>
 #include <stddef.h>
@@ -119,18 +119,16 @@ typedef struct {   /* required; only unverify, status, running_sha, version and 
                                                      whatever zbegin is */
 } udsota_engine_t;
 
-/* The updater's state, the server context's `update` member. */
+/* The download's state, udsota_updater_t's `st` member (udsota_update.h). */
 typedef struct {
     udsota_engine_t   engine;            /* udsota_init's engine, copied */
-    udsota_result_t   last_dl;           /* F1F1, answered by the server itself */
+    udsota_result_t   last_dl;           /* F1F1 */
     uint32_t          dl_announced;      /* memorySize from 0x34 */
     uint32_t          dl_received;       /* data bytes accepted; the offset engine.write gets (coded bytes with
                                             dl_compressed) */
     uint32_t          dl_written;        /* image bytes written in this download, udsota_progress_t.done: set by the
                                             34 and advanced with dl_received after each 76. A download whose 36s carry
                                             other than image bytes (a coded one) sets it from the engine's count */
-    uint32_t          cf_median_us;      /* 64-CF median from the last FC point (UDSOTA_CF_MEDIAN_NONE before one) */
-    uint32_t          cf_stmin_us;       /* the STmin that FC point judged it against */
     bool              download_active;   /* between an accepted 0x34 and 0x37 or an abort */
     bool              ota_open;          /* the engine holds an open image: from the first 0x36's begin (from the 34's
                                             zbegin when coded) to FF01 or an abort */

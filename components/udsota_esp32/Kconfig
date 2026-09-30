@@ -1,34 +1,13 @@
 menu "udsota ESP32 port"
 
-    config UDSOTA_ESP32_UPDATER
-        bool "Firmware updater (RequestDownload and the flash worker)"
-        default y
-        help
-            On: the port serves firmware updates. RequestDownload, TransferData and RequestTransferExit
-            (0x34, 0x36, 0x37), the routines FF01 and F000-F002 and the DIDs F189, F1F0, F1F1 and F1F3
-            are udsota's, and a flash worker writes each download to the inactive OTA slot.
-            Off: a UDS server alone. 0x34, 0x36 and 0x37 answer 0x11, and those routines and DIDs go to
-            the app's hooks (0x31 when the app serves none of them; F189 included, which the app can
-            serve from esp_app_get_description()). Everything else works as before. There is no flash
-            worker (its stack and 4 KB buffer), no engine, no core updater and no OTA write path
-            (esp_ota_begin, write, end and set_boot_partition; ESP-IDF's own esp_partition still links
-            esp_ota_get_running_partition), and a partition table with only a factory app works.
-            udsota_esp32_engine() returns NULL, udsota_esp32_engine_busy() false,
-            udsota_esp32_image_unconfirmed() false without reading the OTA state (with rollback on,
-            confirming an image is then the other updater's job), udsota_esp32_status() no slots,
-            udsota_esp32_progress() IDLE and udsota_esp32_incoming_version() "". The ISO-TP
-            buffers stay sized for a download block.
-
     config UDSOTA_ESP32_WORKER_CORE
         int "Flash worker core"
-        depends on UDSOTA_ESP32_UPDATER
         range 0 0 if FREERTOS_UNICORE
         range 0 1
         default 0
 
     config UDSOTA_ESP32_WORKER_PRIO
         int "Flash worker priority"
-        depends on UDSOTA_ESP32_UPDATER
         range 1 24
         default 3
         help
@@ -37,7 +16,6 @@ menu "udsota ESP32 port"
 
     config UDSOTA_ESP32_WORKER_STACK
         int "Flash worker stack (bytes)"
-        depends on UDSOTA_ESP32_UPDATER
         range 4096 32768
         default 8192
         help
@@ -46,7 +24,6 @@ menu "udsota ESP32 port"
 
     config UDSOTA_ESP32_COMPRESSION
         bool "Compressed downloads (RequestDownload DFI 0x10, raw DEFLATE)"
-        depends on UDSOTA_ESP32_UPDATER
         default n
         help
             Serve downloads whose 0x36 blocks carry a raw DEFLATE stream of the image. The flash worker
@@ -97,54 +74,5 @@ menu "udsota ESP32 port"
             diag task's stack headroom and internal-heap low-water mark, the heap the start took, and a
             warning when flash writes run with the cache off, which on a build running code from flash is
             every download.
-
-    config UDSOTA_ESP32_TASK_CORE
-        int "Diag task core"
-        range 0 0 if FREERTOS_UNICORE
-        range 0 1
-        default 0
-        help
-            Core of the task that owns the ISO-TP link and the UDS server. Put it on the core
-            of the app's CAN task.
-
-    config UDSOTA_ESP32_TASK_PRIO
-        int "Diag task priority"
-        range 1 24
-        default 5
-        help
-            Below the app's CAN task and above its other tasks and the flash worker, so flow control,
-            0x78 and TesterPresent answers keep flowing during an erase.
-
-    config UDSOTA_ESP32_TASK_STACK
-        int "Diag task stack (bytes)"
-        range 4096 16384
-        default 6144
-        help
-            The task also runs the 0x27 key check: a PSA HMAC, or in the ECDSA mode (cfg.key_pubkey) a
-            P-256 signature verify, which needs more. In that mode, check the headroom with
-            UDSOTA_ESP32_DEBUG_MEASURE after an unlock.
-
-    config UDSOTA_ESP32_TASK_STACK_PSRAM
-        bool "Diag task stack in PSRAM"
-        depends on SPIRAM && FREERTOS_TASK_CREATE_ALLOW_EXT_MEM
-        default y
-        help
-            Safe because the diag task never touches flash: the engine's worker makes every
-            esp_ota_* call.
-
-    config UDSOTA_ESP32_BUFS_PSRAM
-        bool "ISO-TP, request and response buffers in PSRAM"
-        depends on SPIRAM
-        default y
-        help
-            8,958 B, touched only by the diag task with the cache on.
-
-    config UDSOTA_ESP32_RX_QUEUE_LEN
-        int "Request frame queue depth"
-        range 8 256
-        default 32
-        help
-            Frames udsota_esp32_on_frame() holds for the diag task, in internal RAM:
-            32 is 64 ms of consecutive frames at STmin 2 ms.
 
 endmenu

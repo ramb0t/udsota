@@ -1,5 +1,7 @@
 # udsota
 
+> **Branch `poc/iso14229`: an experiment, not for merge.** udsota's own UDS server is removed and its firmware updater runs on [iso14229](https://github.com/driftregion/iso14229) instead; [examples/candash_ws43](examples/candash_ws43/README.md) has the design and the bench results. The rest of this README describes `main`.
+
 [![ci](https://github.com/ramb0t/udsota/actions/workflows/ci.yml/badge.svg)](https://github.com/ramb0t/udsota/actions/workflows/ci.yml)
 
 **A device's UDS server over CAN, with firmware update as its main service.**
