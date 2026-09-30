@@ -1104,9 +1104,9 @@ const udsota_engine_t *udsota_esp32_engine(void)
 
 /* Starts the engine once, before anything uses it. Creates the flash worker (Kconfig core, priority and stack;
  * internal RAM; off the task watchdog), its 4 KB block buffer and job queue. Takes the image identity from cfg
- * (product, hw_id, layout_id, req_id, resp_id; the product string must stay valid), the running version from
- * esp_app_desc and the release flag from udsota_image_desc, and puts the inactive slot's size in
- * udsota_esp32_engine()->slot_size. The worker reads the OTA state before its first job. Idempotent. A failed
+ * (product, hw_id, layout_id, req_id, resp_id; the product string must stay valid) and allow_downgrade, the
+ * running version from esp_app_desc and the release flag from udsota_image_desc, and puts the inactive slot's
+ * size in udsota_esp32_engine()->slot_size. The worker reads the OTA state before its first job. Idempotent. A failed
  * allocation or a missing inactive slot is logged, and every download is then refused. Links against
  * udsota_image_desc, so the app places one with UDSOTA_ESP32_IMAGE_DESC. */
 static void engine_start(const udsota_config_t *cfg)
@@ -1128,6 +1128,7 @@ static void engine_start(const udsota_config_t *cfg)
         .diag_response_id = cfg->resp_id,
         .running_version = {0, 0, 0},
         .running_is_release = false,
+        .allow_older = cfg->allow_downgrade,
         .slot_size = (s_target != NULL) ? s_target->size : 0u,
         .product = cfg->product,
     };

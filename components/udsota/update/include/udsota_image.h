@@ -19,6 +19,7 @@ typedef struct {
      * UDSOTA_IMG_FLAG_RELEASE. False for an rc, describe-suffix or dirty build, which SemVer orders below
      * the release of the same core. */
     bool     running_is_release;
+    bool     allow_older;           /* true skips the version rule (UDSOTA_DL_NOT_NEWER) only; false, the default, keeps it */
     uint32_t slot_size;             /* target partition size */
     const char *product;            /* expected esp_app_desc_t project_name, matched exactly; NULL = not checked */
 } udsota_image_ctx_t;
@@ -34,8 +35,9 @@ typedef struct {
  * descriptor release flag that disagrees with the string being a clean "[v]M.m.p", is UDSOTA_DL_BAD_HEADER.
  * By SemVer precedence a release is accepted when its core is newer than the running core, or equal to it
  * while the running image is not a release; a dev build needs a core at least equal. Otherwise
- * UDSOTA_DL_NOT_NEWER. *is_release_out (may be NULL) is written false on entry, then set to the
- * descriptor's release flag once its magic and desc_version check out. */
+ * UDSOTA_DL_NOT_NEWER, unless ctx->allow_older, which skips this one rule and no other. *is_release_out
+ * (may be NULL) is written false on entry, then set to the descriptor's release flag once its magic and
+ * desc_version check out. */
 udsota_reason_t udsota_image_check(const uint8_t *buf, size_t len, uint32_t announced_size,
                                             const udsota_image_ctx_t *ctx, bool *is_release_out);
 

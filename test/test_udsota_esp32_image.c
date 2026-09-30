@@ -200,6 +200,18 @@ static void test_header_then_core_rules(void)
 }
 
 /* Runs the Unity tests in this file. */
+/* The port's check hands ctx->allow_older to the core: an older dev build refused with it clear is accepted
+ * with it set, and a bad header still wins. */
+static void test_allow_older_passes_through(void)
+{
+    ctx.running_version[0] = 2;
+    TEST_ASSERT_EQUAL_INT(UDSOTA_DL_NOT_NEWER, check());
+    ctx.allow_older = true;
+    TEST_ASSERT_EQUAL_INT(UDSOTA_DL_OK, check());
+    img[0] = 0xEA;
+    TEST_ASSERT_EQUAL_INT(UDSOTA_DL_BAD_HEADER, check());
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -213,5 +225,6 @@ int main(void)
     RUN_TEST(test_bad_app_desc_magic);
     RUN_TEST(test_chip_id_is_a_parameter);
     RUN_TEST(test_header_then_core_rules);
+    RUN_TEST(test_allow_older_passes_through);
     return UNITY_END();
 }

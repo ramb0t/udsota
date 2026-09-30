@@ -273,6 +273,7 @@ bool demo_engine_open(demo_engine_t *e, const char *dir, uint32_t slot_size, boo
         .partition_layout_id = cfg->layout_id,
         .diag_request_id = cfg->req_id,
         .diag_response_id = cfg->resp_id,
+        .allow_older = cfg->allow_downgrade,
         .slot_size = slot_size,
         .product = cfg->product,
     };

@@ -4,6 +4,8 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ## [Unreleased]
 
+- Core: `udsota_config_t.allow_downgrade` (port) and `udsota_image_ctx_t.allow_older` let a build accept an older or same-version image; every other first-block check still applies. Off by default, and nothing changes on the wire with it off. Not breaking.
+
 ## [0.11.0] - 2026-09-30
 
 Apps get three new hooks, `did_read_ex`, `routine_ex` and `request`, to answer DIDs and routines with NRCs of their own in any session and to serve SIDs the core doesn't; a generic tester can download with any 1–4 byte ALFID, and the ISO-TP buffer sizes can be set at build time. **Breaking** for builds without the updater: 10 02 answers 0x12.
