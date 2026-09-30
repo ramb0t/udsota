@@ -149,6 +149,14 @@ static int w_routine_ex(void *ctx, uint8_t sub, uint16_t rid, const uint8_t *in,
     return ctl->app.routine_ex(ctl->app.ctx, sub, rid, in, in_len, out, out_max, out_len, access);
 }
 
+/* request hook: the app's request with the app's ctx (installed only when the app has one). */
+static int w_request(void *ctx, const uint8_t *req, size_t len, uint8_t *out, size_t out_max, size_t *out_len,
+                     udsota_access_t access)
+{
+    const udsota_esp32_ctl_t *ctl = ctx;
+    return ctl->app.request(ctl->app.ctx, req, len, out, out_max, out_len, access);
+}
+
 /* Copies the app's hooks and builds the wrapped set (see the header). */
 void udsota_esp32_ctl_init(udsota_esp32_ctl_t *ctl, const udsota_hooks_t *app,
                            bool (*default_reset)(void *ctx), udsota_hooks_t *out)
@@ -181,6 +189,7 @@ void udsota_esp32_ctl_init(udsota_esp32_ctl_t *ctl, const udsota_hooks_t *app,
         .dtc_clear    = (ctl->app.dtc_clear != NULL) ? w_dtc_clear : NULL,
         .did_read_ex  = (ctl->app.did_read_ex != NULL) ? w_did_read_ex : NULL,
         .routine_ex   = (ctl->app.routine_ex != NULL) ? w_routine_ex : NULL,
+        .request      = (ctl->app.request != NULL) ? w_request : NULL,
     };
 }
 

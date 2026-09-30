@@ -11,6 +11,7 @@ import time
 
 import pytest
 from udsoncan import services
+from udsoncan.BaseService import BaseService
 
 from udsota import cli, delta, pack, profile, transport, update, wire
 from udsota.errors import NoResponse, Nrc, SendFailed
@@ -864,3 +865,70 @@ def test_self_test_routine_through_routine_ex(demo, args):
     assert (again.value.code, stopped.value.code) == (0x24, 0x24)
     assert updater_rid.value.code == (0x31 if args else 0x7F)       # without the updater FF01 is the app's: 0x31
     assert "self-test started" in s.log() and "self-test stopped" in s.log()
+
+
+# ---- the app's own service through hooks.request ----
+
+# The demo's echo service, SID BA, as a udsoncan service, so the client's Uds layer sends it and parses its answers
+# (its README): 01 echoes at once, 02 after 0x78s.
+class Echo(BaseService):
+    _sid = 0xBA
+    _use_subfunction = True
+    supported_negative_response = [0x12, 0x13, 0x14]
+
+
+# A SID the demo serves nowhere, which its request hook answers 0x11.
+class Unserved(BaseService):
+    _sid = 0xBB
+    _use_subfunction = False
+    supported_negative_response = []
+
+
+# Check the echo through request: the answer is framed with SID + 0x40 (FA) and carries the sub-function and bytes;
+# an unknown sub-function is 0x12, with SPRMIB too, since an NRC is never suppressed; BA 81 gets no answer at all (the
+# hook's UDSOTA_NO_ANSWER), and the server answers the next request as usual.
+def test_echo_through_request(demo):
+    s = demo()
+    with PipeTransport(EXAMPLE, s) as t:
+        uds = t.uds()
+        assert uds.request(Echo, 0x01, b"\x42\x43") == b"\x01\x42\x43"
+        assert uds.request(Echo, 0x01) == b"\x01"
+        with pytest.raises(Nrc) as bad_sub:
+            uds.request(Echo, 0x03, b"\x42")
+        with pytest.raises(Nrc) as bad_sub_spr:
+            uds.request(Echo, 0x83, b"\x42")
+        with pytest.raises(NoResponse):
+            uds.request(Echo, 0x81, b"\x45")
+        assert uds.request(Echo, 0x01, b"\x44") == b"\x01\x44"
+    assert (bad_sub.value.code, bad_sub_spr.value.code) == (0x12, 0x12)
+    assert not [m for m in s.sent if bytes(m.data[:4]) == bytes([0x03, 0xFA, 0x01, 0x45])]
+
+
+# Check the slow echo: the hook's UDSOTA_PENDING is an app job, so the server answers 0x78 first and the answer
+# routine_poll finishes arrives after it, framed by the core; with SPRMIB set it is still sent, since the core can't
+# tell a pending request's SPRMIB from a data byte.
+def test_slow_echo_answers_after_0x78(demo):
+    s = demo()
+    with PipeTransport(EXAMPLE, s) as t:
+        uds = t.uds()
+        assert uds.request(Echo, 0x02, b"\x42") == b"\x02\x42"
+        assert uds.request(Echo, 0x82, b"\x43") == b"\x02\x43"
+    assert len([m for m in s.sent if bytes(m.data[:4]) == bytes([0x03, 0x7F, 0xBA, 0x78])]) >= 2
+    assert s.log().count("slow echo answered") == 2
+
+
+# Check a SID nobody serves still answers 0x11, now through the demo's request hook, which logs it; and that 34
+# reaches the hook only without the updater: with it, the updater answers 0x7F in the default session and the hook
+# never hears of it.
+@pytest.mark.parametrize("args", [[], ["--no-updater"]])
+def test_unknown_sid_and_34_through_request(demo, args):
+    s = demo(*args)
+    with PipeTransport(EXAMPLE, s) as t:
+        uds = t.uds()
+        with pytest.raises(Nrc) as unserved:
+            uds.request(Unserved)
+        with pytest.raises(Nrc) as download:
+            uds.request_download(4096)
+    assert unserved.value.code == 0x11 and "SID 0xBB is not served" in s.log()
+    assert download.value.code == (0x11 if args else 0x7F)
+    assert ("SID 0x34 is not served" in s.log()) == bool(args)

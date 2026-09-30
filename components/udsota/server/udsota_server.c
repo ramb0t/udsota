@@ -1,8 +1,8 @@
 /* Pure UDS server core: sessions, S3, SecurityAccess, routines, reset, 0x2E, 0x19 and 0x14 through the app's hooks,
  * and the worker-job wait, behind the security and hooks the integrator passes to udsota_core_init; SIDs, RIDs and
  * DIDs the core doesn't own go to the one registered service (udsota_service.h), such as the firmware updater
- * (update/udsota_update.c). The core never names a service. No ESP-IDF: the transport feeds it reassembled requests,
- * reception events and now_ms, and sends whatever it returns. */
+ * (update/udsota_update.c), and a SID it passes to the app's hooks.request. The core never names a service. No
+ * ESP-IDF: the transport feeds it reassembled requests, reception events and now_ms, and sends whatever it returns. */
 #include <assert.h>
 #include <string.h>
 #include "udsota_server.h"
@@ -251,7 +251,7 @@ static udsota_access_t access_of(const udsota_server_t *s)
     return a;
 }
 
-/* True while the worker owns a job: one the server waits on, an orphan (the service's or an app routine's), or
+/* True while the worker owns a job: one the server waits on, an orphan (the service's or an app job's), or
  * anything the service's poll still reports queued (the updater's fire-and-forget abort included). */
 bool udsota_worker_busy(const udsota_server_t *s)
 {
@@ -305,7 +305,7 @@ static void phase_sync(udsota_server_t *s)
 }
 
 /* Stops waiting on the running job; its owner keeps it as an orphan: the service's until its poll stops
- * reporting UDSOTA_PENDING, an app routine's until hooks.routine_poll() does. No answer for it is ever sent. */
+ * reporting UDSOTA_PENDING, an app job's until hooks.routine_poll() does. No answer for it is ever sent. */
 static void orphan_job(udsota_server_t *s)
 {
     if (s->job_app) {
@@ -615,16 +615,18 @@ static size_t reset_poll(udsota_server_t *s, uint32_t now_ms)
     return 0;
 }
 
-/* hooks.routine_poll with the room after 71 01 <rid> (resp and 0 when resp_max < 4, so no pointer runs past the
- * buffer); its out_len lands in job_out_len. UDSOTA_NRC_GENERAL_REJECT when the app registered none. */
+/* hooks.routine_poll with the room after the header the core frames for the app job, app_hdr bytes (71 <sub> <rid>,
+ * or a request's response SID); resp and 0 when resp_max is shorter, so no pointer runs past the buffer. Its out_len
+ * lands in job_out_len. UDSOTA_NRC_GENERAL_REJECT when the app registered none. */
 static int app_poll(udsota_server_t *s, uint8_t *resp, size_t resp_max)
 {
     s->job_out_len = 0u;
     if (s->hooks.routine_poll == NULL) {
         return UDSOTA_NRC_GENERAL_REJECT;
     }
-    const bool room = resp_max >= 4u;
-    return s->hooks.routine_poll(s->hooks.ctx, room ? &resp[4] : resp, room ? resp_max - 4u : 0u, &s->job_out_len);
+    const size_t hdr = s->app_hdr;
+    const bool room = resp_max >= hdr;
+    return s->hooks.routine_poll(s->hooks.ctx, room ? &resp[hdr] : resp, room ? resp_max - hdr : 0u, &s->job_out_len);
 }
 
 /* An app routine's result (udsota_job_done_fn): 0 is 71 <sub> <rid> and the job_out_len bytes the app wrote at
@@ -646,7 +648,7 @@ static size_t app_routine_done(udsota_server_t *s, int result, uint8_t *resp, si
 }
 
 /* 31 <sub> for a RID the core does not own, after the core's checks: 0x31 without hooks.routine_ex or routine; 0x22
- * while an app orphan runs (routine_poll speaks for one routine at a time); nothing when there is no room for 71 <sub>
+ * while an app orphan runs (routine_poll speaks for one app job at a time); nothing when there is no room for 71 <sub>
  * <rid>; else the answer of routine_ex, or of routine (sub 01 only), now or, for UDSOTA_PENDING, from udsota_poll after
  * 0x78s. The option record after the RID is the app's to check. */
 static size_t handle_app_routine(udsota_server_t *s, uint8_t sub, uint16_t rid, const uint8_t *req, size_t len,
@@ -669,6 +671,7 @@ static size_t handle_app_routine(udsota_server_t *s, uint8_t sub, uint16_t rid, 
         : s->hooks.routine(s->hooks.ctx, rid, &req[4], len - 4u, &resp[4], resp_max - 4u, &out_len, access);
     s->job_out_len = out_len;
     s->job_app = (rc == UDSOTA_PENDING);
+    s->app_hdr = 4u;
     return udsota_job_start(s, sid, spr, rc, app_routine_done, ((uint32_t)sub << 16) | rid, resp, resp_max, now_ms);
 }
 
@@ -976,8 +979,53 @@ static size_t handle_clear_dtc(udsota_server_t *s, const uint8_t *req, size_t le
     return 1;
 }
 
+/* ---- The app's own services, through hooks.request ---- */
+
+/* A request's result (udsota_job_done_fn), from hooks.request or routine_poll: 0 is the response SID and the
+ * job_out_len bytes the app wrote at resp[1]; 1..0xFF is that NRC; anything else, UDSOTA_NO_ANSWER from routine_poll
+ * included, or an out record longer than its room, is 0x10. */
+static size_t app_request_done(udsota_server_t *s, int result, uint8_t *resp, size_t resp_max, uint32_t now_ms)
+{
+    (void)now_ms;
+    const uint8_t sid = s->job_sid;
+    if (result > 0 && result <= 0xFF) {
+        return udsota_nrc(resp, resp_max, sid, (uint8_t)result);
+    }
+    if (result != 0 || resp_max < 1u || s->job_out_len > resp_max - 1u) {
+        return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_GENERAL_REJECT);
+    }
+    resp[0] = UDSOTA_POS(sid);
+    return 1u + s->job_out_len;
+}
+
+/* A physical request whose SID neither the core nor the service serves (no job runs): 0x11 for a response SID
+ * (40-7F, C0-FF), without hooks.request, or with no room for the response SID, and 0x22 while an app orphan runs
+ * (routine_poll speaks for one app job at a time), all without a call; else the hook's answer after the response SID
+ * the core frames, nothing for UDSOTA_NO_ANSWER, or, for UDSOTA_PENDING, from udsota_poll after 0x78s, always sent,
+ * since the core can't tell SPRMIB from a data byte. */
+static size_t handle_app_request(udsota_server_t *s, const uint8_t *req, size_t len, uint8_t *resp, size_t resp_max,
+                                 uint32_t now_ms)
+{
+    const uint8_t sid = req[0];
+    if ((sid & UDSOTA_POS_BIT) != 0u || s->hooks.request == NULL || resp_max < 1u) {
+        return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_SERVICE_NOT_SUPPORTED);
+    }
+    if (s->app_orphan) {
+        return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_CONDITIONS_NOT_CORRECT);
+    }
+    size_t out_len = 0u;
+    const int rc = s->hooks.request(s->hooks.ctx, req, len, &resp[1], resp_max - 1u, &out_len, access_of(s));
+    if (rc == UDSOTA_NO_ANSWER) {
+        return 0;
+    }
+    s->job_out_len = out_len;
+    s->job_app = (rc == UDSOTA_PENDING);
+    s->app_hdr = 1u;
+    return udsota_job_start(s, sid, false, rc, app_request_done, 0u, resp, resp_max, now_ms);
+}
+
 /* Routes one request (no job running) to its service handler; a SID the core doesn't own goes to the service, and
- * one it passes, or every one with no service, gets NRC 0x11. */
+ * one it passes, or every one with no service, to hooks.request (handle_app_request), else NRC 0x11. */
 static size_t dispatch(udsota_server_t *s, const uint8_t *req, size_t len, uint8_t *resp, size_t resp_max,
                        uint32_t now_ms)
 {
@@ -1019,7 +1067,7 @@ static size_t dispatch(udsota_server_t *s, const uint8_t *req, size_t len, uint8
                 return n;
             }
         }
-        return udsota_nrc(resp, resp_max, req[0], UDSOTA_NRC_SERVICE_NOT_SUPPORTED);
+        return handle_app_request(s, req, len, resp, resp_max, now_ms);
     }
 }
 
@@ -1219,8 +1267,8 @@ static size_t finish_job(udsota_server_t *s, int rc, uint8_t *resp, size_t resp_
     return (drop_pos && is_positive(resp, n)) ? 0 : n;
 }
 
-/* Advances a running job through its own poll (the service's, or routine_poll for an app routine): its final answer,
- * the 90 s cap (0x72, or 0x10 for an app routine, which programs nothing; the session ends), or the 0x78 cadence. */
+/* Advances a running job through its own poll (the service's, or routine_poll for an app job): its final answer, the
+ * 90 s cap (0x72, or 0x10 for an app job, which programs nothing; the session ends), or the 0x78 cadence. */
 static size_t poll_job(udsota_server_t *s, uint8_t *resp, size_t resp_max, uint32_t now_ms)
 {
     const int rc = s->job_app ? app_poll(s, resp, resp_max) : svc_poll(s);

@@ -154,9 +154,10 @@ udsota_test(test_udsota_bootloop
 # ---- Server, over SERVER_SRCS alone. _write: 0x2E through hooks.did_write, and the access state and session epoch
 # every app hook gets. _progress: udsota_progress() and hooks.progress after each step of a download. _no_engine: the
 # server with no updater registered (udsota_init with a NULL engine). _dtc: 0x19 and 0x14 through the DTC hooks.
-# _app_ex: hooks.did_read_ex and routine_ex, the 90 s cap's NRC per job, and 10 02 with no service.
+# _app_ex: hooks.did_read_ex and routine_ex, the 90 s cap's NRC per job, and 10 02 with no service. _request:
+# hooks.request, the app's route for a SID the core doesn't serve, and UDSOTA_NO_ANSWER.
 foreach(t IN ITEMS server server_security server_routines server_matrix server_hooks server_write
-                   server_functional server_progress server_no_engine server_dtc server_app_ex)
+                   server_functional server_progress server_no_engine server_dtc server_app_ex server_request)
     udsota_test(test_udsota_${t} SOURCES test/test_udsota_${t}.c ${SERVER_SRCS})
 endforeach()
 target_include_directories(test_udsota_server_no_engine PRIVATE ${TEST_DIR}/core_only)   # the rows it shares
@@ -369,6 +370,10 @@ if(UDSOTA_FUZZ AND UDSOTA_FUZZ_SAN_OK)
     # The same with did_read_ex and routine_ex set too, so did_read and routine never run: 22 and 31 01, 02 and 03 on
     # the app's DIDs and RIDs in every session, hook faults answered 0x10, and the updater's RIDs as without the hook.
     udsota_fuzz(fuzz_udsota_app_ex 300 DIGEST 9e26a1fc6faf38df DEFS UDSOTA_FUZZ_APP_HOOKS=1 UDSOTA_FUZZ_APP_EX=1)
+    # The same with request set too: the app's own SIDs answered at once, empty, with NRCs, silently (NO_ANSWER) and
+    # after 0x78s, hook faults answered 0x10, response SIDs 0x11 without a call, and one app job at a time.
+    udsota_fuzz(fuzz_udsota_request 300 DIGEST 99ba55f21dc40daa
+                DEFS UDSOTA_FUZZ_APP_HOOKS=1 UDSOTA_FUZZ_APP_EX=1 UDSOTA_FUZZ_REQUEST=1)
     # The same harness with the progress hook set: done never passes total nor shrinks within a download, and the
     # hook runs at most once per call and reports every change of stage. Its PASS line matches fuzz_udsota's.
     udsota_fuzz(fuzz_udsota_progress 300 DIGEST 167b0bb1e30d7960 DEFS UDSOTA_FUZZ_PROGRESS=1)

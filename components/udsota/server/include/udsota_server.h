@@ -10,7 +10,7 @@
 #include "udsota_update_state.h"   /* udsota_update_t and udsota_progress_t, which the context names */
 
 /* ---- Server-internal timing and limits (not on the wire) ---- */
-#define UDSOTA_JOB_CAP_MS         90000u    /* 0x78 stops here: NRC 0x72 (0x10 for an app routine) and the session
+#define UDSOTA_JOB_CAP_MS         90000u    /* 0x78 stops here: NRC 0x72 (0x10 for an app job) and the session
                                                 ends (twice the worst-case erase) */
 #define UDSOTA_JOB_POLL_MS        5u        /* udsota_poll period while a worker job runs */
 #define UDSOTA_IDLE_POLL_MS       100u      /* longest poll gap in a non-default session (S3) */
@@ -20,10 +20,17 @@
 
 /* A handler of the registered service (udsota_service.h) whose work is still queued passes UDSOTA_PENDING to
  * udsota_job_start instead of a result; the server then waits on the service's poll (the updater's: engine.poll).
- * hooks.routine, routine_ex and routine_poll return it too, for an app routine still running; the server then waits
- * on routine_poll. INT32_MAX: never an esp_err_t, never 0. */
+ * hooks.routine, routine_ex, request and routine_poll return it too, for an app job still running; the server then
+ * waits on routine_poll. INT32_MAX: never an esp_err_t, never 0. */
 #define UDSOTA_PENDING  0x7FFFFFFF
 _Static_assert(INT_MAX >= UDSOTA_PENDING, "UDSOTA_PENDING is returned through int");
+/* hooks.request returns UDSOTA_NO_ANSWER to send nothing: its way to honour SPRMIB on a positive answer to a service
+ * of its own with a sub-function, since the core can't tell which SIDs have one. Only for that, and only from
+ * request: from routine, routine_ex or routine_poll it is a hook fault (0x10). INT32_MAX - 1: never UDSOTA_PENDING, an
+ * NRC or 0. */
+#define UDSOTA_NO_ANSWER  0x7FFFFFFE
+_Static_assert(INT_MAX >= UDSOTA_NO_ANSWER && UDSOTA_NO_ANSWER != UDSOTA_PENDING && UDSOTA_NO_ANSWER > 0xFF,
+               "UDSOTA_NO_ANSWER is returned through int, apart from UDSOTA_PENDING and every NRC");
 
 #define UDSOTA_STMIN_DEFAULT_US    2000u      /* the transport's FC STmin while cfg.stmin_us is 0 */
 #define UDSOTA_BLOCK_SIZE_DEFAULT  64u        /* the transport's FC BS while cfg.block_size is 0 */
@@ -120,9 +127,12 @@ typedef struct {   /* all optional */
                                                       call. It may read udsota_phase() but must not call other udsota
                                                       functions. Never called while routine_ex is set */
     int      (*routine_poll)(void *ctx, uint8_t *out, size_t out_max, size_t *out_len);
-                                                   /* on every udsota_poll while an app routine is pending or
-                                                      orphaned; returns as routine does, and out is again valid only
-                                                      during the call. NULL: a routine that returns UDSOTA_PENDING
+                                                   /* the app job's poll: on every udsota_poll while an app routine or
+                                                      request is pending or orphaned (one at a time); returns as the
+                                                      hook that started it does, UDSOTA_NO_ANSWER aside (0x10), and
+                                                      out, the room after the header the core framed for that hook (71
+                                                      <sub> <rid>, or a request's response SID), is again valid only
+                                                      during the call. NULL: an app job that returns UDSOTA_PENDING
                                                       ends in 0x10 at the first poll. It may read udsota_phase() but
                                                       must not call other udsota functions */
     void     (*progress)(void *ctx, const udsota_progress_t *p);
@@ -183,6 +193,27 @@ typedef struct {   /* all optional */
                                                       without it, and routine is never called. Returns as routine
                                                       does, and the answer is 71 <sub> <rid> out, from routine_poll
                                                       too. NULL: routine, as before */
+    int      (*request)(void *ctx, const uint8_t *req, size_t len, uint8_t *out, size_t out_max, size_t *out_len,
+                        udsota_access_t access);
+                                                   /* the app's own services: a physical request whose SID neither the
+                                                      core nor the service serves (so with the updater never 34, 36 or
+                                                      37, without it those too), where 0x11 was sent, never while a
+                                                      job runs (0x21 first). A response SID (40-7F, C0-FF) is 0x11,
+                                                      and 0x22 while an app orphan runs, both without a call; a
+                                                      functional request never comes here. req is the whole request,
+                                                      SID included (len >= 1), and length, session, sub-function and
+                                                      key are the app's to check. The core writes the response SID
+                                                      (req[0] + 0x40) at resp[0] and out is the room after it; req,
+                                                      out and access are valid only during the call, so a pending
+                                                      request copies what it needs. Returns 0 to answer the response
+                                                      SID and *out_len bytes of out (0 is valid; over out_max is
+                                                      0x10), an NRC (1..0xFF, never 0x78; sent whatever SPRMIB says),
+                                                      UDSOTA_NO_ANSWER for nothing (only for a positive answer with
+                                                      SPRMIB set), or UDSOTA_PENDING, an app job as a routine's (0x78,
+                                                      0x21, 0x10 at the 90 s cap, finished by routine_poll), whose
+                                                      final answer is always sent. Any other value is 0x10. NULL, or
+                                                      no room for the response SID: 0x11, as before. It may read
+                                                      udsota_phase() but must not call other udsota functions */
 } udsota_hooks_t;
 
 typedef struct {
@@ -266,14 +297,16 @@ typedef struct udsota_server {
     uint32_t          job_arg;           /* handler data for job_done, e.g. a 36's block length, or an app routine's
                                             RID with its sub-function in bits 16-23 */
     udsota_job_done_fn job_done;         /* builds the final answer when the job's poll (the service's, or
-                                            hooks.routine_poll for an app routine) reports a result */
+                                            hooks.routine_poll for an app job) reports a result */
     bool              worker_orphan;     /* a service's job the server stopped waiting on at the 90 s cap still runs;
                                             only the service's poll clears it */
-    bool              job_app;           /* the running job is an app routine: polled through hooks.routine_poll,
-                                            never the service's poll */
-    bool              app_orphan;        /* an app routine the server stopped waiting on at the 90 s cap still
-                                            runs; only hooks.routine_poll clears it */
-    size_t            job_out_len;       /* app routine: bytes of its out record, written at resp[4] */
+    bool              job_app;           /* the running job is the app's, a routine or a request: polled through
+                                            hooks.routine_poll, never the service's poll */
+    bool              app_orphan;        /* an app job the server stopped waiting on at the 90 s cap still runs;
+                                            only hooks.routine_poll clears it */
+    uint8_t           app_hdr;           /* the header the core frames before the app job's out record: 4 for
+                                            71 <sub> <rid>, 1 for a request's response SID; kept for an orphan */
+    size_t            job_out_len;       /* app job: bytes of its out record, written at resp[app_hdr] */
     bool              end_pending;       /* udsota_end_session arrived during a job: applied once the job has answered */
     udsota_update_t   update;            /* the firmware updater's state (udsota_update_state.h), engine included */
     udsota_counters_t counters;          /* F1F2, answered by the server itself; the transport bumps its counters here */

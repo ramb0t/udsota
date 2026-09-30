@@ -53,6 +53,10 @@ static struct {
     uint16_t           did_ex_did, routine_ex_rid;
     uint8_t            routine_ex_sub;
     udsota_access_t    ex_access;       /* what the last _ex hook got */
+    int                requests;        /* app request calls */
+    uint8_t            request_sid;     /* the SID of the last one */
+    size_t             request_len, request_out_max;
+    udsota_access_t    request_access;
     int                progress_calls;  /* app progress hook calls */
     udsota_progress_t  progress_arg;    /* what the app's progress hook last got */
     udsota_progress_t  progress_read;   /* what udsota_esp32_ctl_progress() returned inside it */
@@ -499,6 +503,21 @@ static int app_routine_ex(void *ctx, uint8_t sub, uint16_t rid, const uint8_t *i
     return 0;
 }
 
+/* The app's request: records what arrived and answers 0x55 after the response SID. */
+static int app_request(void *ctx, const uint8_t *req, size_t len, uint8_t *out, size_t out_max, size_t *out_len,
+                       udsota_access_t access)
+{
+    r.ctx_seen = ctx;
+    r.requests++;
+    r.request_sid = req[0];
+    r.request_len = len;
+    r.request_out_max = out_max;
+    r.request_access = access;
+    out[0] = 0x55;
+    *out_len = 1u;
+    return 0;
+}
+
 /* The wrapped hooks pass the app's ctx, keep a NULL gate, did_read or stmin_us NULL so the core's
  * default holds, and reset falls back to the port's default only when the app has none. */
 static void test_wrapped_hooks_forward_app_ctx_and_keep_nulls(void)
@@ -750,6 +769,33 @@ static void test_ex_hooks_reach_the_app(void)
     TEST_ASSERT_EQUAL_HEX8_ARRAY(((const uint8_t[]){0x7F, 0x31, 0x7F}), resp, 3);
     TEST_ASSERT_EQUAL_INT(2, r.did_exs);
     TEST_ASSERT_EQUAL_INT(1, r.routine_exs);
+}
+
+/* A SID the core doesn't serve reaches the app's request through the port and the real server, with the app's ctx,
+ * the whole request, the room after the response SID and the session's access; the wrapper is installed only when
+ * the app sets the hook, so without it the SID answers 0x11 as before. */
+static void test_request_reaches_the_app(void)
+{
+    const udsota_hooks_t app = { .request = app_request, .ctx = &s_marker };
+    start(&app);
+    TEST_ASSERT_TRUE(s_hooks.request != NULL);
+    uint8_t resp[16];
+    const uint8_t rq[] = {0xBA, 0x01, 0x42};
+    enter_extended(NOW);
+    TEST_ASSERT_EQUAL_UINT(2u, udsota_on_request(&s_srv, rq, sizeof rq, resp, sizeof resp, NOW + 1u));
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(((const uint8_t[]){0xFA, 0x55}), resp, 2);
+    TEST_ASSERT_EQUAL_PTR(&s_marker, r.ctx_seen);
+    TEST_ASSERT_EQUAL_HEX8(0xBA, r.request_sid);
+    TEST_ASSERT_EQUAL_size_t(sizeof rq, r.request_len);
+    TEST_ASSERT_EQUAL_size_t(sizeof resp - 1u, r.request_out_max);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_EXTENDED, r.request_access.session);
+    TEST_ASSERT_EQUAL_UINT32(s_srv.session_epoch, r.request_access.epoch);
+
+    start(NULL);
+    TEST_ASSERT_TRUE(s_hooks.request == NULL);
+    TEST_ASSERT_EQUAL_UINT(3u, udsota_on_request(&s_srv, rq, sizeof rq, resp, sizeof resp, NOW));
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(((const uint8_t[]){0x7F, 0xBA, 0x11}), resp, 3);
+    TEST_ASSERT_EQUAL_INT(1, r.requests);
 }
 
 /* Sends req and asserts the answer's first byte. */
@@ -1159,6 +1205,7 @@ int main(void)
     RUN_TEST(test_without_write_and_routine_hooks_the_core_answers_as_before);
     RUN_TEST(test_dtc_hooks_reach_the_app);
     RUN_TEST(test_ex_hooks_reach_the_app);
+    RUN_TEST(test_request_reaches_the_app);
     RUN_TEST(test_wait_ticks_never_round_a_wait_to_zero);
     RUN_TEST(test_ids_must_be_11_bit_and_distinct);
     RUN_TEST(test_progress_snapshot_copies_the_report_and_forwards_it);
