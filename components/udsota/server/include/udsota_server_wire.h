@@ -29,7 +29,10 @@
 #define UDSOTA_POS(sid)      ((uint8_t)((sid) | UDSOTA_POS_BIT))
 
 #define UDSOTA_RESET_HARD       0x01        /* 11 01 hardReset, the only reset served */
-#define UDSOTA_RC_START         0x01        /* 31 01 startRoutine, the only routine control served */
+#define UDSOTA_RC_START         0x01        /* 31 01 startRoutine, the only routine control served without
+                                               hooks.routine_ex */
+#define UDSOTA_RC_STOP          0x02        /* 31 02 stopRoutine: hooks.routine_ex only */
+#define UDSOTA_RC_RESULTS       0x03        /* 31 03 requestRoutineResults: hooks.routine_ex only */
 #define UDSOTA_TP_ZERO_SUBFUNC  0x00        /* 3E 00 (3E 80 with the suppress bit) */
 #define UDSOTA_WRITE_DID_MIN_LEN 4u         /* 2E, the DID and at least one data byte; shorter is 0x13 */
 #define UDSOTA_CC_ENABLE_RX_TX  0x00        /* 28 00 enableRxAndTx; 01 and 02 disable one direction */

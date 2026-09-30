@@ -990,7 +990,8 @@ static void test_app_pending_final_nrc_and_sprmib(void)
     TEST_ASSERT_EQUAL_UINT(0, REQ_RAW(0x31, 0x81, 0x12, 0x34));
 }
 
-/* An app routine still pending at the 90 s cap ends in 0x72 and the default session. The core keeps it as an app
+/* An app routine still pending at the 90 s cap ends in 0x10, not the updater's 0x72, and the default session. The
+ * core keeps it as an app
  * orphan: an idle engine.poll never clears it, 10 02 and 11 01 are 0x22, and a second app routine is 0x22 without
  * a call, until routine_poll stops returning pending. The orphan's own answer is never sent. */
 static void test_app_cap_orphans_until_routine_poll(void)
@@ -1000,7 +1001,7 @@ static void test_app_cap_orphans_until_routine_poll(void)
     app.rc = UDSOTA_PENDING;
     app.hold = true;
     TEST_ASSERT_EQUAL_UINT(0, REQ_RAW(0x31, 0x01, 0x12, 0x34));
-    expect_nrc(poll_to_cap(now), UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE);
+    expect_nrc(poll_to_cap(now), UDSOTA_NRC_GENERAL_REJECT);
     TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_DEFAULT, srv.session);
     TEST_ASSERT_FALSE(srv.job_running);
     TEST_ASSERT_TRUE(srv.app_orphan);
@@ -1057,7 +1058,7 @@ static void test_app_cap_during_download_is_aborted(void)
     app.rc = UDSOTA_PENDING;
     app.hold = true;
     TEST_ASSERT_EQUAL_UINT(0, REQ_RAW(0x31, 0x01, 0x12, 0x34));
-    expect_nrc(poll_to_cap(now), UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE);
+    expect_nrc(poll_to_cap(now), UDSOTA_NRC_GENERAL_REJECT);
     TEST_ASSERT_FALSE(srv.update.download_active);
     TEST_ASSERT_EQUAL_UINT8(UDSOTA_DL_ABORTED, srv.update.last_dl.reason_code);
     TEST_ASSERT_TRUE(srv.app_orphan);

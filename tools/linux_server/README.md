@@ -16,6 +16,16 @@ It also serves three DTCs through the DTC hooks, with availability 0x2F and DTCF
 
 `14 FF FF FF` clears them in the extended session, unlocked at the extended level when security is on, and zeroes every status, count and time. Otherwise its hook answers 0x7F, then 0x33, then 0x31 for any other group. The table lives as long as the process, so a clear survives a restart.
 
+Its app DIDs and routine go through `did_read_ex` and `routine_ex`, so each can have its own session and key rule:
+
+| DID or RID | Answers |
+|---|---|
+| DID F191 | the board name, in any session |
+| DID 0200 | `C0 FF EE 01`, in the extended session unlocked at the extended level when security is on; otherwise 0x7F, then 0x33 |
+| RID A001 | a self-test, in any session; an option record answers 0x13. 01 starts it and 02 stops it, each with no status record (0x24 when it already runs, or does not), and 03 answers its state, 00 never started, 01 running or 02 stopped. The state survives a restart |
+
+`--no-updater` starts the server with no updater (`udsota_init` with a NULL engine), as a device that takes its firmware some other way: 34, 36 and 37 answer 0x11, 10 02 answers 0x12, and F189, F1F0, F1F1, F1F3 and the updater's RIDs go to the app's hooks, which don't serve them (0x31). The slots are still opened, so 11 01 restarts into the image they hold.
+
 ## Build
 
 It is built from the root `CMakeLists.txt` on Linux only:
@@ -24,7 +34,7 @@ It is built from the root `CMakeLists.txt` on Linux only:
 cmake -S . -B build && cmake --build build --target udsota_demo_server
 ```
 
-The binary is `build/tools/linux_server/udsota_demo_server`. ctest checks its host HMAC against `udsota_keys.c`'s known answers, runs one request over the pipe, runs an image from `--make-image` through `tools/image_check`, and checks that `--socketcan` refuses an interface that is not vcan.
+The binary is `build/tools/linux_server/udsota_demo_server`. ctest checks its host HMAC against `udsota_keys.c`'s known answers, runs one request over the pipe and two with `--no-updater`, runs an image from `--make-image` through `tools/image_check`, and checks that `--socketcan` refuses an interface that is not vcan.
 
 ## Run it on vcan
 
@@ -65,6 +75,7 @@ A pipe carries no timing, so each frame's arrival stamp is the time the server r
 | `--no-compress` | off | a build without coded downloads: a 34 with DFI 0x10, 0x20 or 0x30 answers 0x31 |
 | `--no-delta` | off | a build without delta downloads: 0x20 and 0x30 answer 0x31, and 0x10 is still served |
 | `--no-dtc` | off | a build without DTC services: the three DTC hooks stay NULL, so 19 and 14 answer 0x11 |
+| `--no-updater` | off | the UDS server alone, with no updater: 34, 36 and 37 answer 0x11 and 10 02 answers 0x12 |
 | `--no-rollback` | off | a build without rollback: an activated image boots UNDEFINED and ConfirmImage changes nothing |
 | `--label LABEL`, `--master FILE` | off | security on: `udsota_keys.c`'s derivation over the host HMAC-SHA256 with this label and the 32-byte master. A label without a master keeps security on and refuses every key, as the ESP32 port does |
 | `--device-id HEX` | 02:00:00:00:00:01 | F18C, and the device ID the keys are derived from |
@@ -86,4 +97,4 @@ The engine checks what an ESP-IDF build would carry, but it does not run a real 
 
 ## Tests
 
-`client/tests/test_e2e_pipe.py` starts the demo in pipe mode and drives it with the client itself. The client's `cli.main`, `update` and `Uds` run over can-isotp's pure-Python ISO-TP stack, behind the same guarded bus, pre-flight and second-tester monitor that `transport.Transport` uses. They cover `info`, a full `flash`, a keyed `flash`, each first-block refusal with its F1F1 reason, an FF01 failure, rollback, the confirm soak, 0x78 on slow jobs, `--drop-76`, answers the pipe drops or delays, a withheld flow control (exit 1 with F1F1's reason) and a lost one (resent). For compressed downloads they cover `flash --compress` and the profile's `compression`, `--compress` and `--compress-auto` against the demo's `--no-compress`, a resent block, a request frame lost and answers lost mid-stream, and corrupt, truncated and refused streams. For delta downloads they cover `flash --diff-from` under both DFIs, a wrong base falling back to a full download, a server without delta, and a 37 answering 0x78. For DTCs they cover `dtc show`, `dtc show --ext` and `dtc clear` against the table above, a keyed clear, the clear hook's order, and `--no-dtc`. `client/tests/test_e2e_vcan.py` runs the demo on vcan0 (or `$UDSOTA_VCAN`) through its SocketCAN backend, and flashes it and reads and clears its DTCs two ways. The client over can-isotp's Python stack on a python-can SocketCAN bus needs only the `vcan` module, so these run on GitHub's hosted runners, whose kernel has no ISO-TP module. The installed `udsota` command over the kernel's ISO-TP socket also needs `can-isotp`, so those run on a Linux machine that has it. Each skips without what it needs, except that the vcan tests fail instead when `$UDSOTA_VCAN` is set, as in CI. Both find the binary in `build/` or through `$UDSOTA_DEMO_SERVER`.
+`client/tests/test_e2e_pipe.py` starts the demo in pipe mode and drives it with the client itself. The client's `cli.main`, `update` and `Uds` run over can-isotp's pure-Python ISO-TP stack, behind the same guarded bus, pre-flight and second-tester monitor that `transport.Transport` uses. They cover `info`, a full `flash`, a keyed `flash`, each first-block refusal with its F1F1 reason, an FF01 failure, rollback, the confirm soak, 0x78 on slow jobs, `--drop-76`, answers the pipe drops or delays, a withheld flow control (exit 1 with F1F1's reason) and a lost one (resent). For compressed downloads they cover `flash --compress` and the profile's `compression`, `--compress` and `--compress-auto` against the demo's `--no-compress`, a resent block, a request frame lost and answers lost mid-stream, and corrupt, truncated and refused streams. For delta downloads they cover `flash --diff-from` under both DFIs, a wrong base falling back to a full download, a server without delta, and a 37 answering 0x78. For DTCs they cover `dtc show`, `dtc show --ext` and `dtc clear` against the table above, a keyed clear, the clear hook's order, and `--no-dtc`. Through the client's UDS layer they cover DID 0200's 0x7F, 0x33 and answer, RID A001's 01, 02 and 03 in the default session with and without the updater, and `--no-updater`'s 0x12 to 10 02. `client/tests/test_e2e_vcan.py` runs the demo on vcan0 (or `$UDSOTA_VCAN`) through its SocketCAN backend, and flashes it and reads and clears its DTCs two ways. The client over can-isotp's Python stack on a python-can SocketCAN bus needs only the `vcan` module, so these run on GitHub's hosted runners, whose kernel has no ISO-TP module. The installed `udsota` command over the kernel's ISO-TP socket also needs `can-isotp`, so those run on a Linux machine that has it. Each skips without what it needs, except that the vcan tests fail instead when `$UDSOTA_VCAN` is set, as in CI. Both find the binary in `build/` or through `$UDSOTA_DEMO_SERVER`.

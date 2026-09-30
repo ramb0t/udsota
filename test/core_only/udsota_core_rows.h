@@ -1,7 +1,7 @@
 /* Groups A to G of the no-updater tests (docs/plans/2026-09-29-seam-tests.md), and I (19 and 14,
  * docs/plans/2026-09-29-dtc-services.md): the server with no service registered, so 34, 36 and 37 answer 0x11, the
- * updater's RIDs and DIDs go to the app's hooks, 10 02 and 11 01 ask only the core's worker rule and the gate, 19 and
- * 14 are served through their hooks, and nothing reaches a service. Two tests include these same rows: the no-engine test
+ * updater's RIDs and DIDs go to the app's hooks, 10 02 answers 0x12, 11 01 asks only the core's worker rule and the
+ * gate, 19 and 14 are served through their hooks, and nothing reaches a service. Two tests include these same rows: the no-engine test
  * (udsota_init with a NULL engine) and the core-only test (udsota_core_init, built without the updater), which proves
  * the two paths answer alike. Core headers only, with its own mock hooks and security, so it compiles without any
  * updater header but udsota_update_state.h.
@@ -155,8 +155,8 @@ static inline const udsota_security_t *rows_security(void)
 
 /* ---- The server under test and the app behind its hooks ---- */
 
-/* The server states the groups run in. Programming is entered by writing s.session: 0.8.0's 10 02 reaches the NULL
- * engine.poll without an engine, and D1 checks 10 02 itself. */
+/* The server states the groups run in. Programming is entered by writing s.session: 10 02 answers 0x12 without the
+ * updater (D1), yet the rows still check what the core does in that session. */
 typedef enum { ST_DEF, ST_EXT, ST_EXT01, ST_PROG, ST_PROG03, ST_N } state_t;
 static const char *const k_state_name[ST_N] = {"default", "extended", "extended+01", "programming", "programming+03"};
 static const uint8_t k_state_session[ST_N] = {UDSOTA_SESSION_DEFAULT, UDSOTA_SESSION_EXTENDED,
@@ -405,13 +405,13 @@ static void start_pending_app_routine(void)
     TEST_ASSERT_TRUE(s.job_running);
 }
 
-/* Starts app routine 1234 in the extended session and lets it run into the 90 s cap: 7F 31 72, an app orphan. */
+/* Starts app routine 1234 in the extended session and lets it run into the 90 s cap: 7F 31 10, an app orphan. */
 static void orphan_app_routine(void)
 {
     enter(ST_EXT, true);
     start_pending_app_routine();
     poll_at(now + UDSOTA_JOB_CAP_MS);
-    NRC(UDSOTA_SID_ROUTINE, UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE);
+    NRC(UDSOTA_SID_ROUTINE, UDSOTA_NRC_GENERAL_REJECT);
     TEST_ASSERT_TRUE(s.app_orphan);
     TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_DEFAULT, s.session);
 }
@@ -653,28 +653,43 @@ static void test_C4_session_and_serial(void)
     }
 }
 
-/* ---- D: 10 02 ---- */
+/* ---- D: 10 02, which has no programming to enter ---- */
 
-/* D1: 10 02 from default asks the gate once and enters programming. */
-static void test_D1_enter_programming(void)
+/* D1: 10 02 answers 0x12 from every state, 10 82 too, without asking the gate, and nothing changes: no session
+ * entry, no epoch step, no relock. */
+static void test_D1_programming_not_supported(void)
 {
-    enter(ST_DEF, false);
-    REQ(0x10, 0x02);
-    EXPECT(0x50, 0x02, 0x00, 0x32, 0x01, 0xF4);
-    TEST_ASSERT_EQUAL_UINT(1, g_mock.gate_calls[UDSOTA_OP_ENTER_PROGRAMMING]);
-    TEST_ASSERT_EQUAL_INT(UDSOTA_PHASE_PROGRAMMING, udsota_phase(&s));
+    for (state_t st = ST_DEF; st < ST_N; st++) {
+        enter(st, false);
+        const uint32_t epoch = s.session_epoch;
+        const uint8_t level = s.security;
+        REQ(0x10, 0x02);
+        NRC(UDSOTA_SID_SESSION, UDSOTA_NRC_SUBFUNC_NOT_SUPPORTED);
+        REQ(0x10, 0x82);
+        NRC(UDSOTA_SID_SESSION, UDSOTA_NRC_SUBFUNC_NOT_SUPPORTED);
+        TEST_ASSERT_EQUAL_UINT_MESSAGE(0, g_mock.gate_calls[UDSOTA_OP_ENTER_PROGRAMMING], msg);
+        TEST_ASSERT_EQUAL_UINT8_MESSAGE(k_state_session[st], s.session, msg);
+        TEST_ASSERT_EQUAL_UINT8_MESSAGE(level, s.security, msg);
+        TEST_ASSERT_EQUAL_UINT32_MESSAGE(epoch, s.session_epoch, msg);
+    }
 }
 
-/* D2: the gate's NRC verbatim. */
-static void test_D2_gate_nrc(void)
+/* D2: the length checks come first, as for any 10: 0x13 for 10 alone and for 10 02 00; the gate's NRC is never
+ * reached. */
+static void test_D2_length_before_the_refusal(void)
 {
     enter(ST_DEF, false);
     g_mock.gate_nrc[UDSOTA_OP_ENTER_PROGRAMMING] = NRC_SPEED;
+    REQ(0x10);
+    NRC(UDSOTA_SID_SESSION, UDSOTA_NRC_INCORRECT_LENGTH);
+    REQ(0x10, 0x02, 0x00);
+    NRC(UDSOTA_SID_SESSION, UDSOTA_NRC_INCORRECT_LENGTH);
     REQ(0x10, 0x02);
-    NRC(UDSOTA_SID_SESSION, NRC_SPEED);
+    NRC(UDSOTA_SID_SESSION, UDSOTA_NRC_SUBFUNC_NOT_SUPPORTED);
+    TEST_ASSERT_EQUAL_UINT(0, g_mock.gate_calls[UDSOTA_OP_ENTER_PROGRAMMING]);
 }
 
-/* D3: an app routine pending: 0x21. */
+/* D3: an app routine pending: 0x21, which the core answers before any 10. */
 static void test_D3_busy_while_app_routine_runs(void)
 {
     enter(ST_EXT, true);
@@ -683,30 +698,45 @@ static void test_D3_busy_while_app_routine_runs(void)
     NRC(UDSOTA_SID_SESSION, UDSOTA_NRC_BUSY_REPEAT);
 }
 
-/* D4: an app orphan after the 90 s cap: 0x22 without asking the gate, until routine_poll finishes it. */
-static void test_D4_app_orphan_blocks_programming(void)
+/* D4: an app orphan after the 90 s cap changes nothing: 0x12 while it runs and after routine_poll finishes it. */
+static void test_D4_app_orphan_still_0x12(void)
 {
     orphan_app_routine();
     REQ(0x10, 0x02);
-    NRC(UDSOTA_SID_SESSION, UDSOTA_NRC_CONDITIONS_NOT_CORRECT);
-    TEST_ASSERT_EQUAL_UINT(0, g_mock.gate_calls[UDSOTA_OP_ENTER_PROGRAMMING]);
+    NRC(UDSOTA_SID_SESSION, UDSOTA_NRC_SUBFUNC_NOT_SUPPORTED);
     app.poll_pending = false;
     poll_at(now + UDSOTA_JOB_POLL_MS);
     TEST_ASSERT_FALSE(s.app_orphan);
     REQ(0x10, 0x02);
-    EXPECT(0x50, 0x02, 0x00, 0x32, 0x01, 0xF4);
+    NRC(UDSOTA_SID_SESSION, UDSOTA_NRC_SUBFUNC_NOT_SUPPORTED);
+    TEST_ASSERT_EQUAL_UINT(0, g_mock.gate_calls[UDSOTA_OP_ENTER_PROGRAMMING]);
 }
 
-/* D5: 10 02 in programming re-enters it: the epoch advances. */
-static void test_D5_reenter_programming(void)
+/* D5: the programming level's requestSeed needs the programming session, now out of reach: 27 03 answers 0x7E in
+ * the extended session, and 10 01 and 10 03 still answer. */
+static void test_D5_programming_seed_unreachable(void)
 {
-    enter(ST_DEF, false);
-    REQ(0x10, 0x02);
-    EXPECT(0x50, 0x02, 0x00, 0x32, 0x01, 0xF4);
-    const uint32_t epoch = s.session_epoch;
-    REQ(0x10, 0x02);
-    EXPECT(0x50, 0x02, 0x00, 0x32, 0x01, 0xF4);
-    TEST_ASSERT_EQUAL_UINT32(epoch + 1u, s.session_epoch);
+    enter(ST_EXT, false);
+    REQ(0x27, UDSOTA_SA_SEED_PROGRAMMING);
+    NRC(UDSOTA_SID_SECURITY, UDSOTA_NRC_SUBFUNC_NOT_SUPPORTED_IN_SESSION);
+    REQ(0x27, UDSOTA_SA_KEY_PROGRAMMING);
+    NRC(UDSOTA_SID_SECURITY, UDSOTA_NRC_SUBFUNC_NOT_SUPPORTED_IN_SESSION);
+    REQ(0x10, 0x03);
+    EXPECT(0x50, 0x03, 0x00, 0x32, 0x01, 0xF4);
+    REQ(0x10, 0x01);
+    EXPECT(0x50, 0x01, 0x00, 0x32, 0x01, 0xF4);
+}
+
+/* D6: functionally, 10 02 is never served: no answer in any state, as with the updater. */
+static void test_D6_functional_programming_silent(void)
+{
+    for (state_t st = ST_DEF; st < ST_N; st++) {
+        enter(st, false);
+        const uint8_t r[] = {0x10, 0x02};
+        rlen = udsota_on_functional_request(&s, r, sizeof r, resp, sizeof resp, now);
+        TEST_ASSERT_EQUAL_size_t_MESSAGE(0, rlen, msg);
+        TEST_ASSERT_EQUAL_UINT8_MESSAGE(k_state_session[st], s.session, msg);
+    }
 }
 
 /* ---- E: 11 01 ---- */
@@ -811,7 +841,7 @@ static void test_F2_app_services(void)
     TEST_ASSERT_TRUE(app.dtc_on);
 }
 
-/* F3: an app routine pending: 0x78 at 40 ms, its answer on the poll after it finishes; at 90 s 0x72 and an orphan. */
+/* F3: an app routine pending: 0x78 at 40 ms, its answer on the poll after it finishes; at 90 s 0x10 and an orphan. */
 static void test_F3_app_routine_job(void)
 {
     enter(ST_EXT, true);
@@ -828,7 +858,7 @@ static void test_F3_app_routine_job(void)
 
     start_pending_app_routine();
     poll_at(now + UDSOTA_JOB_CAP_MS);
-    NRC(UDSOTA_SID_ROUTINE, UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE);
+    NRC(UDSOTA_SID_ROUTINE, UDSOTA_NRC_GENERAL_REJECT);
     TEST_ASSERT_TRUE(s.app_orphan);
     TEST_ASSERT_EQUAL_UINT32(UDSOTA_JOB_POLL_MS, udsota_ms_to_deadline(&s, now));
 }
@@ -999,8 +1029,9 @@ typedef struct {
     ROW(test_B2_updater_rids_reach_app), ROW(test_B3_option_record_reaches_app), ROW(test_B4_session_check_first), \
     ROW(test_B5_subfunction_check), ROW(test_C1_updater_dids_without_app), ROW(test_C2_updater_dids_from_app),      \
     ROW(test_C3_counters_are_the_cores), ROW(test_C4_session_and_serial), ROW(test_B_F002_in_extended),             \
-    ROW(test_D1_enter_programming), ROW(test_D2_gate_nrc), ROW(test_D3_busy_while_app_routine_runs),                \
-    ROW(test_D4_app_orphan_blocks_programming), ROW(test_D5_reenter_programming), ROW(test_E1_reset_locked),       \
+    ROW(test_D1_programming_not_supported), ROW(test_D2_length_before_the_refusal),                                \
+    ROW(test_D3_busy_while_app_routine_runs), ROW(test_D4_app_orphan_still_0x12),                                  \
+    ROW(test_D5_programming_seed_unreachable), ROW(test_D6_functional_programming_silent), ROW(test_E1_reset_locked), \
     ROW(test_E2_reset_restarts), ROW(test_E3_reset_refusals), ROW(test_F1_security_access),                         \
     ROW(test_F2_app_services), ROW(test_F3_app_routine_job), ROW(test_F4_session_ends),                             \
     ROW(test_F5_fc_check_and_progress), ROW(test_G_every_sid_every_state),                                         \

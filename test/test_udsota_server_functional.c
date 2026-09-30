@@ -1,7 +1,8 @@
-/* Host tests for functional addressing (udsota_on_functional_request), 0x28 CommunicationControl, 0x85
- * ControlDTCSetting, what a return to the default session undoes, and P2/P2* per session. */
+/* Host tests for functional addressing (udsota_on_functional_request) and the set of SIDs it answers, 0x28
+ * CommunicationControl, 0x85 ControlDTCSetting, what a return to the default session undoes, and P2/P2* per session. */
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include "unity.h"
 #include "udsota.h"
@@ -353,6 +354,120 @@ static void test_p2_per_session(void)
     TEST_ASSERT_EQUAL_UINT(3, udsota_poll(&s, resp, sizeof resp, now));   /* 3/10 of 10 s */
 }
 
+/* ---- The functional set: every hook set, so every core service is live ---- */
+
+/* hooks.did_write, routine, routine_poll and the _ex hooks: accept everything (the answer's record empty). */
+static uint8_t all_did_write(void *ctx, uint16_t did, const uint8_t *d, size_t n, udsota_access_t a) { return 0u; }
+static int all_routine(void *ctx, uint16_t rid, const uint8_t *in, size_t in_len, uint8_t *out, size_t out_max,
+                       size_t *out_len, udsota_access_t a)
+{
+    *out_len = 0u;
+    return 0;
+}
+static int all_routine_poll(void *ctx, uint8_t *out, size_t out_max, size_t *out_len)
+{
+    *out_len = 0u;
+    return 0;
+}
+static uint8_t all_did_read_ex(void *ctx, uint16_t did, uint8_t *buf, size_t max, size_t *len, udsota_access_t a)
+{
+    buf[0] = 0x01;
+    *len = 1u;
+    return 0u;
+}
+static int all_routine_ex(void *ctx, uint8_t sub, uint16_t rid, const uint8_t *in, size_t in_len, uint8_t *out,
+                          size_t out_max, size_t *out_len, udsota_access_t a)
+{
+    *out_len = 0u;
+    return 0;
+}
+/* hooks.dtc_get, dtc_ext_data and dtc_clear: one DTC, U0073 with status 09 and record 01 as 01 02; clears anything. */
+static bool all_dtc_get(void *ctx, size_t i, udsota_dtc_t *out)
+{
+    out->dtc = 0xC07300u;
+    out->status = 0x09u;
+    return i == 0u;
+}
+static uint8_t all_dtc_ext(void *ctx, uint32_t dtc, uint8_t record, uint8_t *buf, size_t max, size_t *len)
+{
+    buf[0] = 0x01;
+    buf[1] = 0x02;
+    *len = 2u;
+    return 0u;
+}
+static uint8_t all_dtc_clear(void *ctx, uint32_t group, udsota_access_t a) { return 0u; }
+
+/* A fresh server with every hook and security on, in the extended session (10 03 sent physically) or the default. */
+static void all_hooks_server(bool extended)
+{
+    setUp();
+    g_hooks = udsota_mock_hooks(&g_mock);
+    g_hooks.comm_control = hook_cc;
+    g_hooks.dtc_setting = hook_dtc;
+    g_hooks.did_write = all_did_write;
+    g_hooks.routine = all_routine;
+    g_hooks.routine_poll = all_routine_poll;
+    g_hooks.dtc_get = all_dtc_get;
+    g_hooks.dtc_ext_data = all_dtc_ext;
+    g_hooks.dtc_clear = all_dtc_clear;
+    g_hooks.did_read_ex = all_did_read_ex;
+    g_hooks.routine_ex = all_routine_ex;
+    udsota_init(&s, &g_cfg, &ENGINE, udsota_mock_security(), &g_hooks);
+    if (extended) {
+        TEST_ASSERT_EQUAL_UINT(6, PHYS(0x10, 0x03));
+    }
+}
+
+/* A request the core answers physically when every hook is set; the six functional ones among them. */
+typedef struct { uint8_t len; uint8_t b[12]; } body_t;
+static const body_t VALID[] = {
+    {2, {0x10, 0x03}}, {2, {0x3E, 0x00}}, {3, {0x19, 0x02, 0xFF}}, {3, {0x22, 0xF1, 0x86}}, {3, {0x28, 0x00, 0x03}},
+    {2, {0x85, 0x01}}, {2, {0x10, 0x01}}, {3, {0x22, 0x03, 0x00}}, {2, {0x19, 0x0A}}, {2, {0x11, 0x01}},
+    {4, {0x14, 0xFF, 0xFF, 0xFF}}, {2, {0x27, 0x01}}, {4, {0x2E, 0x03, 0x00, 0xAA}}, {4, {0x31, 0x01, 0x12, 0x34}},
+    {4, {0x31, 0x03, 0x12, 0x34}}, {11, {0x34, 0x00, 0x44, 0, 0, 0, 0, 0, 0, 0, 0x40}}, {3, {0x36, 0x01, 0xE9}},
+    {1, {0x37}},
+};
+
+/* Sends b functionally to a fresh all-hooks server in the default or extended session; true when it answers. */
+static bool func_answers(bool extended, const uint8_t *b, size_t len)
+{
+    all_hooks_server(extended);
+    return func(b, len) != 0u;
+}
+
+/* With every hook set and security on, SIDs 00-FF sent functionally in the default and the extended session, each
+ * alone, as SID 01 F1 86 00 and SID 00, and every request in VALID: only 10, 3E, 19, 22, 28 and 85 ever draw an
+ * answer, and each of those does to its valid request, while the rest of VALID answers physically. The set is
+ * functional_served()'s, and the core README names it. */
+static void test_functional_answers_only_its_sids(void)
+{
+    static const uint8_t served[] = {0x10, 0x3E, 0x19, 0x22, 0x28, 0x85};
+    bool answered[256] = {false};
+    for (int ext = 0; ext < 2; ext++) {
+        for (unsigned sid = 0; sid <= 0xFFu; sid++) {
+            const uint8_t one[] = {(uint8_t)sid}, five[] = {(uint8_t)sid, 0x01, 0xF1, 0x86, 0x00};
+            const uint8_t zero[] = {(uint8_t)sid, 0x00};
+            answered[sid] = answered[sid] || func_answers(ext != 0, one, sizeof one) ||
+                            func_answers(ext != 0, five, sizeof five) || func_answers(ext != 0, zero, sizeof zero);
+        }
+        for (size_t i = 0; i < sizeof VALID / sizeof VALID[0]; i++) {
+            const bool a = func_answers(ext != 0, VALID[i].b, VALID[i].len);
+            answered[VALID[i].b[0]] = answered[VALID[i].b[0]] || a;
+            all_hooks_server(true);
+            TEST_ASSERT_TRUE_MESSAGE(phys(VALID[i].b, VALID[i].len) != 0u, "a VALID request is answered physically");
+        }
+    }
+    for (unsigned sid = 0; sid <= 0xFFu; sid++) {
+        bool want = false;
+        for (size_t k = 0; k < sizeof served; k++) {
+            want = want || sid == served[k];
+        }
+        char msg[48];
+        snprintf(msg, sizeof msg, "SID %02X answered functionally", sid);
+        TEST_ASSERT_EQUAL_MESSAGE(want, answered[sid], msg);
+    }
+}
+
 /* Runs every functional, 0x28, 0x85 and P2 test. */
 int main(void)
 {
@@ -371,5 +486,6 @@ int main(void)
     RUN_TEST(test_dtc_setting_checks);
     RUN_TEST(test_default_session_restores_with_one_hook);
     RUN_TEST(test_p2_per_session);
+    RUN_TEST(test_functional_answers_only_its_sids);
     return UNITY_END();
 }
