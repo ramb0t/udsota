@@ -2,7 +2,8 @@
  * ISO-TP adapter run over SocketCAN or a stdin/stdout frame pipe (demo_can.h), with an update engine on
  * two file-backed A/B slots (demo_engine.h). ActivateImage and 11 01 "reboot" in-process: the engine runs
  * the boot slot, stays silent for --boot-ms, and a fresh server starts, so an activated image runs
- * PENDING_VERIFY until ConfirmImage and one reset before that rolls back. A three-DTC table serves 19 and 14.
+ * PENDING_VERIFY until ConfirmImage and one reset before that rolls back. A three-DTC table serves 19 and 14, a keyed
+ * DID the app's did_read_ex and a self-test routine its routine_ex; --no-updater runs the server alone.
  *
  *   udsota_demo_server [--socketcan IFACE] [options]      serve (the pipe by default)
  *   udsota_demo_server --make-image OUT --version V         write an image for the configured identity
@@ -34,6 +35,11 @@
 #define DEMO_IMAGE_PAYLOAD  8192u       /* --make-image's default segment 0 size */
 #define DEMO_MASTER_LEN     32u         /* the client's master_file: 32 raw bytes */
 #define DID_BOARD           0xF191u     /* the example profile's board-name DID */
+#define DID_KEYED           0x0200u     /* 4 bytes, C0 FF EE 01, in the extended session and unlocked at 01 */
+#define RID_SELF_TEST       0xA001u     /* start, stop and results in every session (routine_ex) */
+#define SELF_TEST_IDLE      0x00u       /* results: never started */
+#define SELF_TEST_RUNNING   0x01u
+#define SELF_TEST_STOPPED   0x02u
 #define DEMO_DTC_AVAIL      0x2Fu       /* the status bits the demo supports: 0-3 and 5, as CANDash */
 #define DTC_REC_COUNT       0x01u       /* extended data record 01: the occurrence count, 1 byte */
 #define DTC_REC_SEEN        0x10u       /* extended data record 10: first and last seen, two u32 seconds */
@@ -57,6 +63,7 @@ typedef struct {
     uint32_t    withhold_fc_after;    /* --withhold-fc-after N: refuse the FC point after a message's Nth CF, once */
     uint32_t    drop_fc_after;        /* --drop-fc-after N: lose the FC sent after a message's Nth CF, once */
     bool        no_dtc;               /* --no-dtc: the DTC hooks stay NULL, so 19 and 14 answer 0x11 */
+    bool        no_updater;           /* --no-updater: udsota_init with a NULL engine, the server alone */
 } opts_t;
 
 /* One of the demo's DTCs and its extended data. */
@@ -91,6 +98,7 @@ typedef struct {
     char                dir[240];     /* the mkdtemp state directory, when --state-dir is not given */
     uint32_t            cfs;          /* CFs of the request message now arriving (fault injection counts them) */
     bool                ignore_ff;    /* the FF after a withheld FC is dropped unanswered */
+    uint8_t             self_test;    /* RID_SELF_TEST's state, SELF_TEST_*; a restart keeps it, as the DTCs */
 } demo_t;
 
 static demo_t d;
@@ -170,19 +178,64 @@ static void on_phase(void *ctx, udsota_phase_t p)
     fprintf(stderr, "udsota_demo_server: phase %s\n", (unsigned)p < 5u ? names[p] : "?");
 }
 
-/* hooks.did_read: F191, the board name the example profile's [board] table reads; one longer than max returns its
- * length unwritten (0x14). */
-static size_t on_did_read(void *ctx, uint16_t did, uint8_t *buf, size_t max)
+/* hooks.did_read_ex: F191, the board name the example profile's [board] table reads (0x14 when longer than max), and
+ * DID_KEYED, its rules in ISO order: the extended session (0x7F), then unlocked at the extended level when security
+ * is on (0x33; the demo leaves cfg.level_extended at 0x01). Any other DID is 0x31. */
+static uint8_t on_did_read_ex(void *ctx, uint16_t did, uint8_t *buf, size_t max, size_t *len, udsota_access_t access)
 {
     (void)ctx;
-    const size_t n = strlen(d.o.board);
-    if (did != DID_BOARD || n == 0u) {
+    static const uint8_t keyed[] = {0xC0, 0xFF, 0xEE, 0x01};
+    const size_t board = strlen(d.o.board);
+    const uint8_t *src = (did == DID_BOARD) ? (const uint8_t *)d.o.board : keyed;
+    const size_t n = (did == DID_BOARD) ? board : sizeof keyed;
+    if ((did != DID_BOARD || board == 0u) && did != DID_KEYED) {
+        return UDSOTA_NRC_REQUEST_OUT_OF_RANGE;
+    }
+    if (did == DID_KEYED && access.session != UDSOTA_SESSION_EXTENDED) {
+        return UDSOTA_NRC_SERVICE_NOT_SUPPORTED_IN_SESSION;
+    }
+    if (did == DID_KEYED && d.secured && access.unlocked_level != UDSOTA_SA_SEED_EXTENDED) {
+        return UDSOTA_NRC_SECURITY_ACCESS_DENIED;
+    }
+    if (n > max) {
+        return UDSOTA_NRC_RESPONSE_TOO_LONG;
+    }
+    memcpy(buf, src, n);
+    *len = n;
+    return 0u;
+}
+
+/* hooks.routine_ex: RID_SELF_TEST in every session, with no option record (0x13): 01 starts it (0x24 while it runs),
+ * 02 stops it (0x24 unless it runs), both with no status record, and 03 answers its state as one byte. Any other RID
+ * is 0x31. */
+static int on_routine_ex(void *ctx, uint8_t sub, uint16_t rid, const uint8_t *in, size_t in_len, uint8_t *out,
+                         size_t out_max, size_t *out_len, udsota_access_t access)
+{
+    (void)ctx;
+    (void)in;
+    (void)access;
+    if (rid != RID_SELF_TEST) {
+        return UDSOTA_NRC_REQUEST_OUT_OF_RANGE;
+    }
+    if (in_len != 0u) {
+        return UDSOTA_NRC_INCORRECT_LENGTH;
+    }
+    *out_len = 0u;
+    if (sub == UDSOTA_RC_RESULTS) {
+        if (out_max < 1u) {
+            return UDSOTA_NRC_RESPONSE_TOO_LONG;
+        }
+        out[0] = d.self_test;
+        *out_len = 1u;
         return 0;
     }
-    if (n <= max) {
-        memcpy(buf, d.o.board, n);
+    const bool start = (sub == UDSOTA_RC_START);
+    if (start == (d.self_test == SELF_TEST_RUNNING)) {
+        return UDSOTA_NRC_REQUEST_SEQUENCE_ERROR;
     }
-    return n;
+    d.self_test = start ? SELF_TEST_RUNNING : SELF_TEST_STOPPED;
+    fprintf(stderr, "udsota_demo_server: self-test %s\n", start ? "started" : "stopped");
+    return 0;
 }
 
 /* hooks.reset: the restart is taken once udsota_isotp_service returns; the server stays silent until then. */
@@ -336,7 +389,8 @@ static void start_server(void)
 {
     static udsota_hooks_t hooks;                /* the server and the adapter copy what they need */
     hooks = (udsota_hooks_t){
-        .gate = on_gate, .phase = on_phase, .did_read = on_did_read, .reset = on_reset,
+        .gate = on_gate, .phase = on_phase, .reset = on_reset, .did_read_ex = on_did_read_ex,
+        .routine_ex = on_routine_ex,
     };
     if (!d.o.no_dtc) {
         hooks.dtc_get = on_dtc_get;
@@ -352,7 +406,7 @@ static void start_server(void)
     d.boots++;
     d.cfs = 0u;
     d.ignore_ff = false;
-    udsota_init(&d.srv, &d.cfg, &eng, d.secured ? &sec : NULL, &hooks);
+    udsota_init(&d.srv, &d.cfg, d.o.no_updater ? NULL : &eng, d.secured ? &sec : NULL, &hooks);
     udsota_isotp_init(&d.tp, &d.srv, &d.cfg, &hooks, &can, &d.bufs);
     char v[33];
     demo_engine_version(&d.eng, v);
@@ -457,6 +511,7 @@ static void usage(FILE *out)
           "          --no-compress (refuse DFI 0x10, 0x20 and 0x30 downloads), --no-delta (refuse 0x20 and 0x30)\n"
           "security: --label LABEL [--master FILE (32 bytes)], --device-id 02:00:00:00:00:01, --skip-boot-delay\n"
           "dtc:      --no-dtc (no DTC hooks: 19 and 14 answer 0x11)\n"
+          "server:   --no-updater (the UDS server alone: 34, 36 and 37 answer 0x11, 10 02 answers 0x12)\n"
           "timing:   --boot-ms 500, --job-ms 0, --soak-ms 0, --stmin-us 2000, --block-size 64, --stmin-monitor\n"
           "faults:   --withhold-fc-after N (refuse the FC point after a message's Nth CF, then ignore the next FF),\n"
           "          --drop-fc-after N (lose the FC sent after a message's Nth CF); each once, N a multiple of the BS\n"
@@ -470,7 +525,7 @@ static bool parse_args(int argc, char **argv)
         O_SOCKETCAN = 256, O_REQ, O_RESP, O_PRODUCT, O_HW, O_LAYOUT, O_BOARD, O_CHIP, O_DIR, O_FRESH, O_SLOT, O_RUNNING,
         O_NO_ROLLBACK, O_LABEL, O_MASTER, O_DEVID, O_SKIP_DELAY, O_BOOT_MS, O_JOB_MS, O_SOAK_MS, O_STMIN, O_BS,
         O_MONITOR, O_MAKE, O_VERSION, O_PAYLOAD, O_SELF_TEST, O_HELP, O_REAL_BUS, O_NO_COMPRESS, O_WITHHOLD_FC,
-        O_DROP_FC, O_NO_DELTA, O_NO_DTC,
+        O_DROP_FC, O_NO_DELTA, O_NO_DTC, O_NO_UPDATER,
     };
     static const struct option longopts[] = {
         {"socketcan", required_argument, NULL, O_SOCKETCAN}, {"req-id", required_argument, NULL, O_REQ},
@@ -491,6 +546,7 @@ static bool parse_args(int argc, char **argv)
         {"withhold-fc-after", required_argument, NULL, O_WITHHOLD_FC},
         {"drop-fc-after", required_argument, NULL, O_DROP_FC},
         {"no-delta", no_argument, NULL, O_NO_DELTA}, {"no-dtc", no_argument, NULL, O_NO_DTC},
+        {"no-updater", no_argument, NULL, O_NO_UPDATER},
         {NULL, 0, NULL, 0},
     };
     d.o = (opts_t){
@@ -529,6 +585,7 @@ static bool parse_args(int argc, char **argv)
         case O_DROP_FC:     ok = num("drop-fc-after", optarg, 1, 585, &v); d.o.drop_fc_after = (uint32_t)v; break;
         case O_NO_DELTA:    d.o.no_delta = true; break;
         case O_NO_DTC:      d.o.no_dtc = true; break;
+        case O_NO_UPDATER:  d.o.no_updater = true; break;
         case O_LABEL:       label = optarg; break;
         case O_MASTER:      d.o.master_file = optarg; break;
         case O_DEVID:       ok = parse_device_id(optarg); break;
@@ -702,11 +759,12 @@ int main(int argc, char **argv)
     sigaction(SIGTERM, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
     fprintf(stderr, "udsota_demo_server: %s%s, IDs 0x%03X/0x%03X, %s hw_id %u layout %u, slots of 0x%X in %s, "
-            "security %s, compressed downloads %s, delta downloads %s\n", d.o.iface != NULL ? "SocketCAN " : "pipe on stdin/stdout",
+            "security %s, compressed downloads %s, delta downloads %s, updater %s\n",
+            d.o.iface != NULL ? "SocketCAN " : "pipe on stdin/stdout",
             d.o.iface != NULL ? d.o.iface : "", d.cfg.req_id, d.cfg.resp_id, d.cfg.product, d.cfg.hw_id,
             d.cfg.layout_id, d.o.slot_size, dir,
             !d.secured ? "off" : d.have_kdev ? "on" : "on, no master (every key refused)",
-            d.o.no_compress ? "off" : "on", d.eng.delta ? "on" : "off");
+            d.o.no_compress ? "off" : "on", d.eng.delta ? "on" : "off", d.o.no_updater ? "off" : "on");
     const int rc = serve();
     demo_can_close(&d.can);
     demo_engine_close(&d.eng);

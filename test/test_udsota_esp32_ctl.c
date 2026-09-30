@@ -49,6 +49,10 @@ static struct {
     uint32_t           dtc_ext_dtc, dtc_clear_group;
     uint8_t            dtc_ext_record;
     udsota_access_t    dtc_clear_access;
+    int                did_exs, routine_exs;   /* app did_read_ex and routine_ex calls */
+    uint16_t           did_ex_did, routine_ex_rid;
+    uint8_t            routine_ex_sub;
+    udsota_access_t    ex_access;       /* what the last _ex hook got */
     int                progress_calls;  /* app progress hook calls */
     udsota_progress_t  progress_arg;    /* what the app's progress hook last got */
     udsota_progress_t  progress_read;   /* what udsota_esp32_ctl_progress() returned inside it */
@@ -465,6 +469,36 @@ static uint8_t app_dtc_clear(void *ctx, uint32_t group, udsota_access_t access)
     return 0u;
 }
 
+/* The app's did_read_ex: records what arrived and answers 0x7F in the default session, else D1 D2. */
+static uint8_t app_did_read_ex(void *ctx, uint16_t did, uint8_t *buf, size_t max, size_t *len, udsota_access_t access)
+{
+    r.ctx_seen = ctx;
+    r.did_exs++;
+    r.did_ex_did = did;
+    r.ex_access = access;
+    if (access.session == UDSOTA_SESSION_DEFAULT) {
+        return 0x7Fu;
+    }
+    buf[0] = 0xD1;
+    buf[1] = 0xD2;
+    *len = 2u;
+    return 0u;
+}
+
+/* The app's routine_ex: records what arrived and answers its sub as the status byte. */
+static int app_routine_ex(void *ctx, uint8_t sub, uint16_t rid, const uint8_t *in, size_t in_len,
+                          uint8_t *out, size_t out_max, size_t *out_len, udsota_access_t access)
+{
+    r.ctx_seen = ctx;
+    r.routine_exs++;
+    r.routine_ex_sub = sub;
+    r.routine_ex_rid = rid;
+    r.ex_access = access;
+    out[0] = sub;
+    *out_len = 1u;
+    return 0;
+}
+
 /* The wrapped hooks pass the app's ctx, keep a NULL gate, did_read or stmin_us NULL so the core's
  * default holds, and reset falls back to the port's default only when the app has none. */
 static void test_wrapped_hooks_forward_app_ctx_and_keep_nulls(void)
@@ -677,6 +711,45 @@ static void test_dtc_hooks_reach_the_app(void)
     TEST_ASSERT_EQUAL_UINT(3u, udsota_on_request(&s_srv, rd, sizeof rd, resp, sizeof resp, NOW));
     TEST_ASSERT_EQUAL_HEX8_ARRAY(((const uint8_t[]){0x7F, 0x19, 0x11}), resp, 3);
     TEST_ASSERT_EQUAL_INT(1, r.dtc_clears);
+}
+
+/* 22 and 31 reach the app's did_read_ex and routine_ex through the port and the real server, with the app's ctx, the
+ * DID, sub-function and RID and the session's access; each wrapper is installed only when the app sets its hook, so
+ * without them 22 and 31 answer as before. */
+static void test_ex_hooks_reach_the_app(void)
+{
+    const udsota_hooks_t app = { .did_read_ex = app_did_read_ex, .routine_ex = app_routine_ex, .ctx = &s_marker };
+    start(&app);
+    TEST_ASSERT_TRUE(s_hooks.did_read_ex != NULL && s_hooks.routine_ex != NULL);
+    uint8_t resp[16];
+    const uint8_t rd[] = {0x22, 0x03, 0x00};
+    TEST_ASSERT_EQUAL_UINT(3u, udsota_on_request(&s_srv, rd, sizeof rd, resp, sizeof resp, NOW));
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(((const uint8_t[]){0x7F, 0x22, 0x7F}), resp, 3);
+    TEST_ASSERT_EQUAL_PTR(&s_marker, r.ctx_seen);
+    TEST_ASSERT_EQUAL_HEX16(0x0300u, r.did_ex_did);
+
+    r.ctx_seen = NULL;
+    const uint8_t rc[] = {0x31, 0x03, 0x12, 0x34};                /* in the default session: routine_ex's to judge */
+    TEST_ASSERT_EQUAL_UINT(5u, udsota_on_request(&s_srv, rc, sizeof rc, resp, sizeof resp, NOW + 1u));
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(((const uint8_t[]){0x71, 0x03, 0x12, 0x34, 0x03}), resp, 5);
+    TEST_ASSERT_EQUAL_PTR(&s_marker, r.ctx_seen);
+    TEST_ASSERT_EQUAL_HEX16(0x1234u, r.routine_ex_rid);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_RC_RESULTS, r.routine_ex_sub);
+    TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_DEFAULT, r.ex_access.session);
+
+    enter_extended(NOW + 2u);
+    TEST_ASSERT_EQUAL_UINT(5u, udsota_on_request(&s_srv, rd, sizeof rd, resp, sizeof resp, NOW + 3u));
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(((const uint8_t[]){0x62, 0x03, 0x00, 0xD1, 0xD2}), resp, 5);
+    TEST_ASSERT_EQUAL_UINT32(s_srv.session_epoch, r.ex_access.epoch);
+
+    start(NULL);
+    TEST_ASSERT_TRUE(s_hooks.did_read_ex == NULL && s_hooks.routine_ex == NULL);
+    TEST_ASSERT_EQUAL_UINT(3u, udsota_on_request(&s_srv, rd, sizeof rd, resp, sizeof resp, NOW));
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(((const uint8_t[]){0x7F, 0x22, 0x31}), resp, 3);
+    TEST_ASSERT_EQUAL_UINT(3u, udsota_on_request(&s_srv, rc, sizeof rc, resp, sizeof resp, NOW + 1u));
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(((const uint8_t[]){0x7F, 0x31, 0x7F}), resp, 3);
+    TEST_ASSERT_EQUAL_INT(2, r.did_exs);
+    TEST_ASSERT_EQUAL_INT(1, r.routine_exs);
 }
 
 /* Sends req and asserts the answer's first byte. */
@@ -1085,6 +1158,7 @@ int main(void)
     RUN_TEST(test_write_and_routine_wrappers_follow_each_app_hook);
     RUN_TEST(test_without_write_and_routine_hooks_the_core_answers_as_before);
     RUN_TEST(test_dtc_hooks_reach_the_app);
+    RUN_TEST(test_ex_hooks_reach_the_app);
     RUN_TEST(test_wait_ticks_never_round_a_wait_to_zero);
     RUN_TEST(test_ids_must_be_11_bit_and_distinct);
     RUN_TEST(test_progress_snapshot_copies_the_report_and_forwards_it);

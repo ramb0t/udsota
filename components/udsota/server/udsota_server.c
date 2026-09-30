@@ -230,9 +230,10 @@ static void svc_sync(udsota_server_t *s)
 /* See udsota_service.h. The core calls a registered service's members without a NULL check. */
 void udsota_register_service(udsota_server_t *s, const udsota_service_t *svc)
 {
-    assert(svc == NULL || (svc->request != NULL && svc->routine != NULL && svc->read_did != NULL &&
-                           svc->on_session != NULL && svc->settled != NULL && svc->download_active != NULL &&
-                           svc->poll != NULL && svc->fc_point != NULL && svc->sync != NULL));
+    assert(svc == NULL || (svc->request != NULL && svc->routine != NULL && svc->owns_rid != NULL &&
+                           svc->read_did != NULL && svc->on_session != NULL && svc->settled != NULL &&
+                           svc->download_active != NULL && svc->poll != NULL && svc->fc_point != NULL &&
+                           svc->sync != NULL));
     s->svc = svc;
 }
 
@@ -257,12 +258,11 @@ bool udsota_worker_busy(const udsota_server_t *s)
     return s->job_running || s->worker_orphan || s->app_orphan || svc_poll(s) == UDSOTA_PENDING;
 }
 
-/* 10 02: the service's slot rule, the worker idle and no transfer open (in that order, as the updater's own 34 asks
- * them), then gate(ENTER_PROGRAMMING). With no service only the worker rule and the gate. */
+/* 10 02, with a service registered: its slot rule, the worker idle and no transfer open (in that order, as the
+ * updater's own 34 asks them), then gate(ENTER_PROGRAMMING). */
 static uint8_t program_nrc(const udsota_server_t *s)
 {
-    const udsota_service_t *v = s->svc;
-    if ((v != NULL && !v->settled(s)) || udsota_worker_busy(s) || (v != NULL && v->download_active(s))) {
+    if (!s->svc->settled(s) || udsota_worker_busy(s) || s->svc->download_active(s)) {
         return UDSOTA_NRC_CONDITIONS_NOT_CORRECT;
     }
     return udsota_gate(s, UDSOTA_OP_ENTER_PROGRAMMING);
@@ -403,9 +403,9 @@ void udsota_end_session_now(udsota_server_t *s)
     enter_session(s, UDSOTA_SESSION_DEFAULT, false);
 }
 
-/* 0x10 DiagnosticSessionControl: 01/02/03. 02 needs program_nrc (the service's conditions and an idle worker), then
- * gate(ENTER_PROGRAMMING); 03 needs gate(ENTER_EXTENDED). The positive answer carries the new session's P2 and P2*
- * (10 ms units). */
+/* 0x10 DiagnosticSessionControl: 01/02/03. 02 needs a registered service (0x12 without one: nothing is programmed
+ * there), then program_nrc (the service's conditions and an idle worker) and gate(ENTER_PROGRAMMING); 03 needs
+ * gate(ENTER_EXTENDED). The positive answer carries the new session's P2 and P2* (10 ms units). */
 static size_t handle_session(udsota_server_t *s, const uint8_t *req, size_t len, uint8_t *resp, size_t resp_max)
 {
     if (len < 2) {
@@ -418,6 +418,9 @@ static size_t handle_session(udsota_server_t *s, const uint8_t *req, size_t len,
     }
     if (len != 2) {
         return udsota_nrc(resp, resp_max, UDSOTA_SID_SESSION, UDSOTA_NRC_INCORRECT_LENGTH);
+    }
+    if (sub == UDSOTA_SESSION_PROGRAMMING && s->svc == NULL) {
+        return udsota_nrc(resp, resp_max, UDSOTA_SID_SESSION, UDSOTA_NRC_SUBFUNC_NOT_SUPPORTED);
     }
     uint8_t nrc = 0;
     if (sub == UDSOTA_SESSION_PROGRAMMING) {
@@ -459,9 +462,29 @@ static size_t handle_tester_present(const uint8_t *req, size_t len, uint8_t *res
     return 2;
 }
 
+/* hooks.did_read_ex for a DID the core and the service leave to the app, into the room after 62 <did>: 0 with *len
+ * in 1..room is the answer, 0 with *len 0 or past room 0x10, and any other return the NRC to send. */
+static size_t app_read_did_ex(udsota_server_t *s, uint16_t did, uint8_t *resp, size_t resp_max)
+{
+    const uint8_t sid = UDSOTA_SID_READ_DID;
+    const size_t room = resp_max - 3u;
+    size_t len = 0u;
+    const uint8_t nrc = s->hooks.did_read_ex(s->hooks.ctx, did, &resp[3], room, &len, access_of(s));
+    if (nrc != 0u) {
+        return udsota_nrc(resp, resp_max, sid, nrc);
+    }
+    if (len == 0u || len > room) {
+        return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_GENERAL_REJECT);
+    }
+    resp[0] = UDSOTA_POS(sid);
+    udsota_put_u16be(&resp[1], did);
+    return 3u + len;
+}
+
 /* 0x22 ReadDataByIdentifier, one DID per request. F186 and F1F2 come from the server's own state and F18C from
  * cfg.device_id; every other DID (and F18C without a device ID) goes to the service, and one it passes, or every one
- * with no service, to hooks.did_read; 0 bytes means NRC 0x31, and an answer longer than room 0x14. */
+ * with no service, to hooks.did_read_ex when set (app_read_did_ex), else to hooks.did_read; 0 bytes means NRC 0x31,
+ * and an answer longer than room 0x14. */
 static size_t handle_read_did(udsota_server_t *s, const uint8_t *req, size_t len, uint8_t *resp, size_t resp_max)
 {
     if (len != 1u + 2u * UDSOTA_READ_DID_MAX) {
@@ -486,6 +509,9 @@ static size_t handle_read_did(udsota_server_t *s, const uint8_t *req, size_t len
         }
     } else {
         n = (s->svc != NULL) ? s->svc->read_did(s, did, out, room) : UDSOTA_SVC_PASS;
+        if (n == UDSOTA_SVC_PASS && s->hooks.did_read_ex != NULL) {
+            return app_read_did_ex(s, did, resp, resp_max);
+        }
         if (n == UDSOTA_SVC_PASS) {
             n = (s->hooks.did_read != NULL) ? s->hooks.did_read(s->hooks.ctx, did, out, room) : 0u;
         }
@@ -601,8 +627,9 @@ static int app_poll(udsota_server_t *s, uint8_t *resp, size_t resp_max)
     return s->hooks.routine_poll(s->hooks.ctx, room ? &resp[4] : resp, room ? resp_max - 4u : 0u, &s->job_out_len);
 }
 
-/* An app routine's result (udsota_job_done_fn): 0 is 71 01 <rid> and the job_out_len bytes the app wrote at
- * resp[4]; 1..0xFF is that NRC; anything else, or an out record longer than its room, is 0x10. job_arg is the RID. */
+/* An app routine's result (udsota_job_done_fn): 0 is 71 <sub> <rid> and the job_out_len bytes the app wrote at
+ * resp[4]; 1..0xFF is that NRC; anything else, or an out record longer than its room, is 0x10. job_arg is the RID,
+ * with the sub-function in bits 16-23. */
 static size_t app_routine_done(udsota_server_t *s, int result, uint8_t *resp, size_t resp_max, uint32_t now_ms)
 {
     (void)now_ms;
@@ -613,20 +640,20 @@ static size_t app_routine_done(udsota_server_t *s, int result, uint8_t *resp, si
         return udsota_nrc(resp, resp_max, UDSOTA_SID_ROUTINE, UDSOTA_NRC_GENERAL_REJECT);
     }
     resp[0] = UDSOTA_POS(UDSOTA_SID_ROUTINE);
-    resp[1] = UDSOTA_RC_START;
+    resp[1] = (uint8_t)(s->job_arg >> 16);
     udsota_put_u16be(&resp[2], (uint16_t)s->job_arg);
     return 4u + s->job_out_len;
 }
 
-/* 31 01 for a RID the core does not own, after the session, length and sub-function checks: 0x31 without
- * hooks.routine; 0x22 while an app orphan runs (routine_poll speaks for one routine at a time); nothing when
- * there is no room for 71 01 <rid>; else the app's answer, now or, for UDSOTA_PENDING, from udsota_poll after
+/* 31 <sub> for a RID the core does not own, after the core's checks: 0x31 without hooks.routine_ex or routine; 0x22
+ * while an app orphan runs (routine_poll speaks for one routine at a time); nothing when there is no room for 71 <sub>
+ * <rid>; else the answer of routine_ex, or of routine (sub 01 only), now or, for UDSOTA_PENDING, from udsota_poll after
  * 0x78s. The option record after the RID is the app's to check. */
-static size_t handle_app_routine(udsota_server_t *s, uint16_t rid, const uint8_t *req, size_t len, bool spr,
-                                 uint8_t *resp, size_t resp_max, uint32_t now_ms)
+static size_t handle_app_routine(udsota_server_t *s, uint8_t sub, uint16_t rid, const uint8_t *req, size_t len,
+                                 bool spr, uint8_t *resp, size_t resp_max, uint32_t now_ms)
 {
     const uint8_t sid = UDSOTA_SID_ROUTINE;
-    if (s->hooks.routine == NULL) {
+    if (s->hooks.routine_ex == NULL && s->hooks.routine == NULL) {
         return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_REQUEST_OUT_OF_RANGE);
     }
     if (s->app_orphan) {
@@ -637,18 +664,35 @@ static size_t handle_app_routine(udsota_server_t *s, uint16_t rid, const uint8_t
     }
     const udsota_access_t access = access_of(s);   /* the same access state did_write gets */
     size_t out_len = 0u;
-    const int rc = s->hooks.routine(s->hooks.ctx, rid, &req[4], len - 4u, &resp[4], resp_max - 4u, &out_len, access);
+    const int rc = (s->hooks.routine_ex != NULL)
+        ? s->hooks.routine_ex(s->hooks.ctx, sub, rid, &req[4], len - 4u, &resp[4], resp_max - 4u, &out_len, access)
+        : s->hooks.routine(s->hooks.ctx, rid, &req[4], len - 4u, &resp[4], resp_max - 4u, &out_len, access);
     s->job_out_len = out_len;
     s->job_app = (rc == UDSOTA_PENDING);
-    return udsota_job_start(s, sid, spr, rc, app_routine_done, rid, resp, resp_max, now_ms);
+    return udsota_job_start(s, sid, spr, rc, app_routine_done, ((uint32_t)sub << 16) | rid, resp, resp_max, now_ms);
 }
 
-/* 0x31 startRoutine. Check order: session 7F, length 13, sub-function 12; the service then takes its own RIDs, and
- * any other goes to handle_app_routine. */
+/* 0x31 RoutineControl. With hooks.routine_ex, length 13 comes first; a RID the service owns then takes the path
+ * below, as without the hook, and any other, in every session, the sub-function check (01, 02 or 03, else 12) and
+ * handle_app_routine. Otherwise: session 7F, length 13, sub-function 12 (01 only); the service then takes its own
+ * RIDs, and any other goes to handle_app_routine. */
 static size_t handle_routine(udsota_server_t *s, const uint8_t *req, size_t len, uint8_t *resp, size_t resp_max,
                              uint32_t now_ms)
 {
     const uint8_t sid = UDSOTA_SID_ROUTINE;
+    if (s->hooks.routine_ex != NULL) {
+        if (len < 4u) {
+            return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_INCORRECT_LENGTH);
+        }
+        const uint16_t rid = udsota_get_u16be(&req[2]);
+        if (s->svc == NULL || !s->svc->owns_rid(s, rid)) {
+            const uint8_t sub = req[1] & (uint8_t)~UDSOTA_SPRMIB;
+            if (sub != UDSOTA_RC_START && sub != UDSOTA_RC_STOP && sub != UDSOTA_RC_RESULTS) {
+                return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_SUBFUNC_NOT_SUPPORTED);
+            }
+            return handle_app_routine(s, sub, rid, req, len, (req[1] & UDSOTA_SPRMIB) != 0, resp, resp_max, now_ms);
+        }
+    }
     if (s->session == UDSOTA_SESSION_DEFAULT) {
         return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_SERVICE_NOT_SUPPORTED_IN_SESSION);
     }
@@ -666,7 +710,7 @@ static size_t handle_routine(udsota_server_t *s, const uint8_t *req, size_t len,
             return n;
         }
     }
-    return handle_app_routine(s, rid, req, len, spr, resp, resp_max, now_ms);
+    return handle_app_routine(s, UDSOTA_RC_START, rid, req, len, spr, resp, resp_max, now_ms);
 }
 
 /* ---- 0x11 ECUReset ---- */
@@ -1176,7 +1220,7 @@ static size_t finish_job(udsota_server_t *s, int rc, uint8_t *resp, size_t resp_
 }
 
 /* Advances a running job through its own poll (the service's, or routine_poll for an app routine): its final answer,
- * the 90 s cap (0x72, session ends), or the 0x78 cadence. */
+ * the 90 s cap (0x72, or 0x10 for an app routine, which programs nothing; the session ends), or the 0x78 cadence. */
 static size_t poll_job(udsota_server_t *s, uint8_t *resp, size_t resp_max, uint32_t now_ms)
 {
     const int rc = s->job_app ? app_poll(s, resp, resp_max) : svc_poll(s);
@@ -1188,10 +1232,11 @@ static size_t poll_job(udsota_server_t *s, uint8_t *resp, size_t resp_max, uint3
     if (elapsed >= UDSOTA_JOB_CAP_MS) {
         const uint8_t sid = s->job_sid;
         const bool mine = !s->job_app;   /* the service's job: its on_session hears the cap */
+        const uint8_t nrc = mine ? UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE : UDSOTA_NRC_GENERAL_REJECT;
         orphan_job(s);   /* its owner still runs it; 10 02 waits for it */
         udsota_sat_inc16(&s->counters.resp_pending_caps);
         enter_session(s, UDSOTA_SESSION_DEFAULT, mine);
-        return udsota_nrc(resp, resp_max, sid, UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE);
+        return udsota_nrc(resp, resp_max, sid, nrc);
     }
     const bool due = s->job_pending_sent ? (now_ms - s->last_pending_ms) >= pending_repeat_ms(s)
                                          : elapsed >= pending_first_ms(s);
@@ -1204,7 +1249,7 @@ static size_t poll_job(udsota_server_t *s, uint8_t *resp, size_t resp_max, uint3
 }
 
 /* Advances the job wait, the orphaned-job watch, a latched end_session and S3; returns a response length to send (a
- * 0x78, 0x72 or a job's final answer), or 0. An app that must end a session (a second device on the IDs, say) calls udsota_end_session. */
+ * 0x78, the cap's 0x72 or 0x10, or a job's final answer), or 0. An app that must end a session (a second device on the IDs, say) calls udsota_end_session. */
 static size_t poll_step(udsota_server_t *s, uint8_t *resp, size_t resp_max, uint32_t now_ms)
 {
     if (s->reset_phase != RESET_IDLE) {

@@ -15,6 +15,7 @@ typedef struct udsota_service {            /* const, registered once right after
                       uint8_t *resp, size_t resp_max, uint32_t now_ms);          /* SIDs the core doesn't own */
     size_t (*routine)(udsota_server_t *s, uint16_t rid, const uint8_t *req, size_t len, bool spr,
                       uint8_t *resp, size_t resp_max, uint32_t now_ms);          /* 31 01, after the core's 7F/13/12 */
+    bool   (*owns_rid)(const udsota_server_t *s, uint16_t rid);                /* routine's RIDs, in any session */
     size_t (*read_did)(const udsota_server_t *s, uint16_t did, uint8_t *out, size_t room);  /* 0 = 0x31, over room 0x14 */
     void   (*on_session)(udsota_server_t *s, bool job_capped);                  /* every session entry, first */
     bool   (*settled)(const udsota_server_t *s);                                /* 10 02 slot rule */
@@ -33,9 +34,9 @@ void    udsota_register_service(udsota_server_t *s, const udsota_service_t *svc)
 /* Writes 7F <sid> <nrc>; returns 3, or 0 without writing when resp_max < 3. */
 size_t  udsota_nrc(uint8_t *resp, size_t resp_max, uint8_t sid, uint8_t nrc);
 /* Finishes a handler whose op may have queued worker work. rc == UDSOTA_PENDING starts the wait
- * (poll sends 0x78 from 4/5 of the session's P2, answers 0x72 at 90 s, and calls done once the service's poll, or
- * routine_poll for an app routine, reports a result) and returns 0; any other rc calls done(rc) now and returns
- * its answer. arg is stored for done (udsota_job_arg).
+ * (poll sends 0x78 from 4/5 of the session's P2, answers 0x72 at 90 s, 0x10 for an app routine, and calls done
+ * once the service's poll, or routine_poll for an app routine, reports a result) and returns 0; any other rc calls
+ * done(rc) now and returns its answer. arg is stored for done (udsota_job_arg).
  * suppress_pos drops a positive final answer unless a 0x78 went out first. */
 size_t  udsota_job_start(udsota_server_t *s, uint8_t sid, bool suppress_pos, int rc, udsota_job_done_fn done,
                          uint32_t arg, uint8_t *resp, size_t resp_max, uint32_t now_ms);

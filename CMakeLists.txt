@@ -134,8 +134,9 @@ udsota_test(test_udsota_bootloop
 # ---- Server, over SERVER_SRCS alone. _write: 0x2E through hooks.did_write, and the access state and session epoch
 # every app hook gets. _progress: udsota_progress() and hooks.progress after each step of a download. _no_engine: the
 # server with no updater registered (udsota_init with a NULL engine). _dtc: 0x19 and 0x14 through the DTC hooks.
+# _app_ex: hooks.did_read_ex and routine_ex, the 90 s cap's NRC per job, and 10 02 with no service.
 foreach(t IN ITEMS server server_security server_routines server_matrix server_hooks server_write
-                   server_functional server_progress server_no_engine server_dtc)
+                   server_functional server_progress server_no_engine server_dtc server_app_ex)
     udsota_test(test_udsota_${t} SOURCES test/test_udsota_${t}.c ${SERVER_SRCS})
 endforeach()
 target_include_directories(test_udsota_server_no_engine PRIVATE ${TEST_DIR}/core_only)   # the rows it shares
@@ -343,8 +344,11 @@ if(UDSOTA_FUZZ AND UDSOTA_FUZZ_SAN_OK)
         set_tests_properties(fuzz_udsota_corpus PROPERTIES TIMEOUT 1800)
     endif()
     # The same harness with did_write, routine and routine_poll set: 0x2E served, app routines answered at once,
-    # after 0x78s and orphaned at the 90 s cap, each with exactly one owner.
-    udsota_fuzz(fuzz_udsota_app_hooks 300 DIGEST f89754fc3ef5118b DEFS UDSOTA_FUZZ_APP_HOOKS=1)
+    # after 0x78s and orphaned at the 90 s cap (0x10), each with exactly one owner.
+    udsota_fuzz(fuzz_udsota_app_hooks 300 DIGEST c77cb5bf4f034a07 DEFS UDSOTA_FUZZ_APP_HOOKS=1)
+    # The same with did_read_ex and routine_ex set too, so did_read and routine never run: 22 and 31 01, 02 and 03 on
+    # the app's DIDs and RIDs in every session, hook faults answered 0x10, and the updater's RIDs as without the hook.
+    udsota_fuzz(fuzz_udsota_app_ex 300 DIGEST 9e26a1fc6faf38df DEFS UDSOTA_FUZZ_APP_HOOKS=1 UDSOTA_FUZZ_APP_EX=1)
     # The same harness with the progress hook set: done never passes total nor shrinks within a download, and the
     # hook runs at most once per call and reports every change of stage. Its PASS line matches fuzz_udsota's.
     udsota_fuzz(fuzz_udsota_progress 300 DIGEST 167b0bb1e30d7960 DEFS UDSOTA_FUZZ_PROGRESS=1)
@@ -354,9 +358,10 @@ if(UDSOTA_FUZZ AND UDSOTA_FUZZ_SAN_OK)
     udsota_fuzz(fuzz_udsota_z 600 DIGEST 744cebe8b3e84bd0 SOURCES ${ZSTREAM_SRCS} INCLUDES ${ZSTREAM_INC}
                 DEFS UDSOTA_FUZZ_Z=1 UDSOTA_FUZZ_PROGRESS=1 ${MINIZ_TEST_DEFS})
     # The same harness with no update service (udsota_core_init, which is udsota_init given a NULL engine), from the
-    # five states a download isn't needed for: 34, 36 and 37 get only 0x11 (0x21 while an app routine runs), and the
-    # app hooks give 0x31 its positive answers. Built from the core list, so the updater isn't even linked.
-    udsota_fuzz(fuzz_udsota_no_update 300 DIGEST 9f7c2932c2332507 SERVER ${UDSOTA_SERVER_CORE_SRCS}
+    # three states outside the programming session, which 10 02 can't enter (0x12): 34, 36 and 37 get only 0x11 (0x21
+    # while an app routine runs), and the app hooks give 0x31 its positive answers. Built from the core list, so the
+    # updater isn't even linked.
+    udsota_fuzz(fuzz_udsota_no_update 300 DIGEST 1d28e3ebb7969182 SERVER ${UDSOTA_SERVER_CORE_SRCS}
                 DEFS UDSOTA_FUZZ_NO_UPDATE=1 UDSOTA_FUZZ_APP_HOOKS=1)
     # The same harness with the DTC hooks set over a 90-DTC table: 19 01, 02, 06 and 0A and 14 served, lists past the
     # response buffer (0x14), and every status sent a subset of the availability mask.
