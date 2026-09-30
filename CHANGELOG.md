@@ -4,6 +4,8 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-09-30
+
 - Client: `[config] groups` makes `config set` stage and commit each group of keys in turn, with one `--reset` after the last, for a device that takes one namespace per commit. A writable blob key's `len` refuses a value of another length before the bus opens. Profiles without them behave as before. Not breaking.
 
 ## [0.12.0] - 2026-09-30
