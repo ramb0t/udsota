@@ -112,6 +112,26 @@ udsota_test(test_udsota_isotp
     SOURCES test/test_udsota_isotp.c
     LIBS    udsota_core)
 
+# udsota_isotp_sizes(<name> [RX <n>] [RESP <n>]): test_udsota_isotp_sizes.c over the adapter, server and updater
+# compiled with UDSOTA_ISOTP_RX_MAX and UDSOTA_ISOTP_RESP_MAX set (each at its default when not given), so the receive
+# limits, 34's maxNumberOfBlockLength and the longest 22 and 19 answers are checked at those sizes.
+function(udsota_isotp_sizes name)
+    cmake_parse_arguments(S "" "RX;RESP" "" ${ARGN})
+    set(srcs ${UDSOTA_SERVER_SRCS} ${SERVER_SRCS})
+    list(REMOVE_DUPLICATES srcs)
+    udsota_test(${name} SOURCES test/test_udsota_isotp_sizes.c ${srcs} LIBS isotp)
+    if(S_RX)
+        target_compile_definitions(${name} PRIVATE UDSOTA_ISOTP_RX_MAX=${S_RX}u)
+    endif()
+    if(S_RESP)
+        target_compile_definitions(${name} PRIVATE UDSOTA_ISOTP_RESP_MAX=${S_RESP}u)
+    endif()
+endfunction()
+udsota_isotp_sizes(test_udsota_isotp_sizes)                          # the defaults, 4,095 and 256
+udsota_isotp_sizes(test_udsota_isotp_sizes_small RX 512 RESP 128)
+udsota_isotp_sizes(test_udsota_isotp_sizes_min RX 66 RESP 35)         # the floors udsota_isotp.h asserts
+udsota_isotp_sizes(test_udsota_isotp_sizes_large RESP 1024)
+
 # ---- Core, pure parts ----
 udsota_test(test_udsota_codec
     SOURCES  test/test_udsota_codec.c ${UDSOTA_CODEC_SRCS})
@@ -375,15 +395,25 @@ if(UDSOTA_FUZZ AND UDSOTA_FUZZ_SAN_OK)
     list(REMOVE_DUPLICATES FRAMES_SRCS)
     set_source_files_properties(${ISOTP_C} PROPERTIES
                                 COMPILE_OPTIONS "-include;${ROOT}/components/isotp/isotp_force.h")
-    udsota_test(fuzz_udsota_frames SOURCES ${CORE_TEST}/fuzz_udsota_frames.c ${FRAMES_SRCS}
-                INCLUDES ${CORE_TEST} $<TARGET_PROPERTY:isotp,INTERFACE_INCLUDE_DIRECTORIES>)
-    target_compile_definitions(fuzz_udsota_frames PRIVATE UDSOTA_FUZZ_UBSAN_TRAP=1
-                               $<TARGET_PROPERTY:isotp,INTERFACE_COMPILE_DEFINITIONS>
-                               FUZZ_FRAMES_OTA_DIR="${CMAKE_CURRENT_BINARY_DIR}/fuzz_frames_ota")
-    target_compile_options(fuzz_udsota_frames PRIVATE ${FUZZ_SAN})
-    target_link_options(fuzz_udsota_frames PRIVATE ${FUZZ_SAN})
-    set_tests_properties(fuzz_udsota_frames PROPERTIES TIMEOUT 120
-                         PASS_REGULAR_EXPRESSION "fuzz_udsota_frames: PASS .* digest=0279b8d7535d8ef1")
+    # udsota_fuzz_frames(<name> <ota dir> <digest> [DEFS..]): the harness over FRAMES_SRCS, its slot files in the
+    # build dir's <ota dir>, one per target since ctest runs them side by side.
+    function(udsota_fuzz_frames name ota digest)
+        cmake_parse_arguments(F "" "" "DEFS" ${ARGN})
+        udsota_test(${name} SOURCES ${CORE_TEST}/fuzz_udsota_frames.c ${FRAMES_SRCS}
+                    INCLUDES ${CORE_TEST} $<TARGET_PROPERTY:isotp,INTERFACE_INCLUDE_DIRECTORIES>)
+        target_compile_definitions(${name} PRIVATE UDSOTA_FUZZ_UBSAN_TRAP=1
+                                   $<TARGET_PROPERTY:isotp,INTERFACE_COMPILE_DEFINITIONS>
+                                   FUZZ_FRAMES_OTA_DIR="${CMAKE_CURRENT_BINARY_DIR}/${ota}" ${F_DEFS})
+        target_compile_options(${name} PRIVATE ${FUZZ_SAN})
+        target_link_options(${name} PRIVATE ${FUZZ_SAN})
+        set_tests_properties(${name} PROPERTIES TIMEOUT 120
+                             PASS_REGULAR_EXPRESSION "fuzz_udsota_frames: PASS .* digest=${digest}")
+    endfunction()
+    udsota_fuzz_frames(fuzz_udsota_frames fuzz_frames_ota 0279b8d7535d8ef1)
+    # The same at small buffers, so the receive limits, 34's block length and the answers that fill and overflow the
+    # response buffer are its own: RX_MAX 512, RESP_MAX 128.
+    udsota_fuzz_frames(fuzz_udsota_frames_small fuzz_frames_small_ota e9516cc4754587ad
+                       DEFS UDSOTA_ISOTP_RX_MAX=512u UDSOTA_ISOTP_RESP_MAX=128u)
     # The delta patch path on mutated patches (test/fuzz_udsota_patch.c): udsota_coded over the real detools and
     # tinfl, with AddressSanitizer where the toolchain has it, since the device parses these patches from the bus.
     set(FUZZ_PATCH_SAN ${FUZZ_SAN})

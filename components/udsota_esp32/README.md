@@ -59,7 +59,9 @@ The diag task sleeps on its frame queue until the adapter's next deadline, and t
 | `UDSOTA_ESP32_TASK_PRIO` | 5 | its priority: below the app's CAN task, above the app's other tasks and the flash worker |
 | `UDSOTA_ESP32_TASK_STACK` | 6144 | its stack, in bytes; the 0x27 check runs on it too (an ECDSA verify in that mode) |
 | `UDSOTA_ESP32_TASK_STACK_PSRAM` | y | put the diag task's stack in PSRAM |
-| `UDSOTA_ESP32_BUFS_PSRAM` | y | put the ISO-TP adapter's 8,958 bytes of buffers in PSRAM |
+| `UDSOTA_ESP32_BUFS_PSRAM` | y | put the ISO-TP adapter's buffers, 8,958 bytes at the default sizes, in PSRAM |
+| `UDSOTA_ESP32_ISOTP_RX_MAX` | 4095 | the largest request and the adapter's two receive buffers, in bytes: 322–4095 with the updater, which caps 34's block length at it, and 66–4095 without, where 256 is all it needs ([below](#without-the-updater)) |
+| `UDSOTA_ESP32_ISOTP_RESP_MAX` | 256 | the largest answer and the adapter's three answer buffers, in bytes (35–4095); 19 lists up to (RESP_MAX − 3) / 4 DTCs, 63 at 256 |
 | `UDSOTA_ESP32_WORKER_CORE` | 0 | core of the flash worker (erase, write, verify, activate, confirm) |
 | `UDSOTA_ESP32_WORKER_PRIO` | 3 | its priority; below the app's own tasks (a UI, say), so they keep running during an erase |
 | `UDSOTA_ESP32_WORKER_STACK` | 8192 | its stack, in bytes, sized for the RSA-3072 verify inside `esp_ota_end()` |
@@ -103,4 +105,4 @@ On the wire, 0x34, 0x36 and 0x37 answer 0x11, 10 02 answers 0x12, since there is
 
 The app-facing calls still link: `udsota_esp32_engine()` returns NULL, `udsota_esp32_engine_busy()` false, `udsota_esp32_image_unconfirmed()` false without reading the OTA state, `udsota_esp32_status()` no slots (`UDSOTA_SLOT_NONE`) with the same flags as the updater's (the boot-loop breaker's among them), `udsota_esp32_progress()` IDLE and `udsota_esp32_incoming_version()` "". `udsota_esp32_image_check()` is not built. Security, the device ID, the PSA lock and the boot-loop breaker work as before, though the breaker shows on the wire only if the app serves F1F0. With rollback on, an image the device's other updater writes boots pending verify and that updater must confirm it (`esp_ota_mark_app_valid_cancel_rollback()`), since nothing here does; `sdkconfig.noupdater` turns rollback off.
 
-Still paid: the ISO-TP adapter's buffers, allocated at 8,958 bytes, sized for a download block, and in internal RAM unless `UDSOTA_ESP32_BUFS_PSRAM` puts them in PSRAM, and the updater's 116-byte state inside the server struct. The CHANGELOG has the savings per target and how the heap figure was computed.
+Still paid: the updater's 116-byte state inside the server struct, and the ISO-TP adapter's buffers, 8,958 bytes sized for a download block, in internal RAM unless `UDSOTA_ESP32_BUFS_PSRAM` puts them in PSRAM. Without the updater no request over 256 bytes is ever taken, so set `UDSOTA_ESP32_ISOTP_RX_MAX` to 256, as `examples/esp32/sdkconfig.smallbufs` does, and they drop to 1,280 bytes, 7,678 fewer, and the esp32s3 example's image by 40 bytes of code. The CHANGELOG has the savings per target and how the heap figure was computed.

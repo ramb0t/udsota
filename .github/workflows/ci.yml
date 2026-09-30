@@ -87,6 +87,11 @@ jobs:
         # A config names the example's sdkconfig.* fragments, joined by +. delta+debugmeasure compiles every
         # CONFIG_UDSOTA_ESP32_DEBUG_MEASURE block but the engine's XIP-from-PSRAM branch, which needs SPIRAM.
         config: [default, compression, delta, noupdater, delta+debugmeasure]
+        # Once, on one target: the ISO-TP buffers at a server alone's size (256-byte requests), set from Kconfig for the
+        # core, the port and the app.
+        include:
+          - target: esp32s3
+            config: noupdater+smallbufs
     steps:
       - uses: actions/checkout@v4
       - name: Build the example for ${{ matrix.target }} (${{ matrix.config }})
@@ -119,7 +124,7 @@ jobs:
           xtensa-esp-elf-nm "$b/example.elf" > "$b/syms"   # a file, not a pipe: grep -q would make nm exit 141
           # esp_ota_begin stands for the engine, udsota_update_init and udsota_init for the core's updater (a port
           # that starts the server through udsota_init with a NULL engine links it all, with no esp_ota_* call).
-          if [ "${{ matrix.config }}" = noupdater ]; then
+          if [[ "+${{ matrix.config }}+" == *+noupdater+* ]]; then
             grep -qx '# CONFIG_UDSOTA_ESP32_UPDATER is not set' "$b/sdkconfig" || { echo "the option is still on"; exit 1; }
             if grep -qw esp_ota_begin "$b/syms"; then echo "engine linked in noupdater"; exit 1; fi
             if grep -qwE 'udsota_update_init|udsota_init' "$b/syms"; then echo "core updater linked in noupdater"; exit 1; fi

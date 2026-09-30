@@ -13,7 +13,7 @@
 #define PAD      0xAAu     /* ISO_TP_FRAME_PADDING_VALUE */
 
 _Static_assert(offsetof(struct udsota_isotp, link_cfg) == 0, "isotp_port reads the link cfg at offset 0");
-_Static_assert(UDSOTA_ISOTP_RX_MAX == UDSOTA_DL_MAX_BLOCK_LEN, "the receive buffer holds one whole 0x36 block");
+_Static_assert(UDSOTA_ISOTP_RX_MAX <= UDSOTA_DL_MAX_BLOCK_LEN, "an FF_DL of 12 bits reaches the whole receive buffer");
 
 static const udsota_can_t *s_clock;   /* isotp_user_get_us has no link: the last adapter initialised serves the clock */
 
@@ -47,7 +47,7 @@ static void fc_drop(udsota_isotp_t *t)
  * and a parked FC with it. Call only while the send side is idle. */
 static void link_init(udsota_isotp_t *t, uint32_t limit)
 {
-    isotp_init_link(&t->link, t->resp_id, t->buf->tx, UDSOTA_ISOTP_TX_MAX, t->buf->rx, limit);
+    isotp_init_link(&t->link, t->resp_id, t->buf->tx, sizeof t->buf->tx, t->buf->rx, limit);
     t->link.user_send_can_arg = t;        /* isotp_init_link cleared it; link_cfg is t's first member */
     t->rx_limit = limit;
     t->rx_orphan = false;
@@ -97,8 +97,8 @@ static void tx_response(udsota_isotp_t *t, size_t n)
     if (n == 0u) {
         return;
     }
-    if (n > UDSOTA_ISOTP_RESP_MAX) {
-        n = UDSOTA_ISOTP_RESP_MAX;
+    if (n > sizeof t->buf->park) {
+        n = sizeof t->buf->park;
     }
     if (t->park_len != 0u) {
         t->resp_lost++;                   /* unreachable: every caller waits for !tx_busy() */
@@ -116,10 +116,10 @@ static void take_request(udsota_isotp_t *t, uint32_t now_ms)
         return;
     }
     uint32_t len = 0;
-    if (isotp_receive(&t->link, t->buf->req, UDSOTA_ISOTP_RX_MAX, &len) != ISOTP_RET_OK) {
+    if (isotp_receive(&t->link, t->buf->req, sizeof t->buf->req, &len) != ISOTP_RET_OK) {
         return;
     }
-    tx_response(t, udsota_on_request(t->srv, t->buf->req, len, t->buf->resp, UDSOTA_ISOTP_RESP_MAX, now_ms));
+    tx_response(t, udsota_on_request(t->srv, t->buf->req, len, t->buf->resp, sizeof t->buf->resp, now_ms));
 }
 
 /* Drops the message being reassembled after a withheld FC (the server has counted the stop), and any FC still
@@ -218,7 +218,12 @@ void udsota_isotp_init(udsota_isotp_t *t, udsota_server_t *s, const udsota_confi
         t->stmin_ctx = hooks->ctx;
     }
     /* BS, STmin and the download limit come from s->cfg, as udsota_init resolved them, so the ISO-TP receive
-     * limit is the very maxNumberOfBlockLength that 0x74 announces. The server does not resolve fc_retry_ms. */
+     * limit is the very maxNumberOfBlockLength that 0x74 announces. The server, which knows no transport, caps that
+     * at 4095; a 36 longer than the receive buffer could never arrive, so the adapter caps it at RX_MAX there too.
+     * The server does not resolve fc_retry_ms. */
+    if (s->cfg.max_block_len > UDSOTA_ISOTP_RX_MAX) {
+        s->cfg.max_block_len = (uint16_t)UDSOTA_ISOTP_RX_MAX;
+    }
     const udsota_config_t *rc = &s->cfg;
     t->stmin_default_us = stmin_sendable(rc->stmin_us);
     t->link_cfg.bs = rc->block_size;
@@ -297,7 +302,7 @@ void udsota_isotp_on_func_frame(udsota_isotp_t *t, const uint8_t *data, uint8_t 
     if (tx_busy(t) || t->link.receive_status != ISOTP_RECEIVE_STATUS_IDLE) {
         return;                                           /* a physical request or answer owns the server */
     }
-    tx_response(t, udsota_on_functional_request(t->srv, &data[1], n, t->buf->resp, UDSOTA_ISOTP_RESP_MAX, now_ms));
+    tx_response(t, udsota_on_functional_request(t->srv, &data[1], n, t->buf->resp, sizeof t->buf->resp, now_ms));
 }
 
 /* isotp-c's timers and CFs, N_Cr, the parked FC and answer, the server's poll, a waiting request and the limit switch. */
@@ -319,7 +324,7 @@ uint32_t udsota_isotp_service(udsota_isotp_t *t, uint32_t now_ms)
     fc_retry(t);
     tx_flush(t);
     if (!tx_busy(t) || udsota_restart_armed(t->srv)) {   /* an armed restart still needs its 100 ms fallback */
-        tx_response(t, udsota_poll(t->srv, t->buf->resp, UDSOTA_ISOTP_RESP_MAX, now_ms));
+        tx_response(t, udsota_poll(t->srv, t->buf->resp, sizeof t->buf->resp, now_ms));
     }
     take_request(t, now_ms);
     link_apply_limit(t);

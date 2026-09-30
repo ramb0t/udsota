@@ -780,8 +780,8 @@ static void test_config_defaults_and_overrides(void)
     TEST_ASSERT_EQUAL_HEX8(UDSOTA_NRC_RESPONSE_PENDING, resp[2]);
 }
 
-/* A max_block_len over 4095 is clamped to it, so the 74 answer never announces a block the ISO-TP adapter (capped
- * at 4095 too) could not receive. */
+/* A max_block_len over 4095 is clamped to it, FF_DL's 12 bits; the ISO-TP adapter caps it again at its receive
+ * buffer (test_udsota_isotp_sizes), so the 74 answer never announces a block it could not receive. */
 static void test_max_block_len_clamped_to_4095(void)
 {
     g_cfg.max_block_len = 8000u;

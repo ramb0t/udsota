@@ -193,7 +193,8 @@ typedef struct {
     uint16_t    p2_ms, p2star_ms, s3_ms;   /* 0 = 50 / 5000 / 5000 */
     uint16_t    p2_prog_ms, p2star_prog_ms;   /* P2 and P2* in the programming session; 0 = p2_ms and p2star_ms */
     uint16_t    max_block_len;         /* 34's maxNumberOfBlockLength and the 36 length limit; 0 = 4095, and more is
-                                          clamped to 4095 (UDSOTA_DL_MAX_BLOCK_LEN, as the ISO-TP adapter). With
+                                          clamped to 4095 (UDSOTA_DL_MAX_BLOCK_LEN), and by the ISO-TP adapter to
+                                          its receive buffer (UDSOTA_ISOTP_RX_MAX, 4095 by default). With
                                           udsota_image_check behind check_first, at least 322: the first block
                                           holds 36 <bsc> and UDSOTA_IMAGE_MIN_LEN (320) image bytes */
     uint32_t    stmin_us;              /* default FC STmin; 0 = 2000 */

@@ -30,6 +30,9 @@
 static const char *TAG = "udsota";
 
 _Static_assert(UDSOTA_ESP32_VERSION_MAX == UDSOTA_ESP32_CTL_VERSION_MAX, "the control block holds the public size");
+_Static_assert(UDSOTA_ISOTP_RX_MAX == CONFIG_UDSOTA_ESP32_ISOTP_RX_MAX &&
+               UDSOTA_ISOTP_RESP_MAX == CONFIG_UDSOTA_ESP32_ISOTP_RESP_MAX,
+               "the ISO-TP buffer sizes are the Kconfig's: CMakeLists.txt puts them on the core, PUBLIC");
 
 #define MAX_WAIT_MS   100u      /* longest sleep, so a queued end-session never waits longer */
 #define LOG_EVERY_MS  5000u

@@ -24,6 +24,8 @@ idf.py -C examples/esp32 -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.com
 idf.py -C examples/esp32 -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.noupdater" set-target esp32s3 build
 ```
 
+`sdkconfig.smallbufs`, listed after `sdkconfig.noupdater`, shrinks the ISO-TP adapter's buffers from 8,958 bytes of internal heap to 1,280, since a server without the updater never takes a request over 256 bytes (`CONFIG_UDSOTA_ESP32_ISOTP_RX_MAX`).
+
 `sdkconfig.debugmeasure`, listed after the others, adds bench logs of update timings, stack headroom, internal heap and whether flash writes run with the cache off (`CONFIG_UDSOTA_ESP32_DEBUG_MEASURE`).
 
 `PROJECT_VER` is pinned to `0.1.0-dev` in `CMakeLists.txt`, which makes the image a dev build. Set a clean `X.Y.Z` to build a release, which the unit accepts only when its version is newer than the running one.
