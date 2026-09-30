@@ -4,6 +4,8 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ## [Unreleased]
 
+- Fixed, core: the compressed-download stream no longer adds a zero offset to a NULL input pointer when it is flushed with no input, which C17 leaves undefined; the sanitize job's clang reported it. No compiler udsota targets miscompiled it, and nothing changes on the wire.
+
 ## [0.10.0] - 2026-09-29
 
 udsota serves ReadDTCInformation (0x19: 01, 02, 06, 0A) and ClearDiagnosticInformation (0x14) through three new app hooks, so any UDS tool can read and clear a device's faults, and the client gains `udsota dtc show` and `udsota dtc clear`. Not breaking: with the hooks unset nothing changes on the wire.
