@@ -92,6 +92,9 @@ static size_t svc_routine(udsota_server_t *srv, uint16_t rid, const uint8_t *r, 
     return 5;
 }
 
+/* owns_rid: FF01 only, as routine claims. */
+static bool svc_owns_rid(const udsota_server_t *srv, uint16_t rid) { return rid == SVC_RID; }
+
 /* read_did: F1F1 only, AA CC. */
 static size_t svc_read_did(const udsota_server_t *srv, uint16_t did, uint8_t *out, size_t room)
 {
@@ -124,9 +127,9 @@ static bool svc_fc_point(udsota_server_t *srv, uint32_t median, uint32_t stmin)
 static void svc_sync(udsota_server_t *srv) { v.syncs++; }
 
 static const udsota_service_t k_svc = {
-    .request = svc_request, .routine = svc_routine, .read_did = svc_read_did, .on_session = svc_on_session,
-    .settled = svc_settled, .download_active = svc_download_active, .poll = svc_poll, .fc_point = svc_fc_point,
-    .sync = svc_sync,
+    .request = svc_request, .routine = svc_routine, .owns_rid = svc_owns_rid, .read_did = svc_read_did,
+    .on_session = svc_on_session, .settled = svc_settled, .download_active = svc_download_active, .poll = svc_poll,
+    .fc_point = svc_fc_point, .sync = svc_sync,
 };
 
 /* The rows' server (app none) with the test service registered, in st. */

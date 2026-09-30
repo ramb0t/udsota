@@ -15,6 +15,11 @@ add_test(NAME udsota_demo_server_self_test COMMAND udsota_demo_server --self-tes
 add_test(NAME udsota_demo_server_pipe
          COMMAND sh -c "printf '710#0322F186\\n' | '$<TARGET_FILE:udsota_demo_server>'")
 set_tests_properties(udsota_demo_server_pipe PROPERTIES PASS_REGULAR_EXPRESSION "718#0462F18601AAAAAA")
+# --no-updater runs the server alone: 10 02 answers 7F 10 12, and 31 03 A001 (the self-test's results) 71 03 A0 01 00.
+add_test(NAME udsota_demo_server_no_updater
+         COMMAND sh -c "printf '710#021002\\n710#043103A001\\n' | '$<TARGET_FILE:udsota_demo_server>' --no-updater")
+set_tests_properties(udsota_demo_server_no_updater PROPERTIES
+                     PASS_REGULAR_EXPRESSION "718#037F1012AAAAAAAA.*718#057103A00100AAAA")
 # --socketcan refuses an interface that is not vcan, before it opens any socket: lo, and a name that does not exist.
 add_test(NAME udsota_demo_server_refuses_real_bus
          COMMAND sh -c "! '$<TARGET_FILE:udsota_demo_server>' --socketcan lo && \

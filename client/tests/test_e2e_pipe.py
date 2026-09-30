@@ -10,6 +10,7 @@ import threading
 import time
 
 import pytest
+from udsoncan import services
 
 from udsota import cli, delta, pack, profile, transport, update, wire
 from udsota.errors import NoResponse, Nrc, SendFailed
@@ -785,3 +786,81 @@ def test_dtc_commands_without_dtc_services(demo, tmp_path, capsys):
     for args in (["show"], ["show", "--ext", "U0073"], ["clear"]):
         rc, out, err = dtc_cli(s, "example", capsys, *args)
         assert (rc, out) == (2, "") and "this firmware has no DTC services" in err, args
+
+
+# ---- the app's did_read_ex and routine_ex hooks, and a server without the updater ----
+
+DID_KEYED, RID_SELF_TEST = 0x0200, 0xA001   # the demo's keyed DID and self-test routine (its README)
+
+
+# RoutineControl sub on rid through the client's Uds layer (it has no command for 02 and 03); checks the echo of the
+# sub-function and RID and returns the status record after it.
+def routine_control(uds, sub, rid):
+    d = uds.request(services.RoutineControl, sub, rid.to_bytes(2, "big"))
+    assert d[:3] == bytes([sub]) + rid.to_bytes(2, "big")
+    return d[3:]
+
+
+# Check a demo without the updater (--no-updater): 10 02 answers 0x12 while 10 03 still enters the extended session,
+# and 34 answers 0x11.
+def test_no_updater_refuses_the_programming_session(demo):
+    s = demo("--no-updater")
+    with PipeTransport(EXAMPLE, s) as t:
+        uds = t.uds()
+        with pytest.raises(Nrc) as programming:
+            uds.session(wire.SESSION_PROGRAMMING)
+        assert uds.read_did(wire.DID_SESSION) == bytes([1])
+        uds.session(wire.SESSION_EXTENDED)
+        assert uds.read_did(wire.DID_SESSION) == bytes([wire.SESSION_EXTENDED])
+        with pytest.raises(Nrc) as download:
+            uds.request_download(4096)
+    assert (programming.value.code, download.value.code) == (0x12, 0x11)
+    assert "updater off" in s.log()
+
+
+# Check the keyed DID the demo serves through did_read_ex, its rules in ISO order: 0x7F in the default session, 0x33
+# in the extended session while locked, and its bytes once unlocked; a repeat 10 03 relocks it.
+def test_keyed_did_through_did_read_ex(demo, tmp_path):
+    master = tmp_path / "master.bin"
+    master.write_bytes(MASTER)
+    s = demo("--label", LABEL, "--master", str(master), "--skip-boot-delay")
+    prof = profile.load(write_profile(tmp_path, SECURED % (LABEL, master)))
+    with PipeTransport(prof, s) as t:
+        uds = t.uds()
+        with pytest.raises(Nrc) as default:
+            uds.read_did(DID_KEYED)
+        uds.session(wire.SESSION_EXTENDED)
+        with pytest.raises(Nrc) as locked:
+            uds.read_did(DID_KEYED)
+        uds.unlock(prof.security.level_extended, update.device_keys(uds, prof, MASTER))
+        assert uds.read_did(DID_KEYED) == bytes([0xC0, 0xFF, 0xEE, 0x01])
+        uds.session(wire.SESSION_EXTENDED)
+        with pytest.raises(Nrc) as relocked:
+            uds.read_did(DID_KEYED)
+        assert uds.read_did(0xF191) == b"devkit"                        # the board DID moved to did_read_ex too
+    assert (default.value.code, locked.value.code, relocked.value.code) == (0x7F, 0x33, 0x33)
+
+
+# Check the demo's self-test routine through routine_ex, in the default session, with and without the updater: 03
+# reads 00 (never started), 01 starts it (03 then reads 01, and a second 01 is 0x24), 02 stops it (03 reads 02, and a
+# second 02 is 0x24); the updater's FF01 still answers 0x7F in the default session.
+@pytest.mark.parametrize("args", [[], ["--no-updater"]])
+def test_self_test_routine_through_routine_ex(demo, args):
+    s = demo(*args)
+    with PipeTransport(EXAMPLE, s) as t:
+        uds = t.uds()
+        assert routine_control(uds, 0x03, RID_SELF_TEST) == bytes([0x00])
+        assert routine_control(uds, 0x01, RID_SELF_TEST) == b""
+        assert routine_control(uds, 0x03, RID_SELF_TEST) == bytes([0x01])
+        with pytest.raises(Nrc) as again:
+            routine_control(uds, 0x01, RID_SELF_TEST)
+        assert routine_control(uds, 0x02, RID_SELF_TEST) == b""
+        assert routine_control(uds, 0x03, RID_SELF_TEST) == bytes([0x02])
+        with pytest.raises(Nrc) as stopped:
+            routine_control(uds, 0x02, RID_SELF_TEST)
+        with pytest.raises(Nrc) as updater_rid:
+            uds.routine(0xFF01)
+        assert uds.read_did(wire.DID_SESSION) == bytes([1])            # all of it in the default session
+    assert (again.value.code, stopped.value.code) == (0x24, 0x24)
+    assert updater_rid.value.code == (0x31 if args else 0x7F)       # without the updater FF01 is the app's: 0x31
+    assert "self-test started" in s.log() and "self-test stopped" in s.log()

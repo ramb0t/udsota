@@ -134,6 +134,21 @@ static uint8_t w_dtc_clear(void *ctx, uint32_t group, udsota_access_t access)
     return ctl->app.dtc_clear(ctl->app.ctx, group, access);
 }
 
+/* did_read_ex hook: the app's did_read_ex with the app's ctx (installed only when the app has one). */
+static uint8_t w_did_read_ex(void *ctx, uint16_t did, uint8_t *buf, size_t max, size_t *len, udsota_access_t access)
+{
+    const udsota_esp32_ctl_t *ctl = ctx;
+    return ctl->app.did_read_ex(ctl->app.ctx, did, buf, max, len, access);
+}
+
+/* routine_ex hook: the app's routine_ex with the app's ctx (installed only when the app has one). */
+static int w_routine_ex(void *ctx, uint8_t sub, uint16_t rid, const uint8_t *in, size_t in_len,
+                        uint8_t *out, size_t out_max, size_t *out_len, udsota_access_t access)
+{
+    const udsota_esp32_ctl_t *ctl = ctx;
+    return ctl->app.routine_ex(ctl->app.ctx, sub, rid, in, in_len, out, out_max, out_len, access);
+}
+
 /* Copies the app's hooks and builds the wrapped set (see the header). */
 void udsota_esp32_ctl_init(udsota_esp32_ctl_t *ctl, const udsota_hooks_t *app,
                            bool (*default_reset)(void *ctx), udsota_hooks_t *out)
@@ -164,6 +179,8 @@ void udsota_esp32_ctl_init(udsota_esp32_ctl_t *ctl, const udsota_hooks_t *app,
         .dtc_get      = (ctl->app.dtc_get != NULL) ? w_dtc_get : NULL,
         .dtc_ext_data = (ctl->app.dtc_ext_data != NULL) ? w_dtc_ext_data : NULL,
         .dtc_clear    = (ctl->app.dtc_clear != NULL) ? w_dtc_clear : NULL,
+        .did_read_ex  = (ctl->app.did_read_ex != NULL) ? w_did_read_ex : NULL,
+        .routine_ex   = (ctl->app.routine_ex != NULL) ? w_routine_ex : NULL,
     };
 }
 

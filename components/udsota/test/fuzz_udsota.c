@@ -27,9 +27,9 @@
  *
  * A fifth build, fuzz_udsota_no_update (UDSOTA_FUZZ_NO_UPDATE=1 with UDSOTA_FUZZ_APP_HOOKS=1), starts the server with
  * udsota_core_init, which is udsota_init given a NULL engine, and links no updater (UDSOTA_SERVER_CORE_SRCS), so no
- * update service is registered: it replays from the five states a download isn't needed for,
- * 34, 36 and 37 count as unserved and must only ever get NRC 0x11 (0x21 while an app routine runs), and its
- * coverage floor needs the reset and app hooks only.
+ * update service is registered: it replays from the three states outside the programming session, which 10 02 can't
+ * enter (it answers 0x12), 34, 36 and 37 count as unserved and must only ever get NRC 0x11 (0x21 while an app
+ * routine runs), and its coverage floor needs the reset and app hooks only.
  *
  * A sixth build, fuzz_udsota_dtc (UDSOTA_FUZZ_DTC=1), sets dtc_get, dtc_ext_data and dtc_clear over a table of
  * FUZZ_DTC_N DTCs with junk top bytes, so 19 and 14 are served: 19 02 FF and 19 0A outgrow the response buffer
@@ -38,6 +38,12 @@
  * positive shapes check every status sent is a subset of the availability mask and 59 01's count against the
  * table. Every walk ends at FUZZ_DTC_N, so the index cap is test_index_cap's to pin, not this build's. The other five
  * builds leave the DTC hooks NULL and answer as they did without it.
+ *
+ * A seventh build, fuzz_udsota_app_ex (UDSOTA_FUZZ_APP_EX=1 with UDSOTA_FUZZ_APP_HOOKS=1), also sets did_read_ex and
+ * routine_ex, so did_read and routine must never run: a 22 the core leaves to the app, and a 31 01, 02 or 03 on an
+ * app RID, in every session, get the mocks' positives, NRCs, pending jobs and over-long or empty lengths, and the
+ * oracle takes from each exactly the answer the contract gives (71 <sub> <rid>, 0x10 for a hook fault, the updater's
+ * RIDs as without the hook). The other builds leave both hooks NULL.
  *
  * The PASS line ends with digest=, an FNV-1a hash of every request fed to the server and every answer it gave
  * (empty ones too), so an answer that changes shows there even where the counts don't. It draws no rnd().
@@ -83,8 +89,14 @@
 #ifndef UDSOTA_FUZZ_DTC
 #define UDSOTA_FUZZ_DTC 0         /* 1: FUZZ_HOOKS also sets dtc_get, dtc_ext_data and dtc_clear */
 #endif
+#ifndef UDSOTA_FUZZ_APP_EX
+#define UDSOTA_FUZZ_APP_EX 0      /* 1: FUZZ_HOOKS also sets did_read_ex and routine_ex */
+#endif
 #if UDSOTA_FUZZ_NO_UPDATE && (!UDSOTA_FUZZ_APP_HOOKS || UDSOTA_FUZZ_PROGRESS || defined(UDSOTA_FUZZ_Z))
 #error "UDSOTA_FUZZ_NO_UPDATE needs UDSOTA_FUZZ_APP_HOOKS (0x31's positive answers) and no progress or z build"
+#endif
+#if UDSOTA_FUZZ_APP_EX && (!UDSOTA_FUZZ_APP_HOOKS || UDSOTA_FUZZ_NO_UPDATE)
+#error "UDSOTA_FUZZ_APP_EX needs UDSOTA_FUZZ_APP_HOOKS (routine_poll) and the update service (its RIDs' answers)"
 #endif
 
 /* Every engine and hook callback is mocked; these trip if the API structs gain a callback. */
@@ -98,12 +110,13 @@ _Static_assert(offsetof(udsota_hooks_t, ctx) == 7u * sizeof(void (*)(void)),
 #define HOOK_AFTER(m, prev) (offsetof(udsota_hooks_t, m) == offsetof(udsota_hooks_t, prev) + sizeof(void (*)(void)))
 _Static_assert(HOOK_AFTER(did_write, ctx) && HOOK_AFTER(routine, did_write) && HOOK_AFTER(routine_poll, routine) &&
                HOOK_AFTER(progress, routine_poll) && HOOK_AFTER(dtc_get, progress) &&
-               HOOK_AFTER(dtc_ext_data, dtc_get) && HOOK_AFTER(dtc_clear, dtc_ext_data),
-               "udsota_hooks_t gained or moved a member between ctx and dtc_clear: add it after dtc_clear instead, "
+               HOOK_AFTER(dtc_ext_data, dtc_get) && HOOK_AFTER(dtc_clear, dtc_ext_data) &&
+               HOOK_AFTER(did_read_ex, dtc_clear) && HOOK_AFTER(routine_ex, did_read_ex),
+               "udsota_hooks_t gained or moved a member between ctx and routine_ex: add it after routine_ex instead, "
                "so every earlier field keeps its offset, then mock it in FUZZ_HOOKS and extend this chain");
 #undef HOOK_AFTER
-_Static_assert(offsetof(udsota_hooks_t, dtc_clear) + sizeof(void (*)(void)) == sizeof(udsota_hooks_t),
-               "udsota_hooks_t gained a member after dtc_clear: mock it in FUZZ_HOOKS and move this check");
+_Static_assert(offsetof(udsota_hooks_t, routine_ex) + sizeof(void (*)(void)) == sizeof(udsota_hooks_t),
+               "udsota_hooks_t gained a member after routine_ex: mock it in FUZZ_HOOKS and move this check");
 
 #define REQ_MAX          UDSOTA_DL_MAX_BLOCK_LEN  /* the ISO-TP link never delivers a longer request */
 #define RESP_FULL        256u                  /* UDSOTA_ISOTP_RESP_MAX: the transport's response buffer */
@@ -123,15 +136,17 @@ typedef enum {                                 /* server states a replay starts 
     ST_DEFAULT, ST_EXTENDED, ST_PROG, ST_EXT_UNLOCKED, ST_PROG_UNLOCKED,
     ST_DOWNLOAD, ST_TRANSFER, ST_EXITED, ST_VERIFIED, ST_COUNT
 } state_t;
-#if UDSOTA_FUZZ_NO_UPDATE
-#define ST_FUZZED (ST_PROG_UNLOCKED + 1)       /* no download: the states from download-open on can't be reached */
-#else
-#define ST_FUZZED ST_COUNT                     /* the states a replay starts from */
-#endif
 static const char *const STATE_NAME[ST_COUNT] = {
     "default", "extended", "programming", "extended+01", "programming+03",
     "download-open", "mid-transfer", "transfer-exited", "image-verified",
 };
+#if UDSOTA_FUZZ_NO_UPDATE   /* no service: 10 02 answers 0x12, so neither the programming session nor a download */
+static const state_t FUZZED[] = {ST_DEFAULT, ST_EXTENDED, ST_EXT_UNLOCKED};
+#else                       /* every state, in enum order */
+static const state_t FUZZED[] = {ST_DEFAULT, ST_EXTENDED, ST_PROG, ST_EXT_UNLOCKED, ST_PROG_UNLOCKED, ST_DOWNLOAD,
+                                 ST_TRANSFER, ST_EXITED, ST_VERIFIED};
+#endif
+#define FUZZED_N (sizeof FUZZED / sizeof FUZZED[0])   /* the states a replay starts from */
 
 typedef enum { LAYOUT_END, LAYOUT_START } layout_t;   /* request flush against the guard after / before it */
 
@@ -159,6 +174,10 @@ typedef struct {                               /* the mock platform behind the e
     bool     app_outstanding;                  /* routine returned UDSOTA_PENDING and routine_poll has not finished it */
     uint32_t app_until;                        /* when the outstanding app routine finishes */
 #endif
+#if UDSOTA_FUZZ_APP_EX
+    uint8_t  app_sub;                          /* the sub-function and RID of the routine_ex call that last pended */
+    uint16_t app_rid;
+#endif
 #if UDSOTA_FUZZ_PROGRESS
     unsigned progress_calls;                   /* hooks.progress calls in the current server call */
     udsota_progress_t progress;                /* what hooks.progress last got (IDLE, 0 of 0 after init) */
@@ -172,6 +191,9 @@ typedef enum {                                 /* platform ops whose fuzz-phase 
     OP_BEGIN, OP_WRITE, OP_END, OP_ABORT, OP_ACTIVATE, OP_CONFIRM, OP_IMAGE_CHECK, OP_RESET, OP_UNVERIFY,
 #if UDSOTA_FUZZ_APP_HOOKS
     OP_DID_WRITE, OP_ROUTINE, OP_ROUTINE_POLL,
+#endif
+#if UDSOTA_FUZZ_APP_EX
+    OP_DID_READ_EX, OP_ROUTINE_EX,
 #endif
 #ifdef UDSOTA_FUZZ_Z
     OP_ZBEGIN, OP_ZWRITE, OP_ZEND,
@@ -191,6 +213,12 @@ typedef struct {                               /* counted outside the preamble o
 #endif
 #if UDSOTA_FUZZ_NO_UPDATE
     bool dl_nrc11[3], dl_nrc21;                /* 34, 36, 37 got 0x11 (each), and one of them 0x21 during a job */
+    bool prog_nrc12;                           /* a 10 02 got 0x12 */
+#endif
+#if UDSOTA_FUZZ_APP_EX
+    bool ex_pos_sub[4];                        /* routine_ex answered 71 01, 02 and 03 */
+    bool ex_default_pos;                       /* and positively in the default session */
+    bool ex_reject22, ex_reject31;             /* a hook fault drew 0x10 from a 22 and from a 31 */
 #endif
 #if UDSOTA_FUZZ_PROGRESS
     bool stage_seen[UDSOTA_STAGE_ACTIVATING + 1];   /* stages hooks.progress reported from fuzzed calls */
@@ -437,6 +465,9 @@ static const struct { uint16_t did; uint8_t len; uint8_t fill; } DIDS[] = {
  * the DID, or only its length when max is short (0x14). */
 static size_t mock_did_read(void *ctx, uint16_t did, uint8_t *out, size_t max)
 {
+#if UDSOTA_FUZZ_APP_EX
+    fail("did_read called while did_read_ex is set", NULL, 0, NULL, 0);
+#endif
     memset(out, 0xDD, max);
     for (size_t i = 0; i < sizeof DIDS / sizeof DIDS[0]; i++) {
         if (DIDS[i].did == did) {
@@ -557,6 +588,15 @@ static void mock_progress(void *ctx, const udsota_progress_t *p)
 }
 #endif
 
+#if UDSOTA_FUZZ_APP_HOOKS && !UDSOTA_FUZZ_NO_UPDATE
+/* True for the updater's RIDs, which its service owns: no app hook ever sees them. */
+static bool updater_rid(uint16_t rid)
+{
+    return rid == UDSOTA_RID_CHECK_PROG_DEPS || rid == UDSOTA_RID_GET_RESUME_POINT ||
+           rid == UDSOTA_RID_ACTIVATE_IMAGE || rid == UDSOTA_RID_CONFIRM_IMAGE;
+}
+#endif
+
 #if UDSOTA_FUZZ_APP_HOOKS
 #define APP_RID_SYNC     0x1234u   /* answers 71 01 12 34 00 at once */
 #define APP_RID_PENDING  0x1235u   /* pending for JOB_MS, then 71 01 12 35 00 */
@@ -602,13 +642,15 @@ static int mock_routine(void *ctx, uint16_t rid, const uint8_t *in, size_t in_le
                         uint8_t *out, size_t out_max, size_t *out_len, udsota_access_t access)
 {
     count_op(OP_ROUTINE);
+#if UDSOTA_FUZZ_APP_EX
+    fail("routine called while routine_ex is set", NULL, 0, NULL, 0);
+#endif
     check_access(access);
     if (M.app_outstanding) {
         fail("routine called while an app routine was outstanding", NULL, 0, NULL, 0);
     }
 #if !UDSOTA_FUZZ_NO_UPDATE   /* with no update service its RIDs are the app's, answered 0x31 below */
-    if (rid == UDSOTA_RID_CHECK_PROG_DEPS || rid == UDSOTA_RID_GET_RESUME_POINT ||
-        rid == UDSOTA_RID_ACTIVATE_IMAGE || rid == UDSOTA_RID_CONFIRM_IMAGE) {
+    if (updater_rid(rid)) {
         fail("routine handed a RID the core owns", NULL, 0, NULL, 0);
     }
 #endif
@@ -645,6 +687,129 @@ static int mock_routine_poll(void *ctx, uint8_t *out, size_t out_max, size_t *ou
     M.app_outstanding = false;
     *out_len = app_status(out, out_max);
     return 0;
+}
+#endif
+
+#if UDSOTA_FUZZ_APP_EX
+#define DID_EX_KEYED      0x0300u   /* 4B 59 in the extended session unlocked at 01; else 0x7F, then 0x33 */
+#define DID_EX_OVERLONG   0x0301u   /* *len max + 1: the core's 0x10 */
+#define DID_EX_EMPTY      0x0302u   /* *len 0: the core's 0x10 */
+#define DID_EX_REFUSE     0x0303u   /* NRC 0x22 */
+#define APP_RID_EXTENDED  0x1238u   /* 0x7F outside the extended session, else 71 <sub> 12 38 00 */
+#define APP_RID_OVERLONG  0x1239u   /* *out_len out_max + 1: the core's 0x10 */
+#define APP_RID_BAD_RC    0x123Au   /* returns 0x100, neither 0, an NRC nor pending: the core's 0x10 */
+
+/* Fails unless access is the server's own session, lock and epoch; the _ex hooks run in every session. */
+static void check_access_any(udsota_access_t access)
+{
+    if (access.session != S.session || access.unlocked_level != S.security || access.epoch != S.session_epoch) {
+        fail("an _ex hook handed an access state that is not the server's", NULL, 0, NULL, 0);
+    }
+}
+
+/* DID_EX_KEYED's rule in ISO order: 0x7F outside the extended session, 0x33 unless unlocked at 01, else 0. */
+static uint8_t keyed_nrc(uint8_t session, uint8_t unlocked_level)
+{
+    if (session != UDSOTA_SESSION_EXTENDED) {
+        return UDSOTA_NRC_SERVICE_NOT_SUPPORTED_IN_SESSION;
+    }
+    return unlocked_level != UDSOTA_SA_SEED_EXTENDED ? UDSOTA_NRC_SECURITY_ACCESS_DENIED : 0u;
+}
+
+/* Mock hooks.did_read_ex: first writes all max bytes it was offered (an oversized max faults on the guard page), then
+ * answers DIDS as mock_did_read does but with 0x14 for one longer than max, the DID_EX_ ones as named, and any other
+ * DID 0x31. */
+static uint8_t mock_did_read_ex(void *ctx, uint16_t did, uint8_t *out, size_t max, size_t *len,
+                                udsota_access_t access)
+{
+    count_op(OP_DID_READ_EX);
+    check_access_any(access);
+    memset(out, 0xDD, max);
+    for (size_t i = 0; i < sizeof DIDS / sizeof DIDS[0]; i++) {
+        if (DIDS[i].did == did) {
+            if (DIDS[i].len > max) {
+                return UDSOTA_NRC_RESPONSE_TOO_LONG;
+            }
+            memset(out, DIDS[i].fill, DIDS[i].len);
+            *len = DIDS[i].len;
+            return 0u;
+        }
+    }
+    switch (did) {
+    case DID_EX_KEYED: {
+        const uint8_t nrc = keyed_nrc(access.session, access.unlocked_level);
+        if (nrc != 0u || max < 2u) {
+            return nrc != 0u ? nrc : UDSOTA_NRC_RESPONSE_TOO_LONG;
+        }
+        out[0] = 0x4Bu;
+        out[1] = 0x59u;
+        *len = 2u;
+        return 0u;
+    }
+    case DID_EX_OVERLONG:
+        *len = max + 1u;
+        return 0u;
+    case DID_EX_EMPTY:
+        *len = 0u;
+        return 0u;
+    case DID_EX_REFUSE:
+        return UDSOTA_NRC_CONDITIONS_NOT_CORRECT;
+    default:
+        return UDSOTA_NRC_REQUEST_OUT_OF_RANGE;
+    }
+}
+
+/* Mock hooks.routine_ex: sub 01-03 only, never an updater RID, never while an app routine is outstanding; reads the
+ * option record and writes all of out_max, then answers by RID: SYNC its sub as the status byte, PENDING stop (02) at
+ * once with no status and start or results pending for JOB_MS, HOLD pending past the cap, REFUSE 0x22, EXTENDED 0x7F
+ * outside the extended session, OVERLONG and BAD_RC a hook fault (0x10), any other 0x31. */
+static int mock_routine_ex(void *ctx, uint8_t sub, uint16_t rid, const uint8_t *in, size_t in_len,
+                           uint8_t *out, size_t out_max, size_t *out_len, udsota_access_t access)
+{
+    count_op(OP_ROUTINE_EX);
+    check_access_any(access);
+    if (M.app_outstanding) {
+        fail("routine_ex called while an app routine was outstanding", NULL, 0, NULL, 0);
+    }
+    if (sub < UDSOTA_RC_START || sub > UDSOTA_RC_RESULTS || updater_rid(rid)) {
+        fail("routine_ex handed a sub-function outside 01-03 or a RID the updater owns", NULL, 0, NULL, 0);
+    }
+    touch(in, in_len);
+    memset(out, 0xDD, out_max);
+    if (rid == APP_RID_PENDING && sub == UDSOTA_RC_STOP) {
+        *out_len = 0u;
+        return 0;
+    }
+    switch (rid) {
+    case APP_RID_SYNC:
+        *out_len = app_status(out, out_max);
+        if (*out_len != 0u) {
+            out[0] = sub;
+        }
+        return 0;
+    case APP_RID_PENDING:
+    case APP_RID_HOLD:
+        M.app_outstanding = true;
+        M.app_sub = sub;
+        M.app_rid = rid;
+        M.app_until = M.now + (rid == APP_RID_HOLD ? APP_HOLD_MS : JOB_MS);
+        return UDSOTA_PENDING;
+    case APP_RID_REFUSE:
+        return UDSOTA_NRC_CONDITIONS_NOT_CORRECT;
+    case APP_RID_EXTENDED:
+        if (access.session != UDSOTA_SESSION_EXTENDED) {
+            return UDSOTA_NRC_SERVICE_NOT_SUPPORTED_IN_SESSION;
+        }
+        *out_len = app_status(out, out_max);
+        return 0;
+    case APP_RID_OVERLONG:
+        *out_len = out_max + 1u;
+        return 0;
+    case APP_RID_BAD_RC:
+        return 0x100;
+    default:
+        return UDSOTA_NRC_REQUEST_OUT_OF_RANGE;
+    }
 }
 #endif
 
@@ -911,6 +1076,9 @@ static const udsota_hooks_t FUZZ_HOOKS = {
 #if UDSOTA_FUZZ_DTC
     .dtc_get = mock_dtc_get, .dtc_ext_data = mock_dtc_ext_data, .dtc_clear = mock_dtc_clear,
 #endif
+#if UDSOTA_FUZZ_APP_EX
+    .did_read_ex = mock_did_read_ex, .routine_ex = mock_routine_ex,
+#endif
 };
 
 #if UDSOTA_FUZZ_NO_UPDATE
@@ -1039,12 +1207,30 @@ static bool dtc_shape_ok(const uint8_t *req, size_t rl, uint8_t sub, const uint8
 }
 #endif
 
+/* True for the sub-function a positive 71 may echo for rid: 01, or through routine_ex 02 and 03 on an app RID. */
+static bool routine_sub_ok(uint8_t sub, uint16_t rid)
+{
+#if UDSOTA_FUZZ_APP_EX
+    if ((sub == UDSOTA_RC_STOP || sub == UDSOTA_RC_RESULTS) && !updater_rid(rid)) {
+        return true;
+    }
+#else
+    (void)rid;
+#endif
+    return sub == UDSOTA_RC_START;
+}
+
 /* True when a positive answer r[0..n) to req has the shape the server tests pin for its SID. */
 static bool positive_shape_ok(const uint8_t *req, size_t rl, const uint8_t *r, size_t n)
 {
     const uint8_t sub = rl >= 2 ? (uint8_t)(req[1] & (uint8_t)~UDSOTA_SPRMIB) : 0u;
     switch (req[0]) {
-    case UDSOTA_SID_SESSION:            /* 50 ss 00 32 01 F4 */
+    case UDSOTA_SID_SESSION:            /* 50 ss 00 32 01 F4; never 50 02 with no update service */
+#if UDSOTA_FUZZ_NO_UPDATE
+        if (sub == UDSOTA_SESSION_PROGRAMMING) {
+            return false;
+        }
+#endif
         return n == 6 && rl == 2 && r[1] == sub && r[2] == 0x00 && r[3] == 0x32 && r[4] == 0x01 && r[5] == 0xF4;
     case UDSOTA_SID_RESET:              /* 51 01 */
         return n == 2 && r[1] == UDSOTA_RESET_HARD;
@@ -1052,8 +1238,9 @@ static bool positive_shape_ok(const uint8_t *req, size_t rl, const uint8_t *r, s
         return n >= 4 && rl == 3 && r[1] == req[1] && r[2] == req[2];
     case UDSOTA_SID_SECURITY:           /* 67 ll + 16-byte seed, or 67 ll after a key */
         return (sub & 1u) != 0 ? (n == 2u + UDSOTA_SEED_LEN && r[1] == sub) : (n == 2 && r[1] == sub);
-    case UDSOTA_SID_ROUTINE:            /* 71 01 rid-hi rid-lo [status] */
-        return (n == 4 || n == 5) && rl >= 4 && r[1] == sub && r[2] == req[2] && r[3] == req[3];
+    case UDSOTA_SID_ROUTINE:            /* 71 sub rid-hi rid-lo [status] */
+        return (n == 4 || n == 5) && rl >= 4 && r[1] == sub && r[2] == req[2] && r[3] == req[3] &&
+               routine_sub_ok(sub, udsota_get_u16be(&req[2]));
     case UDSOTA_SID_REQUEST_DOWNLOAD:   /* 74 20 0F FF */
         return n == 4 && r[1] == UDSOTA_DL_LFID && r[2] == 0x0F && r[3] == 0xFF;
     case UDSOTA_SID_TRANSFER_DATA:      /* 76 bsc */
@@ -1116,8 +1303,19 @@ static void check_request_answer(const uint8_t *req, size_t rl, const uint8_t *r
     }
 }
 
+/* True for a poll's positive 71: sub 01, or through routine_ex the sub and RID of the app routine that pended. */
+static bool poll_routine_ok(const uint8_t *r)
+{
+#if UDSOTA_FUZZ_APP_EX
+    if (!updater_rid(udsota_get_u16be(&r[2]))) {
+        return r[1] == M.app_sub && udsota_get_u16be(&r[2]) == M.app_rid;
+    }
+#endif
+    return r[1] == UDSOTA_RC_START;
+}
+
 /* Checks an answer udsota_poll produced: a 0x78/0x72/job NRC, or the positive final answer of one of
- * the two services that start worker jobs (76 BSC for 0x36, 71 01 <rid> [status] for 0x31). */
+ * the two services that start worker jobs (76 BSC for 0x36, 71 <sub> <rid> [status] for 0x31). */
 static void check_poll_answer(const uint8_t *r, size_t n, size_t resp_max)
 {
     if (n > resp_max) {
@@ -1136,7 +1334,7 @@ static void check_poll_answer(const uint8_t *r, size_t n, size_t resp_max)
     const uint8_t sid = (uint8_t)(r[0] & (uint8_t)~UDSOTA_POS_BIT);
     const bool ok = (r[0] & UDSOTA_POS_BIT) != 0 &&
                     ((sid == UDSOTA_SID_TRANSFER_DATA && n == 2) ||
-                     (sid == UDSOTA_SID_ROUTINE && (n == 4 || n == 5) && r[1] == UDSOTA_RC_START));
+                     (sid == UDSOTA_SID_ROUTINE && (n == 4 || n == 5) && poll_routine_ok(r)));
 #if UDSOTA_FUZZ_NO_UPDATE
     if (sid == UDSOTA_SID_TRANSFER_DATA) {
         fail("a 36 answered from a poll with no update service", NULL, 0, r, n);
@@ -1239,6 +1437,151 @@ static void check_no_update(bool job_before, bool restarting, const uint8_t *req
 }
 #endif
 
+#if UDSOTA_FUZZ_NO_UPDATE
+/* With no update service a 10 02 (exactly two bytes) is exactly 7F 10 12, or 7F 10 21 while a job runs; silent only
+ * when 3 bytes don't fit or a restart was armed or had fired. */
+static void check_no_programming(bool job_before, bool restarting, const uint8_t *req, size_t rl, const uint8_t *r,
+                                 size_t n, size_t resp_max)
+{
+    if (rl != 2u || req[0] != UDSOTA_SID_SESSION || (req[1] & (uint8_t)~UDSOTA_SPRMIB) != UDSOTA_SESSION_PROGRAMMING ||
+        resp_max < 3u || restarting) {
+        return;
+    }
+    const uint8_t want = job_before ? UDSOTA_NRC_BUSY_REPEAT : UDSOTA_NRC_SUBFUNC_NOT_SUPPORTED;
+    if (n != 3u || r[0] != UDSOTA_NEG_RESPONSE || r[1] != UDSOTA_SID_SESSION || r[2] != want) {
+        fail("10 02 answered other than 0x12 (0x21 during a job) with no update service", req, rl, r, n);
+    }
+    if (!g_in_preamble && !job_before) {
+        g_stats.prog_nrc12 = true;
+    }
+}
+#endif
+
+#if UDSOTA_FUZZ_APP_EX
+/* The server's state just before a request, which the _ex answers depend on. */
+typedef struct {
+    bool    idle;                               /* no job, no restart armed or fired */
+    bool    orphan;                             /* an app orphan runs */
+    uint8_t session, security;
+} ex_before_t;
+
+/* Fails unless r[0..n) is exactly 7F <req SID> nrc. */
+static void want_nrc(const uint8_t *req, size_t rl, const uint8_t *r, size_t n, uint8_t nrc)
+{
+    if (n != 3u || r[0] != UDSOTA_NEG_RESPONSE || r[1] != req[0] || r[2] != nrc) {
+        fail("an _ex hook's request answered other than its contract gives", req, rl, r, n);
+    }
+}
+
+/* A 22 on a DID_EX_ DID: the keyed rule's NRC or 62 03 00 4B 59, 0x10 for either hook fault, 0x22 for REFUSE. */
+static void check_did_ex(const ex_before_t *b, const uint8_t *req, size_t rl, const uint8_t *r, size_t n)
+{
+    const uint16_t did = udsota_get_u16be(&req[1]);
+    if (did == DID_EX_OVERLONG || did == DID_EX_EMPTY) {
+        want_nrc(req, rl, r, n, UDSOTA_NRC_GENERAL_REJECT);
+        g_stats.ex_reject22 = g_stats.ex_reject22 || !g_in_preamble;
+    } else if (did == DID_EX_REFUSE) {
+        want_nrc(req, rl, r, n, UDSOTA_NRC_CONDITIONS_NOT_CORRECT);
+    } else if (did == DID_EX_KEYED) {
+        const uint8_t nrc = keyed_nrc(b->session, b->security);
+        if (nrc != 0u) {
+            want_nrc(req, rl, r, n, nrc);
+        } else if (n != 5u || r[0] != UDSOTA_POS(UDSOTA_SID_READ_DID) || r[3] != 0x4Bu || r[4] != 0x59u) {
+            fail("the keyed DID unlocked in the extended session answered other than 62 03 00 4B 59", req, rl, r, n);
+        }
+    }
+}
+
+/* A 31 on an app RID through routine_ex (sub already checked 01-03, no orphan): each RID's answer, SPRMIB dropping
+ * a positive one. */
+static void check_routine_ex(const ex_before_t *b, const uint8_t *req, size_t rl, const uint8_t *r, size_t n,
+                             size_t resp_max)
+{
+    const uint16_t rid = udsota_get_u16be(&req[2]);
+    const uint8_t sub = req[1] & (uint8_t)~UDSOTA_SPRMIB;
+    const bool spr = (req[1] & UDSOTA_SPRMIB) != 0u;
+    size_t pos = 0u;                            /* the positive answer's length; 0 = an NRC or a pending job */
+    switch (rid) {
+    case APP_RID_SYNC:
+        pos = resp_max >= 5u ? 5u : 4u;
+        break;
+    case APP_RID_EXTENDED:
+        if (b->session != UDSOTA_SESSION_EXTENDED) {
+            want_nrc(req, rl, r, n, UDSOTA_NRC_SERVICE_NOT_SUPPORTED_IN_SESSION);
+            return;
+        }
+        pos = resp_max >= 5u ? 5u : 4u;
+        break;
+    case APP_RID_PENDING:
+    case APP_RID_HOLD:
+        if (rid == APP_RID_PENDING && sub == UDSOTA_RC_STOP) {
+            pos = 4u;
+            break;
+        }
+        if (n != 0u || !S.job_running || !S.job_app) {
+            fail("a pending routine_ex was answered at once, or no app job runs", req, rl, r, n);
+        }
+        return;
+    case APP_RID_REFUSE:
+        want_nrc(req, rl, r, n, UDSOTA_NRC_CONDITIONS_NOT_CORRECT);
+        return;
+    case APP_RID_OVERLONG:
+    case APP_RID_BAD_RC:
+        want_nrc(req, rl, r, n, UDSOTA_NRC_GENERAL_REJECT);
+        g_stats.ex_reject31 = g_stats.ex_reject31 || !g_in_preamble;
+        return;
+    default:
+        want_nrc(req, rl, r, n, UDSOTA_NRC_REQUEST_OUT_OF_RANGE);
+        return;
+    }
+    if (spr ? n != 0u : (n != pos || r[0] != UDSOTA_POS(UDSOTA_SID_ROUTINE) || r[1] != sub ||
+                         (rid == APP_RID_SYNC && n == 5u && r[4] != sub))) {
+        fail("routine_ex's positive answer is not 71 <sub> <rid> and its record", req, rl, r, n);
+    }
+    if (!spr && !g_in_preamble) {
+        g_stats.ex_pos_sub[sub] = true;
+        g_stats.ex_default_pos = g_stats.ex_default_pos || b->session == UDSOTA_SESSION_DEFAULT;
+    }
+}
+
+/* The _ex contract on one answer, from a server that was idle with room for any answer (resp_max >= 6): a 22 on a
+ * DID_EX_ DID as check_did_ex; a 31 under 4 bytes 0x13 in every session; an updater RID 0x7F in the default session
+ * and 0x12 for a sub other than 01, as without routine_ex; an app RID 0x12 for a sub outside 01-03, 0x22 while an
+ * orphan runs, else check_routine_ex. */
+static void check_app_ex(const ex_before_t *b, const uint8_t *req, size_t rl, const uint8_t *r, size_t n,
+                         size_t resp_max)
+{
+    if (!b->idle || resp_max < 6u || rl == 0u) {
+        return;
+    }
+    if (req[0] == UDSOTA_SID_READ_DID && rl == 3u) {
+        check_did_ex(b, req, rl, r, n);
+        return;
+    }
+    if (req[0] != UDSOTA_SID_ROUTINE) {
+        return;
+    }
+    if (rl < 4u) {
+        want_nrc(req, rl, r, n, UDSOTA_NRC_INCORRECT_LENGTH);
+        return;
+    }
+    const uint8_t sub = req[1] & (uint8_t)~UDSOTA_SPRMIB;
+    if (updater_rid(udsota_get_u16be(&req[2]))) {
+        if (b->session == UDSOTA_SESSION_DEFAULT) {
+            want_nrc(req, rl, r, n, UDSOTA_NRC_SERVICE_NOT_SUPPORTED_IN_SESSION);
+        } else if (sub != UDSOTA_RC_START) {
+            want_nrc(req, rl, r, n, UDSOTA_NRC_SUBFUNC_NOT_SUPPORTED);
+        }
+    } else if (sub < UDSOTA_RC_START || sub > UDSOTA_RC_RESULTS) {
+        want_nrc(req, rl, r, n, UDSOTA_NRC_SUBFUNC_NOT_SUPPORTED);
+    } else if (b->orphan) {
+        want_nrc(req, rl, r, n, UDSOTA_NRC_CONDITIONS_NOT_CORRECT);
+    } else {
+        check_routine_ex(b, req, rl, r, n, resp_max);
+    }
+}
+#endif
+
 /* Returns the guarded response buffer for resp_max, with its canary armed. */
 static uint8_t *resp_buf(size_t resp_max)
 {
@@ -1277,11 +1620,19 @@ static size_t fuzz_request(const uint8_t *in, size_t len, layout_t lay, size_t r
     const bool job_before = S.job_running;
     const bool restarting = udsota_restart_armed(&S) || M.resets != 0u;
 #endif
+#if UDSOTA_FUZZ_APP_EX
+    const ex_before_t ex = {.idle = !S.job_running && !udsota_restart_armed(&S) && M.resets == 0u,
+                            .orphan = S.app_orphan, .session = S.session, .security = S.security};
+#endif
     const size_t n = udsota_on_request(&S, req, len, resp, resp_max, now);
     check_canary(resp, req, len);
     check_request_answer(req, len, resp, n, resp_max);
 #if UDSOTA_FUZZ_NO_UPDATE
     check_no_update(job_before, restarting, req, len, resp, n, resp_max);
+    check_no_programming(job_before, restarting, req, len, resp, n, resp_max);
+#endif
+#if UDSOTA_FUZZ_APP_EX
+    check_app_ex(&ex, req, len, resp, n, resp_max);
 #endif
     digest_fold('Q', req, len);
     digest_fold('A', resp, n);
@@ -1306,9 +1657,17 @@ static void fuzz_poll(size_t resp_max, uint32_t now)
 #if UDSOTA_FUZZ_APP_HOOKS
     const bool job_before = S.job_running;
 #endif
+    const bool app_job = S.job_running && S.job_app;
+    const bool svc_job = S.job_running && !S.job_app && !S.worker_orphan;
     const size_t n = udsota_poll(&S, resp, resp_max, now);
     check_canary(resp, NULL, 0);
     check_poll_answer(resp, n, resp_max);
+    /* The 90 s cap orphans the job it stops waiting on: 0x10 for an app routine, 0x72 for the service's. */
+    const bool capped = (app_job && S.app_orphan) || (svc_job && S.worker_orphan);
+    if (capped && resp_max >= 3u && (n != 3u || resp[2] != (app_job ? UDSOTA_NRC_GENERAL_REJECT
+                                                                   : UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE))) {
+        fail("the 90 s cap answered other than 0x10 for an app routine or 0x72 for the service's job", NULL, 0, resp, n);
+    }
     digest_fold('P', resp, n);
     check_phase();
     check_progress();
@@ -1547,11 +1906,12 @@ static void replay_input(const char *src, const uint8_t *in, size_t len, bool pr
     const size_t one = len > REQ_MAX ? REQ_MAX : len;
     const size_t seq = len > SEQ_MAX_BYTES ? SEQ_MAX_BYTES : len;
     const unsigned variant = pristine ? 0u : (unsigned)(idx % VARIANT_COUNT);
-    for (int st = 0; st < ST_FUZZED; st++) {
+    for (size_t k = 0; k < FUZZED_N; k++) {
+        const state_t st = FUZZED[k];
         const size_t resp_max = pristine ? RESP_FULL : RESP_MAXES[(idx + (unsigned long)st) % RESP_MAX_COUNT];
-        run_single(src, idx, in, one, (state_t)st, LAYOUT_END, variant, resp_max);
-        run_single(src, idx, in, one, (state_t)st, LAYOUT_START, variant, resp_max);
-        run_sequence(src, idx, in, seq, (state_t)st, variant, resp_max);
+        run_single(src, idx, in, one, st, LAYOUT_END, variant, resp_max);
+        run_single(src, idx, in, one, st, LAYOUT_START, variant, resp_max);
+        run_sequence(src, idx, in, seq, st, variant, resp_max);
     }
 }
 
@@ -1695,6 +2055,14 @@ static const seed_t SEEDS[] = {
     SEED(0x31, 0x81, 0x12, 0x35), SEED(0x31, 0x01, 0x12, 0x36), SEED(0x31, 0x01, 0x12, 0x37),
     SEED(0x31, 0x02, 0x12, 0x34),
 #endif
+#if UDSOTA_FUZZ_APP_EX
+    SEED(0x22, 0x03, 0x00), SEED(0x22, 0x03, 0x01), SEED(0x22, 0x03, 0x02), SEED(0x22, 0x03, 0x03),
+    SEED(0x31, 0x03, 0x12, 0x34, 0x01), SEED(0x31, 0x83, 0x12, 0x34), SEED(0x31, 0x02, 0x12, 0x35),
+    SEED(0x31, 0x03, 0x12, 0x35), SEED(0x31, 0x82, 0x12, 0x35), SEED(0x31, 0x01, 0x12, 0x38),
+    SEED(0x31, 0x03, 0x12, 0x38), SEED(0x31, 0x01, 0x12, 0x39), SEED(0x31, 0x02, 0x12, 0x3A),
+    SEED(0x31, 0x04, 0x12, 0x34), SEED(0x31, 0x00, 0x12, 0x34), SEED(0x31, 0x02, 0xF0, 0x01),
+    SEED(0x31, 0x03, 0xF0, 0x02), SEED(0x31, 0x04, 0xFF, 0x01), SEED(0x31, 0x01, 0x12),
+#endif
 #ifdef UDSOTA_FUZZ_Z
     SEED(0x34, 0x10, 0x44, 0, 0, 0, 0, 0, 0, 0, 0x40), SEED(0x34, 0x10, 0x44, 0, 0, 0, 0, 0, 0, 0x01, 0x40),
     SEED(0x34, 0x10, 0x44, 0, 0, 0, 0, 0, 0, 0, 0x01), SEED(0x34, 0x90, 0x44, 0, 0, 0, 0, 0, 0, 0, 0x40),
@@ -1822,8 +2190,33 @@ static void replay_generated(void)
     n = rec(seq, n, 0, sync, sizeof sync);                     /* the orphan still runs: 0x22, routine not called */
     n = rec(seq, n, 0, prog, sizeof prog);                     /* the orphan still runs: 0x22 */
     n = rec(seq, n, 255, tp, sizeof tp);                       /* 102 s: routine_poll finishes it */
-    n = rec(seq, n, 0, prog, sizeof prog);                     /* accepted */
+    n = rec(seq, n, 0, prog, sizeof prog);                     /* accepted (0x12 with no update service) */
     replay_input("seq-app-orphan", seq, n, true);
+#endif
+#if UDSOTA_FUZZ_APP_EX
+    /* routine_ex from the default session: start pending (0x78, then 71 01 12 35 00 from a poll), stop at once,
+     * results pending again; then the keyed DID: 0x7F in default, 0x33 locked in extended, 4B 59 once unlocked with
+     * the run's first seed (so only from a state with no 0x27 before; elsewhere it is just a stream). */
+    const uint8_t start_ex[] = {UDSOTA_SID_ROUTINE, UDSOTA_RC_START, 0x12, 0x35};
+    const uint8_t stop_ex[] = {UDSOTA_SID_ROUTINE, UDSOTA_RC_STOP, 0x12, 0x35};
+    const uint8_t results_ex[] = {UDSOTA_SID_ROUTINE, UDSOTA_RC_RESULTS, 0x12, 0x35};
+    const uint8_t keyed[] = {UDSOTA_SID_READ_DID, 0x03, 0x00};
+    const uint8_t seed_ext[] = {UDSOTA_SID_SECURITY, UDSOTA_SA_SEED_EXTENDED};
+    uint8_t key_ext[2 + UDSOTA_KEY_LEN] = {UDSOTA_SID_SECURITY, UDSOTA_SA_KEY_EXTENDED};
+    uint8_t seed0[UDSOTA_SEED_LEN];
+    mock_seed(0, seed0);
+    fake_key(seed0, UDSOTA_SA_SEED_EXTENDED, &key_ext[2]);
+    n = 0;
+    n = rec(seq, n, 0, start_ex, sizeof start_ex);
+    n = rec(seq, n, 4, stop_ex, sizeof stop_ex);               /* 100 ms: the start has answered */
+    n = rec(seq, n, 0, results_ex, sizeof results_ex);
+    n = rec(seq, n, 4, keyed, sizeof keyed);
+    n = rec(seq, n, 0, ext, sizeof ext);
+    n = rec(seq, n, 0, keyed, sizeof keyed);
+    n = rec(seq, n, 0, seed_ext, sizeof seed_ext);
+    n = rec(seq, n, 1, key_ext, sizeof key_ext);
+    n = rec(seq, n, 0, keyed, sizeof keyed);
+    replay_input("seq-app-ex", seq, n, true);
 #endif
 #if UDSOTA_FUZZ_NO_UPDATE
     /* 34, 36 and 37 while an app routine runs (0x21, the core's busy answer), then after it finishes (0x11). */
@@ -1959,6 +2352,9 @@ static const char *const OP_NAME[OP_COUNT] = {   /* op_id_t names for the covera
 #if UDSOTA_FUZZ_APP_HOOKS
     "did_write", "routine", "routine_poll",
 #endif
+#if UDSOTA_FUZZ_APP_EX
+    "did_read_ex", "routine_ex",
+#endif
 #ifdef UDSOTA_FUZZ_Z
     "zbegin", "zwrite", "zend",
 #endif
@@ -1987,6 +2383,11 @@ static void check_coverage(void)
         }
     }
     for (int op = 0; op < OP_COUNT; op++) {
+#if UDSOTA_FUZZ_APP_EX
+        if (op == OP_ROUTINE) {
+            continue;                                /* routine_ex answers instead, and mock_routine fails a call */
+        }
+#endif
 #if UDSOTA_FUZZ_NO_UPDATE
         if (op != OP_RESET && op != OP_DID_WRITE && op != OP_ROUTINE && op != OP_ROUTINE_POLL) {
             continue;                                /* the engine's ops: there is no engine */
@@ -2016,6 +2417,20 @@ static void check_coverage(void)
         fprintf(stderr, "fuzz_udsota: COVERAGE: no 34, 36 or 37 arrived during a job (its 0x21)\n");
         ok = false;
     }
+    if (!g_stats.prog_nrc12) {
+        fprintf(stderr, "fuzz_udsota: COVERAGE: no 10 02 drew 0x12 with no update service\n");
+        ok = false;
+    }
+#endif
+#if UDSOTA_FUZZ_APP_EX
+    if (!g_stats.ex_pos_sub[UDSOTA_RC_START] || !g_stats.ex_pos_sub[UDSOTA_RC_STOP] ||
+        !g_stats.ex_pos_sub[UDSOTA_RC_RESULTS] || !g_stats.ex_default_pos || !g_stats.ex_reject22 ||
+        !g_stats.ex_reject31) {
+        fprintf(stderr, "fuzz_udsota: COVERAGE: routine_ex 71 01/02/03 %d%d%d, in default %d; 0x10 from 22 %d, 31 %d\n",
+                g_stats.ex_pos_sub[1], g_stats.ex_pos_sub[2], g_stats.ex_pos_sub[3], g_stats.ex_default_pos,
+                g_stats.ex_reject22, g_stats.ex_reject31);
+        ok = false;
+    }
 #endif
 #if UDSOTA_FUZZ_PROGRESS
     for (int st = 0; st <= (int)UDSOTA_STAGE_ACTIVATING; st++) {
@@ -2029,8 +2444,8 @@ static void check_coverage(void)
         ok = false;
     }
 #endif
-    for (int st = 0; st < ST_FUZZED; st++) {
-        ok = ok && g_stats.reached[st];
+    for (size_t k = 0; k < FUZZED_N; k++) {
+        ok = ok && g_stats.reached[FUZZED[k]];
     }
     if (!ok) {
         fprintf(stderr, "fuzz_udsota: COVERAGE floor not met (NRC 0x13 seen=%d, 0x35 seen=%d): a clean run would "
@@ -2224,13 +2639,13 @@ int main(int argc, char **argv)
         replay_path(argv[argi]);
     }
     int reached = 0;
-    for (int st = 0; st < ST_FUZZED; st++) {
-        reached += g_stats.reached[st] ? 1 : 0;
+    for (size_t k = 0; k < FUZZED_N; k++) {
+        reached += g_stats.reached[FUZZED[k]] ? 1 : 0;
     }
     printf("fuzz_udsota: PASS %lu inputs, %lu runs, %lu requests (%lu positive, %lu NRC, %lu silent), "
            "%lu poll answers, %d/%d states reached, digest=%016" PRIx64 "\n",
            g_stats.inputs, g_stats.runs, g_stats.requests, g_stats.positive, g_stats.nrc, g_stats.silent,
-           g_stats.poll_answers, reached, (int)ST_FUZZED, g_digest);
+           g_stats.poll_answers, reached, (int)FUZZED_N, g_digest);
     return 0;
 }
 #endif

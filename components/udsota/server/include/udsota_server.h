@@ -10,7 +10,8 @@
 #include "udsota_update_state.h"   /* udsota_update_t and udsota_progress_t, which the context names */
 
 /* ---- Server-internal timing and limits (not on the wire) ---- */
-#define UDSOTA_JOB_CAP_MS         90000u    /* 0x78 stops here: NRC 0x72 and the session ends (twice the worst-case erase) */
+#define UDSOTA_JOB_CAP_MS         90000u    /* 0x78 stops here: NRC 0x72 (0x10 for an app routine) and the session
+                                                ends (twice the worst-case erase) */
 #define UDSOTA_JOB_POLL_MS        5u        /* udsota_poll period while a worker job runs */
 #define UDSOTA_IDLE_POLL_MS       100u      /* longest poll gap in a non-default session (S3) */
 #define UDSOTA_READ_DID_MAX       1u        /* DIDs per 0x22 request; more is NRC 0x13 (ISO 14229-1 0x22 NRC table) */
@@ -19,8 +20,8 @@
 
 /* A handler of the registered service (udsota_service.h) whose work is still queued passes UDSOTA_PENDING to
  * udsota_job_start instead of a result; the server then waits on the service's poll (the updater's: engine.poll).
- * hooks.routine and hooks.routine_poll return it too, for an app routine still running; the server then waits on
- * routine_poll. INT32_MAX: never an esp_err_t, never 0. */
+ * hooks.routine, routine_ex and routine_poll return it too, for an app routine still running; the server then waits
+ * on routine_poll. INT32_MAX: never an esp_err_t, never 0. */
 #define UDSOTA_PENDING  0x7FFFFFFF
 _Static_assert(INT_MAX >= UDSOTA_PENDING, "UDSOTA_PENDING is returned through int");
 
@@ -83,7 +84,8 @@ typedef struct {   /* all optional */
     void     (*phase)(void *ctx, udsota_phase_t p);/* on every change, from the server's context; it may read
                                                       udsota_phase() but must not call other udsota functions */
     size_t   (*did_read)(void *ctx, uint16_t did, uint8_t *buf, size_t max);  /* 0 = no such DID (0x31); a DID
-                                                      longer than max returns its length, unwritten (0x14) */
+                                                      longer than max returns its length, unwritten (0x14). Never
+                                                      called while did_read_ex is set */
     uint32_t (*stmin_us)(void *ctx);               /* STmin for the next message's first FC; NULL = cfg.stmin_us */
     bool     (*reset)(void *ctx);                  /* restart; returns only on failure (false), then the server re-opens.
                                                       NULL: 11 01 answers 0x11 and ActivateImage answers positive
@@ -111,12 +113,12 @@ typedef struct {   /* all optional */
                                                       only during the call (a pending routine copies what it needs).
                                                       NULL: 0x31, as for any RID nobody serves. Returns 0 (71 01 <rid>
                                                       out), an NRC (1..0xFF, never 0x78), or UDSOTA_PENDING (0x78
-                                                      until routine_poll stops returning pending; 0x72 at the 90 s
+                                                      until routine_poll stops returning pending; 0x10 at the 90 s
                                                       cap, and the routine is then an orphan until routine_poll
                                                       finishes it). Any other value, or *out_len > out_max, is 0x10.
                                                       While an orphan runs, a 31 01 for an app RID is 0x22 without a
                                                       call. It may read udsota_phase() but must not call other udsota
-                                                      functions */
+                                                      functions. Never called while routine_ex is set */
     int      (*routine_poll)(void *ctx, uint8_t *out, size_t out_max, size_t *out_len);
                                                    /* on every udsota_poll while an app routine is pending or
                                                       orphaned; returns as routine does, and out is again valid only
@@ -160,6 +162,27 @@ typedef struct {   /* all optional */
                                                       the NRC, checked in ISO order: its session rule (0x7F), then its
                                                       key rule (0x33), then 0x31 for a group it doesn't clear; never
                                                       0x78. NULL: 14 answers 0x11, as before. Called as dtc_get */
+    uint8_t  (*did_read_ex)(void *ctx, uint16_t did, uint8_t *buf, size_t max, size_t *len, udsota_access_t access);
+                                                   /* did_read with the session's access, for the same DIDs (every one
+                                                      the core doesn't serve and the service passes); when set,
+                                                      did_read is never called. Writes the DID's bytes into buf, at
+                                                      most max (the room after 62 <did>; buf is valid only during the
+                                                      call), sets *len and returns 0; a *len of 0 or over max is 0x10.
+                                                      Else returns the NRC, never 0x78: 0x31 no such DID, 0x7F not in
+                                                      this session, 0x33 locked, 0x22, 0x14 too long for max, ... A
+                                                      functional 22 drops 0x31 and 0x7F as any other NRC suppressed
+                                                      there. NULL: did_read, as before. Called as dtc_get */
+    int      (*routine_ex)(void *ctx, uint8_t sub, uint16_t rid, const uint8_t *in, size_t in_len,
+                           uint8_t *out, size_t out_max, size_t *out_len, udsota_access_t access);
+                                                   /* routine with the sub-function, in every session: when set, a 31
+                                                      of at least 4 bytes (else 0x13) on a RID the service doesn't own
+                                                      comes here with sub 01 startRoutine, 02 stopRoutine or 03
+                                                      requestRoutineResults (SPRMIB cleared; any other sub is 0x12
+                                                      without a call), even in the default session, so the app owns
+                                                      the session rule as did_write does; the service's RIDs answer as
+                                                      without it, and routine is never called. Returns as routine
+                                                      does, and the answer is 71 <sub> <rid> out, from routine_poll
+                                                      too. NULL: routine, as before */
 } udsota_hooks_t;
 
 typedef struct {
@@ -239,7 +262,8 @@ typedef struct udsota_server {
     uint8_t           job_sid;           /* SID being answered with 0x78 */
     uint32_t          job_start_ms;      /* for the first 0x78 and the 90 s cap */
     uint32_t          last_pending_ms;   /* last 0x78 sent */
-    uint32_t          job_arg;           /* handler data for job_done, e.g. a 36's block length or a routine's RID */
+    uint32_t          job_arg;           /* handler data for job_done, e.g. a 36's block length, or an app routine's
+                                            RID with its sub-function in bits 16-23 */
     udsota_job_done_fn job_done;         /* builds the final answer when the job's poll (the service's, or
                                             hooks.routine_poll for an app routine) reports a result */
     bool              worker_orphan;     /* a service's job the server stopped waiting on at the 90 s cap still runs;

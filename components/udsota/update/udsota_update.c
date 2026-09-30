@@ -503,7 +503,15 @@ static size_t confirm_done(udsota_server_t *s, int result, uint8_t *resp, size_t
     return routine_pos(resp, resp_max, UDSOTA_RID_CONFIRM_IMAGE, NULL, 0);
 }
 
-/* The updater's routine: FF01, F000, F001 and F002; any other RID is passed back (UDSOTA_SVC_PASS) before any check.
+/* The updater's RIDs: FF01, F000, F001 and F002, in every session and whatever the sub-function. */
+static bool upd_owns_rid(const udsota_server_t *s, uint16_t rid)
+{
+    (void)s;
+    return rid == UDSOTA_RID_CHECK_PROG_DEPS || rid == UDSOTA_RID_GET_RESUME_POINT ||
+           rid == UDSOTA_RID_ACTIVATE_IMAGE || rid == UDSOTA_RID_CONFIRM_IMAGE;
+}
+
+/* The updater's routine: its own RIDs (upd_owns_rid); any other is passed back (UDSOTA_SVC_PASS) before any check.
  * For its own, after the core's session, length and sub-function checks: RID in this session 31, key 33, exact
  * length 13, then per RID the sequence (24) before the conditions (22). */
 static size_t upd_routine(udsota_server_t *s, uint16_t rid, const uint8_t *req, size_t len, bool spr,
@@ -512,8 +520,7 @@ static size_t upd_routine(udsota_server_t *s, uint16_t rid, const uint8_t *req, 
     (void)req;
     const uint8_t sid = UDSOTA_SID_ROUTINE;
     const bool confirm = (rid == UDSOTA_RID_CONFIRM_IMAGE);   /* extended, no key; the other three programming, keyed */
-    if (!confirm && rid != UDSOTA_RID_CHECK_PROG_DEPS && rid != UDSOTA_RID_GET_RESUME_POINT &&
-        rid != UDSOTA_RID_ACTIVATE_IMAGE) {
+    if (!upd_owns_rid(s, rid)) {
         return UDSOTA_SVC_PASS;
     }
     const udsota_svc_access_t access = udsota_access_check(s, s->cfg.level_programming);
@@ -678,6 +685,7 @@ static int upd_poll(const udsota_server_t *s)
 static const udsota_service_t k_update_service = {
     .request = upd_request,
     .routine = upd_routine,
+    .owns_rid = upd_owns_rid,
     .read_did = upd_read_did,
     .on_session = upd_on_session,
     .settled = slots_settled,
