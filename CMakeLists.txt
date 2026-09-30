@@ -378,7 +378,7 @@ if(UDSOTA_FUZZ AND UDSOTA_FUZZ_SAN_OK)
     target_compile_options(fuzz_udsota_frames PRIVATE ${FUZZ_SAN})
     target_link_options(fuzz_udsota_frames PRIVATE ${FUZZ_SAN})
     set_tests_properties(fuzz_udsota_frames PROPERTIES TIMEOUT 120
-                         PASS_REGULAR_EXPRESSION "fuzz_udsota_frames: PASS .* digest=bae692df8eb90a5c")
+                         PASS_REGULAR_EXPRESSION "fuzz_udsota_frames: PASS .* digest=0279b8d7535d8ef1")
     # The delta patch path on mutated patches (test/fuzz_udsota_patch.c): udsota_coded over the real detools and
     # tinfl, with AddressSanitizer where the toolchain has it, since the device parses these patches from the bus.
     set(FUZZ_PATCH_SAN ${FUZZ_SAN})

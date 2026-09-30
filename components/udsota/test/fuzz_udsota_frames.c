@@ -139,7 +139,7 @@ static const variant_t VARIANTS[VARIANT_COUNT] = {
     {0u, 0u, 2000u, false, true, true, 0u, T0_US},        /* a 2 s FC retry window, past N_Cr */
 };
 
-static const uint32_t STMIN_HOOK[] = {0u, 100u, 950u, 1500u, 5000u, 127000u, 200000u};
+static const uint32_t STMIN_HOOK[] = {0u, 100u, 250u, 950u, 1500u, 5000u, 127000u, 200000u};
 
 /* The app's DIDs: 0x0101 and up answer multi-frame, 0x0102 wraps the SN, 0x0103 fills the 256-byte buffer and 0x0104
  * does not fit it (0x14). */
@@ -152,6 +152,8 @@ typedef struct {
     size_t   size;
 } arena_t;
 
+typedef enum { FCE_SF, FCE_BAD_SN, FCE_LAST, FCE_NCR, FCE_COUNT } fc_end_t;   /* how a parked FC's message ended */
+
 typedef struct {                               /* coverage, printed before the PASS line; check_coverage's floor */
     unsigned long programs, runs, events, fed_phys, fed_func, offered, refused, failed;
     unsigned long fed_pci[16], fed_dlc[16], kind[UDSOTA_RXW_BROKEN + 1], sent_pci[4];
@@ -159,6 +161,7 @@ typedef struct {                               /* coverage, printed before the P
     unsigned long fc_cts, fc_ovflw, withheld, fc_parked, fc_retried, orphan, ff_escape, rx_sn_wrap, tx_sn_wrap;
     unsigned long tester_fc[16];               /* tester FCs fed while an answer was going out, by FS */
     unsigned long ncr, nbs, ovflw_abort, wft_abort, send_err, s3_end, pending78, abandoned, resp_lost, fc_lost;
+    unsigned long fc_ended[FCE_COUNT];         /* a parked FC dropped, counted lost, as its message ended, by how */
     unsigned long func_invalid, func_busy, func_silent, func_answered;
     unsigned long answers_pos, answers_nrc, answers_mf, verify_ok, drained;
 } stats_t;
@@ -475,7 +478,8 @@ static uint8_t hook_gate(void *ctx, udsota_op_t op)
     return (++R.gate_calls >= R.v->gate_deny_from) ? UDSOTA_NRC_CONDITIONS_NOT_CORRECT : 0u;
 }
 
-/* hooks.stmin_us: cycles through STMIN_HOOK, 950 us and 200 ms among them, which the FC rounds up. */
+/* hooks.stmin_us: cycles through STMIN_HOOK: 250 us and 950 us, which the FC rounds up to 300 us and 1 ms (both of
+ * stmin_sendable's rounding branches), and 200 ms, which it caps at 127 ms. */
 static uint32_t hook_stmin(void *ctx)
 {
     (void)ctx;
@@ -582,7 +586,8 @@ static uint32_t can_tx_pending(void *ctx)
     return g_bus.pending;
 }
 
-/* STmin byte to microseconds, exactly as isotp-c decodes it (reserved values are 0). */
+/* STmin byte to microseconds, exactly as isotp-c decodes it: a reserved value is 0, so the CF-pacing oracle's floor
+ * for it is isotp-c's (the link's own STmin), not ISO 15765-2's, whose sender takes a reserved STmin as 127 ms. */
 static uint32_t stmin_to_us(uint8_t b)
 {
     if (b <= 0x7Fu) {
@@ -849,6 +854,7 @@ static void fc_offered(const uint8_t *d, int rc)
     if (fs == FS_CTS && !T.rxw.in_msg) {
         fail("a parked CTS retried for a message the adapter no longer receives", d, CAN_DL);
     }
+    g_call.fc++;
     G.fc_retried++;
     g_pfc.last_ms = now_ms();
     g_pfc.valid = rc == UDSOTA_TX_RETRY;
@@ -1069,6 +1075,8 @@ static void feed_phys(const uint8_t f[CAN_DL], uint8_t dlc, uint32_t rx_us)
     const udsota_rxwatch_t before = T.rxw;
     const uint16_t withheld = S.counters.withheld_fcs;
     const uint8_t send_before = T.link.send_status;
+    const bool parked_before = T.fc_parked;
+    const uint32_t fc_lost_before = udsota_isotp_fc_lost(&T);
     memset(&g_call, 0, sizeof g_call);
     g_ctx = CTX_FRAME;
     udsota_isotp_on_frame(&T, data, dlc, rx_us, now_ms());
@@ -1081,6 +1089,11 @@ static void feed_phys(const uint8_t f[CAN_DL], uint8_t dlc, uint32_t rx_us)
                     (data[0] & 0x0Fu) == 0u;
     const bool dropped = S.counters.withheld_fcs != withheld;
     const uint8_t fs = g_call.fc_f[0] & 0x0Fu;
+    if (parked_before && !T.fc_parked && udsota_isotp_fc_lost(&T) != fc_lost_before && g_call.fc == 0u) {
+        G.fc_ended[FCE_SF] += k == UDSOTA_RXW_SINGLE;
+        G.fc_ended[FCE_BAD_SN] += k == UDSOTA_RXW_BROKEN;
+        G.fc_ended[FCE_LAST] += k == UDSOTA_RXW_LAST;
+    }
     switch (k) {
     case UDSOTA_RXW_FIRST:
     case UDSOTA_RXW_CONSEC_FC:
@@ -1186,6 +1199,8 @@ static void service(void)
     const uint8_t send_before = T.link.send_status;
     const bool rx_before = T.link.receive_status == ISOTP_RECEIVE_STATUS_INPROGRESS;
     const uint8_t session_before = S.session;
+    const bool parked_before = T.fc_parked;
+    const uint32_t fc_lost_before = udsota_isotp_fc_lost(&T);
     memset(&g_call, 0, sizeof g_call);
     g_ctx = CTX_SERVICE;
     const uint32_t w = udsota_isotp_service(&T, now_ms());
@@ -1194,8 +1209,11 @@ static void service(void)
         fail("service asked for a wait over 100 ms, or over 1 ms while a frame waits for the bus", NULL, 0);
     }
     g_wait_ms = w != 0u ? w : 1u;
-    G.ncr += rx_before && T.link.receive_status == ISOTP_RECEIVE_STATUS_IDLE &&
-             T.link.receive_protocol_result == ISOTP_PROTOCOL_RESULT_TIMEOUT_CR;
+    const bool ncr = rx_before && T.link.receive_status == ISOTP_RECEIVE_STATUS_IDLE &&
+                     T.link.receive_protocol_result == ISOTP_PROTOCOL_RESULT_TIMEOUT_CR;
+    G.ncr += ncr;
+    G.fc_ended[FCE_NCR] += ncr && parked_before && !T.fc_parked && udsota_isotp_fc_lost(&T) != fc_lost_before &&
+                           g_call.fc == 0u;
     G.s3_end += session_before != UDSOTA_SESSION_DEFAULT && S.session == UDSOTA_SESSION_DEFAULT;
     note_send_end(send_before);
     check_mirror();
@@ -1874,18 +1892,18 @@ static void build_seeds(void)
     SF(0x10, 0x03); p_wait(5u); SF(0x27, 0x01); p_wait(5u);
     p_bus(2u, 3u); SF(0x11, 0x01); p_wait(150u);
     seed_end(false);
-    /* A parked CTS, then its message ends before the retry: a new SF, an FF over the limit, a wrong SN, N_Cr. */
+    /* A CTS the bus refused, then its message ends in the same wake, before the retry: a new SF, an FF over the limit,
+     * a wrong SN, its last CF; and, where the retry window outlasts it (variant 4's 2 s), N_Cr. */
     seed_begin();
-    p_bus(0u, 1u); RAW(8, 0x10, 0x14, 0x22, 0xF1, 0x86, 0, 0, 0 | 0);
-    p8(EV_SF | EV_NOSVC); p8(2); p8(0x22); p8(0xF1); p8(0x86);
-    p_wait(20u);
-    p_bus(0u, 1u); p8(EV_RAW | EV_NOSVC); p8(8); p8(0x10); p8(0x14); p8(0x22); p8(0xF1); p8(0x86); p8(0); p8(0); p8(0);
-    p8(0);
-    p8(EV_RAW | EV_NOSVC); p8(8); p8(0x11); p8(0x2C); p8(0x22); p8(0xF1); p8(0x86); p8(0); p8(0); p8(0); p8(0);
-    p_wait(20u);
-    p_bus(0u, 1u); p8(EV_RAW | EV_NOSVC); p8(8); p8(0x10); p8(0x14); p8(0x22); p8(0xF1); p8(0x86); p8(0); p8(0); p8(0);
-    p8(0);
-    p8(EV_RAW | EV_NOSVC); p8(8); p8(0x25); p8(1); p8(2); p8(3); p8(4); p8(5); p8(6); p8(7); p8(0);
+    static const uint8_t FF20[CAN_DL] = {0x10, 0x14, 0x22, 0xF1, 0x86, 0, 0, 0};
+    p_bus(0u, 1u); p_raw(8u, FF20, 0, EV_NOSVC); p_sf((const uint8_t[]){0x22, 0xF1, 0x86}, 3u, EV_NOSVC); p_wait(20u);
+    p_bus(0u, 1u); p_raw(8u, FF20, 0, EV_NOSVC);
+    p_raw(8u, (const uint8_t[CAN_DL]){0x11, 0x2C, 0x22, 0xF1, 0x86, 0, 0, 0}, 0, EV_NOSVC); p_wait(20u);
+    p_bus(0u, 1u); p_raw(8u, FF20, 0, EV_NOSVC);
+    p_raw(8u, (const uint8_t[CAN_DL]){0x25, 1, 2, 3, 4, 5, 6, 7}, 0, EV_NOSVC); p_wait(20u);
+    p_bus(0u, 1u); p_raw(8u, (const uint8_t[CAN_DL]){0x10, 0x08, 0x22, 0xF1, 0x86, 0xF1, 0x8C, 0xF1}, 0, EV_NOSVC);
+    p_raw(8u, (const uint8_t[CAN_DL]){0x21, 0x90, 0x00, PAD, PAD, PAD, PAD, PAD}, 0, EV_NOSVC); p_wait(20u);
+    p_bus(0u, 0xFFu); p_raw(8u, FF20, 0, 0u); p_wait(1100u); p_bus(3u, 0u);
     p_wait(20u);
     seed_end(false);
 }
@@ -2080,6 +2098,8 @@ static void print_coverage(void)
            G.sent_pci[PCI_SF], G.sent_pci[PCI_FF], G.sent_pci[PCI_CF], G.sent_pci[PCI_FC], G.fc_cts, G.fc_ovflw,
            G.refused, G.failed, G.withheld, G.fc_parked, G.fc_retried, G.fc_lost, G.park_retried, G.resp_lost,
            G.orphan);
+    printf("fuzz_udsota_frames: parked FCs dropped as their message ended: by an SF %lu, a wrong SN %lu, the last CF "
+           "%lu, N_Cr %lu\n", G.fc_ended[FCE_SF], G.fc_ended[FCE_BAD_SN], G.fc_ended[FCE_LAST], G.fc_ended[FCE_NCR]);
     unsigned long reserved = 0;
     for (unsigned fs = FS_OVFLW + 1u; fs < 16u; fs++) {
         reserved += G.tester_fc[fs];
@@ -2110,6 +2130,10 @@ static void check_coverage(void)
         {"an SF sent", G.sent_pci[PCI_SF]}, {"an FF sent", G.sent_pci[PCI_FF]}, {"a CF sent", G.sent_pci[PCI_CF]},
         {"a CTS sent", G.fc_cts}, {"an overflow FC sent", G.fc_ovflw}, {"a withheld FC point", G.withheld},
         {"an FC parked", G.fc_parked}, {"an FC retried", G.fc_retried}, {"an answer retried", G.park_retried},
+        {"a parked FC dropped by an SF", G.fc_ended[FCE_SF]},
+        {"a parked FC dropped by a wrong SN", G.fc_ended[FCE_BAD_SN]},
+        {"a parked FC dropped by its last CF", G.fc_ended[FCE_LAST]},
+        {"a parked FC dropped at N_Cr", G.fc_ended[FCE_NCR]},
         {"an answer lost", G.resp_lost}, {"an orphan", G.orphan},
         {"a tester WAIT mid-answer", G.tester_fc[FS_WAIT]}, {"a tester overflow mid-answer", G.tester_fc[FS_OVFLW]},
         {"N_Bs", G.nbs}, {"an overflow-ended send", G.ovflw_abort}, {"a WAIT overrun", G.wft_abort},
