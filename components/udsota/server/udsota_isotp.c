@@ -274,6 +274,10 @@ void udsota_isotp_on_frame(udsota_isotp_t *t, const uint8_t *data, uint8_t dlc, 
     if (k == UDSOTA_RXW_FIRST || k == UDSOTA_RXW_SINGLE || k == UDSOTA_RXW_REFUSED) {
         t->rx_orphan = false;                             /* isotp-c replaces whatever it held */
     }
+    if (k == UDSOTA_RXW_SINGLE || k == UDSOTA_RXW_BROKEN || k == UDSOTA_RXW_LAST) {
+        fc_drop(t);                                       /* the message a parked FC answers is over (an FF's own
+                                                             FC supersedes it) */
+    }
     isotp_on_can_message(&t->link, data, dlc);
     take_request(t, now_ms);
 }
@@ -305,6 +309,7 @@ uint32_t udsota_isotp_service(udsota_isotp_t *t, uint32_t now_ms)
     if (rx_busy && t->link.receive_status == ISOTP_RECEIVE_STATUS_IDLE &&
         t->link.receive_protocol_result == ISOTP_PROTOCOL_RESULT_TIMEOUT_CR) {
         udsota_rxwatch_reset(&t->rxw);
+        fc_drop(t);                       /* a CTS still parked for it would invite CFs isotp-c no longer takes */
         if (t->rx_orphan) {
             t->rx_orphan = false;         /* dropped at a withheld FC, which the server already counted */
         } else {
