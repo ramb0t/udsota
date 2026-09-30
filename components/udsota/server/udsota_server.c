@@ -461,7 +461,7 @@ static size_t handle_tester_present(const uint8_t *req, size_t len, uint8_t *res
 
 /* 0x22 ReadDataByIdentifier, one DID per request. F186 and F1F2 come from the server's own state and F18C from
  * cfg.device_id; every other DID (and F18C without a device ID) goes to the service, and one it passes, or every one
- * with no service, to hooks.did_read; 0 bytes means NRC 0x31. */
+ * with no service, to hooks.did_read; 0 bytes means NRC 0x31, and an answer longer than room 0x14. */
 static size_t handle_read_did(udsota_server_t *s, const uint8_t *req, size_t len, uint8_t *resp, size_t resp_max)
 {
     if (len != 1u + 2u * UDSOTA_READ_DID_MAX) {
@@ -478,11 +478,11 @@ static size_t handle_read_did(udsota_server_t *s, const uint8_t *req, size_t len
         out[0] = s->session;
         n = 1;
     } else if (did == UDSOTA_DID_COUNTERS) {
-        n = udsota_pack_counters(out, room, &s->counters);
+        n = room < UDSOTA_COUNTERS_LEN ? UDSOTA_COUNTERS_LEN : udsota_pack_counters(out, room, &s->counters);
     } else if (did == UDSOTA_DID_SERIAL && s->cfg.device_id != NULL && s->cfg.device_id_len != 0u) {
         n = s->cfg.device_id_len;
         if (n <= room) {
-            memcpy(out, s->cfg.device_id, n);     /* longer: 0x31 below */
+            memcpy(out, s->cfg.device_id, n);     /* longer: 0x14 below */
         }
     } else {
         n = (s->svc != NULL) ? s->svc->read_did(s, did, out, room) : UDSOTA_SVC_PASS;
@@ -490,8 +490,11 @@ static size_t handle_read_did(udsota_server_t *s, const uint8_t *req, size_t len
             n = (s->hooks.did_read != NULL) ? s->hooks.did_read(s->hooks.ctx, did, out, room) : 0u;
         }
     }
-    if (n == 0 || n > room) {
+    if (n == 0) {
         return udsota_nrc(resp, resp_max, UDSOTA_SID_READ_DID, UDSOTA_NRC_REQUEST_OUT_OF_RANGE);
+    }
+    if (n > room) {
+        return udsota_nrc(resp, resp_max, UDSOTA_SID_READ_DID, UDSOTA_NRC_RESPONSE_TOO_LONG);
     }
     resp[0] = UDSOTA_POS(UDSOTA_SID_READ_DID);
     udsota_put_u16be(&resp[1], did);

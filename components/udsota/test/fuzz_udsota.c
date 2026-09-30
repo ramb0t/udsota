@@ -433,16 +433,16 @@ static const struct { uint16_t did; uint8_t len; uint8_t fill; } DIDS[] = {
     {0x0200u, 1u, 0x00u}, {0x0201u, 1u, 0x01u}, {0x0202u, 2u, 0x09u}, {0x0203u, 2u, 0x09u}, {0x0204u, 2u, 0x0Eu},
 };
 
-/* Mock hooks.did_read: first writes all max bytes it was offered (so an oversized max faults on the guard page), then the DID. */
+/* Mock hooks.did_read: first writes all max bytes it was offered (so an oversized max faults on the guard page), then
+ * the DID, or only its length when max is short (0x14). */
 static size_t mock_did_read(void *ctx, uint16_t did, uint8_t *out, size_t max)
 {
     memset(out, 0xDD, max);
     for (size_t i = 0; i < sizeof DIDS / sizeof DIDS[0]; i++) {
         if (DIDS[i].did == did) {
-            if (DIDS[i].len > max) {
-                return 0;
+            if (DIDS[i].len <= max) {
+                memset(out, DIDS[i].fill, DIDS[i].len);
             }
-            memset(out, DIDS[i].fill, DIDS[i].len);
             return DIDS[i].len;
         }
     }
@@ -491,25 +491,23 @@ static void mock_status(void *ctx, udsota_status_t *out)
 }
 
 /* Mock engine.version: first writes every byte it was offered (an oversized max faults on the guard page), then
- * 18 bytes of 'v'; 0 when max is short. */
+ * 18 bytes of 'v'; when max is short, only the length (0x14). */
 static size_t mock_version(void *ctx, char *out, size_t max)
 {
     memset(out, 0xDD, max);
-    if (max < 18u) {
-        return 0;
+    if (max >= 18u) {
+        memset(out, 'v', 18u);
     }
-    memset(out, 'v', 18u);
     return 18u;
 }
 
-/* Mock engine.running_sha: the same guard write, then 32 bytes of 0xA3. */
+/* Mock engine.running_sha: the same guard write, then 32 bytes of 0xA3, or only the length when max is short. */
 static size_t mock_running_sha(void *ctx, uint8_t *out, size_t max)
 {
     memset(out, 0xDD, max);
-    if (max < UDSOTA_SHA256_LEN) {
-        return 0;
+    if (max >= UDSOTA_SHA256_LEN) {
+        memset(out, 0xA3, UDSOTA_SHA256_LEN);
     }
-    memset(out, 0xA3, UDSOTA_SHA256_LEN);
     return UDSOTA_SHA256_LEN;
 }
 
@@ -950,8 +948,8 @@ static bool sid_served(uint8_t sid)
     }
 }
 
-/* True for the NRCs udsota.h defines but 0x14, which dtc_nrc_ok takes from a 19 alone; anything else on the wire is
- * a server defect. */
+/* True for the NRCs udsota.h defines but 0x14, which too_long_ok takes from a 22 or a 19 alone; anything else on the
+ * wire is a server defect. */
 static bool nrc_known(uint8_t nrc)
 {
     switch (nrc) {
@@ -976,16 +974,17 @@ static bool nrc_ok(uint8_t nrc)
     return nrc_known(nrc) || (M.live && M.variant == 2u && nrc == FUZZ_GATE_NRC);
 }
 
-/* True for 0x14 responseTooLong to a 19 in the DTC build, the only answer the core sends it in; the other five
- * builds never serve 19, so there it is a defect anywhere, as it is from a poll. */
-static bool dtc_nrc_ok(uint8_t sid, uint8_t nrc)
+/* True for 0x14 responseTooLong to a 22 (a DID longer than the answer buffer) or, in the DTC build, a 19, the only
+ * answers the core sends it in; the other five builds never serve 19, and it is a defect from a poll. */
+static bool too_long_ok(uint8_t sid, uint8_t nrc)
 {
+    if (nrc != UDSOTA_NRC_RESPONSE_TOO_LONG) {
+        return false;
+    }
 #if UDSOTA_FUZZ_DTC
-    return sid == UDSOTA_SID_READ_DTC && nrc == UDSOTA_NRC_RESPONSE_TOO_LONG;
+    return sid == UDSOTA_SID_READ_DID || sid == UDSOTA_SID_READ_DTC;
 #else
-    (void)sid;
-    (void)nrc;
-    return false;
+    return sid == UDSOTA_SID_READ_DID;
 #endif
 }
 
@@ -1098,7 +1097,7 @@ static void check_request_answer(const uint8_t *req, size_t rl, const uint8_t *r
         fail("answered an empty request", req, rl, r, n);
     }
     if (r[0] == UDSOTA_NEG_RESPONSE) {
-        if (n != 3 || r[1] != req[0] || !(nrc_ok(r[2]) || dtc_nrc_ok(req[0], r[2]))) {
+        if (n != 3 || r[1] != req[0] || !(nrc_ok(r[2]) || too_long_ok(req[0], r[2]))) {
             fail("malformed negative response (want 7F <request SID> <known NRC>)", req, rl, r, n);
         }
         if (count) {
@@ -1674,6 +1673,9 @@ static const seed_t SEEDS[] = {
     SEED(0x34, 0x00, 0x44, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF), SEED(0x34, 0x00, 0x44, 0, 0, 0x10, 0, 0, 0, 0, 0x40),
     SEED(0x34, 0x01, 0x44, 0, 0, 0, 0, 0, 0, 0, 0x40), SEED(0x34, 0x00, 0x22, 0, 0, 0, 0x40),
     SEED(0x34, 0x00, 0x44), SEED(0x34, 0x00, 0x44, 0, 0, 0, 0, 0, 0, 0, 0x40, 0x00),
+    SEED(0x34, 0x00, 0x11, 0, 0x40), SEED(0x34, 0x00, 0x11, 0x01, 0x40), SEED(0x34, 0x00, 0x42, 0, 0, 0, 0, 0, 0x40),
+    SEED(0x34, 0x00, 0x24, 0, 0, 0, 0, 0, 0x40, 0x00), SEED(0x34, 0x00, 0x45, 0, 0, 0, 0, 0, 0, 0, 0x40),
+    SEED(0x34, 0x00, 0x00),
     SEED(0x36, 0x01, 0xE9, 0x03, 0x02, 0x4F), SEED(0x36, 0x01, 0x00, 0x03), SEED(0x36, 0x02, 0x55),
     SEED(0x36, 0x01), SEED(0x36, 0x00, 0x11), SEED(0x36, 0xFF, 0x11), SEED(0x36),
     SEED(0x37), SEED(0x37, 0x00),

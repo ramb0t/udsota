@@ -259,8 +259,8 @@ static void test_did_rid_values_pinned(void)
     TEST_ASSERT_EQUAL_HEX8(0xFF, UDSOTA_RESUME_NOT_AVAILABLE);
 }
 
-/* The dataFormatIdentifiers the client sends, and the RequestDownload constants that give the positive response
- * 74 20 0F FF and 4093 data bytes per 0x36. */
+/* The dataFormatIdentifiers and ALFID the client sends, the 34 field widths the server takes, and the RequestDownload
+ * constants that give the positive response 74 20 0F FF and 4093 data bytes per 0x36. */
 static void test_download_values_pinned(void)
 {
     TEST_ASSERT_EQUAL_HEX8(0x00, UDSOTA_DL_DFI);
@@ -268,6 +268,9 @@ static void test_download_values_pinned(void)
     TEST_ASSERT_EQUAL_HEX8(0x20, UDSOTA_DL_DFI_DELTA);
     TEST_ASSERT_EQUAL_HEX8(0x30, UDSOTA_DL_DFI_DELTA_DEFLATE);
     TEST_ASSERT_EQUAL_HEX8(0x44, UDSOTA_DL_ALFID);
+    TEST_ASSERT_EQUAL_UINT(4, UDSOTA_DL_FIELD_MAX);
+    TEST_ASSERT_EQUAL_UINT(3, UDSOTA_DL_REQ_MIN);
+    TEST_ASSERT_EQUAL_UINT(11, UDSOTA_DL_REQ_LEN);
     TEST_ASSERT_EQUAL_UINT(4095, UDSOTA_DL_MAX_BLOCK_LEN);
     TEST_ASSERT_EQUAL_UINT(4093, UDSOTA_DL_MAX_DATA);
     uint8_t resp[4] = {UDSOTA_POS(UDSOTA_SID_REQUEST_DOWNLOAD), UDSOTA_DL_LFID, 0, 0};

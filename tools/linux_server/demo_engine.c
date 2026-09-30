@@ -220,29 +220,32 @@ static void eng_status(void *ctx, udsota_status_t *out)
     fake_ota_fill_status(&((const demo_engine_t *)ctx)->ota, out);
 }
 
-/* engine.running_sha (F1F3): the running image's app_elf_sha256; 0 when the slot holds no image. */
+/* engine.running_sha (F1F3): the running image's app_elf_sha256; 0 when the slot holds no image, its length,
+ * unwritten, when max is short. */
 static size_t eng_running_sha(void *ctx, uint8_t *out, size_t max)
 {
     const demo_engine_t *e = ctx;
     char v[33];
     uint8_t sha[32];
-    if (max < sizeof sha || !fake_ota_slot_desc(&e->ota, e->ota.running_slot, v, sha)) {
+    if (!fake_ota_slot_desc(&e->ota, e->ota.running_slot, v, sha)) {
         return 0;
     }
-    memcpy(out, sha, sizeof sha);
+    if (max >= sizeof sha) {
+        memcpy(out, sha, sizeof sha);
+    }
     return sizeof sha;
 }
 
-/* engine.version (F189): the running image's version string, unterminated; 0 when there is none or max is short. */
+/* engine.version (F189): the running image's version string, unterminated; 0 when there is none, its length,
+ * unwritten, when max is short. */
 static size_t eng_version(void *ctx, char *out, size_t max)
 {
     char v[33];
     demo_engine_version((const demo_engine_t *)ctx, v);
     const size_t n = strlen(v);
-    if (n == 0u || n > max) {
-        return 0;
+    if (n <= max) {
+        memcpy(out, v, n);
     }
-    memcpy(out, v, n);
     return n;
 }
 

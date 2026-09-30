@@ -15,7 +15,7 @@ typedef struct udsota_service {            /* const, registered once right after
                       uint8_t *resp, size_t resp_max, uint32_t now_ms);          /* SIDs the core doesn't own */
     size_t (*routine)(udsota_server_t *s, uint16_t rid, const uint8_t *req, size_t len, bool spr,
                       uint8_t *resp, size_t resp_max, uint32_t now_ms);          /* 31 01, after the core's 7F/13/12 */
-    size_t (*read_did)(const udsota_server_t *s, uint16_t did, uint8_t *out, size_t room);
+    size_t (*read_did)(const udsota_server_t *s, uint16_t did, uint8_t *out, size_t room);  /* 0 = 0x31, over room 0x14 */
     void   (*on_session)(udsota_server_t *s, bool job_capped);                  /* every session entry, first */
     bool   (*settled)(const udsota_server_t *s);                                /* 10 02 slot rule */
     bool   (*download_active)(const udsota_server_t *s);                        /* transfer open */

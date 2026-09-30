@@ -131,6 +131,20 @@ static void test_functional_read_did_suppresses_0x31(void)
     TEST_ASSERT_EQUAL_UINT(0, FUNC(0x22, 0x12, 0x34));
 }
 
+/* app_did for 0x0100: a DID one byte longer than the room it is offered. */
+static size_t app_did_too_long(uint16_t did, uint8_t *buf, size_t max)
+{
+    return did == 0x0100u ? max + 1u : 0u;
+}
+
+/* 22 functionally: 0x14 for a DID too long for the answer is not among the suppressed NRCs, so it is answered. */
+static void test_functional_read_did_answers_0x14(void)
+{
+    g_mock.app_did = app_did_too_long;
+    TEST_ASSERT_EQUAL_UINT(3, FUNC(0x22, 0x01, 0x00));
+    EXPECT(0x7F, 0x22, 0x14);
+}
+
 /* Services udsota never serves functionally get no answer and change nothing, whatever the session. */
 static void test_functional_unserved_services_are_silent(void)
 {
@@ -346,6 +360,7 @@ int main(void)
     RUN_TEST(test_functional_tester_present);
     RUN_TEST(test_functional_session_control);
     RUN_TEST(test_functional_read_did_suppresses_0x31);
+    RUN_TEST(test_functional_read_did_answers_0x14);
     RUN_TEST(test_functional_unserved_services_are_silent);
     RUN_TEST(test_functional_suppresses_0x7f);
     RUN_TEST(test_functional_during_a_job);

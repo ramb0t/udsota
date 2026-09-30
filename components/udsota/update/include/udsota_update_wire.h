@@ -34,10 +34,14 @@
 /* The engine.zformats bit for a coded dataFormatIdentifier: one bit per high nibble (0x10 bit 1, 0x20 bit 2, 0x30
  * bit 3). */
 #define UDSOTA_DL_FMT(dfi)       ((uint16_t)(1u << (((unsigned)(dfi) >> 4) & 0xFu)))
-#define UDSOTA_DL_ALFID          0x44       /* addressAndLengthFormatIdentifier: 4-byte address, 4-byte size */
+#define UDSOTA_DL_ALFID          0x44       /* addressAndLengthFormatIdentifier the client sends: 4-byte address,
+                                               4-byte size */
+#define UDSOTA_DL_FIELD_MAX      4u         /* a 34 takes any ALFID whose nibbles are each 1..4: the low one the
+                                               memoryAddress's bytes, the high one the memorySize's */
 #define UDSOTA_DL_LFID           0x20       /* positive-response lengthFormatIdentifier: 2-byte block length */
 #define UDSOTA_DL_MAX_DATA       (UDSOTA_DL_MAX_BLOCK_LEN - 2u)   /* 4093 data bytes per 0x36 */
-#define UDSOTA_DL_REQ_LEN        11u        /* 34 DFI ALFID address[4] size[4] */
+#define UDSOTA_DL_REQ_MIN        3u         /* 34 DFI ALFID, then the two fields the ALFID sizes */
+#define UDSOTA_DL_REQ_LEN        11u        /* 34 DFI ALFID address[4] size[4]: the client's 34, ALFID 44 */
 #define UDSOTA_TD_MIN_LEN        3u         /* 36 BSC and at least one data byte */
 /* The most bytes a coded download (DFI 0x10, 0x20 or 0x30) of a `size`-byte image may carry: size + size/8 + 1024.
  * zlib and miniz's tdefl never exceed it (their worst case is stored blocks, 5 bytes per 64 KB), and a delta patch

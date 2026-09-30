@@ -42,24 +42,22 @@ static void mock_abort(void *ctx) { m.aborts++; }
 /* Reports the fake worker's state set by the test. */
 static int mock_poll(void *ctx) { return m.job_result; }
 
-/* engine.version: F189 from VERSION; 0 when out is short. */
+/* engine.version: F189 from VERSION; only its length when out is short. */
 static size_t mock_version(void *ctx, char *out, size_t max)
 {
     const size_t n = strlen(VERSION);
-    if (n > max) {
-        return 0;
+    if (n <= max) {
+        memcpy(out, VERSION, n);
     }
-    memcpy(out, VERSION, n);
     return n;
 }
 
-/* engine.running_sha: F1F3 from elf_sha; 0 when out is short. */
+/* engine.running_sha: F1F3 from elf_sha; only its length when out is short. */
 static size_t mock_running_sha(void *ctx, uint8_t *out, size_t max)
 {
-    if (max < sizeof elf_sha) {
-        return 0;
+    if (max >= sizeof elf_sha) {
+        memcpy(out, elf_sha, sizeof elf_sha);
     }
-    memcpy(out, elf_sha, sizeof elf_sha);
     return sizeof elf_sha;
 }
 
@@ -306,6 +304,49 @@ static void test_read_did_errors(void)
     EXPECT_NRC(SEND(0x22, 0xF1), 0x22, 0x13);
     EXPECT_NRC(SEND(0x22, 0xF1, 0x89, 0xF1), 0x22, 0x13);
     EXPECT_NRC(SEND(0x22, 0xF1, 0x89, 0xF1, 0x91), 0x22, 0x13);   /* two DIDs: more than UDSOTA_READ_DID_MAX */
+}
+
+/* app_did for 0x0100: a DID one byte longer than the room it is offered, left unwritten. */
+static size_t app_did_too_long(uint16_t did, uint8_t *out, size_t max)
+{
+    return did == 0x0100u ? max + 1u : 0u;
+}
+
+/* A DID answer longer than the response buffer is 0x14, not 0x31: a hook returning room + 1, and each of the core's
+ * and the engine's DIDs one byte short of its answer. An unknown DID is still 0x31. */
+static void test_read_did_too_long(void)
+{
+    g_mock.app_did = app_did_too_long;
+    EXPECT_NRC(SEND(0x22, 0x01, 0x00), 0x22, 0x14);
+    EXPECT_NRC(SEND(0x22, 0x01, 0x01), 0x22, 0x31);
+    static const struct { uint16_t did; size_t len; } SHORT[] = {
+        {UDSOTA_DID_COUNTERS, UDSOTA_COUNTERS_LEN}, {UDSOTA_DID_STATUS, UDSOTA_STATUS_LEN},
+        {UDSOTA_DID_RESULT, UDSOTA_RESULT_LEN}, {UDSOTA_DID_SW_VERSION, sizeof VERSION - 1u},
+        {UDSOTA_DID_RUNNING_SHA, UDSOTA_SHA256_LEN}, {UDSOTA_DID_SERIAL, 6u},
+    };
+    for (size_t i = 0; i < sizeof SHORT / sizeof SHORT[0]; i++) {
+        const uint8_t req[3] = {UDSOTA_SID_READ_DID, (uint8_t)(SHORT[i].did >> 8), (uint8_t)SHORT[i].did};
+        EXPECT(udsota_on_request(&s, req, sizeof req, resp, 3u + SHORT[i].len - 1u, now), 0x7F, 0x22, 0x14);
+        TEST_ASSERT_EQUAL_UINT(3u + SHORT[i].len, udsota_on_request(&s, req, sizeof req, resp, 3u + SHORT[i].len, now));
+        TEST_ASSERT_EQUAL_HEX8(0x62, resp[0]);
+    }
+}
+
+/* F18C from a cfg.device_id longer than the room after 62 F1 8C is 0x14; one that just fits is answered whole. */
+static void test_read_did_device_id_too_long(void)
+{
+    static uint8_t id[RESP_MAX - 2u];              /* room is RESP_MAX - 3 */
+    memset(id, 0x5A, sizeof id);
+    udsota_config_t cfg = udsota_mock_cfg();
+    const udsota_hooks_t hooks = udsota_mock_hooks(&g_mock);
+    cfg.device_id = id;
+    cfg.device_id_len = sizeof id;
+    udsota_init(&s, &cfg, &k_engine, &k_security, &hooks);
+    EXPECT_NRC(SEND(0x22, 0xF1, 0x8C), 0x22, 0x14);
+    cfg.device_id_len = sizeof id - 1u;
+    udsota_init(&s, &cfg, &k_engine, &k_security, &hooks);
+    TEST_ASSERT_EQUAL_UINT(RESP_MAX, SEND(0x22, 0xF1, 0x8C));
+    TEST_ASSERT_EACH_EQUAL_HEX8(0x5A, &resp[3], RESP_MAX - 3u);
 }
 
 /* Unsupported SIDs get 0x11: 2E included (not served with did_write NULL), and 19 and 14 (not served with dtc_get and
@@ -574,6 +615,8 @@ int main(void)
     RUN_TEST(test_identity_dids_from_engine_cfg_and_hooks);
     RUN_TEST(test_server_owned_dids);
     RUN_TEST(test_read_did_errors);
+    RUN_TEST(test_read_did_too_long);
+    RUN_TEST(test_read_did_device_id_too_long);
     RUN_TEST(test_unknown_sid);
     RUN_TEST(test_never_writes_past_resp_max);
     RUN_TEST(test_s3_timeout_falls_back);

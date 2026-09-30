@@ -50,7 +50,7 @@
 #define UDSOTA_NRC_SERVICE_NOT_SUPPORTED           0x11
 #define UDSOTA_NRC_SUBFUNC_NOT_SUPPORTED           0x12
 #define UDSOTA_NRC_INCORRECT_LENGTH                0x13   /* incorrectMessageLengthOrInvalidFormat */
-#define UDSOTA_NRC_RESPONSE_TOO_LONG               0x14   /* responseTooLong: a 19 answer past the response buffer */
+#define UDSOTA_NRC_RESPONSE_TOO_LONG               0x14   /* responseTooLong: a 22 or 19 answer past the response buffer */
 #define UDSOTA_NRC_BUSY_REPEAT                     0x21   /* busyRepeatRequest: a request while a job runs */
 #define UDSOTA_NRC_CONDITIONS_NOT_CORRECT          0x22   /* interlocks: the app's gate refused */
 #define UDSOTA_NRC_REQUEST_SEQUENCE_ERROR          0x24

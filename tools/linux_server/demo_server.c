@@ -170,15 +170,18 @@ static void on_phase(void *ctx, udsota_phase_t p)
     fprintf(stderr, "udsota_demo_server: phase %s\n", (unsigned)p < 5u ? names[p] : "?");
 }
 
-/* hooks.did_read: F191, the board name the example profile's [board] table reads. */
+/* hooks.did_read: F191, the board name the example profile's [board] table reads; one longer than max returns its
+ * length unwritten (0x14). */
 static size_t on_did_read(void *ctx, uint16_t did, uint8_t *buf, size_t max)
 {
     (void)ctx;
     const size_t n = strlen(d.o.board);
-    if (did != DID_BOARD || n == 0u || n > max) {
+    if (did != DID_BOARD || n == 0u) {
         return 0;
     }
-    memcpy(buf, d.o.board, n);
+    if (n <= max) {
+        memcpy(buf, d.o.board, n);
+    }
     return n;
 }
 
