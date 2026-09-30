@@ -4,6 +4,8 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-30
+
 Apps get three new hooks, `did_read_ex`, `routine_ex` and `request`, to answer DIDs and routines with NRCs of their own in any session and to serve SIDs the core doesn't; a generic tester can download with any 1–4 byte ALFID, and the ISO-TP buffer sizes can be set at build time. **Breaking** for builds without the updater: 10 02 answers 0x12.
 - Core: `udsota.h` names the release it belongs to, as `UDSOTA_VERSION` ("X.Y.Z") and `UDSOTA_VERSION_MAJOR`, `_MINOR` and `_PATCH`, for an `#if` on the release a feature arrived in. `tools/release.py bump` sets all four with the CHANGELOG and `__version__`, so a cut's commit now changes `udsota.h` too, and `check`, which the release workflow runs, fails when they disagree with the tag.
 - Host builds: `sources.cmake` gains `UDSOTA_SERVER_CORE_SRCS`, the server with neither the updater nor the transport (`udsota_server.c`, `udsota_codec.c` and `udsota_keys.c`), for a host build that brings its own isotp-c and so can't link `udsota_isotp.c`, which defines isotp-c's `isotp_user_*` callbacks. The existing lists are unchanged.
