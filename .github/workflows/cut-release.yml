@@ -1,9 +1,9 @@
-# The one release step (see RELEASING.md): run by hand on main right after merging, with minor or patch. It takes
-# the next version from the latest vX.Y.Z tag, dates CHANGELOG's [Unreleased] entries as that version under a new
-# empty [Unreleased], sets the client's __version__, commits both to main, pushes an annotated tag, and runs the
-# release workflow on it. It refuses when [Unreleased] is empty or main's CI hasn't passed on the commit. A tag
-# pushed with this job's token starts no workflow, so it calls release.yml itself. It pushes to main directly: with
-# branch protection on, it needs a bypass.
+# The one release step (see RELEASING.md): run by hand on main right after merging, with minor or patch. It takes the
+# next version from the latest vX.Y.Z tag, dates CHANGELOG's [Unreleased] entries as that version under a new empty
+# [Unreleased], sets the client's __version__ and udsota.h's UDSOTA_VERSION, commits them to main, pushes an annotated
+# tag, and runs the release workflow on it. It refuses when [Unreleased] is empty or main's CI hasn't passed on the
+# commit. A tag pushed with this job's token starts no workflow, so it calls release.yml itself. It pushes to main
+# directly: with branch protection on, it needs a bypass.
 name: cut release
 
 on:
@@ -45,7 +45,7 @@ jobs:
           ci=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$SHA&event=push" \
                --jq '[.workflow_runs[] | select(.status == "completed")][0].conclusion // ""')
           [ "$ci" = success ] || { echo "::error::ci on $SHA is '${ci:-not finished}', not success"; exit 1; }
-      - name: Date [Unreleased], set __version__, commit and tag
+      - name: Date [Unreleased], set __version__ and UDSOTA_VERSION, commit and tag
         id: cut
         env:
           BUMP: ${{ inputs.bump }}

@@ -120,11 +120,11 @@ extern const udsota_image_desc_t udsota_image_desc;
 
 /* ---- Task and app API (udsota_esp32.c) ---- */
 
-/* The app's CAN transport; every member runs on the diag task. can_send queues one frame and never
- * blocks: ESP_OK queued, ESP_ERR_NO_MEM no room now (the port keeps the frame and retries), anything else
- * dropped. tx_pending (nullable) counts frames still in the app's driver, so a restart waits for its
- * answer to leave. tx_dropped (nullable) counts response-ID frames the driver dropped after it queued them;
- * the status counters report it (resp_frames_dropped). */
+/* The app's CAN transport; every member runs on the diag task. can_send queues one frame on id (11-bit CAN IDs
+ * only: cfg's resp_id) and never blocks: ESP_OK queued, ESP_ERR_NO_MEM no room now (the port keeps the frame and
+ * retries), anything else dropped. tx_pending (nullable) counts frames still in the app's driver, so a restart
+ * waits for its answer to leave. tx_dropped (nullable) counts response-ID frames the driver dropped after it queued
+ * them; the status counters report it (resp_frames_dropped). */
 typedef struct {
     esp_err_t (*can_send)(void *ctx, uint16_t id, const uint8_t data[8], uint8_t len);
     uint32_t  (*tx_pending)(void *ctx);
@@ -141,8 +141,9 @@ typedef struct {
  * and should be left out of the image. hooks may be NULL; the diag task calls every hook the app sets with
  * hooks->ctx, and a NULL hooks->reset restarts with esp_restart(). Returns ESP_ERR_INVALID_ARG for a NULL
  * cfg, can or can_send, or a set device_id whose device_id_len is not 1 to UDSOTA_KEYS_ID_MAX (16), a set
- * key_pubkey that is not a 65-byte uncompressed point (04 || X || Y), or a set func_id equal to req_id or
- * resp_id; ESP_ERR_INVALID_STATE on a second call; and ESP_ERR_NO_MEM when an allocation or the task fails.
+ * key_pubkey that is not a 65-byte uncompressed point (04 || X || Y), a req_id or resp_id above 0x7FF (11-bit
+ * CAN IDs only), a req_id equal to resp_id, or a set func_id above 0x7FF or equal to either;
+ * ESP_ERR_INVALID_STATE on a second call; and ESP_ERR_NO_MEM when an allocation or the task fails.
  * Only a bad-argument failure may be retried: after ESP_ERR_NO_MEM the updater stays off for this boot, and
  * a second call returns ESP_ERR_INVALID_STATE. When the buffers or frame queue cannot be allocated nothing
  * else was started; when the diag task cannot be created, what start already set up stays behind: the flash
@@ -150,8 +151,9 @@ typedef struct {
  * and the SAR-ADC entropy source, left on. */
 esp_err_t udsota_esp32_start(const udsota_config_t *cfg, const udsota_hooks_t *hooks, const udsota_esp32_can_t *can);
 /* Any task: queues one frame on cfg->req_id, or on cfg->func_id when set (a functional request), with its receive
- * time in microseconds; never blocks. Other IDs, frames before start and frames past a full queue are dropped (the
- * last counted). */
+ * time in microseconds; never blocks. id is an 11-bit CAN ID only: hand the port no extended frame, whose ID a
+ * uint16_t would truncate. Other IDs, frames before start and frames past a full queue are dropped (the last
+ * counted). */
 void udsota_esp32_on_frame(uint16_t id, const uint8_t *data, uint8_t dlc, uint32_t rx_us);
 /* Any task, an app hook included: asks the diag task to end the session (udsota_end_session) after the
  * request it is serving, or after a running job's answer; requests before it runs count once. No-op

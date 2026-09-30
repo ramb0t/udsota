@@ -36,11 +36,20 @@ static const udsota_dtc_t TABLE[] = {
 };
 #define TABLE_N (sizeof TABLE / sizeof TABLE[0])
 
+/* A table that reports U0073 twice, the second time with a junk top byte: the same DTC on the wire. */
+static const udsota_dtc_t DUP[] = {
+    {0x00056200u, 0x28u},
+    {0x00C07300u, 0x01u},
+    {0x77C07300u, 0x08u},
+};
+#define DUP_N (sizeof DUP / sizeof DUP[0])
+
 /* What the DTC hooks saw, and how they answer. */
 typedef struct {
     unsigned        get_calls;
     size_t          gen;            /* non-zero: dtc_get reports gen generated DTCs (0x100000 + i, status 2F) instead */
     bool            endless;        /* dtc_get never returns false */
+    bool            dup;            /* dtc_get reports DUP instead of TABLE */
     unsigned        ext_calls;
     uint32_t        ext_dtc;
     uint8_t         ext_record;
@@ -88,7 +97,7 @@ static const udsota_engine_t ENGINE = {
     .status = udsota_mock_status, .ctx = &g_mock,
 };
 
-/* hooks.dtc_get: TABLE, or gen generated DTCs, or an endless list. */
+/* hooks.dtc_get: TABLE, or DUP, or gen generated DTCs, or an endless list. */
 static bool hook_get(void *ctx, size_t i, udsota_dtc_t *out)
 {
     g.get_calls++;
@@ -104,6 +113,13 @@ static bool hook_get(void *ctx, size_t i, udsota_dtc_t *out)
         }
         out->dtc = 0x100000u + (uint32_t)i;
         out->status = 0x2Fu;
+        return true;
+    }
+    if (g.dup) {
+        if (i >= DUP_N) {
+            return false;
+        }
+        *out = DUP[i];
         return true;
     }
     if (i >= TABLE_N) {
@@ -334,6 +350,23 @@ static void test_supported(void)
            0xD1, 0x0F, 0x1C, 0x09, 0x41, 0x23, 0x00, 0x00);
 }
 
+/* Availability 0 in cfg reads 0xFF in 19 02, 0A and 06 as in 01: the availability byte, every status sent whole, and
+ * 02's filter, where 0x40 now matches. */
+static void test_availability_zero(void)
+{
+    g_cfg.dtc_availability_mask = 0u;
+    reboot();
+    REQ(0x19, 0x02, 0x40);
+    EXPECT(0x59, 0x02, 0xFF, 0x05, 0x62, 0x00, 0x68, 0x41, 0x23, 0x00, 0x40);
+    REQ(0x19, 0x0A);
+    EXPECT(0x59, 0x0A, 0xFF, 0xC0, 0x73, 0x00, 0x2F, 0x05, 0x62, 0x00, 0x68, 0x92, 0x34, 0x00, 0x00,
+           0xD1, 0x0F, 0x1C, 0x09, 0x41, 0x23, 0x00, 0x40);
+    REQ(0x19, 0x06, 0x05, 0x62, 0x00, 0x01);
+    EXPECT(0x59, 0x06, 0x05, 0x62, 0x00, 0x68, 0x01, 0x05);
+    REQ(0x19, 0x06, 0x41, 0x23, 0x00, 0x02);
+    EXPECT(0x59, 0x06, 0x41, 0x23, 0x00, 0x40);
+}
+
 /* 19 06: one record; FF; the DTC with a non-zero top byte reaches the hook as its 24 bits; *len 0 answers the DTC
  * and status alone; the hook's 0x31 and 0x14 verbatim; *len over max is 0x10; max is resp_max - 6; FE reaches the
  * hook; record 00 and an unknown DTC answer 0x31 with no hook call. */
@@ -382,6 +415,23 @@ static void test_ext_data(void)
     g.get_calls = 0u;
     REQ(0x19, 0x06, 0x05, 0x62, 0x00, 0x01);
     TEST_ASSERT_EQUAL_UINT(2, g.get_calls);            /* the walk stops at the first match */
+}
+
+/* A DTC dtc_get reports twice, whatever its top byte: 19 06 answers the first entry's status and asks no further;
+ * 19 01 counts it twice and 19 02 and 0A list it twice, as dtc_get's contract says. */
+static void test_duplicate_dtc(void)
+{
+    g.dup = true;
+    REQ(0x19, 0x06, 0xC0, 0x73, 0x00, 0x01);
+    EXPECT(0x59, 0x06, 0xC0, 0x73, 0x00, 0x01, 0x01, 0x05);
+    TEST_ASSERT_EQUAL_UINT(2, g.get_calls);            /* the walk stops at the first match */
+    TEST_ASSERT_EQUAL_HEX32(0xC07300u, g.ext_dtc);
+    REQ(0x19, 0x01, 0x09);
+    EXPECT(0x59, 0x01, AVAIL, 0x01, 0x00, 0x03);
+    REQ(0x19, 0x02, 0x09);
+    EXPECT(0x59, 0x02, AVAIL, 0x05, 0x62, 0x00, 0x28, 0xC0, 0x73, 0x00, 0x01, 0xC0, 0x73, 0x00, 0x08);
+    REQ(0x19, 0x0A);
+    EXPECT(0x59, 0x0A, AVAIL, 0x05, 0x62, 0x00, 0x28, 0xC0, 0x73, 0x00, 0x01, 0xC0, 0x73, 0x00, 0x08);
 }
 
 /* Lengths and sub-functions: 0x13 for 19, 19 01, 19 01 FF 00, 19 0A 00 and a short or long 19 06; 0x12 for 19 03
@@ -640,7 +690,9 @@ int main(void)
     RUN_TEST(test_count_by_mask);
     RUN_TEST(test_by_mask);
     RUN_TEST(test_supported);
+    RUN_TEST(test_availability_zero);
     RUN_TEST(test_ext_data);
+    RUN_TEST(test_duplicate_dtc);
     RUN_TEST(test_lengths_and_subfunctions);
     RUN_TEST(test_response_too_long);
     RUN_TEST(test_index_cap);

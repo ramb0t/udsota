@@ -11,6 +11,15 @@ set(CMAKE_C_EXTENSIONS OFF)
 
 enable_testing()
 
+# -DUDSOTA_SANITIZE=ON builds every host target, Unity and the fuzz harnesses included, with AddressSanitizer and
+# UBSan, and the first report ends the program. CI's sanitize job runs the whole suite so, with clang.
+option(UDSOTA_SANITIZE "Build every host target with ASan and UBSan, stopping at the first report" OFF)
+if(UDSOTA_SANITIZE)
+    set(UDSOTA_SAN_FLAGS -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer)
+    add_compile_options(${UDSOTA_SAN_FLAGS})
+    add_link_options(${UDSOTA_SAN_FLAGS})
+endif()
+
 include(FetchContent)
 FetchContent_Declare(unity
     GIT_REPOSITORY https://github.com/ThrowTheSwitch/Unity.git
@@ -271,7 +280,8 @@ add_test(NAME udsota_core_only_probe_state
          COMMAND ${CMAKE_C_COMPILER} -std=c11 -fsyntax-only -Wall -Wextra -Werror -I${CORE_ONLY_INC} -DPROBE_STATE
                  ${TEST_DIR}/fixtures/udsota_portable_probe.c)
 add_test(NAME udsota_core_only_link_updater
-         COMMAND ${CMAKE_C_COMPILER} -DPROBE_LINK_UPDATER ${TEST_DIR}/fixtures/udsota_portable_probe.c
+         COMMAND ${CMAKE_C_COMPILER} ${UDSOTA_SAN_FLAGS} -DPROBE_LINK_UPDATER
+                 ${TEST_DIR}/fixtures/udsota_portable_probe.c
                  $<TARGET_OBJECTS:udsota_server_only> $<TARGET_FILE:isotp>
                  -o ${CMAKE_CURRENT_BINARY_DIR}/udsota_core_only_link_updater
          COMMAND_EXPAND_LISTS)
@@ -287,7 +297,8 @@ set_tests_properties(udsota_seam_grep PROPERTIES PASS_REGULAR_EXPRESSION "check_
 
 # ---- UDS request-parser fuzz harness (on by default; -DUDSOTA_FUZZ=OFF skips it) ----
 # Replays built-in seeds and their mutants (and any corpus in UDSOTA_FUZZ_CORPUS) through the pure
-# server, with guard pages in place of ASan and UBSan in trap mode (no runtime library needed).
+# server, with guard pages in place of ASan and UBSan in trap mode (no runtime library needed). -DUDSOTA_SANITIZE=ON
+# adds ASan on top; the harness keeps SIGSEGV from it (handle_segv=0), so the guard pages still fault as before.
 option(UDSOTA_FUZZ "Build and run the UDS request-parser fuzz harness (fuzz_udsota)" ON)
 set(UDSOTA_FUZZ_CORPUS "" CACHE PATH "Extra corpus directory for the fuzz_udsota_corpus test (off when empty)")
 if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
@@ -307,11 +318,14 @@ if(UDSOTA_FUZZ)
     endif()
 endif()
 if(UDSOTA_FUZZ AND UDSOTA_FUZZ_SAN_OK)
-    # udsota_fuzz(<name> <timeout> [SOURCES..] [INCLUDES..] [DEFS..]): fuzz_udsota.c over the server, with FUZZ_SAN
-    # on the link line too, or gcc wants libubsan.
+    # udsota_fuzz(<name> <timeout> [SERVER..] [SOURCES..] [INCLUDES..] [DEFS..]): fuzz_udsota.c over the server
+    # (SERVER_SRCS unless SERVER names another list), with FUZZ_SAN on the link line too, or gcc wants libubsan.
     function(udsota_fuzz name timeout)
-        cmake_parse_arguments(F "" "DIGEST" "SOURCES;INCLUDES;DEFS" ${ARGN})
-        udsota_test(${name} SOURCES ${CORE_TEST}/fuzz_udsota.c ${SERVER_SRCS} ${F_SOURCES}
+        cmake_parse_arguments(F "" "DIGEST" "SERVER;SOURCES;INCLUDES;DEFS" ${ARGN})
+        if(NOT F_SERVER)
+            set(F_SERVER ${SERVER_SRCS})
+        endif()
+        udsota_test(${name} SOURCES ${CORE_TEST}/fuzz_udsota.c ${F_SERVER} ${F_SOURCES}
                             INCLUDES ${F_INCLUDES})
         target_compile_options(${name} PRIVATE ${FUZZ_SAN})
         target_link_options(${name} PRIVATE ${FUZZ_SAN})
@@ -339,10 +353,11 @@ if(UDSOTA_FUZZ AND UDSOTA_FUZZ_SAN_OK)
     # hook set so that its checks hold on the compressed path too.
     udsota_fuzz(fuzz_udsota_z 600 DIGEST 744cebe8b3e84bd0 SOURCES ${ZSTREAM_SRCS} INCLUDES ${ZSTREAM_INC}
                 DEFS UDSOTA_FUZZ_Z=1 UDSOTA_FUZZ_PROGRESS=1 ${MINIZ_TEST_DEFS})
-    # The same harness with no update service (udsota_init given a NULL engine), from the five states a download
-    # isn't needed for: 34, 36 and 37 get only 0x11 (0x21 while an app routine runs), and the app hooks give 0x31
-    # its positive answers.
-    udsota_fuzz(fuzz_udsota_no_update 300 DIGEST 9f7c2932c2332507 DEFS UDSOTA_FUZZ_NO_UPDATE=1 UDSOTA_FUZZ_APP_HOOKS=1)
+    # The same harness with no update service (udsota_core_init, which is udsota_init given a NULL engine), from the
+    # five states a download isn't needed for: 34, 36 and 37 get only 0x11 (0x21 while an app routine runs), and the
+    # app hooks give 0x31 its positive answers. Built from the core list, so the updater isn't even linked.
+    udsota_fuzz(fuzz_udsota_no_update 300 DIGEST 9f7c2932c2332507 SERVER ${UDSOTA_SERVER_CORE_SRCS}
+                DEFS UDSOTA_FUZZ_NO_UPDATE=1 UDSOTA_FUZZ_APP_HOOKS=1)
     # The same harness with the DTC hooks set over a 90-DTC table: 19 01, 02, 06 and 0A and 14 served, lists past the
     # response buffer (0x14), and every status sent a subset of the availability mask.
     udsota_fuzz(fuzz_udsota_dtc 300 DIGEST e05a7138b28a2a22 DEFS UDSOTA_FUZZ_DTC=1)

@@ -26,11 +26,13 @@ Functional addressing.
 First.
 """
 INIT = '"""udsota."""\n__version__ = "0.4.0"\n'
+HEADER = ('/* udsota. */\n#pragma once\n#define UDSOTA_VERSION_MAJOR 0\n#define UDSOTA_VERSION_MINOR 4\n'
+          '#define UDSOTA_VERSION_PATCH 0\n#define UDSOTA_VERSION       "0.4.0"\n')
 
 
-# Check a tag that matches its dated CHANGELOG section and __version__ passes.
+# Check a tag that matches its dated CHANGELOG section, __version__ and the header's macros passes.
 def test_matching_release_passes():
-    assert release.problems("v0.4.0", CHANGELOG, INIT) == []
+    assert release.problems("v0.4.0", CHANGELOG, INIT, HEADER) == []
 
 
 # Check each way a release can disagree is named.
@@ -43,7 +45,22 @@ def test_matching_release_passes():
     ("v0.4.0", '"""no version"""\n', "sets no __version__"),
 ])
 def test_mismatches_are_named(tag, init, want):
-    found = release.problems(tag, CHANGELOG, init)
+    found = release.problems(tag, CHANGELOG, init, HEADER)
+    assert found and any(want in f for f in found), found
+
+
+# Check a header that disagrees with the tag fails the check, in its string or in any of its three numbers, and one
+# missing the string or a number too. The string-missing case keeps the numbers, so only its own message can match.
+@pytest.mark.parametrize("header, want", [
+    (HEADER.replace('"0.4.0"', '"0.3.0"'), "UDSOTA_VERSION '0.3.0', not '0.4.0'"),
+    (HEADER.replace("MAJOR 0", "MAJOR 1"), "_PATCH 1.4.0, not 0.4.0"),
+    (HEADER.replace("MINOR 4", "MINOR 3"), "_PATCH 0.3.0, not 0.4.0"),
+    (HEADER.replace("PATCH 0", "PATCH 2"), "_PATCH 0.4.2, not 0.4.0"),
+    (HEADER.replace('#define UDSOTA_VERSION       "0.4.0"\n', ""), "defines no UDSOTA_VERSION"),
+    (HEADER.replace("#define UDSOTA_VERSION_MINOR 4\n", ""), "defines no UDSOTA_VERSION_MAJOR, _MINOR and _PATCH"),
+])
+def test_header_mismatches_fail(header, want):
+    found = release.problems("v0.4.0", CHANGELOG, INIT, header)
     assert found and any(want in f for f in found), found
 
 
@@ -74,7 +91,8 @@ def test_repository_current_version_is_released():
     root = pathlib.Path(release.ROOT)
     init = (root / "client" / "udsota" / "__init__.py").read_text()
     version = release.CLIENT_VERSION.search(init)[1]
-    assert release.problems("v" + version, (root / "CHANGELOG.md").read_text(), init) == []
+    assert release.problems("v" + version, (root / "CHANGELOG.md").read_text(), init,
+                            (root / release.HEADER).read_text()) == []
 
 
 # Check a bump counts from the latest tag: minor resets the patch number.
@@ -86,12 +104,14 @@ def test_next_version(latest, part, want):
 
 
 # Check a bump moves [Unreleased]'s entries under the new dated heading, leaves an empty [Unreleased] above it and
-# sets __version__, and that the result passes check for the new tag.
+# sets __version__ and the header's four macros and nothing else in it, and that the result passes check for the new
+# tag.
 def test_bump_dates_unreleased_and_sets_the_version():
-    changelog, init, version = release.bump("minor", "v0.4.0", CHANGELOG, INIT, "2026-10-02")
+    changelog, init, header, version = release.bump("minor", "v0.4.0", CHANGELOG, INIT, HEADER, "2026-10-02")
     assert version == "0.5.0" and init == INIT.replace("0.4.0", "0.5.0")
+    assert header == HEADER.replace("MINOR 4", "MINOR 5").replace('"0.4.0"', '"0.5.0"')
     assert "## [Unreleased]\n\n## [0.5.0] - 2026-10-02\n\nWork in progress.\n\n## [0.4.0]" in changelog
-    assert release.problems("v0.5.0", changelog, init) == []
+    assert release.problems("v0.5.0", changelog, init, header) == []
     assert release.section(changelog, "0.4.0") == ("2026-10-01", "Added progress.")
 
 
@@ -104,20 +124,31 @@ def test_bump_dates_unreleased_and_sets_the_version():
 ])
 def test_bump_refuses(changelog, latest, part, want):
     with pytest.raises(ValueError, match=want.replace("[", "\\[").replace(".", "\\.")):
-        release.bump(part, latest, changelog, INIT, "2026-10-02")
+        release.bump(part, latest, changelog, INIT, HEADER, "2026-10-02")
 
 
-# Check the command line: check exits 0 or 1, notes prints the section.
+# Check a bump refuses a header that disagrees with the latest tag, even when the CHANGELOG and __version__ agree.
+def test_bump_refuses_a_stale_header():
+    with pytest.raises(ValueError, match="UDSOTA_VERSION '0\\.3\\.0', not '0\\.4\\.0'"):
+        release.bump("minor", "v0.4.0", CHANGELOG, INIT, HEADER.replace('"0.4.0"', '"0.3.0"'), "2026-10-02")
+
+
+# Check the command line: check exits 0 or 1, notes prints the section, bump rewrites all three files.
 def test_main(tmp_path, capsys):
-    cl, ini = tmp_path / "CHANGELOG.md", tmp_path / "__init__.py"
+    cl, ini, hdr = tmp_path / "CHANGELOG.md", tmp_path / "__init__.py", tmp_path / "udsota.h"
     cl.write_text(CHANGELOG)
     ini.write_text(INIT)
-    assert release.main(["check", "v0.4.0", "--changelog", str(cl), "--init", str(ini)]) == 0
-    assert release.main(["check", "v0.3.0", "--changelog", str(cl), "--init", str(ini)]) == 1
+    hdr.write_text(HEADER)
+    files = ["--changelog", str(cl), "--init", str(ini), "--header", str(hdr)]
+    assert release.main(["check", "v0.4.0"] + files) == 0
+    assert release.main(["check", "v0.3.0"] + files) == 1
     assert "not '0.3.0'" in capsys.readouterr().err
     assert release.main(["notes", "v0.4.0", "--changelog", str(cl)]) == 0
     assert capsys.readouterr().out.startswith("Added progress.")
-    assert release.main(["bump", "patch", "--latest", "v0.4.0", "--date", "2026-10-02",
-                         "--changelog", str(cl), "--init", str(ini)]) == 0
+    assert release.main(["bump", "patch", "--latest", "v0.4.0", "--date", "2026-10-02"] + files) == 0
     assert capsys.readouterr().out == "0.4.1\n"
-    assert release.main(["check", "v0.4.1", "--changelog", str(cl), "--init", str(ini)]) == 0
+    assert '#define UDSOTA_VERSION_PATCH 1\n#define UDSOTA_VERSION       "0.4.1"' in hdr.read_text()
+    assert release.main(["check", "v0.4.1"] + files) == 0
+    hdr.write_text(HEADER)
+    assert release.main(["check", "v0.4.1"] + files) == 1
+    assert "UDSOTA_VERSION '0.4.0', not '0.4.1'" in capsys.readouterr().err

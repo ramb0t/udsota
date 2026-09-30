@@ -3,10 +3,12 @@
  * req_len, never writes past resp_max or into the request, and always answers with a well-formed
  * positive response, a known NRC, or nothing.
  *
- * This host has no libasan or clang, so guard pages (mmap + PROT_NONE) stand in for ASan: every
+ * Guard pages (mmap + PROT_NONE) are the bounds detector, so the default build needs no ASan: every
  * request sits flush against a guard page on one side, and every response buffer ends at one. UBSan
- * runs in trap mode (the top-level CMakeLists.txt), which needs no runtime library. A fork()ed self-test
- * proves each detector really kills the process before any replay counts as a pass.
+ * runs in trap mode (the top-level CMakeLists.txt), which needs no runtime library. Under
+ * -DUDSOTA_SANITIZE=ON ASan runs as well, with handle_segv=0 so a guard page still faults as a plain
+ * signal. A fork()ed self-test proves each detector really kills the process before any replay counts
+ * as a pass.
  *
  * Inputs: built-in seeds, deterministic mutations of them, then every file named on the command line
  * (for example iso14229's libFuzzer corpus, used here only as arbitrary bytes). Sequence mode borrows
@@ -23,8 +25,9 @@
  * streams of random images, intact and mutated, sent as whole 34/36/37/FF01 sequences, and the progress checks
  * hold on the compressed path too.
  *
- * A fifth build, fuzz_udsota_no_update (UDSOTA_FUZZ_NO_UPDATE=1 with UDSOTA_FUZZ_APP_HOOKS=1), gives udsota_init a
- * NULL engine, so no update service is registered: it replays from the five states a download isn't needed for,
+ * A fifth build, fuzz_udsota_no_update (UDSOTA_FUZZ_NO_UPDATE=1 with UDSOTA_FUZZ_APP_HOOKS=1), starts the server with
+ * udsota_core_init, which is udsota_init given a NULL engine, and links no updater (UDSOTA_SERVER_CORE_SRCS), so no
+ * update service is registered: it replays from the five states a download isn't needed for,
  * 34, 36 and 37 count as unserved and must only ever get NRC 0x11 (0x21 while an app routine runs), and its
  * coverage floor needs the reset and app hooks only.
  *
@@ -32,9 +35,9 @@
  * FUZZ_DTC_N DTCs with junk top bytes, so 19 and 14 are served: 19 02 FF and 19 0A outgrow the response buffer
  * (0x14, which the oracle takes from a 19 in this build alone) while 19 02 01 and 02 08 fit, the mocks fail on an
  * unknown DTC, a top byte or record 00 handed to dtc_ext_data, or an access state that is not the server's, and the
- * positive shapes check every status sent is a subset of the availability mask. Every walk ends at FUZZ_DTC_N, so
- * the index cap is test_index_cap's to pin, not this build's. The other five builds leave the DTC hooks NULL and
- * answer as they did without it.
+ * positive shapes check every status sent is a subset of the availability mask and 59 01's count against the
+ * table. Every walk ends at FUZZ_DTC_N, so the index cap is test_index_cap's to pin, not this build's. The other five
+ * builds leave the DTC hooks NULL and answer as they did without it.
  *
  * The PASS line ends with digest=, an FNV-1a hash of every request fed to the server and every answer it gave
  * (empty ones too), so an answer that changes shows there even where the counts don't. It draws no rnd().
@@ -75,7 +78,7 @@
 #define UDSOTA_FUZZ_PROGRESS 0    /* 1: FUZZ_HOOKS also sets progress */
 #endif
 #ifndef UDSOTA_FUZZ_NO_UPDATE
-#define UDSOTA_FUZZ_NO_UPDATE 0   /* 1: udsota_init gets a NULL engine, so no update service answers */
+#define UDSOTA_FUZZ_NO_UPDATE 0   /* 1: udsota_core_init, no engine, so no update service answers */
 #endif
 #ifndef UDSOTA_FUZZ_DTC
 #define UDSOTA_FUZZ_DTC 0         /* 1: FUZZ_HOOKS also sets dtc_get, dtc_ext_data and dtc_clear */
@@ -92,6 +95,13 @@ _Static_assert(offsetof(udsota_engine_t, zformats) == offsetof(udsota_engine_t, 
                "udsota_engine_t gained a member after zformats: mock it in FUZZ_ENGINE and move this check");
 _Static_assert(offsetof(udsota_hooks_t, ctx) == 7u * sizeof(void (*)(void)),
                "udsota_hooks_t gained a callback: mock it in FUZZ_HOOKS and update this count");
+#define HOOK_AFTER(m, prev) (offsetof(udsota_hooks_t, m) == offsetof(udsota_hooks_t, prev) + sizeof(void (*)(void)))
+_Static_assert(HOOK_AFTER(did_write, ctx) && HOOK_AFTER(routine, did_write) && HOOK_AFTER(routine_poll, routine) &&
+               HOOK_AFTER(progress, routine_poll) && HOOK_AFTER(dtc_get, progress) &&
+               HOOK_AFTER(dtc_ext_data, dtc_get) && HOOK_AFTER(dtc_clear, dtc_ext_data),
+               "udsota_hooks_t gained or moved a member between ctx and dtc_clear: add it after dtc_clear instead, "
+               "so every earlier field keeps its offset, then mock it in FUZZ_HOOKS and extend this chain");
+#undef HOOK_AFTER
 _Static_assert(offsetof(udsota_hooks_t, dtc_clear) + sizeof(void (*)(void)) == sizeof(udsota_hooks_t),
                "udsota_hooks_t gained a member after dtc_clear: mock it in FUZZ_HOOKS and move this check");
 
@@ -663,12 +673,19 @@ static uint32_t fuzz_dtc24(size_t i)
     return 0xC00000u | ((uint32_t)i << 8) | ((i % 3u == 0u) ? 0u : (uint32_t)i);
 }
 
-/* hooks.dtc_get: FUZZ_DTC_N DTCs with a junk top byte, statuses cycling through 00, 01, 2F, 08, 40, 09, FF and 28.
- * An index at the cap is a defect, but the core's walks stop at FUZZ_DTC_N first, so only a walk that skipped ahead
- * would reach it; test_index_cap pins the cap itself. */
-static bool mock_dtc_get(void *ctx, size_t i, udsota_dtc_t *out)
+/* The i-th DTC's status, cycling through 00, 01, 2F, 08, 40, 09, FF and 28. Nothing changes it during a run (the
+ * mock dtc_clear clears nothing), so dtc_count's expectation holds at every 19 01. */
+static uint8_t fuzz_dtc_status(size_t i)
 {
     static const uint8_t STATUS[8] = {0x00, 0x01, 0x2F, 0x08, 0x40, 0x09, 0xFF, 0x28};
+    return STATUS[i % 8u];
+}
+
+/* hooks.dtc_get: FUZZ_DTC_N DTCs with a junk top byte and fuzz_dtc_status's statuses. An index at the cap is a
+ * defect, but the core's walks stop at FUZZ_DTC_N first, so only a walk that skipped ahead would reach it;
+ * test_index_cap pins the cap itself. */
+static bool mock_dtc_get(void *ctx, size_t i, udsota_dtc_t *out)
+{
     count_op(OP_DTC_GET);
     if (i >= UDSOTA_DTC_INDEX_MAX) {
         fail("dtc_get asked for an index at UDSOTA_DTC_INDEX_MAX or past it", NULL, 0, NULL, 0);
@@ -677,7 +694,7 @@ static bool mock_dtc_get(void *ctx, size_t i, udsota_dtc_t *out)
         return false;
     }
     out->dtc = ((uint32_t)(uint8_t)(0x5Bu + 7u * i) << 24) | fuzz_dtc24(i);
-    out->status = STATUS[i % 8u];
+    out->status = fuzz_dtc_status(i);
     return true;
 }
 
@@ -988,8 +1005,18 @@ static bool dtc_list_ok(uint8_t sub, uint8_t mask, const uint8_t *r, size_t n)
     return true;
 }
 
-/* 59 xx for a 19 request: 01's count with the availability and format 00, 02 and 0A's lists, 06's DTC echo and a
- * masked status. */
+/* 59 01's count for a status mask: the table's DTCs whose status & mask & availability is non-zero. */
+static uint16_t dtc_count(uint8_t mask)
+{
+    uint16_t c = 0u;
+    for (size_t i = 0; i < FUZZ_DTC_N; i++) {
+        c += (fuzz_dtc_status(i) & mask & FUZZ_DTC_AVAIL) != 0u;
+    }
+    return c;
+}
+
+/* 59 xx for a 19 request: 01's availability, format 00 and count, 02 and 0A's lists, 06's DTC echo and a masked
+ * status. */
 static bool dtc_shape_ok(const uint8_t *req, size_t rl, uint8_t sub, const uint8_t *r, size_t n)
 {
     if (n < 2u || r[1] != sub) {
@@ -997,7 +1024,8 @@ static bool dtc_shape_ok(const uint8_t *req, size_t rl, uint8_t sub, const uint8
     }
     switch (sub) {
     case UDSOTA_RDTC_COUNT_BY_MASK:
-        return n == 6u && rl == 3u && r[2] == FUZZ_DTC_AVAIL && r[3] == 0x00u;
+        return n == 6u && rl == 3u && r[2] == FUZZ_DTC_AVAIL && r[3] == 0x00u &&
+               udsota_get_u16be(&r[4]) == dtc_count(req[2]);
     case UDSOTA_RDTC_BY_MASK:
         return rl == 3u && dtc_list_ok(sub, req[2], r, n);
     case UDSOTA_RDTC_SUPPORTED:
@@ -1436,7 +1464,7 @@ static uint32_t start_run(state_t st, unsigned variant, bool async)
     }
 #if UDSOTA_FUZZ_NO_UPDATE
     (void)engine;
-    udsota_init(&S, &FUZZ_CFG, NULL, &FUZZ_SECURITY, &FUZZ_HOOKS);   /* the server alone: no update service */
+    udsota_core_init(&S, &FUZZ_CFG, &FUZZ_SECURITY, &FUZZ_HOOKS);   /* udsota_init with a NULL engine, unlinked */
 #else
     udsota_init(&S, &FUZZ_CFG, &engine, &FUZZ_SECURITY, &FUZZ_HOOKS);
 #endif
@@ -1551,6 +1579,23 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     return 0;
 }
 #else  /* the ctest program: self-tests, seeds, mutants, corpus replay */
+
+/* Built with AddressSanitizer (-DUDSOTA_SANITIZE=ON), a guard-page fault must stay a plain SIGSEGV, as the self-test
+ * and on_fatal expect: ASan's own SEGV handler would report it and exit 1. ASan still checks what it instruments. */
+#if defined(__SANITIZE_ADDRESS__)
+#define FUZZ_ASAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define FUZZ_ASAN 1
+#endif
+#endif
+#ifdef FUZZ_ASAN
+const char *__asan_default_options(void);
+const char *__asan_default_options(void)
+{
+    return "handle_segv=0:handle_sigbus=0";
+}
+#endif
 
 /* Writes s to stderr from a signal handler (async-signal-safe). */
 static void say(const char *s)

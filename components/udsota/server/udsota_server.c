@@ -3,6 +3,7 @@
  * DIDs the core doesn't own go to the one registered service (udsota_service.h), such as the firmware updater
  * (update/udsota_update.c). The core never names a service. No ESP-IDF: the transport feeds it reassembled requests,
  * reception events and now_ms, and sends whatever it returns. */
+#include <assert.h>
 #include <string.h>
 #include "udsota_server.h"
 #include "udsota_service.h"
@@ -226,9 +227,12 @@ static void svc_sync(udsota_server_t *s)
     }
 }
 
-/* See udsota_service.h. */
+/* See udsota_service.h. The core calls a registered service's members without a NULL check. */
 void udsota_register_service(udsota_server_t *s, const udsota_service_t *svc)
 {
+    assert(svc == NULL || (svc->request != NULL && svc->routine != NULL && svc->read_did != NULL &&
+                           svc->on_session != NULL && svc->settled != NULL && svc->download_active != NULL &&
+                           svc->poll != NULL && svc->fc_point != NULL && svc->sync != NULL));
     s->svc = svc;
 }
 
