@@ -135,10 +135,11 @@ udsota_reason_t udsota_image_check(const uint8_t *buf, size_t len, uint32_t anno
     /* SemVer precedence: a release beats a newer core, or the same core when the running image is
      * an rc, describe-suffix or dirty build of it (!running_is_release). A dev build (rc included)
      * needs a core at least equal. A running version that did not parse arrives as {0,0,0} with
-     * running_is_release false and so fails open. memcmp of the {major, minor, patch} bytes orders them. */
+     * running_is_release false and so fails open. memcmp of the {major, minor, patch} bytes orders them.
+     * allow_older skips only this rule: the parse and flag check above still apply. */
     const int c = memcmp(ver, ctx->running_version, sizeof ver);
     bool newer = release ? (c > 0 || (c == 0 && !ctx->running_is_release)) : (c >= 0);
-    if (!newer) {
+    if (!ctx->allow_older && !newer) {
         return UDSOTA_DL_NOT_NEWER;
     }
     if (announced_size > ctx->slot_size) {

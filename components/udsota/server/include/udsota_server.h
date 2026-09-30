@@ -239,8 +239,8 @@ typedef struct {
                                        /* both levels: odd requestSeed values 0x01..0x7D (sendKey is level + 1), distinct */
     /* The server never reads the fields below except device_id, device_id_len and the dtc_ fields: it takes security
      * from udsota_init's security argument and leaves the image rules to engine.check_first. The ESP32 port reads
-     * them: key_* for its udsota_security_t, product, hw_id and layout_id for the udsota_image_check rules its engine
-     * runs. */
+     * them: key_* for its udsota_security_t, product, hw_id, layout_id and allow_downgrade for the udsota_image_check
+     * rules its engine runs. */
     const char *key_label;             /* port: security on; K_dev = HMAC(master, label || device_id) */
     const uint8_t *key_master;         /* port: with key_label set and this NULL, security is on and no key matches */
     size_t      key_master_len;        /* port */
@@ -260,6 +260,8 @@ typedef struct {
                                           mask & this is non-zero; 0 = 0xFF (cfg_resolve) */
     uint8_t     dtc_format;            /* 59 01's DTCFormatIdentifier, sent as given: 0x00 SAE J2012-DA format 00
                                           (OBD codes such as U0073 with a failure-type byte), 0x01 ISO 14229-1 */
+    bool        allow_downgrade;       /* port: accept an older or same-version image (udsota_image_ctx_t.allow_older);
+                                          false = refuse, the default */
 } udsota_config_t;
 
 struct udsota_server;

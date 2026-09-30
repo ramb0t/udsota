@@ -411,6 +411,73 @@ static void test_first_failure_wins(void)
     TEST_ASSERT_TRUE(rel);
 }
 
+/* allow_older: a release older than a running release is accepted, reported as a release. */
+static void test_allow_older_release_older_ok(void)
+{
+    ctx.allow_older = true;
+    running_release(1, 2, 3);
+    release("v1.2.2");
+    TEST_ASSERT_EQUAL_INT(UDSOTA_DL_OK, check());
+    TEST_ASSERT_TRUE(rel);
+    release("v0.255.255");
+    TEST_ASSERT_EQUAL_INT(UDSOTA_DL_OK, check());
+}
+
+/* allow_older: a release equal to a running release is accepted. */
+static void test_allow_older_release_equal_ok(void)
+{
+    ctx.allow_older = true;
+    running_release(1, 2, 3);
+    release("v1.2.3");
+    TEST_ASSERT_EQUAL_INT(UDSOTA_DL_OK, check());
+    TEST_ASSERT_TRUE(rel);
+}
+
+/* allow_older: a dev build older than the running version is accepted, reported as not a release. */
+static void test_allow_older_dev_older_ok(void)
+{
+    ctx.allow_older = true;
+    running(1, 2, 3);
+    dev("v1.2.2-4-gabc1234");
+    TEST_ASSERT_EQUAL_INT(UDSOTA_DL_OK, check());
+    TEST_ASSERT_FALSE(rel);
+    running_release(1, 2, 3);
+    TEST_ASSERT_EQUAL_INT(UDSOTA_DL_OK, check());
+}
+
+/* allow_older skips the version rule only: against a running 9.9.9 release that every image here is older
+ * than, an unparseable version and a flag/string mismatch are still UDSOTA_DL_BAD_HEADER, and project, board,
+ * layout, diag IDs and size each still refuse with their own code. */
+static void test_allow_older_other_rules_hold(void)
+{
+    ctx.allow_older = true;
+    running_release(9, 9, 9);
+    TEST_ASSERT_EQUAL_INT(UDSOTA_DL_OK, check());
+    dev("1.2");
+    TEST_ASSERT_EQUAL_INT(UDSOTA_DL_BAD_HEADER, check());
+    set_version("v1.0.0-dev");
+    set_release_flag(true);
+    TEST_ASSERT_EQUAL_INT(UDSOTA_DL_BAD_HEADER, check());
+    dev("v1.0.0");
+    TEST_ASSERT_EQUAL_INT(UDSOTA_DL_BAD_HEADER, check());
+    release("v1.0.0");
+
+    set_project("other");
+    TEST_ASSERT_EQUAL_INT(UDSOTA_DL_BAD_PROJECT, check());
+    set_project("example");
+    img[DESC_OFS + 6] = 3;
+    TEST_ASSERT_EQUAL_INT(UDSOTA_DL_BAD_BOARD, check());
+    img[DESC_OFS + 6] = 1;
+    img[DESC_OFS + 7] = 2;
+    TEST_ASSERT_EQUAL_INT(UDSOTA_DL_BAD_LAYOUT, check());
+    img[DESC_OFS + 7] = 1;
+    img[DESC_OFS + 8] = 0x11;
+    TEST_ASSERT_EQUAL_INT(UDSOTA_DL_BAD_DIAG_IDS, check());
+    img[DESC_OFS + 8] = 0x10;
+    TEST_ASSERT_EQUAL_INT(UDSOTA_DL_TOO_BIG, udsota_image_check(img, sizeof img, SLOT_SIZE + 1u, &ctx, &rel));
+    TEST_ASSERT_EQUAL_INT(UDSOTA_DL_OK, check());
+}
+
 /* Asserts udsota_parse_version(s, n) fails and leaves out {0,0,0} and clean false over sentinels. */
 static void assert_parse_fails(const char *s, size_t n)
 {
@@ -531,6 +598,10 @@ int main(void)
     RUN_TEST(test_release_component_over_255);
     RUN_TEST(test_unparseable_version);
     RUN_TEST(test_first_failure_wins);
+    RUN_TEST(test_allow_older_release_older_ok);
+    RUN_TEST(test_allow_older_release_equal_ok);
+    RUN_TEST(test_allow_older_dev_older_ok);
+    RUN_TEST(test_allow_older_other_rules_hold);
     RUN_TEST(test_parse_version_exported);
     return UNITY_END();
 }

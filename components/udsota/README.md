@@ -119,7 +119,7 @@ udsota_esp32_image_desc(${COMPONENT_LIB})
 
 The CMake helper marks the build a release when `PROJECT_VER` is a clean `vX.Y.Z` tag, and it keeps the unreferenced descriptor in the link.
 
-`cfg.product` is the `project()` name of the app, which ESP-IDF stores in `esp_app_desc_t`. `hw_id` and `layout_id` are the product's to allocate; bump `layout_id` whenever the partition table moves. The port copies `cfg`, `hooks` and `can`, but the strings and arrays `cfg` points to must outlive it. Call `udsota_esp32_bootloop_mark_healthy()` once the app has proved itself after boot: the boot-loop counter makes the fourth boot after three crash resets skip stored settings, because rollback cannot help a valid image that crashes on its own config.
+`cfg.product` is the `project()` name of the app, which ESP-IDF stores in `esp_app_desc_t`. `hw_id` and `layout_id` are the product's to allocate; bump `layout_id` whenever the partition table moves. `cfg.allow_downgrade` lets a dev unit install an older or same-version image; it is the integrator's choice, and a release build should leave it off. The port copies `cfg`, `hooks` and `can`, but the strings and arrays `cfg` points to must outlive it. Call `udsota_esp32_bootloop_mark_healthy()` once the app has proved itself after boot: the boot-loop counter makes the fourth boot after three crash resets skip stored settings, because rollback cannot help a valid image that crashes on its own config.
 
 ## Hooks
 
@@ -252,7 +252,7 @@ The first 36 block is checked before anything is erased, and FF01 checks the who
 - **Header (the port's check):** the chip ID and revision, and a flash mode that matches the running app's (ESP-IDF's `esp_ota_check_image_validity()`); then the ESP image magic, a valid segment count, and the app descriptor's magic (1).
 - **Product:** the app's project name must be `cfg.product` (2).
 - **Descriptor:** its magic, a version of at least 1, and `hw_id` must match `cfg.hw_id` (3). Its layout must match `cfg.layout_id` (4), and its IDs must match `cfg.req_id` and `cfg.resp_id` (5).
-- **Version:** a release, meaning the descriptor's release flag and a clean `[v]X.Y.Z` version, must be newer than the running image by SemVer precedence, so `v1.2.3` installs over `v1.2.3-rc1`. A dev build needs at least the running core version (6). A version that doesn't parse, or a flag that disagrees with the version, is refused (1).
+- **Version:** a release, meaning the descriptor's release flag and a clean `[v]X.Y.Z` version, must be newer than the running image by SemVer precedence, so `v1.2.3` installs over `v1.2.3-rc1`. A dev build needs at least the running core version (6). A version that doesn't parse, or a flag that disagrees with the version, is refused (1). `cfg.allow_downgrade` skips the newer test and nothing else.
 - **Size:** a 34 announcing more than the slot holds answers 0x31 and leaves F1F1 unchanged.
 
 ## Compressed downloads
@@ -415,7 +415,7 @@ The FF01 status byte and F1F1 byte 0.
 | 3 | `UDSOTA_DL_BAD_BOARD` | descriptor missing, wrong magic or version, or `hw_id` differs |
 | 4 | `UDSOTA_DL_BAD_LAYOUT` | `layout_id` differs |
 | 5 | `UDSOTA_DL_BAD_DIAG_IDS` | the image would not answer on this ID pair |
-| 6 | `UDSOTA_DL_NOT_NEWER` | fails the version rule |
+| 6 | `UDSOTA_DL_NOT_NEWER` | fails the version rule, unless `cfg.allow_downgrade` |
 | 7 | `UDSOTA_DL_TOO_BIG` | the announced size exceeds the slot |
 | 8 | `UDSOTA_DL_VERIFY_FAILED` | hash or signature check failed in FF01 |
 | 9 | `UDSOTA_DL_SIG_FAILED` | reserved; ESP-IDF v6.1 reports a signature failure as 8 |
