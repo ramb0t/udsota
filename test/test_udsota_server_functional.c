@@ -397,8 +397,12 @@ static uint8_t all_dtc_ext(void *ctx, uint32_t dtc, uint8_t record, uint8_t *buf
 }
 static uint8_t all_dtc_clear(void *ctx, uint32_t group, udsota_access_t a) { return 0u; }
 
-/* A fresh server with every hook and security on, in the extended session (10 03 sent physically) or the default. */
-static void all_hooks_server(bool extended)
+/* The states the functional sweep starts from: every service the core runs is live in at least one of them. */
+enum { ST_DEFAULT, ST_EXTENDED, ST_PROGRAMMING, ST_DOWNLOAD, ST_COUNT };
+
+/* A fresh server with every hook and security on, in `state`: the default session, the extended one (10 03 sent
+ * physically), the programming one unlocked at level 03, or that with a download open (34 accepted). */
+static void all_hooks_server(int state)
 {
     setUp();
     g_hooks = udsota_mock_hooks(&g_mock);
@@ -413,12 +417,23 @@ static void all_hooks_server(bool extended)
     g_hooks.did_read_ex = all_did_read_ex;
     g_hooks.routine_ex = all_routine_ex;
     udsota_init(&s, &g_cfg, &ENGINE, udsota_mock_security(), &g_hooks);
-    if (extended) {
+    if (state == ST_EXTENDED) {
         TEST_ASSERT_EQUAL_UINT(6, PHYS(0x10, 0x03));
+    }
+    if (state >= ST_PROGRAMMING) {
+        TEST_ASSERT_EQUAL_UINT(6, PHYS(0x10, 0x02));
+        TEST_ASSERT_EQUAL_UINT(2u + UDSOTA_SEED_LEN, PHYS(0x27, UDSOTA_SA_SEED_PROGRAMMING));
+        uint8_t key[2u + UDSOTA_KEY_LEN] = {0x27, UDSOTA_SA_KEY_PROGRAMMING};
+        udsota_mock_key_for(&resp[2], UDSOTA_SA_SEED_PROGRAMMING, &key[2]);
+        TEST_ASSERT_EQUAL_UINT(2, phys(key, sizeof key));
+        EXPECT(0x67, 0x04);
+    }
+    if (state == ST_DOWNLOAD) {
+        TEST_ASSERT_EQUAL_UINT(4, PHYS(0x34, 0x00, 0x44, 0, 0, 0, 0, 0, 0, 0, 0x40));
     }
 }
 
-/* A request the core answers physically when every hook is set; the six functional ones among them. */
+/* A request live physically, with every hook set, in some ST_ state; the six functional ones among them. */
 typedef struct { uint8_t len; uint8_t b[12]; } body_t;
 static const body_t VALID[] = {
     {2, {0x10, 0x03}}, {2, {0x3E, 0x00}}, {3, {0x19, 0x02, 0xFF}}, {3, {0x22, 0xF1, 0x86}}, {3, {0x28, 0x00, 0x03}},
@@ -428,34 +443,58 @@ static const body_t VALID[] = {
     {1, {0x37}},
 };
 
-/* Sends b functionally to a fresh all-hooks server in the default or extended session; true when it answers. */
-static bool func_answers(bool extended, const uint8_t *b, size_t len)
+/* True when n bytes in resp are an NRC a functional request suppresses: 0x11, 0x12, 0x31, 0x7E or 0x7F. */
+static bool suppressed_nrc(size_t n)
 {
-    all_hooks_server(extended);
-    return func(b, len) != 0u;
+    return n == 3u && resp[0] == 0x7F &&
+           (resp[2] == 0x11 || resp[2] == 0x12 || resp[2] == 0x31 || resp[2] == 0x7E || resp[2] == 0x7F);
 }
 
-/* With every hook set and security on, SIDs 00-FF sent functionally in the default and the extended session, each
- * alone, as SID 01 F1 86 00 and SID 00, and every request in VALID: only 10, 3E, 19, 22, 28 and 85 ever draw an
- * answer, and each of those does to its valid request, while the rest of VALID answers physically. The set is
- * functional_served()'s, and the core README names it. */
+/* Sends b functionally to a fresh all-hooks server in `state`; true when it answers or starts a job. */
+static bool func_answers(int state, const uint8_t *b, size_t len)
+{
+    all_hooks_server(state);
+    return func(b, len) != 0u || s.job_running;
+}
+
+/* True when b, sent physically to a fresh all-hooks server in some state, draws a positive answer, an NRC a
+ * functional request would not suppress, or a job: the service is live there. */
+static bool phys_live(const uint8_t *b, size_t len)
+{
+    bool live = false;
+    for (int state = 0; state < ST_COUNT; state++) {
+        all_hooks_server(state);
+        const size_t n = phys(b, len);
+        live = live || (n != 0u && !suppressed_nrc(n)) || s.job_running;
+    }
+    return live;
+}
+
+/* With every hook set and security on, SIDs 00-FF sent functionally in the default, extended and programming
+ * sessions, the last unlocked at level 03 with and without a download open, each alone, as SID 01 F1 86 00 and
+ * SID 00, and every request in VALID: only 10, 3E, 19, 22, 28 and 85 ever draw an answer or start a job, and each
+ * of those does to its valid request, while every request in VALID is live physically in some state (so 34, 36 and
+ * 37 reach past their 0x7F). The set is functional_served()'s, and the core README names it. */
 static void test_functional_answers_only_its_sids(void)
 {
     static const uint8_t served[] = {0x10, 0x3E, 0x19, 0x22, 0x28, 0x85};
     bool answered[256] = {false};
-    for (int ext = 0; ext < 2; ext++) {
+    for (int state = 0; state < ST_COUNT; state++) {
         for (unsigned sid = 0; sid <= 0xFFu; sid++) {
             const uint8_t one[] = {(uint8_t)sid}, five[] = {(uint8_t)sid, 0x01, 0xF1, 0x86, 0x00};
             const uint8_t zero[] = {(uint8_t)sid, 0x00};
-            answered[sid] = answered[sid] || func_answers(ext != 0, one, sizeof one) ||
-                            func_answers(ext != 0, five, sizeof five) || func_answers(ext != 0, zero, sizeof zero);
+            answered[sid] = answered[sid] || func_answers(state, one, sizeof one) ||
+                            func_answers(state, five, sizeof five) || func_answers(state, zero, sizeof zero);
         }
         for (size_t i = 0; i < sizeof VALID / sizeof VALID[0]; i++) {
-            const bool a = func_answers(ext != 0, VALID[i].b, VALID[i].len);
+            const bool a = func_answers(state, VALID[i].b, VALID[i].len);
             answered[VALID[i].b[0]] = answered[VALID[i].b[0]] || a;
-            all_hooks_server(true);
-            TEST_ASSERT_TRUE_MESSAGE(phys(VALID[i].b, VALID[i].len) != 0u, "a VALID request is answered physically");
         }
+    }
+    for (size_t i = 0; i < sizeof VALID / sizeof VALID[0]; i++) {
+        char msg[48];
+        snprintf(msg, sizeof msg, "VALID %02X is live physically", VALID[i].b[0]);
+        TEST_ASSERT_TRUE_MESSAGE(phys_live(VALID[i].b, VALID[i].len), msg);
     }
     for (unsigned sid = 0; sid <= 0xFFu; sid++) {
         bool want = false;
