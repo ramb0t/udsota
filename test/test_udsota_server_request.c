@@ -25,7 +25,7 @@ _Static_assert(offsetof(udsota_hooks_t, routine_ex) == 128u,
 #define SID       0xBAu     /* a SID the core doesn't serve: the app's */
 #define POS10(ss) 0x50, (ss), 0x00, 0x32, 0x01, 0xF4
 
-/* What request, routine_ex and routine_poll saw, and how they answer. */
+/* What request, routine_ex (or routine) and routine_poll saw, and how they answer. */
 typedef struct {
     unsigned        calls;                      /* request */
     uint8_t         req[64];                    /* its req, whole */
@@ -35,7 +35,7 @@ typedef struct {
     size_t          out_len;                    /* the *out_len it sets (it writes C0 C1 ... up to out_max) */
     udsota_access_t access;
     void           *ctx;
-    unsigned        rt_calls;                   /* routine_ex */
+    unsigned        rt_calls;                   /* routine_ex or routine */
     int             rt_rc;
     unsigned        poll_calls;                 /* routine_poll */
     bool            poll_hold;                  /* routine_poll keeps returning UDSOTA_PENDING */
@@ -98,6 +98,15 @@ static int hook_request(void *ctx, const uint8_t *req, size_t len, uint8_t *out,
 /* hooks.routine_ex: counts; returns rt_rc with no out record. */
 static int hook_routine_ex(void *ctx, uint8_t sub, uint16_t rid, const uint8_t *in, size_t in_len,
                            uint8_t *out, size_t out_max, size_t *out_len, udsota_access_t access)
+{
+    x.rt_calls++;
+    *out_len = 0u;
+    return x.rt_rc;
+}
+
+/* hooks.routine: counts; returns rt_rc with no out record. */
+static int hook_routine(void *ctx, uint16_t rid, const uint8_t *in, size_t in_len, uint8_t *out, size_t out_max,
+                        size_t *out_len, udsota_access_t access)
 {
     x.rt_calls++;
     *out_len = 0u;
@@ -304,19 +313,33 @@ static void test_request_gets_the_access_state(void)
     TEST_ASSERT_EQUAL_UINT32(epoch + 1u, x.access.epoch);
 }
 
-/* A functional request never reaches request, in any session, and gets no answer, a SID the hook serves included. */
+/* A functional request never reaches request and gets no answer, a SID the hook serves included: every one of the 256
+ * first bytes, alone and as SID 01, sent functionally in the default, extended and programming sessions with request
+ * answering positive for everything. A SID outside functional_served() stays silent; one in it is the core's. */
 static void test_functional_request_is_silent(void)
 {
-    FUNC(SID, 0x01);
-    TEST_ASSERT_EQUAL_size_t(0, rlen);
-    REQ(0x10, 0x03);
-    FUNC(SID, 0x01);
-    TEST_ASSERT_EQUAL_size_t(0, rlen);
-    FUNC(0x2F, 0x02, 0x00, 0x03);
-    TEST_ASSERT_EQUAL_size_t(0, rlen);
-    FUNC(0x50, 0x01);
-    TEST_ASSERT_EQUAL_size_t(0, rlen);
-    TEST_ASSERT_EQUAL_UINT(0, x.calls);
+    static const uint8_t served[] = {0x10, 0x3E, 0x19, 0x22, 0x28, 0x85};
+    static const uint8_t enter[] = {UDSOTA_SESSION_DEFAULT, UDSOTA_SESSION_EXTENDED, UDSOTA_SESSION_PROGRAMMING};
+    char msg[40];
+    for (size_t e = 0; e < sizeof enter; e++) {
+        for (unsigned sid = 0; sid < 256u; sid++) {
+            for (size_t n = 1u; n <= 2u; n++) {
+                boot(true, false);
+                if (enter[e] != UDSOTA_SESSION_DEFAULT) {
+                    REQ(0x10, enter[e]);
+                    TEST_ASSERT_EQUAL_HEX8(0x50, resp[0]);
+                }
+                snprintf(msg, sizeof msg, "session %02X, SID %02X, len %u", enter[e], sid, (unsigned)n);
+                req_func((const uint8_t[]){(uint8_t)sid, 0x01}, n);
+                TEST_ASSERT_EQUAL_UINT_MESSAGE(0, x.calls, msg);
+                TEST_ASSERT_FALSE_MESSAGE(s.job_running, msg);
+                if (memchr(served, (int)sid, sizeof served) == NULL) {
+                    TEST_ASSERT_EQUAL_size_t_MESSAGE(0, rlen, msg);
+                }
+            }
+        }
+    }
+    boot(true, false);
     REQ(SID, 0x01);                                               /* the same request physically: answered */
     EXPECT(SID + 0x40, 0xC0, 0xC1);
 }
@@ -377,8 +400,8 @@ static void test_no_answer_sends_nothing(void)
     TEST_ASSERT_EQUAL_UINT8(UDSOTA_SESSION_DEFAULT, s.session);
 }
 
-/* UDSOTA_NO_ANSWER is request's alone: from routine_ex, and from routine_poll finishing a routine or a request, it
- * is a hook fault, 0x10. */
+/* UDSOTA_NO_ANSWER is request's alone: from routine_ex, from routine, and from routine_poll finishing a routine or a
+ * request, it is a hook fault, 0x10. */
 static void test_no_answer_elsewhere_is_10(void)
 {
     x.rt_rc = UDSOTA_NO_ANSWER;
@@ -393,6 +416,17 @@ static void test_no_answer_elsewhere_is_10(void)
     REQ(SID, 0x81);
     poll_after(5u);
     NRC(SID, UDSOTA_NRC_GENERAL_REJECT);
+    TEST_ASSERT_FALSE(s.job_running);
+
+    g_hooks.routine_ex = NULL;                                    /* routine, the non-_ex hook */
+    g_hooks.routine = hook_routine;
+    udsota_init(&s, &g_cfg, &ENGINE, NULL, &g_hooks);
+    x.rt_calls = 0u;
+    x.rt_rc = UDSOTA_NO_ANSWER;
+    REQ(0x10, 0x03);
+    REQ(0x31, 0x01, 0x12, 0x34);
+    NRC(0x31, UDSOTA_NRC_GENERAL_REJECT);
+    TEST_ASSERT_EQUAL_UINT(1, x.rt_calls);
     TEST_ASSERT_FALSE(s.job_running);
 }
 

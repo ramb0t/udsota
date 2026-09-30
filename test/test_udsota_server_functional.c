@@ -354,7 +354,7 @@ static void test_p2_per_session(void)
     TEST_ASSERT_EQUAL_UINT(3, udsota_poll(&s, resp, sizeof resp, now));   /* 3/10 of 10 s */
 }
 
-/* ---- The functional set: every hook set, so every core service is live ---- */
+/* ---- The functional set: every hook but request set, so every core service is live ---- */
 
 /* hooks.did_write, routine, routine_poll and the _ex hooks: accept everything (the answer's record empty). */
 static uint8_t all_did_write(void *ctx, uint16_t did, const uint8_t *d, size_t n, udsota_access_t a) { return 0u; }
@@ -400,8 +400,8 @@ static uint8_t all_dtc_clear(void *ctx, uint32_t group, udsota_access_t a) { ret
 /* The states the functional sweep starts from: every service the core runs is live in at least one of them. */
 enum { ST_DEFAULT, ST_EXTENDED, ST_PROGRAMMING, ST_DOWNLOAD, ST_COUNT };
 
-/* A fresh server with every hook and security on, in `state`: the default session, the extended one (10 03 sent
- * physically), the programming one unlocked at level 03, or that with a download open (34 accepted). */
+/* A fresh server with every hook but request and security on, in `state`: the default session, the extended one
+ * (10 03 sent physically), the programming one unlocked at level 03, or that with a download open (34 accepted). */
 static void all_hooks_server(int state)
 {
     setUp();
@@ -470,11 +470,12 @@ static bool phys_live(const uint8_t *b, size_t len)
     return live;
 }
 
-/* With every hook set and security on, SIDs 00-FF sent functionally in the default, extended and programming
- * sessions, the last unlocked at level 03 with and without a download open, each alone, as SID 01 F1 86 00 and
- * SID 00, and every request in VALID: only 10, 3E, 19, 22, 28 and 85 ever draw an answer or start a job, and each
+/* With every hook but request set and security on, SIDs 00-FF sent functionally in the default, extended and
+ * programming sessions, the last unlocked at level 03 with and without a download open, each alone, as SID 01 F1 86 00
+ * and SID 00, and every request in VALID: only 10, 3E, 19, 22, 28 and 85 ever draw an answer or start a job, and each
  * of those does to its valid request, while every request in VALID is live physically in some state (so 34, 36 and
- * 37 reach past their 0x7F). The set is functional_served()'s, and the core README names it. */
+ * 37 reach past their 0x7F). The set is functional_served()'s, and the core README names it; request's own sweep is
+ * test_functional_request_is_silent in test_udsota_server_request.c. */
 static void test_functional_answers_only_its_sids(void)
 {
     static const uint8_t served[] = {0x10, 0x3E, 0x19, 0x22, 0x28, 0x85};
