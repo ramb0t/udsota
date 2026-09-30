@@ -21,7 +21,7 @@ _Static_assert(offsetof(udsota_config_t, key_pubkey_len) == 96u,
 #endif
 
 #define T0         60000u   /* past the 10 s post-boot 0x27 delay */
-#define RESP_FULL  256u     /* UDSOTA_ISOTP_RESP_MAX: the transport's response buffer */
+#define RESP_FULL  256u     /* UDSOTA_ISOTP_RESP_MAX's default: the transport's response buffer */
 #define AVAIL      0x2Fu    /* the tests' availability mask: bits 0-3 and 5 */
 #define NRC_APP    0x22u    /* conditionsNotCorrect, as an app's dtc_clear might answer */
 #define POS10(ss)  0x50, (ss), 0x00, 0x32, 0x01, 0xF4

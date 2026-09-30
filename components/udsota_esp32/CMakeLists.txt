@@ -30,3 +30,9 @@ if(NOT CONFIG_UDSOTA_ESP32_COMPRESSION)
     idf_component_get_property(udsota_lib udsota COMPONENT_LIB)
     target_compile_definitions(${udsota_lib} PRIVATE UDSOTA_COMPRESSION=0)
 endif()
+
+# The ISO-TP buffer sizes size udsota_isotp_bufs_t (udsota_isotp.h), so every file that includes it must see the same
+# values: PUBLIC on the core puts them on the port and on the app, which requires the core.
+idf_component_get_property(udsota_lib udsota COMPONENT_LIB)
+target_compile_definitions(${udsota_lib} PUBLIC UDSOTA_ISOTP_RX_MAX=${CONFIG_UDSOTA_ESP32_ISOTP_RX_MAX}u
+                                                UDSOTA_ISOTP_RESP_MAX=${CONFIG_UDSOTA_ESP32_ISOTP_RESP_MAX}u)

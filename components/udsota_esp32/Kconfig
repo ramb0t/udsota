@@ -17,7 +17,7 @@ menu "udsota ESP32 port"
             udsota_esp32_image_unconfirmed() false without reading the OTA state (with rollback on,
             confirming an image is then the other updater's job), udsota_esp32_status() no slots,
             udsota_esp32_progress() IDLE and udsota_esp32_incoming_version() "". The ISO-TP
-            buffers stay sized for a download block.
+            buffers keep their sizes: UDSOTA_ESP32_ISOTP_RX_MAX shrinks them.
 
     config UDSOTA_ESP32_WORKER_CORE
         int "Flash worker core"
@@ -137,7 +137,31 @@ menu "udsota ESP32 port"
         depends on SPIRAM
         default y
         help
-            8,958 B, touched only by the diag task with the cache on.
+            2 x UDSOTA_ESP32_ISOTP_RX_MAX + 3 x UDSOTA_ESP32_ISOTP_RESP_MAX bytes, 8,958 at the
+            defaults, touched only by the diag task with the cache on. Off, or without SPIRAM, they
+            come from the internal heap.
+
+    config UDSOTA_ESP32_ISOTP_RX_MAX
+        int "Largest request (ISO-TP receive buffers, bytes)"
+        range 322 4095 if UDSOTA_ESP32_UPDATER
+        range 66 4095
+        default 4095
+        help
+            Sizes the ISO-TP receive and request buffers, each this long. With the updater it also
+            caps RequestDownload's maxNumberOfBlockLength, so a smaller value means more, shorter
+            0x36 blocks; the first block must hold 322 bytes (36, its counter and the 320 image
+            bytes the first-block check reads). Without the updater no request over 256 bytes is
+            ever taken, so 256 is all it needs, and saves 7,678 bytes against the default; 66
+            still takes the ECDSA mode's sendKey.
+
+    config UDSOTA_ESP32_ISOTP_RESP_MAX
+        int "Largest answer (ISO-TP response buffers, bytes)"
+        range 35 4095
+        default 256
+        help
+            Sizes the three ISO-TP buffers an answer passes through, each this long. A 0x22 answer
+            over it, or a 0x19 list over (RESP_MAX - 3) / 4 DTCs (63 at 256), answers 0x14
+            responseTooLong. 35 still holds F1F3, the longest answer udsota builds itself.
 
     config UDSOTA_ESP32_RX_QUEUE_LEN
         int "Request frame queue depth"

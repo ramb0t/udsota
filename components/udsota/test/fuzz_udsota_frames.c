@@ -13,7 +13,7 @@
  * a clock that wraps).
  *
  * Checked on every call: every frame the adapter sends is 8 bytes on the response ID, padded with 0xAA, with a valid
- * PCI (an SF of 1-7 bytes, an FF of 8-256, a CF with the next SN only while the tester's last CTS allows it and no
+ * PCI (an SF of 1-7 bytes, an FF of 8 to UDSOTA_ISOTP_RESP_MAX, a CF with the next SN only while the tester's last CTS allows it and no
  * sooner than its STmin, an FC that is CTS with the link's BS and the message's STmin, never under the STmin asked
  * for, or overflow); an FC goes out only at the FC point the receive mirror predicted for that frame (or the adapter
  * withheld it there, counted it and, with nothing sending, dropped isotp-c's copy), or as the retry of the FC the bus
@@ -21,7 +21,7 @@
  * UDSOTA_ISOTP_PARK_MAX_MS; the wait service returns is 1 ms while anything waits for the bus and never over 100 ms; a
  * multi-frame answer stops early only after an overflow FC, a second WAIT, a failed send or N_Bs; every answer
  * reassembled from the frames is well formed (7F, a SID the tester sent and a known NRC, or that SID's positive
- * shape, the app's DIDs and DTC list byte for byte) and at most 256 bytes; a functional frame is answered only while
+ * shape, the app's DIDs and DTC list byte for byte) and no longer than the response buffer; a functional frame is answered only while
  * the link is idle and only as udsota_on_functional_request allows (the functional subset, no 0x11, 0x12, 0x31, 0x7E
  * or 0x7F, no positive answer under SPRMIB, only 3E while a job runs), and never with an FC; the mirror agrees with
  * isotp-c's receive state after every call (mid-message exactly when isotp-c is, bar an orphan, with the same length,
@@ -33,7 +33,11 @@
  * The PASS line ends with digest=, an FNV-1a hash of every frame fed to the adapter and every frame it offered the
  * bus, with the bus's answer, so a changed frame shows there even where the counts don't. The coverage lines before
  * it say what the replay reached, and a floor on them fails a replay that proves nothing. A FAIL names the program;
- * --only replays it alone with a trace of every frame. */
+ * --only replays it alone with a trace of every frame.
+ *
+ * Built at the adapter's default buffer sizes, and again at smaller ones (CMakeLists.txt): the seeds' 36 blocks, the
+ * DIDs that fill and overflow the response buffer, the DTC list and the request lengths at the receive limit's edges
+ * follow UDSOTA_ISOTP_RX_MAX and UDSOTA_ISOTP_RESP_MAX, so each build tests its own limits. */
 #define _DEFAULT_SOURCE   /* MAP_ANONYMOUS, sigaction, fork, prctl under -std=c11 */
 #include <inttypes.h>
 #include <limits.h>
@@ -82,9 +86,21 @@
 #define STALL_MS          1100u                   /* MF_STALL: past N_Cr */
 #define JOB_MS            60u                     /* async engine: a job answers 60 ms later, past the 40 ms 0x78 */
 #define SLOT_SIZE         (16u * FAKE_OTA_SECTOR) /* 64 KiB slots: a 34 past them is refused */
-#define IMG_PAYLOAD       4400u                   /* the seeds' image: two 36 blocks, 4,093 bytes and the rest */
+#define IMG_PAYLOAD       4400u                   /* the seeds' image: two 36 blocks at the default RX_MAX, 4,093
+                                                     bytes and the rest */
 #define IMG_MAX           (IMG_PAYLOAD + 128u)
-#define DTC_N             40u                     /* 19 0A answers 163 bytes: 24 CFs, so the SN wraps */
+#define BLK_LEN           UDSOTA_ISOTP_RX_MAX     /* the seeds' 36s: the longest the adapter takes, as 34 announces */
+#define BLK_DATA          (BLK_LEN - 2u)
+#define RX_IDLE           (UDSOTA_ISOTP_RX_MAX < UDSOTA_ISOTP_RX_LIMIT_IDLE ? UDSOTA_ISOTP_RX_MAX \
+                                                                          : UDSOTA_ISOTP_RX_LIMIT_IDLE)
+#define DTC_N             (UDSOTA_ISOTP_RESP_MAX >= 256u ? 40u : (UDSOTA_ISOTP_RESP_MAX - 3u) / 4u)
+                                                  /* 19 0A answers 163 bytes at the default RESP_MAX: 24 CFs */
+#define DID_WRAP_LEN      (UDSOTA_ISOTP_RESP_MAX >= 256u ? 200u : UDSOTA_ISOTP_RESP_MAX - 8u)   /* DID 0x0102 */
+#define SN_WRAP_LEN       112u                    /* the shortest answer whose CFs wrap the SN: FF 6 + 15 CFs x 7 + 1 */
+
+_Static_assert(BLK_DATA >= UDSOTA_IMAGE_MIN_LEN, "the first 36 holds the image bytes check_first reads");
+_Static_assert(3u + DID_WRAP_LEN >= SN_WRAP_LEN && 3u + 4u * DTC_N >= SN_WRAP_LEN, "DID 0x0102 and 19 0A wrap the SN");
+_Static_assert(UDSOTA_ISOTP_RESP_MAX <= 256u, "SETTLE_MS covers two answers of 37 CFs at the longest STmin");
 #define PROG_MAX          32768u                  /* a longer program is cut */
 #define MUTATIONS_DEFAULT 400u                    /* mutants per seed program */
 #define RANDOM_PROGRAMS   2000u
@@ -141,10 +157,11 @@ static const variant_t VARIANTS[VARIANT_COUNT] = {
 
 static const uint32_t STMIN_HOOK[] = {0u, 100u, 250u, 950u, 1500u, 5000u, 127000u, 200000u};
 
-/* The app's DIDs: 0x0101 and up answer multi-frame, 0x0102 wraps the SN, 0x0103 fills the 256-byte buffer and 0x0104
+/* The app's DIDs: 0x0101 and up answer multi-frame, 0x0102 wraps the SN, 0x0103 fills the response buffer and 0x0104
  * does not fit it (0x14). */
 static const struct { uint16_t did; uint16_t len; } DIDS[] = {
-    {0x0100u, 4u}, {0x0101u, 40u}, {0x0102u, 200u}, {0x0103u, 253u}, {0x0104u, 254u},
+    {0x0100u, 4u}, {0x0101u, 40u}, {0x0102u, DID_WRAP_LEN}, {0x0103u, UDSOTA_ISOTP_RESP_MAX - 3u},
+    {0x0104u, UDSOTA_ISOTP_RESP_MAX - 2u},
 };
 
 typedef struct {
@@ -678,7 +695,7 @@ static bool positive_ok(uint8_t sid, const uint8_t *r, size_t n)
     case UDSOTA_SID_ROUTINE:
         return (n == 4u || n == 5u) && r[1] == UDSOTA_RC_START;
     case UDSOTA_SID_REQUEST_DOWNLOAD:
-        return n == 4u && r[1] == UDSOTA_DL_LFID && r[2] == 0x0Fu && r[3] == 0xFFu;
+        return n == 4u && r[1] == UDSOTA_DL_LFID && r[2] == (uint8_t)(BLK_LEN >> 8) && r[3] == (uint8_t)BLK_LEN;
     case UDSOTA_SID_TRANSFER_DATA:
         return n == 2u;
     case UDSOTA_SID_TRANSFER_EXIT:
@@ -712,7 +729,7 @@ static bool positive_ok(uint8_t sid, const uint8_t *r, size_t n)
 static void check_answer(const uint8_t *r, size_t n)
 {
     if (n == 0u || n > UDSOTA_ISOTP_RESP_MAX) {
-        fail("an answer of no bytes or over the 256-byte response buffer", r, n);
+        fail("an answer of no bytes or over the response buffer", r, n);
     }
     if (r[0] == UDSOTA_NEG_RESPONSE) {
         if (n != 3u || !R.sent_sid[r[1]] || !nrc_known(r[1], r[2])) {
@@ -903,7 +920,7 @@ static int bus_send(void *ctx, uint16_t id, const uint8_t data[8], uint8_t len)
     case PCI_FF: {
         const uint32_t n = ((uint32_t)(data[0] & 0x0Fu) << 8) | data[1];
         if (n < CAN_DL || n > UDSOTA_ISOTP_RESP_MAX) {
-            fail("an FF under 8 or over 256 bytes (the response buffer)", data, CAN_DL);
+            fail("an FF under 8 bytes or over the response buffer", data, CAN_DL);
         }
         break;
     }
@@ -1662,7 +1679,7 @@ static void p_unlock_prog(void)
     p_wait(5u);
 }
 
-/* 34 for size bytes, then the image in 36 blocks of up to 4,093 bytes, gap x 50 us apart with flags at CF at, then
+/* 34 for size bytes, then the image in 36 blocks of up to BLK_DATA bytes, gap x 50 us apart with flags at CF at, then
  * 37 and, when finish, FF01 and ActivateImage. */
 static void p_download(uint32_t size, uint8_t gap, uint8_t flags, uint8_t at, bool finish)
 {
@@ -1672,8 +1689,8 @@ static void p_download(uint32_t size, uint8_t gap, uint8_t flags, uint8_t at, bo
     p_wait(10u);
     static uint8_t blk[UDSOTA_DL_MAX_BLOCK_LEN];
     uint8_t bsc = 1u;
-    for (size_t off = 0; off < g_img_len; off += UDSOTA_DL_MAX_DATA, bsc++) {
-        const size_t n = (g_img_len - off < UDSOTA_DL_MAX_DATA) ? g_img_len - off : UDSOTA_DL_MAX_DATA;
+    for (size_t off = 0; off < g_img_len; off += BLK_DATA, bsc++) {
+        const size_t n = (g_img_len - off < BLK_DATA) ? g_img_len - off : BLK_DATA;
         blk[0] = UDSOTA_SID_TRANSFER_DATA;
         blk[1] = bsc;
         memcpy(&blk[2], &g_img[off], n);
@@ -1784,8 +1801,9 @@ static void build_seeds(void)
     FUNC(8, 0x02, 0x3E, 0x00, PAD, PAD, PAD, PAD, PAD);
     p_wait(40u);
     seed_end(false);
-    /* The whole download over the frame path, FC honoured: 10 02, the key, 34, two 36 blocks (4,095 bytes, the SN
-     * wrapping 36 times), 37, FF01 and ActivateImage. Variant 0 must verify the image. */
+    /* The whole download over the frame path, FC honoured: 10 02, the key, 34, its 36 blocks (at the default RX_MAX
+     * two, the first of 4,095 bytes, the SN wrapping 36 times), 37, FF01 and ActivateImage. Variant 0 must verify the
+     * image. */
     seed_begin();
     p_unlock_prog();
     p_download((uint32_t)g_img_len, 40u, MF_HONOUR, 0u, true);
@@ -1807,8 +1825,8 @@ static void build_seeds(void)
         p_wait(10u);
         m[0] = UDSOTA_SID_TRANSFER_DATA;
         m[1] = 1u;
-        memcpy(&m[2], g_img, UDSOTA_DL_MAX_DATA);
-        p_mf(m, UDSOTA_DL_MAX_BLOCK_LEN, DL_BREAKS[i].gap, DL_BREAKS[i].flags, DL_BREAKS[i].at, DL_BREAKS[i].opf);
+        memcpy(&m[2], g_img, BLK_DATA);
+        p_mf(m, BLK_LEN, DL_BREAKS[i].gap, DL_BREAKS[i].flags, DL_BREAKS[i].at, DL_BREAKS[i].opf);
         p_wait(1500u);
         SF(0x22, 0xF1, 0xF2);
         p_wait(20u);
@@ -1826,22 +1844,23 @@ static void build_seeds(void)
     SF(0x22, 0xF1, 0x8C);
     m[0] = UDSOTA_SID_TRANSFER_DATA;
     m[1] = 1u;
-    memcpy(&m[2], g_img, UDSOTA_DL_MAX_DATA);
-    p_mf(m, UDSOTA_DL_MAX_BLOCK_LEN, 2u, 0u, 0u, 0u);
+    memcpy(&m[2], g_img, BLK_DATA);
+    p_mf(m, BLK_LEN, 2u, 0u, 0u, 0u);
     p_wait(1300u);
     p_autofc(AFC_CTS, 0u, 0u, 0u);
     SF(0x22, 0xF1, 0xF2);
     p_wait(30u);
     seed_end(false);
-    /* Request lengths at the edges: FF_DL 8, 255, 256, 257 (overflow outside a download), an escape FF of 20, an FF of
-     * DLC 7 and one of FF_DL 7 (both ignored), then a CF with no FF and CFs after a wrong SN. */
+    /* Request lengths at the edges: FF_DL 8, and 255, 256 and 257 at the default sizes, the idle receive limit's edges
+     * (overflow past it outside a download), an escape FF of 20, an FF of DLC 7 and one of FF_DL 7 (both ignored),
+     * then a CF with no FF and CFs after a wrong SN. */
     seed_begin();
-    memset(m, 0x01, 300u);
+    memset(m, 0x01, RX_IDLE + 44u);
     m[0] = 0x22;
     p_mf(m, 8u, 10u, 0u, 0u, 0u); p_wait(20u);
-    p_mf(m, 255u, 10u, MF_HONOUR, 0u, 0u); p_wait(20u);
-    p_mf(m, 256u, 10u, MF_HONOUR, 0u, 0u); p_wait(20u);
-    p_mf(m, 257u, 10u, MF_HONOUR, 0u, 0u); p_wait(20u);
+    p_mf(m, RX_IDLE - 1u, 10u, MF_HONOUR, 0u, 0u); p_wait(20u);
+    p_mf(m, RX_IDLE, 10u, MF_HONOUR, 0u, 0u); p_wait(20u);
+    p_mf(m, RX_IDLE + 1u, 10u, MF_HONOUR, 0u, 0u); p_wait(20u);
     p_mf(m, 20u, 10u, MF_ESCAPE, 0u, 0u); p_wait(20u);
     RAW(7, 0x10, 0x14, 0x22, 0xF1, 0x86, 0, 0, 0); RAW(8, 0x10, 0x07, 0x22, 0xF1, 0x86, 0, 0, 0);
     RAW(8, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x22, 0xF1); RAW(8, 0x10, 0x00, 0x00, 0x00, 0x10, 0x00, 0x22, 0xF1);
