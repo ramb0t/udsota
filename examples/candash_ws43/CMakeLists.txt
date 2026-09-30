@@ -3,10 +3,10 @@
 # is a link to the repository root, the udsota component. See README.md.
 cmake_minimum_required(VERSION 3.22)
 
-# A dev build (a suffix after the core) needs a core at least the running one's: 0.4.1 goes both ways with CANDash
-# v0.4.1-*. Override with -DPOC_VER=... to build a second image to update to.
+# A dev build (a suffix after the core) needs a core at least the running one's: 0.5.0 goes both ways with CANDash
+# v0.5.0. Override with -DPOC_VER=... to build a second image to update to.
 if(NOT DEFINED POC_VER)
-    set(POC_VER "0.4.1-lite.1")
+    set(POC_VER "0.5.0-lite.1")
 endif()
 set(PROJECT_VER "${POC_VER}")
 

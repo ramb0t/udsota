@@ -13,6 +13,8 @@ BUSY_BACKOFF_S = (0.05, 0.1, 0.2, 0.4, 0.8, 1.6)   # waits before each retry aft
 SA_DELAY_S = 10.0        # the server's 0x27 delay after boot or after three wrong keys
 KEEPALIVE_S = 2.0        # 3E 00 interval in a session: iso14229 restarts S3 (5.1 s) only on 10 and 3E
 P2_STAR_S = 5.5          # client P2*: the wait for a late answer, or a running job's next 0x78 (sent every 1.5 s)
+SIG_P2_S = 2.0           # P2 for a signed key: an ESP32-S3 checks P-256 in software (~0.45 s), and iso14229 answers
+                         # no 0x78 to 0x27
 
 
 # One request method per service the update uses.
@@ -145,7 +147,16 @@ class Uds:
             return                                   # already unlocked: iso14229 answers a 2-byte zero seed
         if len(seed) != SEED_LEN:
             raise UpdateFailed("seed is %d bytes, expected %d" % (len(seed), SEED_LEN))
-        self.request(services.SecurityAccess, seed_level + 1, keys.key(seed, seed_level))
+        key = keys.key(seed, seed_level)
+        set_config, p2 = getattr(self.client, "set_config", None), getattr(self.client, "config", {}).get("p2_timeout")
+        slow = len(key) > SEED_LEN and set_config is not None and p2 is not None
+        if slow:
+            set_config("p2_timeout", max(p2, SIG_P2_S))
+        try:
+            self.request(services.SecurityAccess, seed_level + 1, key)
+        finally:
+            if slow:
+                set_config("p2_timeout", p2)
 
     # RequestDownload of size bytes at address 0, in data format dfi (DL_DFI_DEFLATE: the blocks carry a raw DEFLATE
     # stream of those size bytes); returns the data bytes per 0x36 block.

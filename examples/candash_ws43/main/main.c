@@ -50,7 +50,9 @@ static const char *TAG = "poc";
 
 UDSOTA_IMAGE_DESC(HW_ID, LAYOUT_ID, REQ_ID, RESP_ID);
 
-#if defined(POC_HAVE_MASTER)
+#if defined(POC_HAVE_PUBKEY)
+#include "udsota_pubkey.h"           /* from `udsota keygen`: ECDSA 0x27, which wins over the HMAC master */
+#elif defined(POC_HAVE_MASTER)
 extern const uint8_t _binary_poc_master_start[];
 extern const uint8_t _binary_poc_master_end[];
 #endif
@@ -267,7 +269,9 @@ static void server_task(void *arg)
 static esp_err_t server_start(void)
 {
     const udsota_cfg_t cfg = {
-#if defined(POC_HAVE_MASTER)
+#if defined(POC_HAVE_PUBKEY)
+        .key_pubkey = udsota_pubkey, .key_pubkey_len = sizeof udsota_pubkey,
+#elif defined(POC_HAVE_MASTER)
         .key_label = KEY_LABEL, .key_master = _binary_poc_master_start,
         .key_master_len = (size_t)(_binary_poc_master_end - _binary_poc_master_start),
 #endif
@@ -284,7 +288,7 @@ static esp_err_t server_start(void)
     ESP_RETURN_ON_FALSE(xTaskCreatePinnedToCore(server_task, "uds", SERVER_STACK, NULL, SERVER_PRIO, NULL, 0) == pdPASS,
                         ESP_ERR_NO_MEM, TAG, "task");
     ESP_LOGI(TAG, "iso14229 %s serving udsota on 0x%03X/0x%03X, 0x27 %s", UDS_LIB_VERSION, (unsigned)REQ_ID,
-             (unsigned)RESP_ID, (cfg.key_master != NULL) ? "on (HMAC)" : "OFF");
+             (unsigned)RESP_ID, (cfg.key_pubkey != NULL) ? "on (ECDSA)" : (cfg.key_master != NULL) ? "on (HMAC)" : "OFF");
     return ESP_OK;
 }
 

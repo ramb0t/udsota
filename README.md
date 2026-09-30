@@ -74,6 +74,7 @@ iso14229 is used as it is, and these follow from it. They are candidates for ups
 
 - S3 restarts only on `10` and `3E`, not on every request, so a tester keeps the session with `3E` (the client sends one whenever 2 s have passed). The one exception udsota makes: while its own flash job runs, it holds the session, for up to 90 s.
 - The security level survives a session change, so `10 01` then `10 02` stays unlocked.
+- iso14229 answers no 0x78 to `27`, and counts one as a failed key. An ECDSA key takes about 0.45 s to check on an ESP32-S3 (P-256 in software), so its answer comes after P2; the client waits 2 s for it.
 - Timers compare as signed 32-bit differences: after 24.9 days of uptime, 0x27 answers 0x37 until day 49.7, and a server idle that long holds its next answer.
 - A `36` resent after its `76` was lost gets 0x24 and ends the transfer; a resent `37` gets 0x70. The positive answer to `10` carries iso14229's client P2 defaults.
 - ISO-TP frames are not padded and N_Bs and N_Cr are 100 ms. `-DISO_TP_FRAME_PADDING` and `-DISO_TP_DEFAULT_RESPONSE_TIMEOUT_US=1000000` change both without patching iso14229.
