@@ -1,4 +1,5 @@
 # ISO-TP buffers for a server without the updater: list this file after sdkconfig.noupdater in SDKCONFIG_DEFAULTS (see
 # README.md). No request over 256 bytes is taken without a download open, so the receive buffers need no more, and the
-# adapter's buffers drop from 8,958 bytes to 1,280.
+# adapter's buffers drop from 8,958 bytes to 1,280. With the updater on, 256 is under the option's range (322), and Kconfig
+# ignores it with a note, not a warning, and keeps 4095.
 CONFIG_UDSOTA_ESP32_ISOTP_RX_MAX=256
