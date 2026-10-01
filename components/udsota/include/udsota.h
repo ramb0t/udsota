@@ -8,6 +8,6 @@
 /* The udsota release this header belongs to, for an #if on the release a feature arrived in. tools/release.py sets
  * all four at each cut, and its check fails when they disagree with the tag (RELEASING.md). */
 #define UDSOTA_VERSION_MAJOR 0
-#define UDSOTA_VERSION_MINOR 13
+#define UDSOTA_VERSION_MINOR 14
 #define UDSOTA_VERSION_PATCH 0
-#define UDSOTA_VERSION       "0.13.0"
+#define UDSOTA_VERSION       "0.14.0"
