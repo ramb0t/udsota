@@ -104,6 +104,7 @@ udsota never changes iso14229's code. Where iso14229 has no call for what an upd
 ```sh
 cmake -S . -B build && cmake --build build -j && ctest --test-dir build   # the host test
 python -m pytest client/tests                                              # the client's
+python -m pytest client/tests/test_e2e_lite.py                             # the client against udsota_lite_server
 ```
 
 MIT licence. Third-party code is listed in [THIRD_PARTY.md](THIRD_PARTY.md).

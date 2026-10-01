@@ -1,31 +1,26 @@
-"""Helpers for the end-to-end tests against tools/linux_server's udsota_demo_server: finding the binary,
-building images as its engine (fake_engine) does, running it in pipe mode, a client transport over that pipe that
-stands in for transport.Transport (can-isotp's Python ISO-TP stack instead of the kernel's), and the profile,
-cli.main and state helpers both e2e modules share."""
+"""Helpers for the end-to-end test against udsota_lite_server (test_e2e_lite.py) and the unit tests: building
+images as a udsota server expects them, running a server in pipe mode, a client transport over that pipe that stands
+in for transport.Transport (can-isotp's Python ISO-TP stack instead of the kernel's), and the profile, cli.main and
+state helpers. A subset of udsota main's client/tests/demo_server.py, with the same names."""
 import errno
 import hashlib
-import os
 import pathlib
 import queue
 import random
 import re
-import shutil
 import struct
 import subprocess
 import threading
 
 import can
 import isotp
-import pytest
 from udsoncan.client import Client
 from udsoncan.connections import PythonIsoTpConnection
 
 from udsota import cli, profile, transport, wire
 from udsota.uds import Uds
 
-ROOT = pathlib.Path(__file__).resolve().parents[2]
-BINARY_NAME = "udsota_demo_server"
-MASTER = bytes(range(32))                # the key tests' master: the udsota-example vectors and udsota_keys.c's KAT
+MASTER = bytes(range(32))                # the key tests' master, and udsota_lite_server's
 LABEL = "udsota-example"
 EXAMPLE = profile.load("example")
 
@@ -35,44 +30,18 @@ ISOTP_PARAMS = {"tx_padding": transport.PAD, "tx_data_min_length": 8, "blocking_
                 "stmin": 0, "blocksize": 0, "rx_flowcontrol_timeout": 1000, "rx_consecutive_frame_timeout": 1000}
 
 # PipeTransport's default P2, in place of the client's 150 ms (transport.P2_S). A shared CI runner can stall the
-# demo or the client's threads past 150 ms, and the late answer then fails the next request too. A test of the
-# test whose client must resend during a 1 s job, to meet the server's 0x21, passes p2_s=transport.P2_S.
+# server or the client's threads past 150 ms, and the late answer then fails the next request too.
 PIPE_P2_S = 1.0
 
 
-# The demo server binary: $UDSOTA_DEMO_SERVER, else build/tools/linux_server/ or the PATH; None when absent.
-def find_binary():
-    env = os.environ.get("UDSOTA_DEMO_SERVER")
-    if env:
-        return env if os.access(env, os.X_OK) else None
-    built = ROOT / "build" / "tools" / "linux_server" / BINARY_NAME
-    if os.access(built, os.X_OK):
-        return str(built)
-    return shutil.which(BINARY_NAME)
-
-
-# The skip (or, with $UDSOTA_VCAN set, failure) text when the demo is not built.
-BUILD_HINT = ("%s is not built: cmake -S . -B build && cmake --build build --target %s (or set UDSOTA_DEMO_SERVER)"
-              % (BINARY_NAME, BINARY_NAME))
-
-
-# The binary, or a pytest skip naming how to build it.
-def binary_or_skip():
-    path = find_binary()
-    if path is None:
-        pytest.skip(BUILD_HINT)
-    return path
-
-
-# True for a clean tag, the ESP32 port's release rule ^v?[0-9]+\.[0-9]+\.[0-9]+$ (fake_engine's is_clean_tag).
+# True for a clean tag, the release rule ^v?[0-9]+\.[0-9]+\.[0-9]+$.
 def is_release(version):
     return re.fullmatch(r"v?[0-9]+\.[0-9]+\.[0-9]+", version) is not None
 
 
-# An image the demo accepts, byte for byte what `udsota_demo_server --make-image` writes (unless noise: a segment
-# of pseudo-random text that compresses about as well as a real app): fake_ota_build_image's
-# one-segment ESP32-S3 image (esp_app_desc_t at 32, the udsota descriptor at 288, app_elf_sha256 = SHA-256 of the
-# version, checksum byte, appended SHA-256) with this product, layout and IDs.
+# An image a udsota server accepts: a one-segment ESP32-S3 image (esp_app_desc_t at 32, the udsota descriptor at 288,
+# app_elf_sha256 = SHA-256 of the version, checksum byte, appended SHA-256) with this product, layout and IDs, its
+# segment a byte pattern, or with noise pseudo-random text that compresses about as well as a real app.
 def build_image(version="v0.2.0", product="example", hw_id=1, layout=1, ids=(0x710, 0x718), payload=8192,
                 release=None, noise=False):
     unpadded = 32 + payload
@@ -119,8 +88,8 @@ def reseal(image):
     return bytes(img)
 
 
-# A base and a new image for delta downloads, the pair test/fixtures/delta_fixtures.h holds: v0.2.0, and v0.3.0 with
-# one byte in every 50 changed over [4000, 8000), about what a small code change does to an app.
+# A base and a new image for delta downloads: v0.2.0, and v0.3.0 with one byte in every 50 changed over
+# [4000, 8000), about what a small code change does to an app.
 def delta_pair(payload=12000):
     base = build_image(version="v0.2.0", noise=True, payload=payload)
     new = bytearray(build_image(version="v0.3.0", noise=True, payload=payload))
@@ -136,10 +105,8 @@ def parse_line(line):
                        is_extended_id=len(ident) == 8)
 
 
-# udsota_demo_server in pipe mode: frames in on its stdin, out on its stdout, its log in log_path. For fault
-# injection, drop(msg) -> True keeps a response frame from the client (kept in dropped; release() hands one on
-# later), tap(msg) sees every frame the client sends before the server does, and drop_tx(msg) -> True keeps one
-# from the server (kept in dropped_tx). Every frame the server sent is kept in sent.
+# A server binary in pipe mode: frames in on its stdin, out on its stdout, its log in log_path. tap(msg) sees every
+# frame the client sends before the server does, and every frame the server sent is kept in sent.
 class DemoServer:
     # Start binary with args; the log goes to log_path.
     def __init__(self, binary, args, log_path):
@@ -148,37 +115,26 @@ class DemoServer:
             self.proc = subprocess.Popen([binary, *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                          stderr=err, bufsize=0)
         self.rx = queue.Queue()
-        self.sent, self.dropped, self.drop, self.tap = [], [], None, None
-        self.dropped_tx, self.drop_tx = [], None
+        self.sent, self.tap = [], None
         self._wlock = threading.Lock()
         self._reader = threading.Thread(target=self._read, daemon=True)
         self._reader.start()
 
-    # Reader thread: every stdout line becomes a frame for the client, unless drop() takes it.
+    # Reader thread: every stdout line becomes a frame for the client.
     def _read(self):
         for raw in self.proc.stdout:
             msg = parse_line(raw.decode())
             self.sent.append(msg)
-            if self.drop is not None and self.drop(msg):
-                self.dropped.append(msg)
-                continue
             self.rx.put(msg)
 
     # Write one frame to the server, after tap() has seen it.
     def send(self, msg):
         if self.tap is not None:
             self.tap(msg)
-        if self.drop_tx is not None and self.drop_tx(msg):
-            self.dropped_tx.append(msg)
-            return
         line = "%03X#%s\n" % (msg.arbitration_id, bytes(msg.data).hex().upper())
         with self._wlock:
             self.proc.stdin.write(line.encode())
             self.proc.stdin.flush()
-
-    # Hand a dropped frame to the client after all, as if it had been delayed.
-    def release(self, msg):
-        self.rx.put(msg)
 
     # The next frame from the server, or None after timeout seconds.
     def recv(self, timeout=None):
@@ -314,7 +270,7 @@ names = { 1 = "devkit" }
 """
 
 
-# cli.main with argv, its transport a PipeTransport on server (a DemoServer or a vcan link) with client P2 p2_s.
+# cli.main with argv, its transport a PipeTransport on server (a DemoServer) with client P2 p2_s.
 def run_cli(server, argv, p2_s=PIPE_P2_S):
     return cli.main(argv, transport=lambda prof, interface: PipeTransport(prof, server, p2_s=p2_s))
 
