@@ -13,6 +13,10 @@ if(ESP_PLATFORM)
                            PRIV_REQUIRES app_update bootloader_support esp_app_format esp_partition esp_timer
                                          esp_hw_support esp_system mbedtls)
     target_compile_definitions(${COMPONENT_LIB} PUBLIC UDSOTA_IMG_RELEASE=${udsota_release})
+    # Keep the app's UDSOTA_IMAGE_DESC in every image: ESP-IDF places .rodata_custom_desc without KEEP, so under
+    # --gc-sections it would go from a build that never reaches udsota_init (diagnostics compiled out, say), and units
+    # would then refuse that image as BAD_BOARD.
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u udsota_image_desc")
     # iso14229's isotp-c trips GCC's stringop-overflow (upstream's own ESP32 example allows it too).
     set_source_files_properties(iso14229/iso14229.c PROPERTIES COMPILE_OPTIONS
                                 "-Wno-error=stringop-overflow;-Wno-stringop-overflow")
