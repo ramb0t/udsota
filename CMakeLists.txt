@@ -43,13 +43,13 @@ set_source_files_properties(udsota.c test/test_udsota.c PROPERTIES COMPILE_OPTIO
 add_test(NAME test_udsota COMMAND test_udsota)
 
 # The app on a host for the client's end-to-end test (client/tests/test_e2e_lite.py): udsota on iso14229 over
-# isotp-c, CAN frames on stdin and stdout, two RAM slots, ASan and UBSan.
+# isotp-c, CAN frames on stdin and stdout, two RAM slots, every timer on CLOCK_MONOTONIC, ASan and UBSan.
 add_executable(udsota_lite_server test/e2e/lite_server.c test/e2e/lite_platform.c test/e2e/sha256_host.c
                test/e2e/hmac_sha256_host.c udsota.c iso14229/iso14229.c test/miniz/miniz.c)
 target_include_directories(udsota_lite_server PRIVATE . iso14229 test/miniz test/e2e)
 target_compile_definitions(udsota_lite_server PRIVATE UDS_SYS=UDS_SYS_UNIX UDS_AUTOSELECT_TP=0 UDS_TP_ISOTP_C
-                                                      _DEFAULT_SOURCE UDSOTA_TEST MINIZ_NO_STDIO MINIZ_NO_TIME
-                                                      MINIZ_NO_ARCHIVE_APIS MINIZ_NO_ZLIB_APIS)
+                                                      UDS_CUSTOM_MILLIS _DEFAULT_SOURCE UDSOTA_TEST MINIZ_NO_STDIO
+                                                      MINIZ_NO_TIME MINIZ_NO_ARCHIVE_APIS MINIZ_NO_ZLIB_APIS)
 target_compile_options(udsota_lite_server PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=all
                                                   -fno-omit-frame-pointer)
 target_link_options(udsota_lite_server PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=all)

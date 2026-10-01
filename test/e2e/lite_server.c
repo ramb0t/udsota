@@ -118,6 +118,13 @@ int isotp_user_send_can(const uint32_t arbitration_id, const uint8_t *data, cons
     return ISOTP_RET_OK;
 }
 
+/* iso14229's S3, P2, 0x27 delays and reset timer on the clock the soak gate and the boot silence use, as esp_timer
+ * on the device (UDS_CUSTOM_MILLIS; iso14229's own UDSMillis on UNIX is the wall clock, which NTP can step). */
+uint32_t UDSMillis(void)
+{
+    return (uint32_t)mono_ms();
+}
+
 uint32_t isotp_user_get_us(void)
 {
     return (uint32_t)mono_us();
