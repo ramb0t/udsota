@@ -952,11 +952,15 @@ bool udsota_event(UDSServer_t *srv, UDSEvent_t ev, void *arg, UDSErr_t *rc)
         }
         return true;
     case UDS_EVT_DiagSessCtrl: {
-        const uint8_t type = ((UDSDiagSessCtrlArgs_t *)arg)->type;
-        if (type < UDS_LEV_DS_DS || type > UDS_LEV_DS_EXTDS) {
+        UDSDiagSessCtrlArgs_t *a = arg;
+        if (a->type < UDS_LEV_DS_DS || a->type > UDS_LEV_DS_EXTDS) {
             return false;
         }
-        *rc = on_session(srv, type);
+        if (a->p2_star_ms < srv->p2_star_ms) {           /* iso14229 sends its client default, 1500 ms, which the 0x78s
+                                                            (every 0.3 x P2*) would race; P2 keeps its 150 ms */
+            a->p2_star_ms = srv->p2_star_ms;
+        }
+        *rc = on_session(srv, a->type);
         break;
     }
     case UDS_EVT_EcuReset:
@@ -1107,6 +1111,27 @@ int udsota_init(const udsota_cfg_t *cfg)
 bool udsota_busy(void)
 {
     return U.started && (worker_busy() || U.dl_active);
+}
+
+/* See udsota.h. A poll either reads a request or sends its answer, never both, and iso14229 keeps requestInProgress
+ * set until the answer is handed to ISO-TP, which has copied it. So once the flag is clear, between polls, no request
+ * is half-served, and ending the session can't change an answer. */
+bool udsota_end_session(UDSServer_t *srv)
+{
+    if (srv->requestInProgress) {
+        return false;
+    }
+    if (srv->sessionType != UDS_LEV_DS_DS && srv->ecuResetScheduled == 0u) {
+        if (U.started) {
+            settle();
+            end_session(srv);
+        } else {
+            srv->sessionType = UDS_LEV_DS_DS;
+            srv->securityLevel = 0;
+            srv->xferIsActive = false;
+        }
+    }
+    return true;
 }
 
 void udsota_progress(udsota_progress_t *out)

@@ -2,7 +2,7 @@
 
 udsota vendors two libraries. Each licence travels with its library and applies to those files only.
 
-**iso14229** by driftregion and contributors, MIT licence, upstream commit `d018adc7` (0.11.0 and 31 commits): the single-file amalgamation `iso14229.c` and `iso14229.h`, unmodified, with the isotp-c it embeds. The files and their licence are in `iso14229/`.
+**iso14229** by driftregion and contributors, MIT licence: the single-file amalgamation `iso14229.c` and `iso14229.h`, with the isotp-c it embeds, and its licence, unmodified in `iso14229/`. They are upstream's committed root files at `d018adc7015a88d7a4f164418fcb7e7927e5aa77`, upstream main of 2026-09-29, untagged. Its `UDS_LIB_VERSION` says 0.11.0, but the git tag 0.11.0 is an earlier commit (8a7eb23d, whose header says 0.10.2); this one is 31 commits past it. Upstream CI passed at this commit on 2026-09-29: GitHub Actions unit tests (run 36615027352: linux, windows, arduino, esp32 on ESP-IDF 5.2) and static analysis (run 36615027250, whose lint job checks the committed amalgamation against `src/`), and CircleCI. `iso14229/SHA256SUMS` holds the three files' hashes, and CI fails if they change.
 
 **miniz** by Rich Geldreich, RAD Game Tools and Valve Software, MIT licence, release 3.0.2 (the amalgamated `miniz.c` and `miniz.h`), unpatched, in `test/miniz/` with its licence. Only the host test builds it: on the ESP32, udsota calls the ROM's copy of miniz's inflater, tinfl.
 

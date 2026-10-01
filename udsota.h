@@ -131,6 +131,12 @@ int      udsota_init(const udsota_cfg_t *cfg);
 /* From iso14229's event callback, before the app's own handling, on the server's task: true when udsota answered
  * the event, with *rc for the callback to return; false when the event is the app's. */
 bool     udsota_event(UDSServer_t *srv, UDSEvent_t ev, void *arg, UDSErr_t *rc);
+/* Ends a non-default session for the app (say, on hearing another tester), with udsota's own abort and relock: an
+ * open download ends and F1F1 says ABORTED. The server's task only, between UDSServerPoll calls, never from the event
+ * callback. While iso14229 has a request in progress (a job answering 0x78, or an answer still to send) it does
+ * nothing and returns false: call it again after the next poll. True once the session is the default one, or a reset
+ * is scheduled. The app gets no SessionTimeout event, and a transfer the app owns ends too. */
+bool     udsota_end_session(UDSServer_t *srv);
 /* True while a flash job runs or a download is open, as of the last event udsota saw. Any task. */
 bool     udsota_busy(void);
 /* The current download's progress. The server's task. */

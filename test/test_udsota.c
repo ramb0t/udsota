@@ -442,6 +442,7 @@ int main(void)
     EXPECT(B(0x22, 0xF1, 0xF1), B(0x62, 0xF1, 0xF1, UDSOTA_DL_OK));
     EXPECT(B(0x31, 0x01, 0xF0, 0x01), B(0x71, 0x01, 0xF0, 0x01));
     CHECK(P.activations == 1 && P.st.boot_slot == 1);
+    CHECK(udsota_end_session(&s_srv) && s_srv.sessionType == UDS_LEV_DS_PRGS);   /* the reset is already scheduled */
     for (int ms = 0; ms < 200; ms++) {            /* the restart is iso14229's scheduled reset */
         g_now++;
         tick();
@@ -554,6 +555,62 @@ int main(void)
     EXPECT(B(0x37), B(0x77));
     EXPECT(B(0x31, 0x01, 0xFF, 0x01), B(0x71, 0x01, 0xFF, 0x01, 0x00));
     EXPECT(B(0x22, 0xF1, 0xF1), B(0x62, 0xF1, 0xF1, UDSOTA_DL_OK, 0, 0, 0x20, 0x00));
+
+    /* 50 xx carries the server's P2* (5000 ms, in 10 ms units) beside iso14229's P2 of 150 ms. */
+    s_allow_downgrade = false;
+    P.st = (udsota_status_t){.running_slot = 0, .boot_slot = 0, .running_state = UDSOTA_IMG_VALID};
+    P.expect = img;
+    P.expect_len = sizeof img;
+    boot();
+    EXPECT(B(0x10, 0x03), B(0x50, 0x03, 0x00, 0x96, 0x01, 0xF4));
+
+    /* udsota_end_session: an idle session ends at once, locked; the default session needs nothing. */
+    unlock(0x01);
+    CHECK(udsota_end_session(&s_srv) && s_srv.sessionType == UDS_LEV_DS_DS && s_srv.securityLevel == 0);
+    CHECK(udsota_end_session(&s_srv));
+    EXPECT(B(0x22, 0xF1, 0x86), B(0x62, 0xF1, 0x86, 0x01));
+
+    /* While a block's job runs it refuses, and the block is still answered; then the open download ends, ABORTED. */
+    EXPECT(B(0x10, 0x02), B(0x50, 0x02));
+    unlock(0x03);
+    request_download(sizeof img, 0x00);
+    {
+        static uint8_t req[2 + 4093];
+        uint8_t resp[64];
+        req[0] = 0x36;
+        req[1] = 1;
+        memcpy(&req[2], img, 4093);
+        UDSSDU_t info = {.A_TA_Type = UDS_A_TA_TYPE_PHYSICAL};
+        assert(UDSTpSend(s_tester, req, sizeof req, &info) == UDS_OK);
+        int refusals = 0, n = -1;
+        for (int ms = 0; ms < 10000 && n < 0; ms++) {
+            g_now++;
+            tick();
+            if (s_srv.requestInProgress) {
+                CHECK(!udsota_end_session(&s_srv));
+                refusals++;
+            }
+            (void)UDSTpPoll(s_tester);
+            size_t got = 0;
+            if (UDSTpRecv(s_tester, resp, sizeof resp, &got, NULL) == UDS_OK && got > 0u &&
+                !(got == 3u && resp[0] == 0x7Fu && resp[2] == 0x78u)) {
+                n = (int)got;
+            }
+        }
+        CHECK(refusals > 0 && n == 2 && resp[0] == 0x76 && resp[1] == 1);
+    }
+    CHECK(udsota_busy());
+    CHECK(udsota_end_session(&s_srv) && s_srv.sessionType == UDS_LEV_DS_DS && !udsota_busy());
+    EXPECT(B(0x22, 0xF1, 0xF1), B(0x62, 0xF1, 0xF1, UDSOTA_DL_ABORTED, 0, 0, 0x0F, 0xFD));
+    EXPECT(B(0x36, 0x02, 0x00), B(0x7F, 0x36, 0x70));
+
+    /* With udsota not started, it still ends the app's session, lock and transfer. */
+    udsota_test_reboot();
+    s_srv.sessionType = UDS_LEV_DS_EXTDS;
+    s_srv.securityLevel = 1;
+    s_srv.xferIsActive = true;
+    CHECK(udsota_end_session(&s_srv) && s_srv.sessionType == UDS_LEV_DS_DS && s_srv.securityLevel == 0 &&
+          !s_srv.xferIsActive);
 
     if (g_failures != 0) {
         fprintf(stderr, "%d check(s) failed\n", g_failures);

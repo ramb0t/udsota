@@ -9,6 +9,8 @@ jobs:
         cc: [gcc, clang]
     steps:
       - uses: actions/checkout@v4
+      - name: The vendored iso14229 files match iso14229/SHA256SUMS
+        run: cd iso14229 && sha256sum -c SHA256SUMS
       - run: cmake -S . -B build && cmake --build build -j && ctest --test-dir build --output-on-failure
         env:
           CC: ${{ matrix.cc }}
