@@ -48,6 +48,8 @@ A delta goes as DFI 0x20, an Espressif `esp_delta_ota` patch compressed with hea
 
 The core README's [Flashing without the client](../components/udsota/README.md#flashing-without-the-client) gives the sequence and its fallbacks. The 0x27 key is not in the manifest: in the ECDSA mode the flasher asks the product's signing service to sign each seed ([Key management](../README.md#key-management)).
 
+A server built on driftregion's iso14229 restarts S3 only on 10 and 3E, not on every answered request as udsota's own does, so outside the default session the tool sends 3E 00 before any request that comes over 2 s after the last 10 or 3E. It also takes iso14229's 2-byte zero seed as already unlocked, and waits up to 2 s for the answer to a 64-byte signed key, since iso14229 sends no 0x78 while the server checks it.
+
 The tool transmits only on the profile's request ID and never on a `deny_tx` ID. Before its first frame it listens for 2 s and stops if it hears the response ID or the profile's busy value. During a run it stops if a response arrives that it did not ask for.
 
 The exit code says why it stopped:

@@ -36,7 +36,7 @@ from udsoncan.exceptions import TimeoutException
 import udsota
 from udsota import cli, config, delta, dtc, errors, keys, pack, profile, transport, update, wire
 from udsota.image import parse_image
-from udsota.uds import KEEPALIVE_S, SA_DELAY_S, Uds
+from udsota.uds import KEEPALIVE_S, SA_DELAY_S, SIG_P2_S, Uds
 
 from .demo_server import MASTER, build_image, delta_pair, elf_sha, reseal
 
@@ -178,6 +178,7 @@ class FakeTime:
 # patch with detools.
 # With dtcs, [(dtc, status)] in the order dtc_get reports them, it serves 0x19 and 0x14 with the core's rules and the
 # demo server's clear hook; without, both answer 0x11.
+# With s3_on, only a request with one of those SIDs restarts S3, as (0x10, 0x3E) do on iso14229.
 class FakeServer:
     # Knobs select the faults and states each test needs.
     def __init__(self, max_block=18, boot_silence=2, confirm_refusals=2, running_state=3, sha=OLD_SHA,
@@ -186,7 +187,7 @@ class FakeServer:
                  lose_ff01_once=False, activate_nrcs=None, activate_fail=None, no_fc=None, security=True,
                  pubkey=None, cfg_keys=None, commit_status=0, compress=False, z_nomem=False, delta=(), base=None,
                  no_memory=(), lose_bad_base=False, dtcs=None, dtc_ext=None, dtc_avail=0x2F, dtc_format=0x00,
-                 level_extended=0x01, cfg_groups=()):
+                 level_extended=0x01, cfg_groups=(), s3_on=None):
         self.max_block, self.boot_silence, self.confirm_refusals = max_block, boot_silence, confirm_refusals
         self.running_state, self.sha, self.board = running_state, sha, board
         self.other_state, self.other_sha = other_state, other_sha
@@ -221,6 +222,7 @@ class FakeServer:
         self.dtc_ext = dtc_ext                  # {dtc: its records for record FF}; None: no dtc_ext_data (19 06: 0x12)
         self.dtc_avail, self.dtc_format = dtc_avail, dtc_format   # cfg.dtc_availability_mask and cfg.dtc_format
         self.level_extended = level_extended    # the requestSeed level 14's hook needs unlocked
+        self.s3_on = s3_on                      # the SIDs that restart S3; None: every request
 
     # Answer one request payload with a list of response payloads ([] = no answer).
     def handle(self, req):
@@ -237,7 +239,8 @@ class FakeServer:
         now = self.clock()
         if self.session != 1 and now - self.last_t > 5.0:
             self.session, self.unlocked = 1, 0          # S3 expired
-        self.last_t = now
+        if self.s3_on is None or sid in self.s3_on:
+            self.last_t = now
         if self.silence:
             self.silence -= 1
             return []
@@ -572,7 +575,7 @@ def uds_for(server, ft, monitor=None):
         conn = transport.GuardedConnection(conn, monitor)
     client = Client(conn, config=transport.client_config())
     client.open()
-    return Uds(client, sleep=ft.sleep)
+    return Uds(client, sleep=ft.sleep, clock=ft.clock)
 
 
 # Run flash against server with fake time; returns (rc, fake time, pre-roll count).
@@ -599,7 +602,9 @@ UNLOCK_EXT = [(0x22, 0xF18C), (0x10, 3), (0x27, 1), (0x27, 2)]
 RESET = UNLOCK_EXT + [(0x11, 1)]
 DOWNLOAD_TAIL = [(0x37, None), (0x31, 0xFF01), (0x31, 0xF001)]
 DOWNLOAD = [(0x34, None)] + blocks() + DOWNLOAD_TAIL
-AFTER_ACTIVATE = [(0x22, 0xF1F3)] * 3 + [(0x10, 3)] + [(0x31, 0xF002)] * 3 + [(0x22, 0xF1F0)]
+# 10 03, then ConfirmImage refused twice 2 s apart: the third try, 4 s after the 10, gets a 3E 00 first (KEEPALIVE_S).
+CONFIRM = [(0x10, 3), (0x31, 0xF002), (0x31, 0xF002), (0x3E, 0), (0x31, 0xF002), (0x22, 0xF1F0)]
+AFTER_ACTIVATE = [(0x22, 0xF1F3)] * 3 + CONFIRM
 
 
 # ---- keys: the udsota-example vectors and the core's KAT ----
@@ -1343,6 +1348,10 @@ def test_wait_for_image_polls_through_send_errors():
                 raise self.errors.pop(0)
             return NEW_SHA
 
+        # The boot wait's note that the server restarted: nothing to track.
+        def restarted(self):
+            pass
+
     update.wait_for_image(Rebooting(), NEW_SHA, lambda: None, sleep=ft.sleep, clock=ft.clock)
     assert ft.sleeps == [update.REBOOT_WAIT_S] + [update.BOOT_POLL_S] * 3
 
@@ -1419,7 +1428,7 @@ def test_precheck_no_op_and_confirm_need_no_device_key(running_state):
 def test_precheck_same_image_unconfirmed_confirms_it():
     d = FakeServer(sha=NEW_SHA, running_state=2)
     assert run_flash(d)[0] == 0
-    assert d.log == PRECHECK + [(0x10, 3)] + [(0x31, 0xF002)] * 3 + [(0x22, 0xF1F0)]
+    assert d.log == PRECHECK + CONFIRM
     assert d.running_state == 3
     d = FakeServer(sha=NEW_SHA, running_state=2, confirm_refusals=10 ** 6)
     with pytest.raises(errors.Nrc):
@@ -1614,7 +1623,7 @@ def test_activate_failure_reset_refused_stops():
 def test_confirm_command():
     ft, d = FakeTime(), FakeServer(running_state=2)
     assert update.confirm_cmd(uds_for(d, ft), sleep=ft.sleep, clock=ft.clock, log=lambda *a: None) == 0
-    assert d.log == [(0x22, 0xF1F0), (0x10, 3)] + [(0x31, 0xF002)] * 3 + [(0x22, 0xF1F0)]
+    assert d.log == [(0x22, 0xF1F0)] + CONFIRM
     ft, d = FakeTime(), FakeServer(running_state=3)
     assert update.confirm_cmd(uds_for(d, ft), sleep=ft.sleep, clock=ft.clock, log=lambda *a: None) == 0
     assert d.log == [(0x22, 0xF1F0)]
@@ -1660,6 +1669,114 @@ def test_info_reads_identity_and_config():
     assert d.log == [(0x22, did) for did in order] + [(0x22, 0x0200 + i) for i in range(4)]
     assert "F18C device ID: 02:00:00:00:00:01" in lines and "0202 calibration: 09 c4" in lines
     assert "F1B1 api version: 1.2.3" in lines
+
+
+# ---- servers on iso14229: the keepalive, the already-unlocked seed, a signed key's P2 ----
+
+# Check a request in a non-default session gets a 3E 00 first once the last 10 or 3E is more than KEEPALIVE_S old:
+# none in the default session, none at exactly KEEPALIVE_S, and a 10 or a 3E restarts the timer.
+def test_keepalive_goes_first_after_keepalive_s_in_a_session():
+    ft, d = FakeTime(), FakeServer(security=False)
+    uds = uds_for(d, ft)
+    ft.sleep(5.0)
+    uds.read_did(0xF1F0)                        # default session
+    uds.session(3)
+    ft.sleep(KEEPALIVE_S)
+    uds.read_did(0xF1F0)                        # exactly KEEPALIVE_S after the 10
+    ft.sleep(0.5)
+    uds.session(3)                              # 2.5 s: a 10 goes as it is and restarts the timer
+    ft.sleep(1.5)
+    uds.read_did(0xF1F0)
+    uds.tester_present()                        # 1.5 s: a 3E goes as it is and restarts the timer
+    ft.sleep(1.5)
+    uds.read_did(0xF1F0)
+    ft.sleep(0.6)
+    uds.read_did(0xF1F0)                        # 2.1 s after the 3E: one goes first
+    uds.read_did(0xF1F0)
+    assert d.log == [(0x22, 0xF1F0), (0x10, 3), (0x22, 0xF1F0), (0x10, 3), (0x22, 0xF1F0), (0x3E, 0),
+                     (0x22, 0xF1F0), (0x3E, 0), (0x22, 0xF1F0), (0x22, 0xF1F0)]
+
+
+# Check 10 01 and a positive 11 01 end the session for the keepalive: no 3E 00 before a request after them.
+def test_keepalive_stops_after_10_01_and_11_01():
+    ft, d = FakeTime(), FakeServer(security=False, boot_silence=0)
+    uds = uds_for(d, ft)
+    uds.session(3)
+    uds.session(1)
+    ft.sleep(3.0)
+    uds.read_did(0xF1F0)
+    uds.session(3)
+    uds.ecu_reset()
+    ft.sleep(3.0)
+    uds.read_did(0xF1F3)
+    assert d.log == [(0x10, 3), (0x10, 1), (0x22, 0xF1F0), (0x10, 3), (0x11, 1), (0x22, 0xF1F3)]
+    assert not uds.in_session
+
+
+# Check the fake's s3_on (the known positive for the next test): reads 4 s and 6 s after 10 03 keep the session when
+# every request restarts S3, as on udsota, and find it lapsed when only 10 and 3E do, as on iso14229.
+@pytest.mark.parametrize("s3_on,session", [(None, 3), ((0x10, 0x3E), 1)])
+def test_fake_s3_on(s3_on, session):
+    ft, d = FakeTime(), FakeServer(s3_on=s3_on)
+    d.clock = ft.clock
+    d.handle(b"\x10\x03")
+    for wait in (4.0, 2.0):
+        ft.sleep(wait)
+        d.handle(b"\x22\xf1\xf0")
+    assert d.session == session
+
+
+# Check confirm holds the extended session through five 0x22s on a server that restarts S3 only on 10 and 3E: a 3E 00
+# goes first whenever the last is over KEEPALIVE_S old (every other try, 2 s apart in fake time). A flash completes.
+def test_confirm_keeps_the_session_where_only_10_and_3e_restart_s3():
+    ft, d = FakeTime(), FakeServer(running_state=2, confirm_refusals=5, s3_on=(0x10, 0x3E))
+    assert update.confirm_cmd(uds_for(d, ft), sleep=ft.sleep, clock=ft.clock, log=lambda *a: None) == 0
+    assert d.log == ([(0x22, 0xF1F0), (0x10, 3), (0x31, 0xF002)] + [(0x31, 0xF002), (0x3E, 0), (0x31, 0xF002)] * 2
+                     + [(0x31, 0xF002), (0x22, 0xF1F0)])
+    assert d.running_state == 3
+    assert run_flash(FakeServer(confirm_refusals=5, s3_on=(0x10, 0x3E)))[0] == 0
+
+
+# Check an all-zero seed of 2 bytes (iso14229's answer when already unlocked) or SEED_LEN bytes skips sendKey, and an
+# empty seed, a 3-byte zero one and a 2-byte nonzero one are refused as any seed that is not SEED_LEN bytes.
+@pytest.mark.parametrize("seed,why", [(bytes(2), None), (bytes(keys.SEED_LEN), None),
+                                      (b"", "seed is 0 bytes, expected 16"), (bytes(3), "seed is 3 bytes, expected 16"),
+                                      (b"\x00\x01", "seed is 2 bytes, expected 16")])
+def test_zero_seed_means_unlocked(seed, why):
+    ft, d = FakeTime(), FakeServer()
+    d.s27 = lambda req, sub: [bytes([0x67, sub]) + seed]
+    uds, dk = uds_for(d, ft), keys.DeviceKeys(MASTER, P.security.label, MAC)
+    uds.session(2)
+    if why is None:
+        uds.unlock(0x03, dk)
+    else:
+        with pytest.raises(errors.UpdateFailed, match=why):
+            uds.unlock(0x03, dk)
+    assert d.log == [(0x10, 2), (0x27, 3)]
+
+
+# Check a signed (64-byte) key goes with P2 raised to SIG_P2_S and P2 is restored after it, also when the key is
+# refused (0x35, a key pair the server does not hold); a 16-byte key goes with the client's P2.
+def test_signed_key_waits_sig_p2_s():
+    ft, d = FakeTime(), FakeServer(pubkey=TESTER_PUB)
+    uds, p2s, real = uds_for(d, ft), [], d.s27
+
+    # Record P2 at each 0x27, then answer as the fake does.
+    def s27(req, sub):
+        p2s.append(uds.client.config["p2_timeout"])
+        return real(req, sub)
+
+    d.s27 = s27
+    uds.session(2)
+    uds.unlock(0x03, keys.SigningKeys(TESTER_KEY, MAC))
+    assert d.unlocked == 3 and p2s == [transport.P2_S, SIG_P2_S]
+    d.pubkey, p2s[:] = KAT_PUB, []
+    with pytest.raises(errors.Nrc) as e:
+        uds.unlock(0x03, keys.SigningKeys(TESTER_KEY, MAC))
+    assert e.value.code == 0x35 and p2s == [transport.P2_S, SIG_P2_S]
+    d.pubkey, p2s[:] = None, []
+    uds.unlock(0x03, keys.DeviceKeys(MASTER, P.security.label, MAC))
+    assert p2s == [transport.P2_S, transport.P2_S] and uds.client.config["p2_timeout"] == transport.P2_S
 
 
 # ---- main ----
@@ -2603,6 +2720,10 @@ def test_boot_wait_timeouts_name_their_cause():
         # Every read times out.
         def read_did(self, did):
             raise errors.NoResponse("no answer")
+
+        # The boot wait's note that the server restarted: nothing to track.
+        def restarted(self):
+            pass
 
     with pytest.raises(errors.UpdateFailed, match="did not answer within 60 s of ActivateImage$"):
         update.wait_for_image(Gone(), NEW_SHA, lambda: None, sleep=ft.sleep, clock=ft.clock)

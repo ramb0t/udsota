@@ -11,24 +11,33 @@ from .wire import DL_ALFID, DL_DFI, DL_MAX_DATA, NRC_BUSY, NRC_PENDING, NRC_TIME
 
 BUSY_BACKOFF_S = (0.05, 0.1, 0.2, 0.4, 0.8, 1.6)   # waits before each retry after NRC 0x21
 SA_DELAY_S = 10.0        # the server's 0x27 delay after boot or after three wrong keys
-KEEPALIVE_S = 2.0        # 3E 00 interval while waiting in a session (at least every 2 s)
+KEEPALIVE_S = 2.0        # 3E 00 interval in a session: iso14229 restarts S3 (5.1 s) only on 10 and 3E
 P2_STAR_S = 5.5          # client P2*: the wait for a late answer, or a running job's next 0x78 (sent every 1.5 s)
+SIG_P2_S = 2.0           # P2 for a signed key: an ESP32-S3 checks P-256 in software (~0.45 s), and iso14229 answers
+                         # no 0x78 to 0x27
+UNLOCKED_SEED_LEN = 2    # iso14229's seed when already unlocked: two zero bytes
 
 
 # One request method per service the update uses.
 class Uds:
-    # client: an open udsoncan Client; sleep is injectable for tests.
-    def __init__(self, client, sleep=time.sleep):
-        self.client, self.sleep = client, sleep
+    # client: an open udsoncan Client; sleep and clock are injectable for tests.
+    def __init__(self, client, sleep=time.sleep, clock=time.monotonic):
+        self.client, self.sleep, self.clock = client, sleep, clock
+        self.in_session, self.kept = False, clock()
 
     # Send one request; return the positive response after its SID. Retries NRC 0x21 with backoff;
     # raises Nrc on other NRCs, NoResponse on a timeout, SendFailed when the send fails twice, and
     # UpdateFailed on an answer udsoncan cannot parse or that belongs to another service.
+    # In a non-default session, a 3E 00 goes first when the last 10 or 3E is more than KEEPALIVE_S old.
     def request(self, service, sub=None, data=b""):
+        sid = service.request_id()
+        if sid not in (0x10, 0x3E) and self.in_session and self.clock() - self.kept > KEEPALIVE_S:
+            self.tester_present()
         req = Request(service=service, subfunction=sub, data=bytes(data))
         for delay in BUSY_BACKOFF_S + (None,):
             try:
                 resp = self.send_resending(req)
+                self.answered(sid, sub)
                 return bytes(resp.data or b"")
             except NegativeResponseException as e:
                 if e.response.code == NRC_BUSY and delay is not None:
@@ -36,6 +45,7 @@ class Uds:
                     # lost): listen out the backoff for that answer rather than sleep through its 0x78s.
                     late = self.await_answer(service, delay)
                     if late is not None:
+                        self.answered(sid, sub)
                         return late
                     continue
                 raise Nrc(service.request_id(), e.response.code)
@@ -44,6 +54,20 @@ class Uds:
             except (InvalidResponseException, UnexpectedResponseException) as e:
                 raise UpdateFailed("unexpected answer to service 0x%02X: %s" % (service.request_id(), e))
         raise AssertionError("unreachable")
+
+    # Track the session after a positive answer to sid with sub-function sub: a 10 or 3E restarts the keepalive
+    # timer, 10 01 and 11 01 (the server restarts) leave the non-default session, and other 10s enter one.
+    def answered(self, sid, sub):
+        if sid in (0x10, 0x3E):
+            self.kept = self.clock()
+        if sid == 0x10:
+            self.in_session = sub != 0x01
+        elif sid == 0x11 and sub == 0x01:
+            self.in_session = False
+
+    # The server restarted (it answers in the default session): no keepalive until the next 10.
+    def restarted(self):
+        self.in_session = False
 
     # Listen window_s seconds for an answer to service that no send of ours is waiting for: a late one, or one
     # still being served. A 0x78 extends the wait by P2_STAR_S each time, as it would for a request. Returns the
@@ -121,8 +145,8 @@ class Uds:
         self.request(services.TesterPresent, 0x00)
 
     # SecurityAccess seed then key at seed_level, keys a keys.DeviceKeys (16-byte keys) or keys.SigningKeys (64-byte
-    # signatures); an all-zero seed means already unlocked. NRC 0x37 (the server's delay after boot) is waited out
-    # once, with 3E 00 keeping S3 alive.
+    # signatures, sent with P2 raised to SIG_P2_S); an all-zero seed of SEED_LEN or UNLOCKED_SEED_LEN bytes means
+    # already unlocked. NRC 0x37 (the server's delay after boot) is waited out once, with 3E 00 keeping S3 alive.
     def unlock(self, seed_level, keys):
         try:
             seed = self.request(services.SecurityAccess, seed_level)[1:]
@@ -133,10 +157,17 @@ class Uds:
                 self.sleep(KEEPALIVE_S)
                 self.tester_present()
             seed = self.request(services.SecurityAccess, seed_level)[1:]
+        if len(seed) in (SEED_LEN, UNLOCKED_SEED_LEN) and not any(seed):
+            return                                   # already unlocked
         if len(seed) != SEED_LEN:
             raise UpdateFailed("seed is %d bytes, expected %d" % (len(seed), SEED_LEN))
-        if any(seed):
-            self.request(services.SecurityAccess, seed_level + 1, keys.key(seed, seed_level))
+        key, p2 = keys.key(seed, seed_level), self.client.config["p2_timeout"]
+        if len(key) > SEED_LEN:
+            self.client.set_config("p2_timeout", max(p2, SIG_P2_S))
+        try:
+            self.request(services.SecurityAccess, seed_level + 1, key)
+        finally:
+            self.client.set_config("p2_timeout", p2)
 
     # RequestDownload of size bytes at address 0, in data format dfi (DL_DFI_DEFLATE: the blocks carry a raw DEFLATE
     # stream of those size bytes); returns the data bytes per 0x36 block.

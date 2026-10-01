@@ -4,6 +4,8 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ## [Unreleased]
 
+- Client: works with a server built on driftregion's iso14229, which restarts S3 only on 10 and 3E. Outside the default session the client sends 3E 00 before any request that comes over 2 s after the last 10 or 3E, so ConfirmImage's retries in `flash` and `confirm` (31 01 F002 every 2 s) no longer let the session lapse after 5 s, which got 0x7F and exit 1. A 2-byte all-zero seed, iso14229's answer when already unlocked, counts as unlocked as a 16-byte one does; any other seed that is not 16 bytes, an empty one included, is still refused. A 64-byte signed key waits up to 2 s (P2, 0.15 s otherwise) for its answer, since iso14229 sends no 0x78 for 0x27. With udsota's own server the one change on the wire is that 3E 00, wherever a session runs over 2 s: during a download and between ConfirmImage retries. Not breaking.
+
 ## [0.13.0] - 2026-09-30
 
 - Client: `[config] groups` makes `config set` stage and commit each group of keys in turn, with one `--reset` after the last, for a device that takes one namespace per commit. A writable blob key's `len` refuses a value of another length before the bus opens. Profiles without them behave as before. Not breaking.

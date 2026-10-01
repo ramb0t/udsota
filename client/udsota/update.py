@@ -17,7 +17,7 @@ from .wire import (DID_COUNTERS, DID_DEVICE_ID, DID_RESULT, DID_RUNNING_SHA, DID
 REBOOT_WAIT_S = 3.0
 BOOT_TIMEOUT_S = 60.0
 BOOT_POLL_S = 1.0
-CONFIRM_RETRY_S = 2.0    # under S3 (5 s), so the retries keep the extended session open
+CONFIRM_RETRY_S = 2.0    # between ConfirmImage tries; Uds's 3E 00 keepalive holds the extended session meanwhile
 CONFIRM_TIMEOUT_S = 120.0   # a product's soak plus its health check, with margin
 # flash's diff_format (--diff-format): the delta DFIs it may try; and each delta DFI's name in the log.
 DIFF_DFIS = {"auto": (DL_DFI_DELTA, DL_DFI_DELTA_DEFLATE), "heatshrink": (DL_DFI_DELTA,),
@@ -293,8 +293,9 @@ def check_image(uds, log=print):
 
 
 # Wait for a restarting server: pre-roll and poll the running SHA until it answers, and return it. after names what
-# restarted it, for the timeout message.
+# restarted it, for the timeout message. The server comes back in the default session, so no 3E 00 precedes a poll.
 def wait_for_boot(uds, preroll, after, sleep=time.sleep, clock=time.monotonic):
+    uds.restarted()
     sleep(REBOOT_WAIT_S)
     deadline = clock() + BOOT_TIMEOUT_S
     while True:
