@@ -27,7 +27,7 @@ class Uds:
 
     # Send one request; return the positive response after its SID. Retries NRC 0x21 with backoff;
     # raises Nrc on other NRCs, NoResponse on a timeout, SendFailed when the send fails twice, and
-    # UpdateFailed on an answer udsoncan cannot parse or that belongs to another service.
+    # UpdateFailed on an answer udsoncan cannot parse or that belongs to another service (a 3E 00 passes over it).
     # In a non-default session, a 3E 00 goes first when the last 10 or 3E is more than KEEPALIVE_S old.
     def request(self, service, sub=None, data=b""):
         sid = service.request_id()
@@ -51,7 +51,18 @@ class Uds:
                 raise Nrc(service.request_id(), e.response.code)
             except TimeoutException as e:
                 raise NoResponse("no response to service 0x%02X: %s" % (service.request_id(), e))
-            except (InvalidResponseException, UnexpectedResponseException) as e:
+            except UnexpectedResponseException as e:
+                if sid != 0x3E:
+                    raise UpdateFailed("unexpected answer to service 0x%02X: %s" % (sid, e))
+                # A late answer to an earlier request (a block's answer to its resend, see transfer) can come
+                # first to the keepalive: pass over it and await the 3E's own answer.
+                late = self.await_answer(service, P2_STAR_S)
+                if late is None:
+                    raise NoResponse("no response to service 0x3E after an answer to service 0x%02X"
+                                     % e.response.service.request_id())
+                self.answered(sid, sub)
+                return late
+            except InvalidResponseException as e:
                 raise UpdateFailed("unexpected answer to service 0x%02X: %s" % (service.request_id(), e))
         raise AssertionError("unreachable")
 

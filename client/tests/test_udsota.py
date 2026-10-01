@@ -1713,6 +1713,24 @@ def test_keepalive_stops_after_10_01_and_11_01():
     assert not uds.in_session
 
 
+# Check the keepalive passes over a late answer to an earlier request that comes before its 7E (block 1's answer to
+# its resend, see Uds.transfer), and the block it went ahead of completes; with no 7E after it, NoResponse.
+def test_keepalive_passes_over_a_late_answer():
+    ft, d = FakeTime(), FakeServer(security=False)
+    d.s3e = lambda req, sub: [b"\x76\x01", bytes([0x7E, sub])]
+    d.s36 = lambda req, bsc: [bytes([0x76, bsc])]
+    uds = uds_for(d, ft)
+    uds.session(2)
+    ft.sleep(KEEPALIVE_S + 0.1)
+    uds.transfer(2, b"\xaa")
+    assert d.log == [(0x10, 2), (0x3E, 0), (0x36, 2)] and uds.kept == ft.clock()
+    d.s3e = lambda req, sub: [b"\x76\x02"]
+    ft.sleep(KEEPALIVE_S + 0.1)
+    with pytest.raises(errors.NoResponse, match="no response to service 0x3E after an answer to service 0x36"):
+        uds.transfer(3, b"\xaa")
+    assert d.log[3:] == [(0x3E, 0)]
+
+
 # Check the fake's s3_on (the known positive for the next test): reads 4 s and 6 s after 10 03 keep the session when
 # every request restarts S3, as on udsota, and find it lapsed when only 10 and 3E do, as on iso14229.
 @pytest.mark.parametrize("s3_on,session", [(None, 3), ((0x10, 0x3E), 1)])

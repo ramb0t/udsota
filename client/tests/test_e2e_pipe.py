@@ -346,6 +346,35 @@ def test_late_answer_is_not_the_next_blocks(demo, tmp_path):
     assert flash(s, image_file(tmp_path, build_image("v0.2.0"))) == 0
 
 
+# Check the same race when the request after the resend is the keepalive's (KEEPALIVE_S 0 puts a 3E 00 before every
+# request in the session): the repeat's 76 01 comes before the 7E, and the client passes over it.
+def test_late_answer_is_not_the_keepalives(demo, tmp_path, monkeypatch):
+    monkeypatch.setattr("udsota.uds.KEEPALIVE_S", 0.0)
+    s = demo()
+    held, lock, seen = [], threading.Lock(), {"block 1": 0, "next": None}
+
+    def drop(m):                                  # hold block 1's answers until a request follows its resend
+        with lock:
+            if is_block_answer(m, 1) and seen["next"] is None:
+                held.append(m)
+                return True
+            return False
+
+    def tap(m):                                   # release them during the resend, then during that request's send
+        with lock:
+            if is_block_request(m, 1):
+                seen["block 1"] += 1
+            elif seen["block 1"] == 2 and seen["next"] is None and m.data[0] >> 4 in (0, 1):   # a SF or FF
+                seen["next"] = bytes(m.data[:3])
+            if seen["block 1"] == 2:
+                while held:
+                    s.release(held.pop(0))
+
+    s.drop, s.tap = drop, tap
+    assert flash(s, image_file(tmp_path, build_image("v0.2.0"))) == 0
+    assert seen["next"] == bytes([0x02, 0x3E, 0x00])
+
+
 # Suspected in the client audit, confirmed here, and fixed: when the first 0x78 of a job longer than the 0x21
 # backoff (an erase of 8 s) is lost, every resend answered 0x21 until the client gave up, because the 0x78s the
 # server repeats every 1.5 s arrived while the client slept between retries. The client now listens out each
