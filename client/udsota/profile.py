@@ -23,10 +23,12 @@ KEYS = {"can": {"interface", "req_id", "resp_id", "deny_tx"},
         "preroll": {"tester_present_frames"},
         "functional": {"id", "quiet_bus"},
         "dids": None,
-        "config": {"commit_rid", "status_did", "hash"},
+        "config": {"commit_rid", "status_did", "hash", "groups"},
         "dtcs": None}
-DID_KEYS = {"name", "decode", "type", "writable", "min", "max"}
+DID_KEYS = {"name", "decode", "type", "writable", "min", "max", "len"}
 HASH_KEYS = {"did", "first", "last", "schema"}
+GROUP_KEYS = {"name", "first", "last"}
+BLOB_MAX = 4092   # the most one 0x2E carries: SID and DID plus 4092 bytes fill a 4095-byte ISO-TP message
 
 
 SECURITY_MODES = {"hmac": ("label", "master_file"), "ecdsa": ("private_key_file",)}   # mode: its required keys
@@ -56,7 +58,8 @@ class BusyDetector:
 
 
 # One [dids] entry: DIDs first..last (equal for a single DID), shown as name and decoded with decode. A writable
-# entry is one DID config set can write: type u8, u16 or blob, and for u8 and u16 the write range min..max.
+# entry is one DID config set can write: type u8, u16 or blob, and for u8 and u16 the write range min..max. A blob's
+# len is the exact length a write must have (None: any).
 @dataclass(frozen=True)
 class DidEntry:
     first: int
@@ -67,6 +70,7 @@ class DidEntry:
     writable: bool = False
     min: int | None = None
     max: int | None = None
+    len: int | None = None
 
 
 # [config] hash: SHA-256 of schema || (did BE16, len, value)* over every DID in first..last the device answers,
@@ -79,12 +83,22 @@ class HashSpec:
     schema: int
 
 
-# [config]: the routine that commits staged writes, an optional status DID and an optional hash check.
+# One [config] groups entry: the writable keys in DIDs first..last, staged and committed together.
+@dataclass(frozen=True)
+class ConfigGroup:
+    name: str
+    first: int
+    last: int
+
+
+# [config]: the routine that commits staged writes, an optional status DID, an optional hash check, and the groups
+# config set commits one at a time, in file order (empty: every writable key is one group).
 @dataclass(frozen=True)
 class ConfigSpec:
     commit_rid: int
     status_did: int | None
     hash: HashSpec | None
+    groups: tuple = ()
 
 
 # A loaded profile. None or empty means the feature is off; interface None means --interface must name one.
@@ -205,13 +219,43 @@ def _did_entry(name, key, entry):
         lo, hi = _int(name, entry, "min", 0, top, default=0), _int(name, entry, "max", 0, top, default=top)
         if lo > hi:
             _bad(name, "[dids] %s min %d is above max %d" % (key, lo, hi))
-    return DidEntry(first, last, label, decode, vtype, writable, lo, hi)
+    if "len" in entry and vtype != "blob":
+        _bad(name, "[dids] %s len needs type blob" % key)
+    return DidEntry(first, last, label, decode, vtype, writable, lo, hi, _int(name, entry, "len", 1, BLOB_MAX))
 
 
-# [config] as a ConfigSpec (None when absent): commit_rid, the optional status_did and hash = { did, first, last,
-# schema }, all four required in the hash. The hash DID and the status DID lie outside first..last: inside, their
-# own records would feed the hash and the check could never pass.
-def _config(name, t):
+# [config] groups as a tuple of ConfigGroup: each { name, first, last } with all three required, the names distinct
+# and the ranges disjoint, and every writable key in dids inside one of them.
+def _groups(name, groups, dids):
+    if not isinstance(groups, list):
+        _bad(name, "[config] groups must be a list of { name = \"...\", first = 0x..., last = 0x... }")
+    out = []
+    for g in groups:
+        if not isinstance(g, dict) or set(g) - GROUP_KEYS:
+            _bad(name, "[config] groups entries must be { name = \"...\", first = 0x..., last = 0x... }")
+        label = _str(name, g, "name", required=True)
+        if KEY_NAME.fullmatch(label) is None:
+            _bad(name, "[config] group name %r: a group's name is letters, digits and _" % label)
+        if any(o.name == label for o in out):
+            _bad(name, "[config] two groups are named %s" % label)
+        grp = ConfigGroup(label, _int(name, g, "first", 0, 0xFFFF, required=True),
+                          _int(name, g, "last", 0, 0xFFFF, required=True))
+        if grp.first > grp.last:
+            _bad(name, "[config] group %s first 0x%04X is above last 0x%04X" % (label, grp.first, grp.last))
+        for o in out:
+            if grp.first <= o.last and o.first <= grp.last:
+                _bad(name, "[config] groups %s and %s overlap" % (o.name, label))
+        out.append(grp)
+    for e in dids:
+        if e.writable and not any(g.first <= e.first <= g.last for g in out):
+            _bad(name, "[config] groups: writable key %s (0x%04X) lies in no group" % (e.name, e.first))
+    return tuple(out)
+
+
+# [config] as a ConfigSpec (None when absent): commit_rid, the optional status_did, hash = { did, first, last,
+# schema }, all four required in the hash, and groups (_groups, over dids). The hash DID and the status DID lie
+# outside first..last: inside, their own records would feed the hash and the check could never pass.
+def _config(name, t, dids):
     if t is None:
         return None
     spec, h = None, t.get("hash")
@@ -230,7 +274,8 @@ def _config(name, t):
     if spec is not None and status_did is not None and spec.first <= status_did <= spec.last:
         _bad(name, "[config] status_did 0x%04X is inside the hash range 0x%04X..0x%04X"
              % (status_did, spec.first, spec.last))
-    return ConfigSpec(_int(name, t, "commit_rid", 0, 0xFFFF, required=True), status_did, spec)
+    groups = _groups(name, t["groups"], dids) if "groups" in t else ()
+    return ConfigSpec(_int(name, t, "commit_rid", 0, 0xFFFF, required=True), status_did, spec, groups)
 
 
 # [dtcs] as {(dtc, any_ftb): description}: each key a code dtc.parse_code reads, each value a non-empty string, and no
@@ -318,7 +363,7 @@ def from_dict(name, d):
                    preroll_frames=_int(name, d.get("preroll", {}), "tester_present_frames", 0, 64, default=0),
                    dids=dids, func_id=func_id, compression=compression,
                    quiet_bus=func_t is not None and _bool(name, func_t, "quiet_bus", False),
-                   config=_config(name, d.get("config")), dtcs=_dtcs(name, d.get("dtcs", {})))
+                   config=_config(name, d.get("config"), dids), dtcs=_dtcs(name, d.get("dtcs", {})))
 
 
 # Load a profile by name (a file in udsota/profiles) or by path (anything with a / or ending .toml).
