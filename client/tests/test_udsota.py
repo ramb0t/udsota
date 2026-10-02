@@ -36,7 +36,7 @@ from udsoncan.exceptions import TimeoutException
 import udsota
 from udsota import cli, config, delta, dtc, errors, keys, pack, profile, transport, update, wire
 from udsota.image import parse_image
-from udsota.uds import KEEPALIVE_S, SA_DELAY_S, SIG_P2_S, Uds
+from udsota.uds import BUSY_BACKOFF_S, KEEPALIVE_S, SA_DELAY_S, SIG_P2_S, Uds
 
 from .demo_server import MASTER, build_image, delta_pair, elf_sha, reseal
 
@@ -1714,7 +1714,8 @@ def test_keepalive_stops_after_10_01_and_11_01():
 
 
 # Check the keepalive passes over a late answer to an earlier request that comes before its 7E (block 1's answer to
-# its resend, see Uds.transfer), and the block it went ahead of completes; with no 7E after it, NoResponse.
+# its resend, see Uds.transfer), and the block it went ahead of completes; with no 7E after it, the next block still
+# goes.
 def test_keepalive_passes_over_a_late_answer():
     ft, d = FakeTime(), FakeServer(security=False)
     d.s3e = lambda req, sub: [b"\x76\x01", bytes([0x7E, sub])]
@@ -1726,9 +1727,8 @@ def test_keepalive_passes_over_a_late_answer():
     assert d.log == [(0x10, 2), (0x3E, 0), (0x36, 2)] and uds.kept == ft.clock()
     d.s3e = lambda req, sub: [b"\x76\x02"]
     ft.sleep(KEEPALIVE_S + 0.1)
-    with pytest.raises(errors.NoResponse, match="no response to service 0x3E after an answer to service 0x36"):
-        uds.transfer(3, b"\xaa")
-    assert d.log[3:] == [(0x3E, 0)]
+    uds.transfer(3, b"\xaa")
+    assert d.log[3:] == [(0x3E, 0), (0x36, 3)] and not uds.lost_7e
 
 
 # Check the fake's s3_on (the known positive for the next test): reads 4 s and 6 s after 10 03 keep the session when
@@ -1753,6 +1753,456 @@ def test_confirm_keeps_the_session_where_only_10_and_3e_restart_s3():
                      + [(0x31, 0xF002), (0x22, 0xF1F0)])
     assert d.running_state == 3
     assert run_flash(FakeServer(confirm_refusals=5, s3_on=(0x10, 0x3E)))[0] == 0
+
+
+# ---- a keepalive that goes unanswered, and the keepalive between 0x21 retries ----
+
+AGED = KEEPALIVE_S + 0.1     # a gap after the last 10 or 3E that puts a 3E 00 ahead of the next request
+VERIFY_S = 3.0               # SlowVerify's FF01 time: over KEEPALIVE_S, so a 3E 00 goes ahead of ActivateImage
+
+
+# Lose the answers to d's next n 3Es: each 3E arrives (and restarts S3), its 7E never comes.
+def lose_7e(d, n=1):
+    real, left = d.s3e, [n]
+
+    # Answer nothing while answers are left to lose, then as the fake does.
+    def s3e(req, sub):
+        if left[0]:
+            left[0] -= 1
+            return []
+        return real(req, sub)
+
+    d.s3e = s3e
+
+
+# A Uds in the programming session of server d (no security), inside a download of blocks 16-byte blocks all sent
+# (none: no download yet).
+def in_download(d, blocks=1):
+    ft = FakeTime()
+    uds = uds_for(d, ft)
+    uds.session(2)
+    if blocks:
+        uds.request_download(16 * blocks)
+    for n in range(1, blocks + 1):
+        uds.transfer(n, bytes(16))
+    return ft, uds
+
+
+# Check a 3E 00 that gets no answer ahead of 0x37 is not logged as "no answer to 0x37": the 0x37 goes once.
+def test_unanswered_keepalive_is_not_logged_as_no_answer_to_0x37():
+    d = FakeServer(security=False)
+    ft, uds = in_download(d)
+    ft.sleep(AGED)
+    lose_7e(d)
+    lines = []
+    update.transfer_exit(uds, 16, log=lines.append)
+    assert not any("no answer to 0x37" in line for line in lines), lines
+    assert d.log.count((0x37, None)) == 1
+
+
+# Check a 3E 00 that gets no answer ahead of 0x37 leaves 0x37 its one resend: the 77 lost after it is resent, and the
+# 0x24 to the resend reads F1F1 DL_OK as the existing lost-77 path does.
+def test_unanswered_keepalive_leaves_0x37_its_resend():
+    d = FakeServer(security=False, lose_77_once=True)
+    ft, uds = in_download(d)
+    ft.sleep(AGED)
+    lose_7e(d)
+    lines = []
+    update.transfer_exit(uds, 16, log=lines.append)
+    assert d.log.count((0x37, None)) == 2
+    assert lines[-1] == "the first 0x37 closed the transfer (its 77 was lost): last result DL_OK, 16 bytes"
+
+
+# Check a 3E 00 that gets no answer ahead of FF01 is not logged as "no answer to FF01": the FF01 goes once.
+def test_unanswered_keepalive_is_not_logged_as_no_answer_to_ff01():
+    d = FakeServer(security=False)
+    ft, uds = in_download(d)
+    uds.transfer_exit()
+    ft.sleep(AGED)
+    lose_7e(d)
+    lines = []
+    update.check_image(uds, log=lines.append)
+    assert not any("no answer to FF01" in line for line in lines), lines
+    assert d.log.count((0x31, 0xFF01)) == 1
+
+
+# Check a 3E 00 that gets no answer ahead of FF01 leaves FF01 its one resend: its lost 00 is resent and repeated.
+def test_unanswered_keepalive_leaves_ff01_its_resend():
+    d = FakeServer(security=False, lose_ff01_once=True)
+    ft, uds = in_download(d)
+    uds.transfer_exit()
+    ft.sleep(AGED)
+    lose_7e(d)
+    update.check_image(uds, log=lambda *a: None)
+    assert d.log.count((0x31, 0xFF01)) == 2 and d.verified
+
+
+# Check a 3E 00 that gets no answer ahead of a 0x36 block leaves the block its one resend: its lost 76 is resent and
+# the server writes the block once.
+def test_unanswered_keepalive_leaves_a_block_its_resend():
+    d = FakeServer(security=False, lose_76_once=2)
+    ft, uds = in_download(d, blocks=0)
+    uds.request_download(32)
+    update.send_block(uds, 1, bytes(16))
+    ft.sleep(AGED)
+    lose_7e(d)
+    update.send_block(uds, 2, bytes(16))
+    assert d.log.count((0x36, 2)) == 2 and d.writes == 2
+
+
+# A FakeServer whose FF01 takes VERIFY_S of fake time (its check under 0x78), so a 3E 00 goes ahead of ActivateImage.
+class SlowVerify(FakeServer):
+    # FF01 moves the fake clock on, then answers as the fake does.
+    def s31(self, req, rid):
+        if rid == 0xFF01:
+            self.ft.t += VERIFY_S
+        return super().s31(req, rid)
+
+
+# SlowVerify whose first ActivateImage request never arrives (LostActivateRequest).
+class SlowVerifyLostActivate(SlowVerify, LostActivateRequest):
+    pass
+
+
+# Run flash on d with fake time; returns (rc, log lines).
+def flash_on(d):
+    ft, lines = FakeTime(), []
+    d.ft = ft
+    rc = update.flash(uds_for(d, ft), P, make_image(), MASTER, preroll=lambda: None, sleep=ft.sleep,
+                      clock=ft.clock, log=lines.append)
+    return rc, lines
+
+
+# Check a 3E 00 that gets no answer ahead of ActivateImage is not logged as no answer to ActivateImage, and
+# ActivateImage goes once.
+def test_unanswered_keepalive_is_not_logged_as_no_answer_to_activate():
+    d = SlowVerify()
+    lose_7e(d)
+    rc, lines = flash_on(d)
+    assert rc == 0
+    assert not any(line.startswith("no answer to ActivateImage") for line in lines), lines
+    assert d.log.count((0x31, 0xF001)) == 1
+
+
+# Check a 3E 00 that gets no answer ahead of ActivateImage leaves ActivateImage its one resend: a first request that
+# never arrives is sent again and the update completes (test_lost_activate_request_is_resent_once, after a keepalive).
+def test_unanswered_keepalive_leaves_activate_its_resend():
+    d = SlowVerifyLostActivate()
+    lose_7e(d)
+    rc, _ = flash_on(d)
+    assert rc == 0 and d.sha == NEW_SHA
+    assert d.log.count((0x31, 0xF001)) == 2
+
+
+# Check two 3E 00s in a row that get no answer, ahead of ActivateImage and of activation_landed's F1F3, are not taken
+# for a server restarting after ActivateImage: the server, which never got ActivateImage, is not then said to have
+# reverted or never switched.
+def test_unanswered_keepalives_are_not_a_restart_after_activate():
+    d = SlowVerify()
+    lose_7e(d, 2)
+    rc, lines = flash_on(d)
+    assert rc == 0 and d.sha == NEW_SHA
+    assert "no answer to ActivateImage, and none since: the server is restarting" not in lines
+
+
+# Check a 3E 00 that gets no answer ahead of a later group's commit does not name that group as one that "may have
+# committed": its commit never reached the server.
+def test_unanswered_keepalive_is_not_a_commit_that_may_have_landed():
+    d, ft = FakeServer(cfg_keys=CFG_VALUES, cfg_groups=FAKE_GROUPS), FakeTime()
+    real2e = d.s2e
+
+    # prefs' 2E takes long enough that a 3E 00 goes ahead of prefs' commit; that 3E's 7E is lost.
+    def s2e(req, did):
+        if did == 0x0202:
+            ft.t += AGED
+            lose_7e(d)
+        return real2e(req, did)
+
+    d.s2e = s2e
+    writes = config.parse_writes(G, ["mode=2", "tag=ccdd"], True, True)
+    msg = ""
+    try:
+        config.config_set(uds_for(d, ft), G, writes, MASTER, commit=True, reset=True, sleep=ft.sleep,
+                          clock=ft.clock, log=lambda *a: None)
+    except errors.UpdateFailed as e:
+        msg = str(e)
+    assert msg == "" and d.log.count((0x31, CFG_COMMIT_RID)) == 2, msg
+
+
+# A FakeServer whose first 3E is answered late: nothing within P2, and its 7E comes just ahead of the answer to the next
+# request but a 3E (a 3E between is answered at once), as when a stall holds one 7E past P2.
+class Late7E(FakeServer):
+    # Hold the first 3E's answers; deliver them ahead of the next answers to a request but a 3E.
+    def handle(self, req):
+        out = super().handle(req)
+        if req[0] == 0x3E and not hasattr(self, "held"):
+            self.held = out
+            return []
+        if req[0] != 0x3E and getattr(self, "held", None):
+            out, self.held = self.held + out, []
+        return out
+
+
+# Check a 7E that lands on a request when no keepalive went unanswered is still an unexpected answer (a second tester's,
+# say).
+def test_stray_7e_is_unexpected_unless_a_keepalive_went_unanswered():
+    d = FakeServer(security=False)
+    ft, uds = in_download(d)
+    real36 = d.s36
+    d.s36 = lambda req, bsc: [b"\x7e\x00"] + real36(req, bsc)
+    with pytest.raises(errors.UpdateFailed, match="unexpected answer to service 0x36"):
+        uds.transfer(2, bytes(16))
+
+
+# Check a keepalive's 7E that comes after P2 is passed over by the request it lands on, as the keepalive passes over a
+# late answer to an earlier request: the 0x37 takes its own 77, and the transfer closes with one 0x37.
+def test_late_keepalive_answer_is_passed_over_by_the_next_request():
+    d = Late7E(security=False)
+    ft, uds = in_download(d)
+    ft.sleep(AGED)
+    lines = []
+    update.transfer_exit(uds, 16, log=lines.append)
+    assert d.dl_complete and d.log.count((0x37, None)) == 1 and not uds.lost_7e, (d.log[-4:], lines)
+
+
+# A StubConnection whose empty waits take fake time: a wait with nothing queued advances the clock by its timeout (P2,
+# P2*, or a backoff await_answer listens out) and then times out, as a real ISO-TP socket would.
+class TimedConnection(StubConnection):
+    # Wrap server; ft is the FakeTime both sides read.
+    def __init__(self, server, ft):
+        super().__init__(server)
+        self.ft = ft
+
+    # Next queued answer; with none, the timeout passes in fake time first.
+    def specific_wait_frame(self, timeout=None):
+        if not self.queue:
+            self.ft.t += timeout or 0.0
+            raise TimeoutException("stub: no answer within %.3f s" % (timeout or 0.0))
+        return self.queue.popleft()
+
+
+# A Uds over a TimedConnection to server, on ft's clock.
+def timed_uds(server, ft):
+    server.clock = ft.clock
+    client = Client(TimedConnection(server, ft), config=transport.client_config())
+    client.open()
+    return Uds(client, sleep=ft.sleep, clock=ft.clock)
+
+
+# Make server's handler name (e.g. "s31") answer 0x21 to its next n requests (n < 0: to every one), then as before.
+# Each 0x21 comes from the handler, after FakeServer.handle's S3 and session checks, as an app's or gate's does.
+def busy(server, name, n):
+    real, left = getattr(server, name), [n]
+
+    # 0x21 while left, then the real answer.
+    def answer(req, arg):
+        if left[0] != 0:
+            left[0] -= 1
+            return server.nrc(req[0], 0x21)
+        return real(req, arg)
+
+    setattr(server, name, answer)
+
+
+# An iso14229-like server (S3 restarted only by 10 and 3E) with a ConfirmImage the app can answer 0x21 to.
+def iso_server():
+    return FakeServer(security=False, s3_on=(0x10, 0x3E), running_state=2, confirm_refusals=0)
+
+
+# Check (the known positive for the next two tests) a request 1.0 s after the 10, answered 0x21 six times, completes
+# on its seventh send 3.15 s later (the six BUSY_BACKOFF_S steps) and the session holds, so the timed fake's S3 runs as
+# the next tests need.
+def test_busy_retries_inside_s3_complete():
+    ft, d = FakeTime(), iso_server()
+    busy(d, "s31", 6)
+    uds = timed_uds(d, ft)
+    uds.session(3)
+    ft.sleep(1.0)
+    uds.routine(wire.RID_CONFIRM)
+    assert d.log.count((0x31, wire.RID_CONFIRM)) == 7
+    assert ft.t == pytest.approx(1.0 + sum(BUSY_BACKOFF_S)) and d.session == 3 and d.running_state == 3
+
+
+# Check a request 1.99 s after the last 10 or 3E (not over KEEPALIVE_S, so no 3E goes first), answered 0x21 six
+# times, gets its answer at the seventh send on a server that restarts S3 only on 10 and 3E: a 3E goes between the
+# retries once KEEPALIVE_S has passed, so the 3.15 s backoff cannot let the session lapse.
+def test_busy_retries_keep_the_session_where_only_10_and_3e_restart_s3():
+    ft, d = FakeTime(), iso_server()
+    busy(d, "s31", 6)
+    uds = timed_uds(d, ft)
+    uds.session(3)
+    ft.sleep(KEEPALIVE_S - 0.01)
+    uds.routine(wire.RID_CONFIRM)                    # v0.14.0: errors.Nrc "service 0x31 answered NRC 0x7F"
+    assert d.log.count((0x31, wire.RID_CONFIRM)) == 7 and (0x3E, 0) in d.log
+    assert d.session == 3 and d.running_state == 3
+
+
+# Check the same with the server busy throughout: every retry meets the session, and the error is the server's 0x21,
+# not the 0x7F (serviceNotSupportedInActiveSession) of a lapsed session.
+def test_busy_throughout_reports_0x21_not_a_lapsed_session():
+    ft, d = FakeTime(), iso_server()
+    busy(d, "s31", -1)
+    uds = timed_uds(d, ft)
+    uds.session(3)
+    ft.sleep(KEEPALIVE_S - 0.01)
+    with pytest.raises(errors.Nrc) as e:
+        uds.routine(wire.RID_CONFIRM)
+    assert d.log.count((0x31, wire.RID_CONFIRM)) == 7
+    assert (e.value.sid, e.value.code) == (0x31, 0x21), str(e.value)
+    assert d.session == 3
+
+
+# Check a request that passed over a late 7E and then got no answer of its own times out within its P2, so the resend
+# its caller makes still finds the session on a server that restarts S3 only on 10 and 3E: a lost 77 after a late 7E
+# is recovered as any lost 77 is, and the NoResponse names the request.
+def test_late_7e_then_a_lost_answer_leaves_the_resend_its_session():
+    def setup():
+        ft, d = FakeTime(), Late7E(security=False, lose_77_once=True, s3_on=(0x10, 0x3E))
+        uds = timed_uds(d, ft)
+        uds.session(2)
+        uds.request_download(16)
+        uds.transfer(1, bytes(16))
+        ft.sleep(AGED)
+        return d, uds
+
+    d, uds = setup()
+    with pytest.raises(errors.NoResponse, match="no response to service 0x37 after an answer to service 0x3E"):
+        uds.transfer_exit()
+    d, uds = setup()
+    lines = []
+    update.transfer_exit(uds, 16, log=lines.append)
+    assert lines == ["no answer to 0x37: resending it",
+                     "the first 0x37 closed the transfer (its 77 was lost): last result DL_OK, 16 bytes"]
+    assert d.session == 2
+
+
+# Check a request that passed over a late 7E and then got 0x21 as its own answer retries it with backoff, as any 0x21.
+def test_late_7e_then_the_requests_own_0x21_is_retried():
+    ft = FakeTime()
+    d = Late7E(security=False, s3_on=(0x10, 0x3E), running_state=2, confirm_refusals=0)
+    busy(d, "s31", 1)
+    uds = timed_uds(d, ft)
+    uds.session(3)
+    ft.sleep(AGED)
+    uds.routine(wire.RID_CONFIRM)
+    assert d.log.count((0x31, wire.RID_CONFIRM)) == 2 and d.running_state == 3 and d.session == 3
+
+
+# A FakeServer that never gets the first 3E request: no answer, no log, and no S3 restart.
+class LostKeepalive(FakeServer):
+    # Drop the first 3E unserved; everything else as FakeServer.
+    def handle(self, req):
+        if req[0] == 0x3E and not getattr(self, "lost", False):
+            self.lost = True
+            return []
+        return super().handle(req)
+
+
+# Check a keepalive that never arrived leaves the keepalive timer where it was: the next request sends another 3E even
+# within KEEPALIVE_S of the lost one, and the session holds on a server that restarts S3 only on 10 and 3E.
+def test_lost_keepalive_leaves_the_keepalive_timer():
+    ft, d = FakeTime(), LostKeepalive(security=False, s3_on=(0x10, 0x3E))
+    uds = uds_for(d, ft)
+    uds.session(3)
+    ft.sleep(AGED)
+    uds.read_did(0xF1F0)
+    ft.sleep(0.5)
+    uds.read_did(0xF1F0)
+    assert d.log == [(0x10, 3), (0x22, 0xF1F0), (0x3E, 0), (0x22, 0xF1F0)] and d.session == 3
+
+
+# Check the pass-over ends once a request after the unanswered keepalive is answered: a 7E that lands on a later
+# request is unexpected again.
+def test_stray_7e_after_the_next_answer_is_unexpected():
+    ft, d = FakeTime(), FakeServer(security=False)
+    uds = uds_for(d, ft)
+    uds.session(3)
+    ft.sleep(AGED)
+    lose_7e(d)
+    uds.read_did(0xF1F0)
+    real22 = d.s22
+    d.s22 = lambda req, did: [b"\x7e\x00"] + real22(req, did)
+    with pytest.raises(errors.UpdateFailed, match="unexpected answer to service 0x22"):
+        uds.read_did(0xF1F0)
+
+
+# Check an NRC to a request after the unanswered keepalive ends the pass-over as a positive answer does.
+def test_stray_7e_after_the_next_nrc_is_unexpected():
+    ft, d = FakeTime(), FakeServer(security=False)
+    uds = uds_for(d, ft)
+    uds.session(3)
+    ft.sleep(AGED)
+    lose_7e(d)
+    with pytest.raises(errors.Nrc):
+        uds.read_did(0x1234)
+    real22 = d.s22
+    d.s22 = lambda req, did: [b"\x7e\x00"] + real22(req, did)
+    with pytest.raises(errors.UpdateFailed, match="unexpected answer to service 0x22"):
+        uds.read_did(0xF1F0)
+
+
+# Check an NRC that comes after a passed-over 7E ends the pass-over too.
+def test_stray_7e_after_an_nrc_behind_a_late_7e_is_unexpected():
+    ft, d = FakeTime(), Late7E(security=False)
+    uds = uds_for(d, ft)
+    uds.session(3)
+    ft.sleep(AGED)
+    with pytest.raises(errors.Nrc):
+        uds.read_did(0x1234)
+    real22 = d.s22
+    d.s22 = lambda req, did: [b"\x7e\x00"] + real22(req, did)
+    with pytest.raises(errors.UpdateFailed, match="unexpected answer to service 0x22"):
+        uds.read_did(0xF1F0)
+
+
+# Check a 3E 00 that gets no answer while unlock waits out the server's 0x37 delay does not end the run.
+def test_unanswered_keepalive_in_the_0x37_wait_is_not_a_failure():
+    d = FakeServer(nrc_once={(0x27, 3): 0x37})
+    real = d.handle
+
+    # Lose the first 3E's 7E once the seed request has been refused with 0x37.
+    def handle(req):
+        out = real(req)
+        if req[0] == 0x27 and out[0][:1] == b"\x7f":
+            lose_7e(d)
+        return out
+
+    d.handle = handle
+    rc, ft, _ = run_flash(d)
+    assert rc == 0 and d.sha == NEW_SHA and ft.t >= SA_DELAY_S
+
+
+# Check a 3E answered after an unanswered one keeps the pass-over: its 7E may be the earlier 3E's, so its own can still
+# land on the next request.
+def test_a_later_keepalives_answer_keeps_the_pass_over():
+    ft, d = FakeTime(), FakeServer(security=False)
+    uds = uds_for(d, ft)
+    uds.session(3)
+    lose_7e(d)
+    uds.keep_alive()
+    uds.keep_alive()
+    real22 = d.s22
+    d.s22 = lambda req, did: [b"\x7e\x00"] + real22(req, did)
+    uds.read_did(0xF1F0)
+    assert d.log[-1] == (0x22, 0xF1F0) and not uds.lost_7e
+
+
+# Check, after an unanswered keepalive, a late negative answer to it (7F 3E xx) is passed over as its 7E is, while an
+# answer to another service still is not.
+@pytest.mark.parametrize("stray,passed", [(b"\x7f\x3e\x21", True), (b"\x76\x01", False)])
+def test_only_a_keepalives_late_answer_is_passed_over(stray, passed):
+    d = FakeServer(security=False)
+    ft, uds = in_download(d)
+    ft.sleep(AGED)
+    lose_7e(d)
+    real37 = d.s37
+    d.s37 = lambda req, arg: [stray] + real37(req, arg)
+    if passed:
+        uds.transfer_exit()
+        assert d.dl_complete
+    else:
+        with pytest.raises(errors.UpdateFailed, match="unexpected answer to service 0x37"):
+            uds.transfer_exit()
 
 
 # Check an all-zero seed of 2 bytes (iso14229's answer when already unlocked) or SEED_LEN bytes skips sendKey, and an
