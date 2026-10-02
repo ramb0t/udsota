@@ -1,6 +1,6 @@
 # udsota client
 
-`udsota` is udsota's PC client, copied unchanged from udsota release v0.14.1. It reads a device's identity, update state and fault codes and installs firmware over UDS on ISO-TP, on Linux with SocketCAN and the kernel's ISO-TP module. Its reference (every command, the profile's tables and the exit codes) is [the client README at v0.14.1](https://github.com/ramb0t/udsota/blob/v0.14.1/client/README.md); this page covers only what is different on lite.
+`udsota` is udsota's PC client, copied unchanged from udsota release v0.14.2. It reads a device's identity, update state and fault codes and installs firmware over UDS on ISO-TP, on Linux with SocketCAN and the kernel's ISO-TP module. Its reference (every command, the profile's tables and the exit codes) is [the client README at v0.14.2](https://github.com/ramb0t/udsota/blob/v0.14.2/client/README.md); this page covers only what is different on lite.
 
 ```sh
 pip install ./client                                  # Python 3.11 or newer; the udsota command
