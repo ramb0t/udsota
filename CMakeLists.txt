@@ -1,5 +1,5 @@
 # udsota. Under ESP-IDF this directory is the component: udsota.c and the vendored iso14229. On a host it builds the
-# end-to-end test: cmake -S . -B build && cmake --build build && ctest --test-dir build
+# host test and udsota_lite_server: cmake -S . -B build && cmake --build build && ctest --test-dir build
 if(ESP_PLATFORM)
     # A clean [v]X.Y.Z PROJECT_VER is a release; UDSOTA_IMAGE_DESC stamps the flag into the image.
     idf_build_get_property(udsota_ver PROJECT_VER)

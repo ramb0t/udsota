@@ -1,4 +1,4 @@
-# udsota: the host end-to-end test, the client's tests, the client against udsota_lite_server, and the ESP32 example
+# udsota: the host test, the client's tests, the client against udsota_lite_server, and the ESP32 example
 # built with a throwaway signing key.
 name: ci
 on: [push, pull_request]
