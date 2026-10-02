@@ -2189,7 +2189,7 @@ def test_a_later_keepalives_answer_keeps_the_pass_over():
 
 # Check, after an unanswered keepalive, a late negative answer to it (7F 3E xx) is passed over as its 7E is, while an
 # answer to another service still is not.
-@pytest.mark.parametrize("stray,passed", [(b"\x7f\x3e\x21", True), (b"\x76\x01", False)])
+@pytest.mark.parametrize("stray,passed", [(b"\x7f\x3e\x21", True), (b"\x71\x01\xff\x01", False)])
 def test_only_a_keepalives_late_answer_is_passed_over(stray, passed):
     d = FakeServer(security=False)
     ft, uds = in_download(d)
@@ -2203,6 +2203,131 @@ def test_only_a_keepalives_late_answer_is_passed_over(stray, passed):
     else:
         with pytest.raises(errors.UpdateFailed, match="unexpected answer to service 0x37"):
             uds.transfer_exit()
+
+
+# ---- a block whose answer comes after the previous block's late 76 ----
+
+# Make d answer the first send of block 2 with answer(req, bsc, real), where real is the fake's own handler.
+def first_send_of_block_2(d, answer):
+    real, sent = d.s36, []
+
+    # The scripted answer once, then the fake's own.
+    def s36(req, bsc):
+        if bsc == 2 and not sent:
+            sent.append(1)
+            return answer(req, bsc, real)
+        return real(req, bsc)
+
+    d.s36 = s36
+
+
+# A Uds over the timed stub to d, in the programming session with block 1 of a 2-block download sent.
+def timed_after_block_1(d, ft):
+    uds = timed_uds(d, ft)
+    uds.session(2)
+    uds.request_download(32)
+    update.send_block(uds, 1, bytes(16))
+    return uds
+
+
+# Check a block whose own 76 is lost after the 76 to the previous block's repeat times out within P2, so send_block's
+# resend finds the session whether S3 restarts on every request (udsota's server) or only on 10 and 3E, and even with
+# the keepalive nearly due; the block is written once. (A server built on iso14229 answers a repeated block 0x24, not
+# 76; the fake answers repeats as udsota does.)
+@pytest.mark.parametrize("s3_on", [None, (0x10, 0x3E)], ids=["s3-every-request", "s3-on-10-and-3e"])
+def test_lost_answer_after_a_late_76_is_resent_within_s3(s3_on):
+    ft, d = FakeTime(), FakeServer(security=False, s3_on=s3_on)
+    uds = timed_after_block_1(d, ft)
+    ft.sleep(KEEPALIVE_S - 0.01)
+
+    # Block 1's late 76 comes first; block 2 is written but its 76 is lost.
+    def answer(req, bsc, real):
+        real(req, bsc)
+        return [b"\x76\x01"]
+
+    first_send_of_block_2(d, answer)
+    t0 = ft.t
+    update.send_block(uds, 2, bytes(16))
+    assert ft.t - t0 == pytest.approx(transport.P2_S)   # the one wait: P2 for the block's own 76
+    assert d.log.count((0x36, 2)) == 2 and d.writes == 2 and d.session == 2
+
+
+# Check a block answered 0x21 next to the 76 to the previous block's repeat is retried with backoff and written once,
+# whether that 76 comes first or lands in the backoff, and whichever way S3 restarts; a whole flash with that block
+# completes.
+@pytest.mark.parametrize("s3_on", [None, (0x10, 0x3E)], ids=["s3-every-request", "s3-on-10-and-3e"])
+@pytest.mark.parametrize("frames", [[b"\x76\x01", b"\x7f\x36\x21"], [b"\x7f\x36\x21", b"\x76\x01"]],
+                         ids=["late-76-first", "0x21-first"])
+def test_busy_block_after_a_late_76_is_retried(s3_on, frames):
+    ft, d = FakeTime(), FakeServer(security=False, s3_on=s3_on)
+    uds = timed_after_block_1(d, ft)
+    first_send_of_block_2(d, lambda req, bsc, real: list(frames))
+    uds.transfer(2, bytes(16))                  # the retry is the request's own, not send_block's resend
+    assert d.log.count((0x36, 2)) == 2 and d.writes == 2 and d.session == 2
+    ft, d = FakeTime(), FakeServer(s3_on=s3_on)
+    first_send_of_block_2(d, lambda req, bsc, real: list(frames))
+    rc = update.flash(timed_uds(d, ft), P, make_image(), MASTER, sleep=ft.sleep, clock=ft.clock, log=lambda *a: None)
+    assert rc == 0 and d.sha == NEW_SHA
+
+
+# Check the 76 to a download's last block that lands on 0x37 (the block was resent after its first 76 came late, and
+# the resend took that one) is passed over and the transfer closes; a 76 with another counter is still unexpected,
+# and so is the same 76 once the 0x37 has been answered.
+@pytest.mark.parametrize("stray,passed", [(b"\x76\x02", True), (b"\x76\x01", False)])
+def test_last_blocks_late_76_is_passed_over_by_0x37(stray, passed):
+    ft, d = FakeTime(), FakeServer(security=False)
+    uds = uds_for(d, ft)
+    uds.session(2)
+    uds.request_download(32)
+    update.send_block(uds, 1, bytes(16))
+    update.send_block(uds, 2, bytes(16))
+    real37 = d.s37
+    d.s37 = lambda req, arg: [stray] + real37(req, arg)
+    if not passed:
+        with pytest.raises(errors.UpdateFailed, match="unexpected answer to service 0x37"):
+            uds.transfer_exit()
+        return
+    update.transfer_exit(uds, 32, log=lambda *a: None)
+    assert d.dl_complete and d.log.count((0x37, None)) == 1
+    real31 = d.s31
+    d.s31 = lambda req, rid: [stray] + real31(req, rid)
+    with pytest.raises(errors.UpdateFailed, match="unexpected answer to service 0x31"):
+        uds.routine(0xFF01)
+
+
+# Check an NRC to the 0x37 ends the pass-over of the last block's 76 as a positive answer does: a stray 76 on the
+# F1F1 read after a 0x37 refused 0x24 is unexpected.
+def test_last_blocks_76_after_an_nrc_to_0x37_is_unexpected():
+    ft, d = FakeTime(), FakeServer(security=False)
+    uds = uds_for(d, ft)
+    uds.session(2)
+    uds.request_download(48)
+    update.send_block(uds, 1, bytes(16))
+    update.send_block(uds, 2, bytes(16))
+    with pytest.raises(errors.Nrc):
+        uds.transfer_exit()                     # a block short: 0x24
+    real22 = d.s22
+    d.s22 = lambda req, did: [b"\x76\x02"] + real22(req, did)
+    with pytest.raises(errors.UpdateFailed, match="unexpected answer to service 0x22"):
+        uds.read_did(0xF1F1)
+
+
+# Check the counter wrap: block 0x00 passes over the 76 to block 0xFF's repeat, and the 0x37 after a last block 0x00
+# passes over its 76 00.
+def test_late_76_across_the_counter_wrap():
+    ft, d = FakeTime(), FakeServer(security=False)
+    uds = uds_for(d, ft)
+    uds.session(2)
+    uds.request_download(256 * 16)
+    for n in range(1, 256):
+        update.send_block(uds, n & 0xFF, bytes(16))
+    real36 = d.s36
+    d.s36 = lambda req, bsc: ([b"\x76\xff"] if bsc == 0 else []) + real36(req, bsc)
+    update.send_block(uds, 0x00, bytes(16))
+    real37 = d.s37
+    d.s37 = lambda req, arg: [b"\x76\x00"] + real37(req, arg)
+    update.transfer_exit(uds, 256 * 16, log=lambda *a: None)
+    assert d.dl_complete and d.writes == 256
 
 
 # Check an all-zero seed of 2 bytes (iso14229's answer when already unlocked) or SEED_LEN bytes skips sendKey, and an
