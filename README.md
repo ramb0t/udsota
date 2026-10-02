@@ -74,7 +74,7 @@ A version is `PROJECT_VER`. A clean `X.Y.Z` is a release, which a device takes o
 
 Lite leaves out four things `main` has: delta downloads (the client's `--diff-from` gets 0x31 to each delta `34` and sends the full image), the boot-loop breaker, the ISO-TP counters (F1F2) and functional addressing. The rest come from using iso14229 as it is, and each is a candidate for an upstream fix:
 
-- S3 restarts only on `10` and `3E`, not on every request, so a tester keeps a session with `3E`; the client sends one before any request that comes 2 s or more after the last `10` or `3E`. During udsota's own flash job the tester waits on 0x78s and can't send one, so udsota holds the session itself, for up to 90 s.
+- S3 restarts only on `10` and `3E`, not on every request, so a tester keeps a session with `3E`; the client sends one before any request or 0x21 retry that comes 2 s or more after the last `10` or `3E`. During udsota's own flash job the tester waits on 0x78s and can't send one, so udsota holds the session itself, for up to 90 s.
 - `27` gets no 0x78, because iso14229 counts a pending answer as a failed key. A P-256 signature takes about 0.45 s to check on an ESP32-S3, past P2, so the client waits up to 2 s for that answer.
 - A lost positive answer to a `36` or `37` fails the run, and the next run starts from the first byte. The resent `36` gets 0x24, which ends the transfer, and the resent `37` gets 0x70, which the client doesn't take as the first one's success.
 - The answer to `10` carries iso14229's client defaults, P2 150 ms and P2* 1500 ms. udsota raises that P2* to the server's own (5000 ms), because the server's 0x78s come every 1.5 s and would race 1500 ms.
