@@ -18,7 +18,7 @@ The version keeps CANDash's `0.5.0` core, because a device takes a dev build onl
 
 ## Bench results (2026-09-30)
 
-Nothing after fa70d8d has run on hardware: not the relock on every `10 01/02/03` (8051f15), `allow_downgrade` (9b9b3e6), the image descriptor kept in every build (a362e5c), the server's P2* in the `10` answer and `udsota_end_session` (632078e), nor main's client (d2a2262 on).
+Nothing after fa70d8d has run on hardware: not the relock on every `10 01/02/03` (8051f15), `allow_downgrade` (9b9b3e6), the image descriptor kept in every build (a362e5c), the server's P2* in the `10` answer and `udsota_end_session` (632078e), `udsota_poll` and `-fwrapv` on iso14229.c (727b5c3), nor main's client (d2a2262 on).
 
 Over PCAN at 250 kbit/s, with the branch's own client of the day and CANDash's profile (HMAC 0x27, signed images, rollback on), on 14a1785:
 
