@@ -17,9 +17,11 @@ if(ESP_PLATFORM)
     # --gc-sections it would go from a build that never reaches udsota_init (diagnostics compiled out, say), and units
     # would then refuse that image as BAD_BOARD.
     target_link_libraries(${COMPONENT_LIB} INTERFACE "-u udsota_image_desc")
-    # iso14229's isotp-c trips GCC's stringop-overflow (upstream's own ESP32 example allows it too).
+    # iso14229's isotp-c trips GCC's stringop-overflow (upstream's own ESP32 example allows it too). -fwrapv: its
+    # IsoTpTimeAfter subtracts as int32_t, and without it GCC folds that to a compare that ends a transfer with a
+    # false N_Bs or N_Cr timeout whenever the 32-bit us clock passes 2^31, every 71.6 minutes (test_isotp_wrap).
     set_source_files_properties(iso14229/iso14229.c PROPERTIES COMPILE_OPTIONS
-                                "-Wno-error=stringop-overflow;-Wno-stringop-overflow")
+                                "-Wno-error=stringop-overflow;-Wno-stringop-overflow;-fwrapv")
     return()
 endif()
 
@@ -28,6 +30,7 @@ project(udsota C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 enable_testing()
+set_source_files_properties(iso14229/iso14229.c PROPERTIES COMPILE_OPTIONS "-fwrapv")   # as the component does
 
 # iso14229 on its mock transport with a clock the test sets, udsota over the test's platform, and miniz's tinfl
 # (tdefl too, to make a raw-DEFLATE image).
@@ -55,3 +58,11 @@ target_compile_options(udsota_lite_server PRIVATE -fsanitize=address,undefined -
 target_link_options(udsota_lite_server PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=all)
 set_source_files_properties(test/e2e/lite_server.c test/e2e/lite_platform.c PROPERTIES COMPILE_OPTIONS
                             "-Wall;-Wextra;-Werror")
+
+# isotp-c's timers across the 2^31 us point, at -O2, where the -fwrapv above matters.
+add_executable(test_isotp_wrap test/test_isotp_wrap.c iso14229/iso14229.c)
+target_include_directories(test_isotp_wrap PRIVATE iso14229)
+target_compile_definitions(test_isotp_wrap PRIVATE UDS_SYS=UDS_SYS_UNIX UDS_AUTOSELECT_TP=0 UDS_TP_ISOTP_C
+                                                   UDS_CUSTOM_MILLIS _DEFAULT_SOURCE)
+target_compile_options(test_isotp_wrap PRIVATE -O2)
+add_test(NAME test_isotp_wrap COMMAND test_isotp_wrap)

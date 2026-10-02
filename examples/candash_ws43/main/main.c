@@ -1,6 +1,7 @@
 /* udsota on iso14229, on the CANDash ws43 (Waveshare ESP32-S3-Touch-LCD-4.3). The app owns everything iso14229
- * needs, as an iso14229 user already does: the TWAI node, the server task that feeds isotp-c and calls UDSServerPoll,
- * and the event callback. The callback hands each event to udsota_event() first and serves the rest (here, F191). */
+ * needs, as an iso14229 user already does: the TWAI node, the server task that feeds isotp-c and calls UDSServerPoll
+ * (then udsota_poll), and the event callback. The callback hands each event to udsota_event() first and serves the
+ * rest (here, F191). */
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -246,8 +247,8 @@ static void on_progress(void *ctx, const udsota_progress_t *p)
     }
 }
 
-/* The server task: request frames into isotp-c, then UDSServerPoll, at least every millisecond, so a finished
- * flash job is answered within one; bus-off is recovered here, since the driver refuses to send until then. */
+/* The server task: request frames into isotp-c, then UDSServerPoll and udsota_poll, at least every millisecond, so a
+ * finished flash job is answered within one; bus-off is recovered here, since the driver refuses to send until then. */
 static void server_task(void *arg)
 {
     (void)arg;
@@ -263,6 +264,7 @@ static void server_task(void *arg)
             (void)twai_node_recover(s_node);
         }
         UDSServerPoll(&s_srv);
+        udsota_poll(&s_srv);
     }
 }
 

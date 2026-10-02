@@ -1,11 +1,13 @@
 /* udsota: safe A/B firmware updates over UDS (ISO 14229) for an ESP32 that runs iso14229's server.
  *
  * The app owns iso14229: its server, transport, task and event callback. udsota is a guest in that callback. Call
- * udsota_init() once, then udsota_event() first thing in the callback; it answers the events that belong to an
- * update and returns false for everything else, which the app serves as before.
+ * udsota_init() once, udsota_event() first thing in the callback, and udsota_poll() after every UDSServerPoll.
+ * udsota_event answers the events that belong to an update and returns false for everything else, which the app
+ * serves as before.
  *
  *     UDSOTA_IMAGE_DESC(1, 1, 0x7E6, 0x7EE);          // hw_id, partition layout, request ID, response ID
  *     udsota_init(&(udsota_cfg_t){ .key_pubkey = pub, .key_pubkey_len = sizeof pub });
+ *     for (;;) { UDSServerPoll(&srv); udsota_poll(&srv); }   // the app's server task
  *     static UDSErr_t fn(UDSServer_t *srv, UDSEvent_t ev, void *arg) {
  *         UDSErr_t rc;
  *         if (udsota_event(srv, ev, arg, &rc)) return rc;
@@ -137,6 +139,11 @@ bool     udsota_event(UDSServer_t *srv, UDSEvent_t ev, void *arg, UDSErr_t *rc);
  * nothing and returns false: call it again after the next poll. True once the session is the default one, or a reset
  * is scheduled. The app gets no SessionTimeout event, and a transfer the app owns ends too. */
 bool     udsota_end_session(UDSServer_t *srv);
+/* Keeps iso14229's timers from wrapping: call it after every UDSServerPoll, on the server's task. Without it, iso14229
+ * holds the answer to a request that comes 24.86 days after its last answer (or UDSServerInit) until 49.71 days
+ * after that, and from 24.86 to 49.71 days after UDSServerInit (or a failed key) answers every 27 with 0x37 (or
+ * 0x36). */
+void     udsota_poll(UDSServer_t *srv);
 /* True while a flash job runs or a download is open, as of the last event udsota saw. Any task. */
 bool     udsota_busy(void);
 /* The current download's progress. The server's task. */

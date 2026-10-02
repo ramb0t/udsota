@@ -1108,6 +1108,23 @@ int udsota_init(const udsota_cfg_t *cfg)
     return udsota_plat_start();
 }
 
+/* iso14229 compares its deadlines with UDSTimeAfter, a 32-bit difference read as expired when it is 1 to 2^31 - 1, so
+ * a deadline that expired 2^31 ms (24.86 days) ago reads as pending again until 2^32 ms. Its P2 timer, set at
+ * UDSServerInit and when an answer goes out, then holds the next request's answer, and its two 0x27 delays, set at
+ * UDSServerInit and on a failed key, answer 27 with 0x37 or 0x36. Run every pass, this moves each one that has expired
+ * to now - 1, which still reads as expired (a difference of 0 would not), so none ever gets old enough to wrap; a
+ * pending one is left alone. The other deadlines are set afresh before each use. */
+void udsota_poll(UDSServer_t *srv)
+{
+    const uint32_t now = UDSMillis();
+    uint32_t *const timers[] = {&srv->p2_timer, &srv->sec_access_boot_delay_timer, &srv->sec_access_auth_fail_timer};
+    for (size_t i = 0; i < sizeof timers / sizeof timers[0]; i++) {
+        if ((uint32_t)(now - *timers[i] - 1u) < 0x7FFFFFFFu) {
+            *timers[i] = now - 1u;
+        }
+    }
+}
+
 bool udsota_busy(void)
 {
     return U.started && (worker_busy() || U.dl_active);

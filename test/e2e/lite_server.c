@@ -1,10 +1,11 @@
 /* udsota_lite_server: udsota on unmodified iso14229 as an app runs it, on a Linux host, for the client's end-to-end
  * test (client/tests/test_e2e_lite.py). It plays examples/candash_ws43's main.c with the example profile's identity:
  * CAN frames arrive on stdin and leave on stdout, one per line as `710#0322F18C` (the framing of the client tests'
- * PipeTransport), through isotp-c; UDSServerPoll runs about every millisecond; and the event callback hands each
- * event to udsota_event() first, then serves the app's own: F191, and config writes (2E, a commit routine, a status
- * DID and a hash DID) as the profile's [dids] and [config] describe them. A restart (11 01, or F001's answer) is a
- * boot in-process after --boot-ms of silence: lite_platform.c's slots, then udsota and iso14229 from scratch.
+ * PipeTransport), through isotp-c; UDSServerPoll, then udsota_poll, runs about every millisecond; and the event
+ * callback hands each event to udsota_event() first, then serves the app's own: F191, and config writes (2E, a commit
+ * routine, a status DID and a hash DID) as the profile's [dids] and [config] describe them. A restart (11 01, or
+ * F001's answer) is a boot in-process after --boot-ms of silence: lite_platform.c's slots, then udsota and iso14229
+ * from scratch.
  *
  *     udsota_lite_server --image FILE [--soak-ms N] [--boot-ms N] [-v]
  *
@@ -380,7 +381,7 @@ static void take(const char *buf, size_t n)
     }
 }
 
-/* Serves until stdin's EOF: frames into isotp-c, then UDSServerPoll, at least every millisecond. */
+/* Serves until stdin's EOF: frames into isotp-c, then UDSServerPoll and udsota_poll, at least every millisecond. */
 static int serve(void)
 {
     boot();
@@ -410,6 +411,7 @@ static int serve(void)
             continue;
         }
         UDSServerPoll(&s_srv);
+        udsota_poll(&s_srv);
         if (s_reset) {
             s_reset = false;
             s_booting = true;

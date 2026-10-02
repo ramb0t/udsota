@@ -226,9 +226,14 @@ static void boot(void)
     g_now += 1500u;                               /* past iso14229's 1 s boot delay for 0x27 */
 }
 
+static bool s_pin = true;                         /* udsota_poll after each pass, as an app's server task does */
+
 static void tick(void)
 {
     UDSServerPoll(&s_srv);
+    if (s_pin) {
+        udsota_poll(&s_srv);
+    }
 }
 
 static int s_pendings;                            /* 0x78s the last xfer saw */
@@ -393,6 +398,7 @@ int main(void)
     EXPECT(B(0x34, 0x00, 0x44, 0, 0, 0, 0, 0, 0, 0x10, 0), B(0x7F, 0x34, 0x33));
     EXPECT(B(0x27, 0x01), B(0x7F, 0x27, 0x7E));   /* the extended level, in programming */
     EXPECT(B(0x27, 0x04, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16), B(0x7F, 0x27, 0x24));
+    EXPECT(B(0x27, 0x03), B(0x7F, 0x27, 0x36));   /* inside that delay: udsota_poll leaves a pending timer alone */
     g_now += 1100u;                               /* iso14229's delay after a refused key */
     EXPECT(B(0x27, 0x03), B(0x67, 0x03));
     EXPECT(B(0x27, 0x04, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16), B(0x7F, 0x27, 0x35));
@@ -519,7 +525,7 @@ int main(void)
     P.hang = true;
     const uint32_t t0 = g_now;
     EXPECT(B(0x31, 0x01, 0xFF, 0x01), B(0x7F, 0x31, 0x72));
-    CHECK(g_now - t0 >= 90000u && s_pendings >= 50);
+    CHECK(g_now - t0 >= 90000u && s_pendings >= 50 && s_pendings <= 61);   /* every 1.5 s: P2 timers kept */
     EXPECT(B(0x22, 0xF1, 0x86), B(0x62, 0xF1, 0x86, 0x01));
     EXPECT(B(0x22, 0xF1, 0xF1), B(0x62, 0xF1, 0xF1, UDSOTA_DL_WORKER_TIMEOUT));
     EXPECT(B(0x10, 0x02), B(0x7F, 0x10, 0x22));
@@ -611,6 +617,46 @@ int main(void)
     s_srv.xferIsActive = true;
     CHECK(udsota_end_session(&s_srv) && s_srv.sessionType == UDS_LEV_DS_DS && s_srv.securityLevel == 0 &&
           !s_srv.xferIsActive);
+
+    /* udsota_poll leaves iso14229's 1 s boot delay alone while it runs: a 27 just after UDSServerInit gets 0x37. */
+    boot();
+    g_now -= 1500u;                               /* back to just after UDSServerInit */
+    EXPECT(B(0x27, 0x01), B(0x7F, 0x27, 0x37));
+    g_now += 1500u;
+
+    /* udsota_poll: after 25.5 days of passes 2^20 ms apart (past 2^31 ms, the wrap), idle or answering a read on every
+     * pass, a read, the programming session and a seed are answered at once. The controls run without it: an idle
+     * server holds the read's answer, and a busy one answers 27 with 0x37, the boot delay read as pending again. */
+    for (int pin = 1; pin >= 0; pin--) {
+        for (int busy = 0; busy <= 1; busy++) {
+            s_pin = pin != 0;
+            boot();
+            for (uint32_t i = 0; i < 2100u; i++) {
+                g_now += 1u << 20;
+                tick();
+                if (busy) {
+                    EXPECT(B(0x22, 0xF1, 0x86), B(0x62, 0xF1, 0x86, 0x01));
+                }
+            }
+            if (pin && !busy) {                  /* now - 1 reads as expired in the same millisecond; now would not */
+                CHECK(s_srv.p2_timer == g_now - 1u && s_srv.sec_access_boot_delay_timer == g_now - 1u &&
+                      s_srv.sec_access_auth_fail_timer == g_now - 1u);
+            }
+            if (!pin && !busy) {
+                static const uint8_t read[] = {0x22, 0xF1, 0x86};
+                CHECK(xfer(read, sizeof read, resp, sizeof resp) == -1);
+                continue;
+            }
+            EXPECT(B(0x22, 0xF1, 0x86), B(0x62, 0xF1, 0x86, 0x01));
+            EXPECT(B(0x10, 0x02), B(0x50, 0x02));
+            if (pin) {
+                EXPECT(B(0x27, 0x03), B(0x67, 0x03));
+            } else {
+                EXPECT(B(0x27, 0x03), B(0x7F, 0x27, 0x37));
+            }
+        }
+    }
+    s_pin = true;
 
     if (g_failures != 0) {
         fprintf(stderr, "%d check(s) failed\n", g_failures);
