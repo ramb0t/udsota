@@ -4,6 +4,8 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ## [Unreleased]
 
+## [0.14.2] - 2026-10-02
+
 - Fixed, client: on udsota's own server, a block whose first 76 comes after P2 no longer stops a download. The client resends that block and takes the late 76 as the resend's answer, so the server's 76 to the repeat lands on the next request. After the last block that request is the 0x37, which now passes over the 76; before, it stopped the run with "unexpected answer to service 0x37". After any other block it is the next block, which now waits for its own answer within P2, not P2* (5.5 s, longer than S3), and retries a 0x21 to it with backoff. Before, when that own answer was lost or was 0x21, the client waited out P2* and the resend met a lapsed session, stopping the run with 0x7F. A server built on iso14229 answers the repeat 0x24 and ends the transfer, so there the run stops either way. Not breaking.
 
 ## [0.14.1] - 2026-10-02
