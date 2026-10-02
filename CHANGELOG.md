@@ -4,6 +4,8 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-10-02
+
 - Fixed, client: a 3E 00 keepalive that gets no answer no longer fails the request it goes ahead of. That request goes as usual with its own resend, and a 7E that comes late is passed over by the request it lands on. Before, the 3E's NoResponse came out of a request that was never sent. `flash` and `confirm` stopped with exit 1, the new image unconfirmed, when the 3E ahead of a ConfirmImage retry got no answer. `flash` logged "no answer to 0x37", "to FF01" or "to ActivateImage" and spent that request's one resend, so a lost answer after it (for ActivateImage, a lost request) ended the run. Two unanswered 3Es before ActivateImage read as a server that restarted on the old image, and `config set` said a group whose commit was never sent "may have committed". The keepalive that waits out a 0x37 to 27 follows the same rule. A 3E that passes over a late answer to an earlier request waits its P2 for its 7E, not P2* (5.5 s, longer than S3), and retries a 0x21. Not breaking.
 - Fixed, client: the keepalive is now checked before each retry after 0x21 as well as before the request. On a server that restarts S3 only on 10 and 3E, the 3.15 s of retries no longer let the session lapse before the last one, which then got 0x7F whether the server would have answered it or sent 0x21 again. With udsota's own server, a 3E 00 can now also go between 0x21 retries; a late answer to the retried request that lands on that 3E is passed over, and the retry gets the server's answer to a repeat. Not breaking.
 
