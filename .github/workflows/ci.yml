@@ -45,3 +45,4 @@ jobs:
           mkdir -p examples/candash_ws43/secrets
           espsecure.py generate_signing_key --version 2 examples/candash_ws43/secrets/dev_signing_key.pem
           idf.py -C examples/candash_ws43 -B build build
+          idf.py -C examples/candash_ws43 -B build-ws43b -DPOC_BOARD=ws43b build

@@ -105,7 +105,7 @@ udsota never changes iso14229's code. Where iso14229 has no call for what an upd
 | `udsota.c`, `udsota.h` | The updater, iso14229's events and the ESP-IDF platform. `udsota.h` ends with the platform functions a port to another MCU would supply |
 | `iso14229/` | iso14229, vendored unmodified, with its MIT licence and `SHA256SUMS`, which CI checks; its commit is in [THIRD_PARTY.md](THIRD_PARTY.md) |
 | `CMakeLists.txt` | The ESP-IDF component, or on a host the tests |
-| [`examples/candash_ws43`](examples/candash_ws43/README.md) | An app on the CANDash ws43 (ESP32-S3) with CANDash's identity, so updates go both ways |
+| [`examples/candash_ws43`](examples/candash_ws43/README.md) | An app on the CANDash ws43 or ws43b (ESP32-S3) with CANDash's identity, so updates go both ways |
 | `test/test_udsota.c` | The host test: updates through iso14229's mock transport into a RAM slot, plain and raw DEFLATE, under ASan and UBSan |
 | `test/e2e/` | `udsota_lite_server`: udsota and iso14229 as a Linux process with RAM A/B slots, for the client's end-to-end test |
 | [`client/`](client/README.md) | The `udsota` command-line tool, copied from udsota's releases, for Linux with SocketCAN |

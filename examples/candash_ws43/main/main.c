@@ -1,7 +1,7 @@
-/* udsota on iso14229, on the CANDash ws43 (Waveshare ESP32-S3-Touch-LCD-4.3). The app owns everything iso14229
- * needs, as an iso14229 user already does: the TWAI node, the server task that feeds isotp-c and calls UDSServerPoll
- * (then udsota_poll), and the event callback. The callback hands each event to udsota_event() first and serves the
- * rest (here, F191). */
+/* udsota on iso14229, on the CANDash ws43 (Waveshare ESP32-S3-Touch-LCD-4.3), or with POC_BOARD_WS43B the ws43b (the
+ * 4.3B). The app owns everything iso14229 needs, as an iso14229 user already does: the TWAI node, the server task that
+ * feeds isotp-c and calls UDSServerPoll (then udsota_poll), and the event callback. The callback hands each event to
+ * udsota_event() first and serves the rest (here, F191). */
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -27,21 +27,32 @@ static const char *TAG = "poc";
 /* CANDash's identity (CAN-Protocol-SPEC 1.20: Display_Diag_Request/Response), so images move both ways. */
 #define REQ_ID        0x7E6u
 #define RESP_ID       0x7EEu
-#define HW_ID         1u          /* BOARD_WS43 */
 #define LAYOUT_ID     1u          /* CANDASH_PARTITION_LAYOUT_ID: partitions.csv is CANDash's */
-#define BOARD_NAME    "ws43"      /* F191, which CANDash's client profile checks */
 #define DID_BOARD     0xF191u
 #define KEY_LABEL     "CANDash-SA-v1"
 
-/* The ws43's CAN: TWAI on GPIO20/19, 250 kbit/s at CANDash's timing (80 MHz / 16, 1 + 15 + 4 quanta, SJW 2). The
- * transceiver shares its pins with USB: CH422G EXIO5 high selects CAN. */
+/* The board's CAN: TWAI at 250 kbit/s at CANDash's timing (80 MHz / 16, 1 + 15 + 4 quanta, SJW 2). Its GPIOs and the
+ * CH422G expander's first byte are as in CANDash's ws_variant.h. The ws43's transceiver shares GPIO20/19 with USB,
+ * and EXIO5 high selects CAN. The ws43b's has GPIO15/16 to itself; its EXIO0 and EXIO5 are the DI0/DI1 inputs, which
+ * CANDash drives high (the CH422G has one direction bit for all its IOs). CANDash's ws43b_exio.h warns that this is
+ * unverified and may damage the CH422G or the DI optocoupler: don't power a ws43b with DI0/DI1 wired. */
+#if defined(POC_BOARD_WS43B)
+#define HW_ID         2u          /* BOARD_WS43B */
+#define BOARD_NAME    "ws43b"     /* F191, which CANDash's client profile checks */
+#define CAN_TX_GPIO   15
+#define CAN_RX_GPIO   16
+#define EXIO_BOOT     ((1u << 5) | (1u << 4) | (1u << 3) | (1u << 0))   /* DI1/DI0 high, SD_CS off, LCD out of reset */
+#else
+#define HW_ID         1u          /* BOARD_WS43 */
+#define BOARD_NAME    "ws43"
 #define CAN_TX_GPIO   20
 #define CAN_RX_GPIO   19
+#define EXIO_BOOT     ((1u << 5) | (1u << 4) | (1u << 3))   /* USB_SEL = CAN, SD_CS off, LCD out of reset */
+#endif
 #define I2C_SDA       8
 #define I2C_SCL       9
 #define CH422G_MODE   0x24u       /* the CH422G's registers are I2C addresses */
 #define CH422G_IO_OUT 0x38u
-#define EXIO_BOOT     ((1u << 5) | (1u << 4) | (1u << 3))   /* USB_SEL = CAN, SD_CS off, LCD out of reset */
 
 #define TX_SLOTS      16u
 #define RX_QUEUE_LEN  64u
@@ -135,8 +146,9 @@ static esp_err_t can_start(void)
     return twai_node_enable(s_node);
 }
 
-/* The ws43's CH422G: CAN selected on the shared pins, backlight off. Write, enable outputs, write again. */
-static esp_err_t select_can(void)
+/* The CH422G's EXIO_BOOT, backlight off (on the ws43, CAN selected on the shared pins). Write, enable outputs, write
+ * again. */
+static esp_err_t expander_boot(void)
 {
     i2c_master_bus_handle_t bus;
     const i2c_master_bus_config_t bus_cfg = {
@@ -297,7 +309,7 @@ static esp_err_t server_start(void)
 void app_main(void)
 {
     ESP_LOGI(TAG, "udsota on iso14229 (%s)", esp_app_get_description()->version);
-    esp_err_t err = select_can();
+    esp_err_t err = expander_boot();
     if (err == ESP_OK) {
         err = can_start();
     }
