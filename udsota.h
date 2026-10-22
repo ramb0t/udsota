@@ -157,6 +157,18 @@ bool     udsota_busy(void);
 void     udsota_progress(udsota_progress_t *out);
 /* True while the running image waits for 31 01 F002 (with rollback on, a reset would roll it back). Any task. */
 bool     udsota_unconfirmed(void);
+/* The lock that serialises PSA crypto between udsota and the app's own PSA users, since TF-PSA-Crypto's operations
+ * are not thread-safe. udsota holds it for its key setup in udsota_init and its 0x27 check on the server's task, and
+ * for esp_ota_end (FF01) and esp_ota_set_boot_partition (F001) on the flash worker. Takes it within wait_ms
+ * (UDSOTA_PSA_WAIT_FOREVER: no limit); true when held. Any task but an ISR; it is not recursive. On ESP-IDF it
+ * returns true without locking before udsota_init, udsota's 0x27 check waits 40 ms for it and answers 0x22 when the
+ * app holds it longer, and the worker waits as long as it takes. A host build is one task: the lock is a depth
+ * counter that locks before udsota_init too, and any take while it is held fails at once, so 0x27 answers 0x22
+ * and FF01 and F001 fail with UDSOTA_DL_VERIFY_FAILED. */
+#define UDSOTA_PSA_WAIT_FOREVER UINT32_MAX
+bool     udsota_psa_lock(uint32_t wait_ms);
+/* Releases the lock udsota_psa_lock() took, on the same task. */
+void     udsota_psa_unlock(void);
 
 /* ---- Porting and host tests ----
  * The platform under the updater. On ESP-IDF udsota.c defines these; anywhere else the build supplies them (the

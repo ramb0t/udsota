@@ -2,7 +2,7 @@
  *   1. the wire contract and state
  *   2. the image rules: what the first 320 bytes must say before anything is erased
  *   3. compressed downloads: raw DEFLATE through the ROM's tinfl into the image
- *   4. 0x27 keys: HMAC per device, or ECDSA signatures
+ *   4. 0x27 keys: HMAC per device, or ECDSA signatures, and the PSA lock around udsota's PSA calls
  *   5. the updater: 34, 36, 37, the routines, the DIDs and the session rules
  *   6. iso14229's events
  *   7. the ESP-IDF platform: the flash worker on esp_ota_*, the slot status, identity and crypto
@@ -23,6 +23,7 @@
 #include "esp_random.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "miniz.h"                 /* esp_rom's: tinfl_decompress runs from ROM */
 _Static_assert(sizeof(tinfl_decompressor) == 10992u && TINFL_LZ_DICT_SIZE == 32768, "the ROM's tinfl layout");
@@ -56,6 +57,7 @@ _Static_assert(sizeof(tinfl_decompressor) == 10992u && TINFL_LZ_DICT_SIZE == 327
 #define SIG_LEN         64u        /* ECDSA mode: r || s over SHA-256 of the message below */
 #define SIG_TAG         "udsota-27-ecdsa-v1"
 #define SEED_VALID_MS   30000u
+#define KEY_LOCK_MS     40u        /* 0x27's wait for the PSA lock: an app that holds it longer gets 0x22 */
 #define ID_MAX          16u
 #define LABEL_MAX       32u
 #define MAX_BLOCK       4095u      /* 34's maxNumberOfBlockLength: SID, BSC and 4093 data bytes */
@@ -325,16 +327,77 @@ static int job_zend(void)
     return ok ? UDSOTA_DL_OK : (failed != UDSOTA_DL_OK ? failed : UDSOTA_DL_BAD_STREAM);
 }
 
-/* ==== 4. 0x27 keys ==== */
+/* ==== 4. 0x27 keys and the PSA lock ==== */
+
+/* The PSA lock (udsota.h). On ESP-IDF a FreeRTOS mutex in static storage, created by udsota_init before its key
+ * setup, so the worker inherits a waiting task's priority while it holds it. A host build is one task: the lock is a
+ * depth that the host test reads, and a wait on it held fails at once. */
+#if defined(ESP_PLATFORM)
+static StaticSemaphore_t s_psa_storage;
+static SemaphoreHandle_t s_psa;
+
+static void psa_lock_init(void)
+{
+    if (s_psa == NULL) {
+        s_psa = xSemaphoreCreateMutexStatic(&s_psa_storage);
+    }
+}
+
+bool udsota_psa_lock(uint32_t wait_ms)
+{
+    if (s_psa == NULL) {
+        return true;                                     /* before udsota_init: only start code runs */
+    }
+    const TickType_t ticks = (wait_ms == UDSOTA_PSA_WAIT_FOREVER) ? portMAX_DELAY : pdMS_TO_TICKS(wait_ms);
+    return xSemaphoreTake(s_psa, ticks) == pdTRUE;
+}
+
+void udsota_psa_unlock(void)
+{
+    if (s_psa != NULL) {
+        (void)xSemaphoreGive(s_psa);
+    }
+}
+#else
+static int s_psa_depth;
+
+static void psa_lock_init(void) {}
+
+bool udsota_psa_lock(uint32_t wait_ms)
+{
+    (void)wait_ms;
+    if (s_psa_depth != 0) {
+        return false;
+    }
+    s_psa_depth++;
+    return true;
+}
+
+void udsota_psa_unlock(void)
+{
+    s_psa_depth--;
+}
+
+#if defined(UDSOTA_TEST)
+int udsota_test_psa_depth(void)
+{
+    return s_psa_depth;
+}
+#endif
+#endif
 
 /* HMAC mode: the expected key for seed at requestSeed level: HMAC-SHA256(K_dev, seed || level || ID)[0..15]. */
 static bool hmac_key(const uint8_t seed[SEED_LEN], uint8_t level, uint8_t key[KEY_LEN])
 {
-    uint8_t msg[SEED_LEN + 1u + ID_MAX], full[32];
+    uint8_t msg[SEED_LEN + 1u + ID_MAX], full[32] = {0};
     memcpy(msg, seed, SEED_LEN);
     msg[SEED_LEN] = level;
     memcpy(&msg[SEED_LEN + 1u], U.devid, U.devid_len);
-    const bool ok = U.key_ok && udsota_plat_hmac(U.kdev, sizeof U.kdev, msg, SEED_LEN + 1u + U.devid_len, full);
+    bool ok = U.key_ok && udsota_psa_lock(KEY_LOCK_MS);
+    if (ok) {
+        ok = udsota_plat_hmac(U.kdev, sizeof U.kdev, msg, SEED_LEN + 1u + U.devid_len, full);
+        udsota_psa_unlock();
+    }
     memcpy(key, full, KEY_LEN);
     wipe(full, sizeof full);
     wipe(msg, sizeof msg);
@@ -353,7 +416,12 @@ static int ecdsa_check(const uint8_t seed[SEED_LEN], uint8_t level, const uint8_
     msg[n++] = level;
     msg[n++] = (uint8_t)U.devid_len;
     memcpy(&msg[n], U.devid, U.devid_len);
-    return U.key_ok ? udsota_plat_ecdsa(msg, n + U.devid_len, sig) : -1;
+    if (!U.key_ok || !udsota_psa_lock(KEY_LOCK_MS)) {
+        return -1;
+    }
+    const int v = udsota_plat_ecdsa(msg, n + U.devid_len, sig);
+    udsota_psa_unlock();
+    return v;
 }
 
 /* ==== 5. The updater ==== */
@@ -643,8 +711,27 @@ static int transfer_exit(const UDSServer_t *srv, size_t extra)
 
 /* ---- 31 01: FF01 verify, F000 resume point, F001 activate, F002 confirm ---- */
 
-static int job_verify(void) { return udsota_plat_end(); }
-static int job_activate(void) { return udsota_plat_activate(); }
+/* esp_ota_end and esp_ota_set_boot_partition hash through PSA. The wait has no limit: the app holds it briefly. */
+static int job_verify(void)
+{
+    if (!udsota_psa_lock(UDSOTA_PSA_WAIT_FOREVER)) {
+        return UDSOTA_DL_VERIFY_FAILED;
+    }
+    const int r = udsota_plat_end();
+    udsota_psa_unlock();
+    return r;
+}
+
+static int job_activate(void)
+{
+    if (!udsota_psa_lock(UDSOTA_PSA_WAIT_FOREVER)) {
+        return UDSOTA_DL_VERIFY_FAILED;
+    }
+    const int r = udsota_plat_activate();
+    udsota_psa_unlock();
+    return r;
+}
+
 static int job_confirm(void) { return udsota_plat_confirm(); }
 
 static int one_byte(uint8_t *status, size_t *status_len, uint8_t b)
@@ -1068,6 +1155,7 @@ int udsota_init(const udsota_cfg_t *cfg)
     if (U.started || cfg == NULL || udsota_image_desc.magic != 0x5544534Fu) {
         return -1;
     }
+    psa_lock_init();
     U.cfg = *cfg;
     U.product = (cfg->product != NULL) ? cfg->product : udsota_plat_project();
     const char *v = udsota_plat_version();
@@ -1088,14 +1176,18 @@ int udsota_init(const udsota_cfg_t *cfg)
     if (U.devid_len == 0u) {
         LOGW("no device ID (a bad device_id_len, or no MAC)");
     } else if (U.sec_ecdsa) {
-        U.key_ok = cfg->key_pubkey != NULL && cfg->key_pubkey_len == 65u && udsota_plat_ecdsa_key(cfg->key_pubkey) == 0;
+        if (cfg->key_pubkey != NULL && cfg->key_pubkey_len == 65u && udsota_psa_lock(UDSOTA_PSA_WAIT_FOREVER)) {
+            U.key_ok = udsota_plat_ecdsa_key(cfg->key_pubkey) == 0;
+            udsota_psa_unlock();
+        }
     } else if (U.sec_on && cfg->key_label != NULL && cfg->key_master != NULL) {
         uint8_t msg[LABEL_MAX + ID_MAX];
         const size_t ln = strnlen(cfg->key_label, LABEL_MAX + 1u);
-        if (ln <= LABEL_MAX) {
+        if (ln <= LABEL_MAX && udsota_psa_lock(UDSOTA_PSA_WAIT_FOREVER)) {
             memcpy(msg, cfg->key_label, ln);
             memcpy(&msg[ln], U.devid, U.devid_len);
             U.key_ok = udsota_plat_hmac(cfg->key_master, cfg->key_master_len, msg, ln + U.devid_len, U.kdev);
+            udsota_psa_unlock();
         }
         wipe(msg, sizeof msg);
     }

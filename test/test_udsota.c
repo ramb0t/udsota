@@ -1,8 +1,8 @@
 /* End-to-end host test: iso14229's server on its mock transport, udsota in the app's event callback, and a platform
- * of this file's own (a RAM slot, jobs that stay pending a while as the ESP32 worker's do, a stand-in HMAC). A tester
- * sends raw requests on a clock the test sets. It covers a whole update (10 02, 27 03/04, 34, 36s through 0x78, 37,
- * FF01, F001 and the restart, F002 after it), a compressed one, the image rules, and the edges where udsota keeps
- * itself in step with iso14229. */
+ * of this file's own (a RAM slot, jobs that stay pending a while as the ESP32 worker's do, stand-ins for HMAC and
+ * ECDSA). A tester sends raw requests on a clock the test sets. It covers a whole update (10 02, 27 03/04, 34, 36s
+ * through 0x78, 37, FF01, F001 and the restart, F002 after it), a compressed one, the image rules, the PSA lock, and
+ * the edges where udsota keeps itself in step with iso14229. */
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -19,6 +19,7 @@
 
 UDSOTA_IMAGE_DESC(1, 1, TESTER, SERVER);
 void udsota_test_reboot(void);
+int  udsota_test_psa_depth(void);
 
 static uint32_t g_now = 1000u;
 uint32_t UDSMillis(void)
@@ -37,6 +38,9 @@ static int g_failures;
 
 /* ---- The platform: a RAM slot and a worker whose jobs finish after P.delay polls ---- */
 
+/* The platform calls that run PSA on ESP-IDF: each must run under udsota's PSA lock. */
+enum { PSA_HMAC, PSA_ECDSA_KEY, PSA_ECDSA, PSA_END, PSA_ACTIVATE, PSA_CALLS };
+
 static struct {
     int (*job)(void);
     int      countdown, result, delay;
@@ -48,7 +52,16 @@ static struct {
     udsota_status_t st;
     int      aborts, activations, confirms;
     uint8_t  seed_ctr;
+    int      psa_calls[PSA_CALLS], psa_unlocked;
 } P = {.delay = 80};
+
+static void psa_call(int which)
+{
+    P.psa_calls[which]++;
+    if (udsota_test_psa_depth() != 1) {
+        P.psa_unlocked++;
+    }
+}
 
 int udsota_plat_start(void) { return 0; }
 int udsota_plat_run(int (*job)(void))
@@ -101,6 +114,7 @@ int udsota_plat_write(const uint8_t *d, size_t n)
 }
 int udsota_plat_end(void)
 {
+    psa_call(PSA_END);
     if (!P.open) {
         return P.verified ? UDSOTA_DL_OK : UDSOTA_DL_ABORTED;
     }
@@ -110,6 +124,7 @@ int udsota_plat_end(void)
 }
 int udsota_plat_activate(void)
 {
+    psa_call(PSA_ACTIVATE);
     if (!P.verified) {
         return UDSOTA_DL_VERIFY_FAILED;
     }
@@ -148,7 +163,7 @@ bool udsota_plat_rng16(uint8_t out[16])
     return true;
 }
 /* A stand-in for HMAC-SHA256: udsota only needs the same function on both sides. */
-bool udsota_plat_hmac(const uint8_t *key, size_t key_len, const uint8_t *msg, size_t msg_len, uint8_t out[32])
+static void stand_in_hmac(const uint8_t *key, size_t key_len, const uint8_t *msg, size_t msg_len, uint8_t out[32])
 {
     uint32_t h = 2166136261u;
     for (size_t i = 0; i < key_len; i++) {
@@ -161,21 +176,41 @@ bool udsota_plat_hmac(const uint8_t *key, size_t key_len, const uint8_t *msg, si
         h = (h ^ (uint8_t)i) * 16777619u;
         out[i] = (uint8_t)(h >> 24);
     }
+}
+bool udsota_plat_hmac(const uint8_t *key, size_t key_len, const uint8_t *msg, size_t msg_len, uint8_t out[32])
+{
+    psa_call(PSA_HMAC);
+    stand_in_hmac(key, key_len, msg, msg_len, out);
     return true;
 }
-int udsota_plat_ecdsa_key(const uint8_t *pubkey) { (void)pubkey; return -1; }
-int udsota_plat_ecdsa(const uint8_t *msg, size_t n, const uint8_t sig[64]) { (void)msg; (void)n; (void)sig; return -1; }
+/* A stand-in for ECDSA: any key imports, and a signature that starts 5A is valid. */
+int udsota_plat_ecdsa_key(const uint8_t *pubkey)
+{
+    (void)pubkey;
+    psa_call(PSA_ECDSA_KEY);
+    return 0;
+}
+int udsota_plat_ecdsa(const uint8_t *msg, size_t n, const uint8_t sig[64])
+{
+    (void)msg;
+    (void)n;
+    psa_call(PSA_ECDSA);
+    return (sig[0] == 0x5Au) ? 1 : 0;
+}
 
 /* ---- The app ---- */
 
 static const char    k_label[] = "udsota-test";
 static const uint8_t k_master[32] = {1, 2, 3, 4, 5, 6, 7, 8};
 static const uint8_t k_id[6] = {0x02, 0, 0, 0, 0, 0x01};
+static const uint8_t k_pub[65] = {0x04};
 static UDSServer_t s_srv;
 static UDSTp_t    *s_tester;
 static int         s_resets;
 static uint8_t     s_gate_36;             /* the gate's answer to CONTINUE_TRANSFER */
 static bool        s_allow_downgrade;     /* cfg.allow_downgrade at the next boot */
+static bool        s_ecdsa;               /* the ECDSA mode at the next boot, with k_pub */
+static int         s_app_psa;             /* 1 while the app holds the PSA lock */
 
 static UDSErr_t app_fn(UDSServer_t *srv, UDSEvent_t ev, void *arg)
 {
@@ -220,9 +255,14 @@ static void boot(void)
     assert(UDSServerInit(&s_srv) == UDS_OK);
     s_srv.tp = server_tp;
     s_srv.fn = app_fn;
-    const udsota_cfg_t cfg = {.key_label = k_label, .key_master = k_master, .key_master_len = sizeof k_master,
-                              .gate = gate, .reset = do_reset, .allow_downgrade = s_allow_downgrade};
+    udsota_cfg_t cfg = {.key_label = k_label, .key_master = k_master, .key_master_len = sizeof k_master,
+                        .gate = gate, .reset = do_reset, .allow_downgrade = s_allow_downgrade};
+    if (s_ecdsa) {
+        cfg.key_pubkey = k_pub;
+        cfg.key_pubkey_len = sizeof k_pub;
+    }
     assert(udsota_init(&cfg) == 0);
+    CHECK(udsota_test_psa_depth() == 0);
     g_now += 1500u;                               /* past iso14229's 1 s boot delay for 0x27 */
 }
 
@@ -254,6 +294,7 @@ static int xfer(const uint8_t *req, size_t len, uint8_t *resp, size_t max)
                 s_pendings++;
                 continue;
             }
+            CHECK(udsota_test_psa_depth() == s_app_psa);   /* udsota's locks and unlocks balance */
             return (int)n;
         }
     }
@@ -281,11 +322,11 @@ static void tester_key(const uint8_t *seed, uint8_t level, uint8_t key[16])
     uint8_t kdev[32], msg[64], full[32];
     memcpy(msg, k_label, sizeof k_label - 1u);
     memcpy(&msg[sizeof k_label - 1u], k_id, sizeof k_id);
-    udsota_plat_hmac(k_master, sizeof k_master, msg, sizeof k_label - 1u + sizeof k_id, kdev);
+    stand_in_hmac(k_master, sizeof k_master, msg, sizeof k_label - 1u + sizeof k_id, kdev);
     memcpy(msg, seed, 16);
     msg[16] = level;
     memcpy(&msg[17], k_id, sizeof k_id);
-    udsota_plat_hmac(kdev, sizeof kdev, msg, 17u + sizeof k_id, full);
+    stand_in_hmac(kdev, sizeof kdev, msg, 17u + sizeof k_id, full);
     memcpy(key, full, 16);
 }
 
@@ -657,6 +698,45 @@ int main(void)
         }
     }
     s_pin = true;
+
+    /* The PSA lock held by the app: a key answers 0x22 without running the crypto, and the seed is spent; once the
+     * lock is free, the next seed's key unlocks. The same in the ECDSA mode, where a good signature unlocks. */
+    for (int ecdsa = 0; ecdsa <= 1; ecdsa++) {
+        s_ecdsa = ecdsa != 0;
+        boot();
+        EXPECT(B(0x10, 0x03), B(0x50, 0x03));
+        uint8_t req[2 + 64] = {0x27, 0x01}, seed[64];
+        const size_t key_len = ecdsa ? 64u : 16u;
+        const int calls = P.psa_calls[ecdsa ? PSA_ECDSA : PSA_HMAC];
+        CHECK(xfer(req, 2, seed, sizeof seed) == 18);
+        req[1] = 0x02;
+        if (ecdsa) {
+            req[2] = 0x5A;
+        } else {
+            tester_key(&seed[2], 0x01, &req[2]);
+        }
+        CHECK(udsota_psa_lock(0));
+        s_app_psa = 1;
+        CHECK(xfer(req, 2 + key_len, resp, sizeof resp) == 3 && resp[0] == 0x7F && resp[2] == 0x22);
+        CHECK(P.psa_calls[ecdsa ? PSA_ECDSA : PSA_HMAC] == calls);
+        udsota_psa_unlock();
+        s_app_psa = 0;
+        g_now += 1100u;                           /* iso14229's delay after a refused key */
+        req[1] = 0x01;
+        CHECK(xfer(req, 2, seed, sizeof seed) == 18);
+        req[1] = 0x02;
+        if (!ecdsa) {
+            tester_key(&seed[2], 0x01, &req[2]);
+        }
+        CHECK(xfer(req, 2 + key_len, resp, sizeof resp) == 2 && resp[0] == 0x67 && resp[1] == 0x02);
+    }
+    s_ecdsa = false;
+
+    /* Every PSA call of the run held the lock, and each kind ran. */
+    CHECK(P.psa_unlocked == 0 && udsota_test_psa_depth() == 0);
+    for (int i = 0; i < PSA_CALLS; i++) {
+        CHECK(P.psa_calls[i] > 0);
+    }
 
     if (g_failures != 0) {
         fprintf(stderr, "%d check(s) failed\n", g_failures);
