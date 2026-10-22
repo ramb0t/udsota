@@ -109,9 +109,9 @@ CFG_COMMIT_RID, CFG_HASH_DID, CFG_STATUS_DID = 0x1234, 0xF1B0, 0xF1B2   # CONF's
 CFG_VALUES = {0x0200: b"\x01", 0x0201: b"\x07\xd0", 0x0202: b"\xaa\xbb", 0x0205: b"\x2a"}   # 0x0203 is absent
 
 
-# The ecdsa mode's known answers, pinned in udsota_keys.c (KAT_SIG_*) and test/test_udsota_keys.c too: the
-# message for SEED, level 0x03 and MAC, its SHA-256, and the test key (private scalar 01 02 .. 20) with its
-# signature over that message.
+# The ecdsa mode's known answers: the message for SEED, level 0x03 and MAC, which test/test_udsota.c checks is the
+# message udsota.c verifies, its SHA-256, and the test key (private scalar 01 02 .. 20) with its signature over that
+# message.
 SIG_MSG_L3 = bytes.fromhex("7564736f74612d32372d65636473612d7631101112131415161718191a1b1c1d1e1f0306020000000001")
 SIG_DIGEST_L3 = "af914ba6ad030d8ac102fe70ba98255a9e50ad7c45373941db3d4aaac246b4ce"
 KAT_SCALAR = int.from_bytes(bytes(range(1, 33)), "big")
@@ -627,8 +627,8 @@ def test_seed_key_vectors(level):
     assert keys.seed_key(keys.derive_k_dev(MASTER, P.security.label, MAC), SEED, level, MAC) == KEYS[level]
 
 
-# Check the core's known-answer test (udsota_keys.c, KAT_*): label udsota-kat, master 0..31, ID 02:00:00:00:00:01,
-# seed 0x10..0x1F. The C self-test and test/test_udsota_keys.c pin the same bytes.
+# Check the hmac mode's known answers: label udsota-kat, master 0..31, ID 02:00:00:00:00:01, seed 0x10..0x1F.
+# test/test_udsota.c pins the ecdsa mode's message, not these; test_e2e_lite.py unlocks udsota.c's hmac mode.
 def test_core_kat_vectors():
     k_dev = keys.derive_k_dev(MASTER, b"udsota-kat", MAC)
     assert k_dev.hex() == "7bac00ce789369a8fb6f3ce1d1fbe7fea02cd3cdbed02a23a0a48a9d1a268757"
@@ -656,7 +656,7 @@ def test_load_master_refuses_anything_else(tmp_path, content):
 
 # ---- keys: the ecdsa mode ----
 
-# Check the signed message and its SHA-256 against the bytes udsota_keys.c builds (test/test_udsota_keys.c pins them).
+# Check the signed message and its SHA-256 against the bytes udsota.c verifies (test/test_udsota.c pins them).
 def test_sig_message_known_answer():
     m = keys.sig_message(SEED, 0x03, MAC)
     assert m == SIG_MSG_L3 and hashlib.sha256(m).hexdigest() == SIG_DIGEST_L3
@@ -671,8 +671,8 @@ def test_sig_message_refuses_bad_input(seed, device_id):
         keys.sig_message(seed, 0x03, device_id)
 
 
-# Check the device's ECDSA self-test vector (udsota_keys.c KAT_SIG_*): the test scalar's public point, and a
-# signature that verifies over the level-3 message and not over the level-1 one.
+# Check the test key the client's ecdsa tests sign with: the test scalar's public point, and a signature that
+# verifies over the level-3 message and not over the level-1 one.
 def test_sig_self_test_vector():
     assert keys.public_point(ec.derive_private_key(KAT_SCALAR, ec.SECP256R1())) == KAT_PUB
     assert ecdsa_valid(KAT_PUB, KAT_SIG_L3, SIG_MSG_L3)

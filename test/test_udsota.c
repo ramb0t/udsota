@@ -1,10 +1,12 @@
 /* End-to-end host test: iso14229's server on its mock transport, udsota in the app's event callback, and a platform
  * of this file's own (a RAM slot, jobs that stay pending a while as the ESP32 worker's do, stand-ins for HMAC and
  * ECDSA). A tester sends raw requests on a clock the test sets. It covers a whole update (10 02, 27 03/04, 34, 36s
- * through 0x78, 37, FF01, F001 and the restart, F002 after it), a compressed one, the image rules, the PSA lock, and
- * the edges where udsota keeps itself in step with iso14229. */
+ * through 0x78, 37, FF01, F001 and the restart, F002 after it), a compressed one, the image rules (case by case on
+ * the first block too), a corrupt and a short compressed stream, security off, the message the ECDSA mode verifies,
+ * the PSA lock, and the edges where udsota keeps itself in step with iso14229. */
 #include <assert.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,6 +22,16 @@
 UDSOTA_IMAGE_DESC(1, 1, TESTER, SERVER);
 void udsota_test_reboot(void);
 int  udsota_test_psa_depth(void);
+udsota_reason_t udsota_test_check_first(const uint8_t *b, size_t len, uint32_t size);
+
+/* The descriptor's layout is wire: every unit's image rules and the client (client/udsota/image.py) read it at these
+ * offsets from byte 288 of an image. */
+_Static_assert(sizeof(udsota_image_desc_t) == 32u, "udsota_image_desc_t is 32 bytes");
+_Static_assert(offsetof(udsota_image_desc_t, magic) == 0u && offsetof(udsota_image_desc_t, desc_version) == 4u &&
+               offsetof(udsota_image_desc_t, hw_id) == 6u && offsetof(udsota_image_desc_t, partition_layout_id) == 7u &&
+               offsetof(udsota_image_desc_t, diag_request_id) == 8u &&
+               offsetof(udsota_image_desc_t, diag_response_id) == 10u && offsetof(udsota_image_desc_t, flags) == 12u &&
+               offsetof(udsota_image_desc_t, reserved) == 13u, "udsota_image_desc_t's fields at their wire offsets");
 
 static uint32_t g_now = 1000u;
 uint32_t UDSMillis(void)
@@ -52,8 +64,12 @@ static struct {
     udsota_status_t st;
     int      aborts, activations, confirms;
     uint8_t  seed_ctr;
+    bool     seed_kat;                 /* seeds are 10 11 .. 1F, the client's known-answer SEED */
     int      psa_calls[PSA_CALLS], psa_unlocked;
-} P = {.delay = 80};
+    uint8_t  ecdsa_msg[64];            /* the last message the ECDSA check verified */
+    size_t   ecdsa_len;
+    const char *version;               /* the running image's version */
+} P = {.delay = 80, .version = "0.4.1-lite.1"};
 
 static void psa_call(int which)
 {
@@ -141,7 +157,7 @@ int udsota_plat_confirm(void)
 void udsota_plat_unverify(void) { P.verified = false; }
 void udsota_plat_status(udsota_status_t *out) { *out = P.st; }
 uint32_t udsota_plat_slot_size(void) { return SLOT; }
-const char *udsota_plat_version(void) { return "0.4.1-lite.1"; }
+const char *udsota_plat_version(void) { return P.version; }
 const char *udsota_plat_project(void) { return "udsota-test"; }
 const uint8_t *udsota_plat_sha(void)
 {
@@ -157,7 +173,7 @@ size_t udsota_plat_mac(uint8_t out[16])
 bool udsota_plat_rng16(uint8_t out[16])
 {
     for (int i = 0; i < 16; i++) {
-        out[i] = (uint8_t)(0xA0u + P.seed_ctr + i);
+        out[i] = (uint8_t)(P.seed_kat ? 0x10u + i : 0xA0u + P.seed_ctr + i);
     }
     P.seed_ctr++;
     return true;
@@ -192,9 +208,9 @@ int udsota_plat_ecdsa_key(const uint8_t *pubkey)
 }
 int udsota_plat_ecdsa(const uint8_t *msg, size_t n, const uint8_t sig[64])
 {
-    (void)msg;
-    (void)n;
     psa_call(PSA_ECDSA);
+    P.ecdsa_len = (n <= sizeof P.ecdsa_msg) ? n : 0u;
+    memcpy(P.ecdsa_msg, msg, P.ecdsa_len);
     return (sig[0] == 0x5Au) ? 1 : 0;
 }
 
@@ -210,7 +226,9 @@ static int         s_resets;
 static uint8_t     s_gate_36;             /* the gate's answer to CONTINUE_TRANSFER */
 static bool        s_allow_downgrade;     /* cfg.allow_downgrade at the next boot */
 static bool        s_ecdsa;               /* the ECDSA mode at the next boot, with k_pub */
+static bool        s_no_keys;             /* no keys at the next boot: security off */
 static int         s_app_psa;             /* 1 while the app holds the PSA lock */
+static int         s_app_27;              /* 27s that reached the app */
 
 static UDSErr_t app_fn(UDSServer_t *srv, UDSEvent_t ev, void *arg)
 {
@@ -223,6 +241,10 @@ static UDSErr_t app_fn(UDSServer_t *srv, UDSEvent_t ev, void *arg)
         return UDS_NRC_RequestOutOfRange;
     case UDS_EVT_DiagSessCtrl:
         return UDS_NRC_SubFunctionNotSupported;
+    case UDS_EVT_SecAccessRequestSeed:
+    case UDS_EVT_SecAccessValidateKey:
+        s_app_27++;
+        return UDS_NRC_RequestOutOfRange;
     case UDS_EVT_SessionTimeout:
     case UDS_EVT_Err:
         return UDS_OK;
@@ -255,9 +277,14 @@ static void boot(void)
     assert(UDSServerInit(&s_srv) == UDS_OK);
     s_srv.tp = server_tp;
     s_srv.fn = app_fn;
+    s_srv.p2_ms = 5;                              /* as the examples set it */
     udsota_cfg_t cfg = {.key_label = k_label, .key_master = k_master, .key_master_len = sizeof k_master,
                         .gate = gate, .reset = do_reset, .allow_downgrade = s_allow_downgrade};
-    if (s_ecdsa) {
+    if (s_no_keys) {
+        cfg.key_label = NULL;
+        cfg.key_master = NULL;
+        cfg.key_master_len = 0;
+    } else if (s_ecdsa) {
         cfg.key_pubkey = k_pub;
         cfg.key_pubkey_len = sizeof k_pub;
     }
@@ -407,6 +434,163 @@ static void refused(const uint8_t *img, uint8_t reason)
     CHECK(xfer(req, sizeof req, resp, sizeof resp) == 8 && memcmp(resp, want, sizeof want) == 0);
 }
 
+/* ---- The first-block rules, case by case ----
+ * Each case starts udsota on a running image of its version and runs the image rules on a first block from stamp_as:
+ * a dev build 0.4.1-lite.2 of udsota-test for the ESP32-S3 and this board (hw 1, layout 1, TESTER and SERVER), with
+ * the case's changes. The names are those of the v0.14.2 tests whose rules these keep (test_udsota_image.c and
+ * test_udsota_esp32_image.c). */
+#define FULL32 "abcdefghijklmnopqrstuvwxyz012345"   /* a project name that fills its 32-byte field */
+#define POKE(...) .poke = {__VA_ARGS__}, .pokes = (int)(sizeof((struct poke_s[]){__VA_ARGS__}) / sizeof(struct poke_s))
+struct poke_s {
+    uint16_t at;
+    uint8_t  val;
+};
+typedef struct {
+    const char     *name;
+    const char     *running;        /* the running image's version; NULL = 0.4.1-lite.1 */
+    const char     *version;        /* the image's; NULL = 0.4.1-lite.2 */
+    uint8_t         flags;          /* the image descriptor's: 0x01 a release */
+    const char     *project;        /* the image's; NULL = udsota-test */
+    const char     *product;        /* cfg.product; NULL = the running image's project, udsota-test */
+    bool            allow_downgrade;
+    struct poke_s   poke[2];        /* bytes set after stamping */
+    int             pokes;
+    size_t          len;            /* bytes the rules get; 0 = 320 */
+    uint32_t        size;           /* the 34's memorySize; 0 = 8192 */
+    udsota_reason_t want;
+} first_case_t;
+
+static const first_case_t k_first[] = {
+    {"first_block_passes", .want = UDSOTA_DL_OK},
+    {"size: the slot", .size = SLOT, .want = UDSOTA_DL_OK},
+    {"size: a byte over the slot", .size = SLOT + 1u, .want = UDSOTA_DL_TOO_BIG},
+    {"size: under 320", .size = 319u, .want = UDSOTA_DL_BAD_HEADER},
+    {"short_or_null: 319 bytes", .len = 319u, .want = UDSOTA_DL_BAD_HEADER},
+    {"bad_image_magic", POKE({0, 0xEA}), .want = UDSOTA_DL_BAD_HEADER},
+    {"wrong_chip: ESP32-S2", POKE({12, 0x02}), .want = UDSOTA_DL_BAD_HEADER},
+    {"wrong_chip: its high byte", POKE({13, 0x01}), .want = UDSOTA_DL_BAD_HEADER},
+    {"spi_mode: 5", POKE({2, 5}), .want = UDSOTA_DL_OK},
+    {"spi_mode: 6", POKE({2, 6}), .want = UDSOTA_DL_BAD_HEADER},
+    {"segment_count: 16", POKE({1, 16}), .want = UDSOTA_DL_OK},
+    {"segment_count: 0", POKE({1, 0}), .want = UDSOTA_DL_BAD_HEADER},
+    {"segment_count: 17", POKE({1, 17}), .want = UDSOTA_DL_BAD_HEADER},
+    {"seg0_too_short: 288", POKE({28, 0x20}, {29, 0x01}), .want = UDSOTA_DL_OK},
+    {"seg0_too_short: 287", POKE({28, 0x1F}, {29, 0x01}), .want = UDSOTA_DL_BAD_HEADER},
+    {"seg0_too_short: 0x01000000", POKE({29, 0x00}, {31, 0x01}), .want = UDSOTA_DL_OK},
+    {"bad_app_desc_magic", POKE({32, 0x33}), .want = UDSOTA_DL_BAD_HEADER},
+    {"bad_app_desc_magic: its top byte", POKE({35, 0xAC}), .want = UDSOTA_DL_BAD_HEADER},
+    {"wrong_project: one letter", .project = "udsota-tesu", .want = UDSOTA_DL_BAD_PROJECT},
+    {"wrong_project: longer", .project = "udsota-test2", .want = UDSOTA_DL_BAD_PROJECT},
+    {"wrong_project: shorter", .project = "udsota-tes", .want = UDSOTA_DL_BAD_PROJECT},
+    {"product_from_cfg", .product = "widget", .project = "widget", .want = UDSOTA_DL_OK},
+    {"product_from_cfg: not the running project", .product = "widget", .want = UDSOTA_DL_BAD_PROJECT},
+    {"product_fills_field", .project = FULL32, .product = FULL32, .want = UDSOTA_DL_OK},
+    {"product_fills_field: a longer product", .project = FULL32, .product = FULL32 "6", .want = UDSOTA_DL_BAD_PROJECT},
+    {"bad_desc_magic", POKE({288, 0x4E}), .want = UDSOTA_DL_BAD_BOARD},
+    {"bad_desc_magic: its top byte", POKE({291, 0x56}), .want = UDSOTA_DL_BAD_BOARD},
+    {"desc_version: 0", POKE({292, 0}), .want = UDSOTA_DL_BAD_BOARD},
+    {"desc_version: 2", POKE({292, 2}), .want = UDSOTA_DL_OK},
+    {"desc_version: 0x0100", POKE({292, 0}, {293, 1}), .want = UDSOTA_DL_OK},
+    {"wrong_board", POKE({294, 3}), .want = UDSOTA_DL_BAD_BOARD},
+    {"wrong_layout", POKE({295, 2}), .want = UDSOTA_DL_BAD_LAYOUT},
+    {"wrong_diag_ids: request", POKE({296, 0xE1}), .want = UDSOTA_DL_BAD_DIAG_IDS},
+    {"wrong_diag_ids: request's high byte", POKE({297, 0x08}), .want = UDSOTA_DL_BAD_DIAG_IDS},
+    {"wrong_diag_ids: response", POKE({298, 0xE9}), .want = UDSOTA_DL_BAD_DIAG_IDS},
+    {"wrong_diag_ids: response's high byte", POKE({299, 0x08}), .want = UDSOTA_DL_BAD_DIAG_IDS},
+    {"other_flag_bits_ignored: a release", .version = "0.5.0", .flags = 0xFF, .want = UDSOTA_DL_OK},
+    {"other_flag_bits_ignored: a dev build", .flags = 0xFE, .want = UDSOTA_DL_OK},
+    {"release_equal_not_newer", .running = "1.2.3", .version = "v1.2.3", .flags = 1, .want = UDSOTA_DL_NOT_NEWER},
+    {"release_older_not_newer: patch", .running = "1.2.3", .version = "v1.2.2", .flags = 1,
+     .want = UDSOTA_DL_NOT_NEWER},
+    {"release_older_not_newer: minor", .running = "1.2.3", .version = "1.1.9", .flags = 1,
+     .want = UDSOTA_DL_NOT_NEWER},
+    {"release_older_not_newer: major", .running = "1.2.3", .version = "v0.255.255", .flags = 1,
+     .want = UDSOTA_DL_NOT_NEWER},
+    {"release_newer_ok: patch", .running = "1.2.3", .version = "v1.2.4", .flags = 1, .want = UDSOTA_DL_OK},
+    {"release_newer_ok: minor", .running = "1.2.3", .version = "1.3.0", .flags = 1, .want = UDSOTA_DL_OK},
+    {"release_newer_ok: major", .running = "1.255.255", .version = "v2.0.0", .flags = 1, .want = UDSOTA_DL_OK},
+    {"dev_equal_ok: describe", .running = "0.1.0-dev", .version = "v0.1.0-3-gabc1234", .want = UDSOTA_DL_OK},
+    {"dev_equal_ok: dirty", .running = "0.1.0-dev", .version = "v0.1.0-dirty", .want = UDSOTA_DL_OK},
+    {"dev_equal_ok: build metadata", .running = "0.1.0-dev", .version = "0.1.0+devkit", .want = UDSOTA_DL_OK},
+    {"dev_older_not_newer", .running = "0.2.0-dev", .version = "v0.1.9-12-gabc1234-dirty",
+     .want = UDSOTA_DL_NOT_NEWER},
+    {"release_over_running_rc_same_core_ok", .running = "1.2.3-rc1", .version = "v1.2.3", .flags = 1,
+     .want = UDSOTA_DL_OK},
+    {"release_older_than_running_rc_not_newer", .running = "1.2.3-rc1", .version = "v1.2.2", .flags = 1,
+     .want = UDSOTA_DL_NOT_NEWER},
+    {"dev_rc_over_rc_ok", .running = "1.2.3-rc1", .version = "v1.2.3-rc2", .want = UDSOTA_DL_OK},
+    {"dev_rc_over_rc_ok: an rc over an older release", .running = "1.2.2", .version = "v1.2.3-rc1",
+     .want = UDSOTA_DL_OK},
+    {"dev_newer_ok", .running = "0.1.0-dev", .version = "v0.2.0-1-gabc1234", .want = UDSOTA_DL_OK},
+    {"unparseable_running_fails_open: a release", .running = "abcdef0", .version = "v0.0.1", .flags = 1,
+     .want = UDSOTA_DL_OK},
+    {"unparseable_running_fails_open: a dev build", .running = "abcdef0", .version = "0.0.0-x", .want = UDSOTA_DL_OK},
+    {"unparseable_running_fails_open: runs as a dev build", .running = "abcdef0", .version = "v0.0.0", .flags = 1,
+     .want = UDSOTA_DL_OK},
+    {"flag_set_dev_string: describe", .version = "v1.2.3-4-gabc", .flags = 1, .want = UDSOTA_DL_BAD_HEADER},
+    {"flag_set_dev_string: build metadata", .version = "v1.2.3+devkit", .flags = 1, .want = UDSOTA_DL_BAD_HEADER},
+    {"flag_clear_release_string", .version = "v1.2.3", .want = UDSOTA_DL_BAD_HEADER},
+    {"flag_clear_release_string: no v", .version = "1.2.3", .want = UDSOTA_DL_BAD_HEADER},
+    {"release_component_over_255: major", .version = "v256.0.0", .flags = 1, .want = UDSOTA_DL_BAD_HEADER},
+    {"release_component_over_255: patch", .version = "v1.2.256", .flags = 1, .want = UDSOTA_DL_BAD_HEADER},
+    {"unparseable_version: a hash", .version = "abcdef0", .want = UDSOTA_DL_BAD_HEADER},
+    {"unparseable_version: a dirty hash", .version = "1a2b3c4-dirty", .want = UDSOTA_DL_BAD_HEADER},
+    {"unparseable_version: digits", .version = "1234567", .want = UDSOTA_DL_BAD_HEADER},
+    {"unparseable_version: 1", .version = "1", .want = UDSOTA_DL_BAD_HEADER},
+    {"unparseable_version: 1.2", .version = "1.2", .want = UDSOTA_DL_BAD_HEADER},
+    {"unparseable_version: 1.2.300", .version = "1.2.300", .want = UDSOTA_DL_BAD_HEADER},
+    {"unparseable_version: 1.2.3x", .version = "1.2.3x", .want = UDSOTA_DL_BAD_HEADER},
+    {"unparseable_version: 1..3", .version = "1..3", .want = UDSOTA_DL_BAD_HEADER},
+    {"unparseable_version: empty", .version = "", .want = UDSOTA_DL_BAD_HEADER},
+    {"unparseable_version: v", .version = "v", .want = UDSOTA_DL_BAD_HEADER},
+    {"unparseable_version: V1.2.3", .version = "V1.2.3", .want = UDSOTA_DL_BAD_HEADER},
+    {"unparseable_version: a leading space", .version = " 1.2.3", .want = UDSOTA_DL_BAD_HEADER},
+    {"unparseable_version: no terminator", .version = "0000000000000000000000000001.2.3",
+     .want = UDSOTA_DL_BAD_HEADER},
+    {"header_then_core_rules", .project = "other", POKE({0, 0xEA}), .want = UDSOTA_DL_BAD_HEADER},
+    {"first_failure_wins: project before board", .project = "other", POKE({294, 3}), .want = UDSOTA_DL_BAD_PROJECT},
+    {"first_failure_wins: board before size", POKE({294, 3}), .size = SLOT + 1u, .want = UDSOTA_DL_BAD_BOARD},
+    {"first_failure_wins: newer before size", .running = "0.1.0", .version = "v0.1.0", .flags = 1, .size = SLOT + 1u,
+     .want = UDSOTA_DL_NOT_NEWER},
+    {"first_failure_wins: a parse failure before size", .version = "1.2", .size = SLOT + 1u,
+     .want = UDSOTA_DL_BAD_HEADER},
+    {"allow_older_release_older_ok", .allow_downgrade = true, .running = "1.2.3", .version = "v1.2.2", .flags = 1,
+     .want = UDSOTA_DL_OK},
+    {"allow_older_release_equal_ok", .allow_downgrade = true, .running = "1.2.3", .version = "v1.2.3", .flags = 1,
+     .want = UDSOTA_DL_OK},
+    {"allow_older_dev_older_ok", .allow_downgrade = true, .running = "0.2.0-dev", .version = "0.1.0-dev",
+     .want = UDSOTA_DL_OK},
+    {"allow_older_other_rules_hold: board", .allow_downgrade = true, .running = "1.2.3", .version = "v1.2.2",
+     .flags = 1, POKE({294, 3}), .want = UDSOTA_DL_BAD_BOARD},
+    {"allow_older_other_rules_hold: release flag", .allow_downgrade = true, .running = "1.2.3", .version = "1.2.2",
+     .want = UDSOTA_DL_BAD_HEADER},
+    {"allow_older_other_rules_hold: size", .allow_downgrade = true, .size = SLOT + 1u, .want = UDSOTA_DL_TOO_BIG},
+};
+
+static void first_block_cases(void)
+{
+    static uint8_t b[320];
+    for (size_t i = 0; i < sizeof k_first / sizeof k_first[0]; i++) {
+        const first_case_t *c = &k_first[i];
+        P.version = (c->running != NULL) ? c->running : "0.4.1-lite.1";
+        udsota_test_reboot();
+        assert(udsota_init(&(udsota_cfg_t){.product = c->product, .allow_downgrade = c->allow_downgrade}) == 0);
+        stamp_as(b, (c->version != NULL) ? c->version : "0.4.1-lite.2",
+                 (c->project != NULL) ? c->project : "udsota-test", 1, 1, TESTER, c->flags);
+        for (int k = 0; k < c->pokes; k++) {
+            b[c->poke[k].at] = c->poke[k].val;
+        }
+        const udsota_reason_t got = udsota_test_check_first(b, (c->len != 0u) ? c->len : sizeof b,
+                                                            (c->size != 0u) ? c->size : 8192u);
+        if (got != c->want) {
+            fprintf(stderr, "%s:%d: first block %s: reason %d, want %d\n", __FILE__, __LINE__, c->name, (int)got,
+                    (int)c->want);
+            g_failures++;
+        }
+    }
+    P.version = "0.4.1-lite.1";
+}
+
 int main(void)
 {
     static uint8_t img[100000], other[8192];
@@ -419,6 +603,7 @@ int main(void)
     P.expect = img;
     P.expect_len = sizeof img;
     P.st = (udsota_status_t){.running_slot = 0, .boot_slot = 0, .running_state = UDSOTA_IMG_VALID};
+    first_block_cases();
     boot();
     uint8_t resp[64];
 
@@ -731,6 +916,77 @@ int main(void)
         CHECK(xfer(req, 2 + key_len, resp, sizeof resp) == 2 && resp[0] == 0x67 && resp[1] == 0x02);
     }
     s_ecdsa = false;
+
+    /* The ECDSA mode verifies SIG_TAG || seed || level || ID length || ID. For the client's known seed (10..1F), level
+     * 03 and this device's MAC that is the client's SIG_MSG_L3 (client/tests/test_udsota.py), the bytes it signs. */
+    {
+        static const uint8_t sig_msg_l3[] = {
+            0x75, 0x64, 0x73, 0x6f, 0x74, 0x61, 0x2d, 0x32, 0x37, 0x2d, 0x65, 0x63, 0x64, 0x73, 0x61, 0x2d, 0x76, 0x31,
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x03, 0x06,
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
+        s_ecdsa = true;
+        P.seed_kat = true;
+        boot();
+        EXPECT(B(0x10, 0x02), B(0x50, 0x02));
+        uint8_t req[2 + 64] = {0x27, 0x03}, seed[64];
+        CHECK(xfer(req, 2, seed, sizeof seed) == 18 && memcmp(&seed[2], &sig_msg_l3[18], 16) == 0);
+        req[1] = 0x04;
+        req[2] = 0x5A;                            /* the stand-in's valid signature */
+        P.ecdsa_len = 0;
+        CHECK(xfer(req, sizeof req, resp, sizeof resp) == 2 && resp[0] == 0x67 && resp[1] == 0x04);
+        CHECK(P.ecdsa_len == sizeof sig_msg_l3 && memcmp(P.ecdsa_msg, sig_msg_l3, sizeof sig_msg_l3) == 0);
+        s_ecdsa = false;
+        P.seed_kat = false;
+    }
+
+    /* Security off (no keys, as examples/esp32 runs): every 27 is the app's, and a download needs no key, so 34, the
+     * blocks, 37 and FF01 pass without one. */
+    s_no_keys = true;
+    boot();
+    EXPECT(B(0x10, 0x02), B(0x50, 0x02));
+    {
+        const int app_27 = s_app_27;
+        EXPECT(B(0x27, 0x03), B(0x7F, 0x27, 0x31));
+        EXPECT(B(0x27, 0x04, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16), B(0x7F, 0x27, 0x31));
+        CHECK(s_app_27 == app_27 + 2 && s_srv.securityLevel == 0);
+    }
+    memcpy(other, img, sizeof other);
+    stamp(other, "0.4.1-lite.2", "udsota-test");
+    P.expect = other;
+    P.expect_len = sizeof other;
+    request_download(sizeof other, 0x00);
+    send_all(other, sizeof other);
+    EXPECT(B(0x37), B(0x77));
+    EXPECT(B(0x31, 0x01, 0xFF, 0x01), B(0x71, 0x01, 0xFF, 0x01, 0x00));
+    P.expect = img;
+    P.expect_len = sizeof img;
+    s_no_keys = false;
+
+    /* A corrupt and a short compressed stream each end BAD_STREAM, the corrupt one at its 36 (0x31) and the short one
+     * at the 37 (0x72), and neither image is verified: FF01 is out of sequence and the platform's end never runs. */
+    {
+        static uint8_t bad[5 + 1000 + 1] = {0x00, 0xE8, 0x03, 0x17, 0xFC};   /* a stored block of 1000 bytes, */
+        memcpy(&bad[5], img, 1000);
+        bad[sizeof bad - 1u] = 0x07;                                         /* then a final one of the reserved type */
+        size_t zlen = 0;
+        uint8_t *z = tdefl_compress_mem_to_heap(img, sizeof img, &zlen, TDEFL_DEFAULT_MAX_PROBES);
+        assert(z != NULL && zlen > 2u * 320u);
+        boot();
+        const int ends = P.psa_calls[PSA_END];
+        EXPECT(B(0x10, 0x02), B(0x50, 0x02));
+        unlock(0x03);
+        request_download(sizeof img, 0x10);
+        CHECK(block(1, bad, 0, sizeof bad, resp, sizeof resp) == 3 && resp[0] == 0x7F && resp[2] == 0x31);
+        EXPECT(B(0x22, 0xF1, 0xF1), B(0x62, 0xF1, 0xF1, UDSOTA_DL_BAD_STREAM));
+        EXPECT(B(0x31, 0x01, 0xFF, 0x01), B(0x7F, 0x31, 0x24));
+        request_download(sizeof img, 0x10);
+        send_all(z, zlen / 2u);
+        EXPECT(B(0x37), B(0x7F, 0x37, 0x72));
+        EXPECT(B(0x22, 0xF1, 0xF1), B(0x62, 0xF1, 0xF1, UDSOTA_DL_BAD_STREAM));
+        EXPECT(B(0x31, 0x01, 0xFF, 0x01), B(0x7F, 0x31, 0x24));
+        CHECK(P.psa_calls[PSA_END] == ends);
+        mz_free(z);
+    }
 
     /* Every PSA call of the run held the lock, and each kind ran. */
     CHECK(P.psa_unlocked == 0 && udsota_test_psa_depth() == 0);
