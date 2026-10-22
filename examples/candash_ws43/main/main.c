@@ -299,6 +299,8 @@ static esp_err_t server_start(void)
                         "isotp");
     s_srv.tp = &s_tp.hdl;
     s_srv.fn = on_event;
+    s_srv.p2_ms = 5;  /* iso14229's 50 ms default spaces back-to-back answers enough to clip the client's P2 under a
+                         CAN rate cap; 5 ms keeps a token rate limit. See README "Known limits". */
     ESP_RETURN_ON_FALSE(xTaskCreatePinnedToCore(server_task, "uds", SERVER_STACK, NULL, SERVER_PRIO, NULL, 0) == pdPASS,
                         ESP_ERR_NO_MEM, TAG, "task");
     ESP_LOGI(TAG, "iso14229 %s serving udsota on 0x%03X/0x%03X, 0x27 %s", UDS_LIB_VERSION, (unsigned)REQ_ID,

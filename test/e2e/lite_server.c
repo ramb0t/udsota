@@ -317,6 +317,7 @@ static void boot(void)
     (void)UDSServerTpISOTpCInit(&s_tp, REQ_ID, RESP_ID, UDS_TP_NOOP_ADDR);
     s_srv.tp = &s_tp.hdl;
     s_srv.fn = on_event;
+    s_srv.p2_ms = 5;  /* match the example; iso14229's 50 ms default is a rate limit, not a deadline. See README. */
     s_boot_ms = mono_ms();
     s_booting = false;
 }
