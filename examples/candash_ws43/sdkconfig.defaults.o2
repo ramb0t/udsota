@@ -1,0 +1,4 @@
+# -O2, as CANDash ships, layered on sdkconfig.defaults with -DSDKCONFIG_DEFAULTS; CI builds the ws43 this way, since
+# -O2 is where iso14229.c's -fwrapv matters. Give such a build its own -DSDKCONFIG: defaults never override an option
+# an existing sdkconfig already sets, so the project's would keep -Og.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y

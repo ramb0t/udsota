@@ -66,3 +66,21 @@ target_compile_definitions(test_isotp_wrap PRIVATE UDS_SYS=UDS_SYS_UNIX UDS_AUTO
                                                    UDS_CUSTOM_MILLIS _DEFAULT_SOURCE)
 target_compile_options(test_isotp_wrap PRIVATE -O2)
 add_test(NAME test_isotp_wrap COMMAND test_isotp_wrap)
+
+# tools/image_check, once per chip and board: udsota's image rules run on a built image, as a unit with that chip,
+# descriptor and slot size would (CI runs each on its board's image). Not a test: it needs the image.
+function(udsota_image_check name chip hw layout req resp slot)
+    add_executable(${name} tools/image_check.c udsota.c test/miniz/miniz.c)
+    target_include_directories(${name} PRIVATE . iso14229 test/miniz)
+    target_compile_definitions(${name} PRIVATE UDS_SYS=UDS_SYS_UNIX UDS_AUTOSELECT_TP=0 UDS_CUSTOM_MILLIS
+                                               _DEFAULT_SOURCE UDSOTA_TEST MINIZ_NO_STDIO MINIZ_NO_TIME
+                                               MINIZ_NO_ARCHIVE_APIS MINIZ_NO_ZLIB_APIS CHIP_ID=${chip}u
+                                               IMAGE_CHECK_HW=${hw} IMAGE_CHECK_LAYOUT=${layout}
+                                               IMAGE_CHECK_REQ=${req} IMAGE_CHECK_RESP=${resp}
+                                               IMAGE_CHECK_SLOT=${slot}u)
+endfunction()
+set_source_files_properties(tools/image_check.c PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror")
+udsota_image_check(image_check_example_esp32   0 1 1 0x710 0x718 0x1E0000)   # examples/esp32 and its partitions.csv
+udsota_image_check(image_check_example_esp32s3 9 1 1 0x710 0x718 0x1E0000)
+udsota_image_check(image_check_ws43            9 1 1 0x7E6 0x7EE 0x400000)   # examples/candash_ws43
+udsota_image_check(image_check_ws43b           9 2 1 0x7E6 0x7EE 0x400000)

@@ -1,8 +1,10 @@
 # Builds what a Release carries, at one commit: the client's wheel and sdist and the example's app image for esp32s3
-# and esp32. release.yml calls it (workflow_call) with the tagged commit before it publishes; a CI workflow can call it
-# with its own commit, so the assets a tag would release are built before the tag exists. Each job uploads its files
-# as an artifact of the calling run: client, example-esp32s3 and example-esp32. Actions are pinned by commit, since
-# release.yml publishes what these jobs build.
+# and esp32. release.yml calls it (workflow_call) with the tagged commit before it publishes; ci.yml calls it with its
+# own commit and fail_on_warning set, so the assets a tag would release are built, warning-free, before the tag exists
+# (ci.yml then runs udsota's image rules on the images). release.yml leaves fail_on_warning off, since cut-release has
+# already required green CI on that commit and a release that fails here fails after its tag is pushed. Each job
+# uploads its files as an artifact of the calling run: client, example-esp32s3 and example-esp32. Actions are pinned
+# by commit, since release.yml publishes what these jobs build.
 name: release assets
 
 on:
@@ -12,6 +14,10 @@ on:
         description: "The commit to build"
         type: string
         required: true
+      fail_on_warning:
+        description: "Fail an image build that prints a compiler warning"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -47,10 +53,15 @@ jobs:
           ref: ${{ inputs.ref }}
       - name: Build the example's app image for ${{ matrix.target }}
         shell: bash
+        env:
+          FAIL_ON_WARNING: ${{ inputs.fail_on_warning }}
         run: |
           . "$IDF_PATH/export.sh"
           b="$PWD/examples/esp32/build/${{ matrix.target }}"
-          idf.py -C examples/esp32 -B "$b" -D SDKCONFIG="$b/sdkconfig" set-target ${{ matrix.target }} build
+          mkdir -p "${b%/*}"   # tee opens $b.log before idf.py has made the build tree
+          idf.py -C examples/esp32 -B "$b" -D SDKCONFIG="$b/sdkconfig" set-target ${{ matrix.target }} build 2>&1 | tee "$b.log"
+          # a bare `! grep` gates the step only while it is the last line
+          if [ "$FAIL_ON_WARNING" = true ] && grep -E 'warning:' "$b.log"; then exit 1; fi
           mkdir -p out && cp "$b/example.bin" "out/example-${{ matrix.target }}.bin"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

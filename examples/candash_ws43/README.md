@@ -14,7 +14,7 @@ idf.py -B build-2 -DPOC_VER=0.5.0-lite.2 build          # a second image to upda
 udsota --profile <CANDash>/tools/udsota-candash.toml flash --compress build/candash.bin
 ```
 
-For the ws43b, add `-DPOC_BOARD=ws43b`; its sdkconfig stays in its build directory, because its console is native USB. Don't power a ws43b with its DI0/DI1 inputs wired: the example drives them high as CANDash does, and CANDash warns that this may damage the CH422G or the optocoupler.
+For `-O2`, as CANDash ships, add `-DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.o2"` and give the build its own `-DSDKCONFIG=<build dir>/sdkconfig`, since the project's sdkconfig keeps `-Og`. For the ws43b, add `-DPOC_BOARD=ws43b`; its sdkconfig stays in its build directory, because its console is native USB. Don't power a ws43b with its DI0/DI1 inputs wired: the example drives them high as CANDash does, and CANDash warns that this may damage the CH422G or the optocoupler.
 
 The version keeps CANDash's `0.5.0` core, because a device takes a dev build only when its `X.Y.Z` is at least the running one's. For ECDSA 0x27 instead of CANDash's HMAC master, add `-DPOC_PUBKEY_DIR=<dir>` with the `udsota_pubkey.h` that `udsota keygen` writes, and give the client a profile whose `[security]` has `mode = "ecdsa"` and the private key.
 

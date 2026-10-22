@@ -32,7 +32,9 @@ _Static_assert(sizeof(tinfl_decompressor) == 10992u && TINFL_LZ_DICT_SIZE == 327
 #define LOGW(...) ESP_LOGW("udsota", __VA_ARGS__)
 #else
 #include "miniz.h"                 /* host builds: miniz's tinfl */
-#define CHIP_ID 9u                 /* ESP32-S3, for host tests */
+#ifndef CHIP_ID
+#define CHIP_ID 9u                 /* ESP32-S3, for host tests; tools/image_check sets the chip it checks for */
+#endif
 #define LOGW(...) ((void)0)
 #endif
 
@@ -1262,6 +1264,12 @@ void udsota_test_reboot(void)
 {
     zdl_close();
     memset(&U, 0, sizeof U);
+}
+
+/* The image rules on an image's first bytes, as a 34's first 36 meets them (tools/image_check). After udsota_init. */
+udsota_reason_t udsota_test_check_first(const uint8_t *b, size_t len, uint32_t size)
+{
+    return check_first(b, len, size);
 }
 #endif
 

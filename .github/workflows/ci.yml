@@ -1,6 +1,8 @@
-# udsota: the host test, the client's tests and the release tool's, the client against udsota_lite_server, the CANDash
-# example built with a throwaway signing key, and what a release of this commit would carry (release-assets.yml): the
-# client's wheel and sdist and examples/esp32's image for esp32s3 and esp32.
+# udsota: the host test, the client's tests and the release tool's, the client against udsota_lite_server (gcc and
+# clang builds of each), the CANDash example built with a throwaway signing key for the ws43, the ws43b and the ws43 at
+# -O2, and what a release of this commit would carry (release-assets.yml): the client's wheel and sdist and
+# examples/esp32's image for esp32s3 and esp32. Every image build fails on a compiler warning, and every image must
+# pass udsota's image rules (tools/image_check.c) while a copy with a broken descriptor must not.
 name: ci
 on: [push, pull_request]
 jobs:
@@ -30,12 +32,17 @@ jobs:
         run: cd /tmp && python -c "from udsota import profile; print(profile.load('example'))"
   e2e:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        cc: [gcc, clang]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: cmake -S . -B build && cmake --build build -j --target udsota_lite_server && test -x build/udsota_lite_server
+        env:
+          CC: ${{ matrix.cc }}
       - run: python -m pip install "./client[diff]" pytest && python -m pytest -q -rsx client/tests/test_e2e_lite.py
         env:
           UDSOTA_LITE_SERVER: ${{ github.workspace }}/build/udsota_lite_server
@@ -44,14 +51,63 @@ jobs:
     container: espressif/idf:v6.1
     steps:
       - uses: actions/checkout@v4
-      - shell: bash
+      - name: Build the CANDash example for the ws43, the ws43b and the ws43 at -O2, failing on any warning
+        shell: bash
         run: |
           . "$IDF_PATH/export.sh"
           mkdir -p examples/candash_ws43/secrets
           espsecure.py generate_signing_key --version 2 examples/candash_ws43/secrets/dev_signing_key.pem
-          idf.py -C examples/candash_ws43 -B build build
-          idf.py -C examples/candash_ws43 -B build-ws43b -DPOC_BOARD=ws43b build
+          p="$PWD/examples/candash_ws43"
+          build() {   # build <dir> [idf.py options...], logged to <dir>.log
+            d="$1"; shift
+            idf.py -C examples/candash_ws43 -B "$d" "$@" build 2>&1 | tee "$d.log"
+            if grep -E 'warning:' "$d.log"; then exit 1; fi   # a bare `! grep` gates the step only while it is last
+          }
+          build build
+          build build-ws43b -DPOC_BOARD=ws43b
+          # -O2, as CANDash ships: its own sdkconfig, because the ws43 build wrote the project's and defaults never
+          # override an option an sdkconfig already sets.
+          build build-o2 -D SDKCONFIG="$PWD/build-o2/sdkconfig" -D SDKCONFIG_DEFAULTS="$p/sdkconfig.defaults;$p/sdkconfig.defaults.o2"
+          grep -qx 'CONFIG_COMPILER_OPTIMIZATION_PERF=y' build-o2/sdkconfig || { echo "build-o2 is not -O2"; exit 1; }
+      - name: Collect the images for image-check
+        run: |
+          mkdir -p out
+          cp build/candash.bin out/candash-ws43.bin
+          cp build-ws43b/candash.bin out/candash-ws43b.bin
+          cp build-o2/candash.bin out/candash-ws43-o2.bin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: candash
+          path: out/*
   release-assets:
     uses: ./.github/workflows/release-assets.yml
     with:
       ref: ${{ github.sha }}
+      fail_on_warning: true
+  image-check:
+    needs: [esp32, release-assets]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: images
+          merge-multiple: true
+      - name: Each image passes udsota's image rules, and fails them with its descriptor's magic broken
+        shell: bash
+        run: |
+          cmake -S . -B build
+          cmake --build build -j --target image_check_example_esp32 image_check_example_esp32s3 image_check_ws43 \
+                                        image_check_ws43b
+          check() {   # check <image_check_ suffix> <image> <product>
+            "build/image_check_$1" "images/$2.bin" "$3"
+            cp "images/$2.bin" broken.bin
+            printf '\0' | dd of=broken.bin bs=1 seek=288 conv=notrunc status=none
+            rc=0; "build/image_check_$1" broken.bin "$3" || rc=$?
+            [ "$rc" = 3 ] || { echo "$2 with a broken descriptor gave $rc, not 3 (UDSOTA_DL_BAD_BOARD)"; exit 1; }
+          }
+          check example_esp32 example-esp32 example
+          check example_esp32s3 example-esp32s3 example
+          check ws43 candash-ws43 candash
+          check ws43b candash-ws43b candash
+          check ws43 candash-ws43-o2 candash
