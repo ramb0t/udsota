@@ -37,6 +37,39 @@
 #define UDSOTA_VERSION_PATCH 2
 #define UDSOTA_VERSION       "0.14.2"
 
+/* ---- Wire contract ----
+ * The numbers a tester sees, under the names udsota v0.14.2 gave them. client/udsota/wire.py, keys.py and image.py
+ * mirror them, and client/tests/test_udsota.py checks each against its client copy, or against v0.14.2's for the few
+ * the client never uses: changing one needs a matching client change and a CHANGELOG entry. NRCs and sessions are iso14229's (UDS_NRC_*, UDS_LEV_DS_*), and the download reasons are
+ * udsota_reason_t below. */
+#define UDSOTA_DID_ACTIVE_SESSION   0xF186u   /* 1 B: the active session */
+#define UDSOTA_DID_SW_VERSION       0xF189u   /* the running image's version string */
+#define UDSOTA_DID_SERIAL           0xF18Cu   /* the device ID the keys bind to */
+#define UDSOTA_DID_STATUS           0xF1F0u   /* 16 B: the A/B slots (udsota_status_t) */
+#define UDSOTA_DID_RESULT           0xF1F1u   /* 5 B: the last download's reason and bytes received */
+#define UDSOTA_DID_RUNNING_SHA      0xF1F3u   /* 32 B: the running image's app_elf_sha256 */
+#define UDSOTA_RID_CHECK_PROG_DEPS  0xFF01u   /* CheckProgrammingDependencies (verify): status udsota_reason_t */
+#define UDSOTA_RID_GET_RESUME_POINT 0xF000u   /* reserved: status UDSOTA_RESUME_NOT_AVAILABLE */
+#define UDSOTA_RID_ACTIVATE_IMAGE   0xF001u
+#define UDSOTA_RID_CONFIRM_IMAGE    0xF002u
+#define UDSOTA_RESUME_NOT_AVAILABLE 0xFFu
+#define UDSOTA_DL_DFI               0x00u     /* 34's dataFormatIdentifier: the image as it is */
+#define UDSOTA_DL_DFI_DEFLATE       0x10u     /* raw DEFLATE (RFC 1951); memorySize is still the image's size */
+#define UDSOTA_DL_MAX_BLOCK_LEN     4095u     /* 34's maxNumberOfBlockLength: SID, BSC and 4093 data bytes */
+#define UDSOTA_DL_Z_BOUND(size)     ((uint64_t)(size) + ((uint64_t)(size) >> 3) + 1024u)   /* the most bytes a
+                                                 DEFLATE download of a size-byte image may take; past it, 0x71 */
+#define UDSOTA_SA_SEED_EXTENDED     0x01u     /* 27 01/02, extended session; iso14229's securityLevel once unlocked */
+#define UDSOTA_SA_SEED_PROGRAMMING  0x03u     /* 27 03/04, programming session: unlocks downloads */
+#define UDSOTA_SEED_LEN             16u
+#define UDSOTA_SA_SEED_VALID_MS     30000u    /* a seed is single-use and expires after this */
+#define UDSOTA_KEY_LEN              16u       /* HMAC mode: HMAC-SHA256(K_dev, seed || level || ID)[0..15] */
+#define UDSOTA_KEYS_SIG_LEN         64u       /* ECDSA mode: r || s over SHA-256 of the message below */
+#define UDSOTA_KEYS_SIG_TAG         "udsota-27-ecdsa-v1"   /* the message: tag || seed || level || ID length || ID */
+#define UDSOTA_KEYS_PUBKEY_LEN      65u       /* cfg.key_pubkey: 04 || X || Y, P-256 */
+#define UDSOTA_KEYS_ID_MAX          16u       /* the longest device ID (F18C) */
+#define UDSOTA_IMG_DESC_OFFSET      288u      /* udsota_image_desc_t in the image, right after esp_app_desc_t */
+#define UDSOTA_STATUS_SIG_CHECKED   0x01u     /* F1F0's flags: images are signature-checked */
+
 /* ---- The image descriptor ----
  * Every image says which board, partition layout and CAN IDs it is for, at offset 288 (right after ESP-IDF's
  * esp_app_desc_t), so a device refuses a wrong image before erasing anything. Place it once, at file scope in the
@@ -207,4 +240,5 @@ size_t      udsota_plat_mac(uint8_t out[16]);
 bool        udsota_plat_rng16(uint8_t out[16]);
 bool        udsota_plat_hmac(const uint8_t *key, size_t key_len, const uint8_t *msg, size_t msg_len, uint8_t out[32]);
 int         udsota_plat_ecdsa_key(const uint8_t *pubkey);          /* 0 once the key is usable */
-int         udsota_plat_ecdsa(const uint8_t *msg, size_t n, const uint8_t sig[64]);   /* 1 valid, 0 not, -1 unknown */
+int         udsota_plat_ecdsa(const uint8_t *msg, size_t n,
+                              const uint8_t sig[UDSOTA_KEYS_SIG_LEN]);   /* 1 valid, 0 not, -1 unknown */

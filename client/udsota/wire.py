@@ -1,7 +1,8 @@
-"""The udsota wire contract (components/udsota/include/udsota_wire.h, over the server's udsota_server_wire.h and
-the updater's udsota_update_wire.h): sessions, server-owned DIDs, routines, NRCs, the download format, the DTC
-services' numbers and the status, result, counter and DTC status layouts. DECODE and describe_result are
-Python-only: how info and config render DID records."""
+"""The udsota wire contract, as udsota.h's "Wire contract" block and the NRCs and sessions it takes from iso14229.h
+give it, and as v0.14.2's udsota_wire.h gave it for units still on a v0.14.x server (test/fixtures/wire-v0.14/):
+sessions, server-owned DIDs, routines, NRCs, the download format, the DTC services' numbers and the status, result,
+counter and DTC status layouts. DECODE and describe_result are Python-only: how info and config render DID
+records."""
 import struct
 
 from .errors import UpdateFailed
@@ -33,7 +34,7 @@ STATUS_FLAGS = {0x01: "signature-checked", 0x02: "boot-ignored-config"}
 DL_REASONS = ("DL_OK", "DL_BAD_HEADER", "DL_BAD_PROJECT", "DL_BAD_BOARD", "DL_BAD_LAYOUT",
               "DL_BAD_DIAG_IDS", "DL_NOT_NEWER", "DL_TOO_BIG", "DL_VERIFY_FAILED", "DL_SIG_FAILED",
               "DL_WORKER_TIMEOUT", "DL_ABORTED", "DL_FLASH_ERROR", "DL_BAD_STREAM",
-              "DL_NO_MEMORY", "DL_BAD_BASE")   # udsota_reason_t (udsota_wire.h)
+              "DL_NO_MEMORY", "DL_BAD_BASE")   # udsota_reason_t (udsota.h)
 # 9 (DL_SIG_FAILED) is reserved and not emitted by IDF v6.1: esp_ota_end returns one code for a hash or a
 # signature failure, so FF01 reports both as 8 (DL_VERIFY_FAILED).
 COUNTER_NAMES = ("seq_errors", "ncr_timeouts", "repeated_blocks", "aborts", "withheld_fcs",

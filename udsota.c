@@ -1,5 +1,5 @@
 /* udsota: safe A/B firmware updates over UDS on iso14229's server (see udsota.h). One file:
- *   1. the wire contract and state
+ *   1. the limits and state; the wire contract is in udsota.h
  *   2. the image rules: what the first 320 bytes must say before anything is erased
  *   3. compressed downloads: raw DEFLATE through the ROM's tinfl into the image
  *   4. 0x27 keys: HMAC per device, or ECDSA signatures, and the PSA lock around udsota's PSA calls
@@ -38,36 +38,13 @@ _Static_assert(sizeof(tinfl_decompressor) == 10992u && TINFL_LZ_DICT_SIZE == 327
 #define LOGW(...) ((void)0)
 #endif
 
-/* ==== 1. Wire contract and state ==== */
+/* ==== 1. Limits and state (the wire contract is udsota.h's) ==== */
 
-#define DID_SESSION     0xF186u    /* 1 B: the active session */
-#define DID_VERSION     0xF189u    /* the running image's version string */
-#define DID_DEVICE_ID   0xF18Cu    /* the device ID the keys bind to */
-#define DID_STATUS      0xF1F0u    /* 16 B: the A/B slots (udsota_status_t) */
-#define DID_RESULT      0xF1F1u    /* 5 B: the last download's reason and bytes received */
-#define DID_RUNNING_SHA 0xF1F3u    /* 32 B: the running image's app_elf_sha256 */
-#define RID_VERIFY      0xFF01u    /* CheckProgrammingDependencies */
-#define RID_RESUME      0xF000u    /* reserved: answers "no resume point" */
-#define RID_ACTIVATE    0xF001u
-#define RID_CONFIRM     0xF002u
-#define DFI_PLAIN       0x00u
-#define DFI_DEFLATE     0x10u
-#define LEVEL_EXT       0x01u      /* 27 01/02, extended session */
-#define LEVEL_PROG      0x03u      /* 27 03/04, programming session: unlocks downloads */
-#define SEED_LEN        16u
-#define KEY_LEN         16u        /* HMAC mode: HMAC-SHA256(K_dev, seed || level || ID)[0..15] */
-#define SIG_LEN         64u        /* ECDSA mode: r || s over SHA-256 of the message below */
-#define SIG_TAG         "udsota-27-ecdsa-v1"
-#define SEED_VALID_MS   30000u
 #define KEY_LOCK_MS     40u        /* 0x27's wait for the PSA lock: an app that holds it longer gets 0x22 */
-#define ID_MAX          16u
 #define LABEL_MAX       32u
-#define MAX_BLOCK       4095u      /* 34's maxNumberOfBlockLength: SID, BSC and 4093 data bytes */
 #define BUF_LEN         4096u
 #define IMAGE_MIN       320u       /* image header 24 + segment header 8 + esp_app_desc_t 256 + descriptor 32 */
-#define DESC_OFFSET     288u
 #define JOB_CAP_MS      90000u     /* the longest udsota holds a session for its own flash job */
-#define Z_BOUND(size)   ((uint64_t)(size) + ((uint64_t)(size) >> 3) + 1024u)   /* most bytes a compressed image may take */
 
 typedef int (*done_fn)(int result, uint8_t *status, size_t *status_len);
 
@@ -89,13 +66,13 @@ static struct {
     uint8_t        running_version[3];
     bool           running_release;
     const char    *product;
-    uint8_t        devid[ID_MAX];
+    uint8_t        devid[UDSOTA_KEYS_ID_MAX];
     size_t         devid_len;
     /* 0x27 */
     bool           sec_on, sec_ecdsa, key_ok;
     uint8_t        kdev[32];
     bool           seed_valid;
-    uint8_t        seed_level, seed[SEED_LEN];
+    uint8_t        seed_level, seed[UDSOTA_SEED_LEN];
     uint32_t       seed_ms;
     /* The download */
     uint8_t        last_reason;
@@ -175,7 +152,7 @@ static udsota_reason_t check_first(const uint8_t *b, size_t len, uint32_t size)
     if (plen > 32u || memcmp(project, U.product, plen) != 0 || (plen < 32u && project[plen] != '\0')) {
         return UDSOTA_DL_BAD_PROJECT;
     }
-    const uint8_t *d = &b[DESC_OFFSET];
+    const uint8_t *d = &b[UDSOTA_IMG_DESC_OFFSET];
     if (le32(d) != udsota_image_desc.magic || le16(d + 4) < 1u || d[6] != udsota_image_desc.hw_id) {
         return UDSOTA_DL_BAD_BOARD;
     }
@@ -389,32 +366,32 @@ int udsota_test_psa_depth(void)
 #endif
 
 /* HMAC mode: the expected key for seed at requestSeed level: HMAC-SHA256(K_dev, seed || level || ID)[0..15]. */
-static bool hmac_key(const uint8_t seed[SEED_LEN], uint8_t level, uint8_t key[KEY_LEN])
+static bool hmac_key(const uint8_t seed[UDSOTA_SEED_LEN], uint8_t level, uint8_t key[UDSOTA_KEY_LEN])
 {
-    uint8_t msg[SEED_LEN + 1u + ID_MAX], full[32] = {0};
-    memcpy(msg, seed, SEED_LEN);
-    msg[SEED_LEN] = level;
-    memcpy(&msg[SEED_LEN + 1u], U.devid, U.devid_len);
+    uint8_t msg[UDSOTA_SEED_LEN + 1u + UDSOTA_KEYS_ID_MAX], full[32] = {0};
+    memcpy(msg, seed, UDSOTA_SEED_LEN);
+    msg[UDSOTA_SEED_LEN] = level;
+    memcpy(&msg[UDSOTA_SEED_LEN + 1u], U.devid, U.devid_len);
     bool ok = U.key_ok && udsota_psa_lock(KEY_LOCK_MS);
     if (ok) {
-        ok = udsota_plat_hmac(U.kdev, sizeof U.kdev, msg, SEED_LEN + 1u + U.devid_len, full);
+        ok = udsota_plat_hmac(U.kdev, sizeof U.kdev, msg, UDSOTA_SEED_LEN + 1u + U.devid_len, full);
         udsota_psa_unlock();
     }
-    memcpy(key, full, KEY_LEN);
+    memcpy(key, full, UDSOTA_KEY_LEN);
     wipe(full, sizeof full);
     wipe(msg, sizeof msg);
     return ok;
 }
 
-/* ECDSA mode: the tester signs SIG_TAG || seed || level || ID length || ID, so a signature opens one level of one
- * device for one seed. 1 valid, 0 not, -1 no verdict now. */
-static int ecdsa_check(const uint8_t seed[SEED_LEN], uint8_t level, const uint8_t *sig)
+/* ECDSA mode: the tester signs UDSOTA_KEYS_SIG_TAG || seed || level || ID length || ID, so a signature opens one
+ * level of one device for one seed. 1 valid, 0 not, -1 no verdict now. */
+static int ecdsa_check(const uint8_t seed[UDSOTA_SEED_LEN], uint8_t level, const uint8_t *sig)
 {
-    uint8_t msg[sizeof SIG_TAG - 1u + SEED_LEN + 2u + ID_MAX];
-    size_t n = sizeof SIG_TAG - 1u;
-    memcpy(msg, SIG_TAG, n);
-    memcpy(&msg[n], seed, SEED_LEN);
-    n += SEED_LEN;
+    uint8_t msg[sizeof UDSOTA_KEYS_SIG_TAG - 1u + UDSOTA_SEED_LEN + 2u + UDSOTA_KEYS_ID_MAX];
+    size_t n = sizeof UDSOTA_KEYS_SIG_TAG - 1u;
+    memcpy(msg, UDSOTA_KEYS_SIG_TAG, n);
+    memcpy(&msg[n], seed, UDSOTA_SEED_LEN);
+    n += UDSOTA_SEED_LEN;
     msg[n++] = level;
     msg[n++] = (uint8_t)U.devid_len;
     memcpy(&msg[n], U.devid, U.devid_len);
@@ -534,7 +511,7 @@ static int dl_access(const UDSServer_t *srv)
     if (srv->sessionType != UDS_LEV_DS_PRGS) {
         return UDS_NRC_ServiceNotSupportedInActiveSession;
     }
-    return (U.sec_on && srv->securityLevel != LEVEL_PROG) ? UDS_NRC_SecurityAccessDenied : 0;
+    return (U.sec_on && srv->securityLevel != UDSOTA_SA_SEED_PROGRAMMING) ? UDS_NRC_SecurityAccessDenied : 0;
 }
 
 static void dl_flash_failed(void)
@@ -561,7 +538,8 @@ static int request_download(const UDSServer_t *srv, uint8_t dfi, uint32_t addr, 
         U.last_reason = UDSOTA_DL_FLASH_ERROR;           /* no inactive slot */
         return UDS_NRC_ConditionsNotCorrect;
     }
-    if ((dfi != DFI_PLAIN && dfi != DFI_DEFLATE) || addr != 0u || size == 0u || size > udsota_plat_slot_size()) {
+    if ((dfi != UDSOTA_DL_DFI && dfi != UDSOTA_DL_DFI_DEFLATE) || addr != 0u || size == 0u ||
+        size > udsota_plat_slot_size()) {
         return UDS_NRC_RequestOutOfRange;
     }
     if (U.ota_open) {                                    /* a finished image that never passed FF01 */
@@ -569,7 +547,7 @@ static int request_download(const UDSServer_t *srv, uint8_t dfi, uint32_t addr, 
         settle();
         U.ota_open = false;
     }
-    const bool compressed = (dfi == DFI_DEFLATE);
+    const bool compressed = (dfi == UDSOTA_DL_DFI_DEFLATE);
     if (compressed && zdl_open() != UDSOTA_DL_OK) {
         U.last_reason = UDSOTA_DL_NO_MEMORY;
         U.last_bytes = 0;
@@ -631,7 +609,7 @@ static int transfer_data(UDSServer_t *srv, const uint8_t *data, size_t len, bool
     if (rc != 0) {
         return rc;
     }
-    if (len < 1u || len + 2u > MAX_BLOCK) {
+    if (len < 1u || len + 2u > UDSOTA_DL_MAX_BLOCK_LEN) {
         return UDS_NRC_IncorrectMessageLengthOrInvalidFormat;
     }
     if (!U.dl_active) {
@@ -644,7 +622,7 @@ static int transfer_data(UDSServer_t *srv, const uint8_t *data, size_t len, bool
         }
         return rc;
     }
-    const uint64_t limit = U.compressed ? Z_BOUND(U.announced) : U.announced;
+    const uint64_t limit = U.compressed ? UDSOTA_DL_Z_BOUND(U.announced) : U.announced;
     if ((uint64_t)U.received + len > limit) {
         abort_download();
         return UDS_NRC_TransferDataSuspended;
@@ -775,8 +753,9 @@ static int confirm_done(int result, uint8_t *status, size_t *status_len)
 static int routine(const UDSServer_t *srv, uint8_t ctrl, uint16_t rid, size_t opt_len, uint8_t *status,
                    size_t *status_len)
 {
-    const bool confirm = (rid == RID_CONFIRM);
-    if (!confirm && rid != RID_VERIFY && rid != RID_RESUME && rid != RID_ACTIVATE) {
+    const bool confirm = (rid == UDSOTA_RID_CONFIRM_IMAGE);
+    if (!confirm && rid != UDSOTA_RID_CHECK_PROG_DEPS && rid != UDSOTA_RID_GET_RESUME_POINT &&
+        rid != UDSOTA_RID_ACTIVATE_IMAGE) {
         return -1;
     }
     if (srv->sessionType == UDS_LEV_DS_DS) {
@@ -788,7 +767,7 @@ static int routine(const UDSServer_t *srv, uint8_t ctrl, uint16_t rid, size_t op
     if (srv->sessionType != (confirm ? UDS_LEV_DS_EXTDS : UDS_LEV_DS_PRGS)) {
         return UDS_NRC_RequestOutOfRange;
     }
-    if (!confirm && U.sec_on && srv->securityLevel != LEVEL_PROG) {
+    if (!confirm && U.sec_on && srv->securityLevel != UDSOTA_SA_SEED_PROGRAMMING) {
         return UDS_NRC_SecurityAccessDenied;
     }
     if (opt_len != 0u) {
@@ -796,7 +775,7 @@ static int routine(const UDSServer_t *srv, uint8_t ctrl, uint16_t rid, size_t op
     }
     int rc;
     switch (rid) {
-    case RID_VERIFY:
+    case UDSOTA_RID_CHECK_PROG_DEPS:
         if (U.slot_verified && !U.ota_open) {
             return one_byte(status, status_len, UDSOTA_DL_OK);   /* a repeat after a pass */
         }
@@ -806,9 +785,9 @@ static int routine(const UDSServer_t *srv, uint8_t ctrl, uint16_t rid, size_t op
         U.dl_complete = U.ota_open = U.slot_verified = false;   /* the verify closes the image either way */
         U.last_reason = UDSOTA_DL_WORKER_TIMEOUT;                /* until the verdict */
         return run_job(job_verify, verify_done, 0x31, status, status_len);
-    case RID_RESUME:
-        return one_byte(status, status_len, 0xFFu);
-    case RID_ACTIVATE:
+    case UDSOTA_RID_GET_RESUME_POINT:
+        return one_byte(status, status_len, UDSOTA_RESUME_NOT_AVAILABLE);
+    case UDSOTA_RID_ACTIVATE_IMAGE:
         if (!U.slot_verified) {
             return UDS_NRC_RequestSequenceError;
         }
@@ -816,7 +795,7 @@ static int routine(const UDSServer_t *srv, uint8_t ctrl, uint16_t rid, size_t op
             return rc;
         }
         return run_job(job_activate, activate_done, 0x31, status, status_len);
-    default: {                                               /* RID_CONFIRM */
+    default: {                                               /* UDSOTA_RID_CONFIRM_IMAGE */
         if ((rc = gate(UDSOTA_OP_CONFIRM)) != 0) {
             return rc;
         }
@@ -843,19 +822,19 @@ static size_t read_did(const UDSServer_t *srv, uint16_t did, uint8_t *out)
 {
     udsota_status_t st;
     switch (did) {
-    case DID_SESSION:
+    case UDSOTA_DID_ACTIVE_SESSION:
         out[0] = srv->sessionType;
         return 1;
-    case DID_DEVICE_ID:
+    case UDSOTA_DID_SERIAL:
         memcpy(out, U.devid, U.devid_len);
         return U.devid_len;
-    case DID_VERSION: {
+    case UDSOTA_DID_SW_VERSION: {
         const char *v = udsota_plat_version();
         const size_t n = strnlen(v, 32);
         memcpy(out, v, n);
         return n;
     }
-    case DID_STATUS:
+    case UDSOTA_DID_STATUS:
         status_now(&st);
         out[0] = st.running_slot;
         out[1] = st.running_state;
@@ -865,14 +844,14 @@ static size_t read_did(const UDSServer_t *srv, uint16_t did, uint8_t *out)
         memcpy(&out[7], st.other_elf_sha_prefix, 8);
         out[15] = st.flags;
         return 16;
-    case DID_RESULT:
+    case UDSOTA_DID_RESULT:
         out[0] = U.last_reason;
         out[1] = (uint8_t)(U.last_bytes >> 24);
         out[2] = (uint8_t)(U.last_bytes >> 16);
         out[3] = (uint8_t)(U.last_bytes >> 8);
         out[4] = (uint8_t)U.last_bytes;
         return 5;
-    case DID_RUNNING_SHA:
+    case UDSOTA_DID_RUNNING_SHA:
         memcpy(out, udsota_plat_sha(), 32);
         return 32;
     default:
@@ -966,7 +945,7 @@ static UDSErr_t on_security(UDSServer_t *srv, uint8_t level, const uint8_t *key,
     if (srv->sessionType == UDS_LEV_DS_DS) {
         return UDS_NRC_ServiceNotSupportedInActiveSession;
     }
-    if (srv->sessionType != (level == LEVEL_PROG ? UDS_LEV_DS_PRGS : UDS_LEV_DS_EXTDS)) {
+    if (srv->sessionType != (level == UDSOTA_SA_SEED_PROGRAMMING ? UDS_LEV_DS_PRGS : UDS_LEV_DS_EXTDS)) {
         return UDS_NRC_SubFunctionNotSupportedInActiveSession;
     }
     if (worker_busy()) {
@@ -982,24 +961,25 @@ static UDSErr_t on_security(UDSServer_t *srv, uint8_t level, const uint8_t *key,
         }
         U.seed_level = level;
         U.seed_ms = UDSMillis();
-        return (UDSErr_t)sa->copySeed(srv, U.seed, SEED_LEN);
+        return (UDSErr_t)sa->copySeed(srv, U.seed, UDSOTA_SEED_LEN);
     }
-    if (len != (U.sec_ecdsa ? SIG_LEN : KEY_LEN)) {
+    if (len != (U.sec_ecdsa ? UDSOTA_KEYS_SIG_LEN : UDSOTA_KEY_LEN)) {
         return UDS_NRC_IncorrectMessageLengthOrInvalidFormat;   /* the seed stays */
     }
-    const bool fresh = U.seed_valid && U.seed_level == level && (uint32_t)(UDSMillis() - U.seed_ms) < SEED_VALID_MS;
+    const bool fresh = U.seed_valid && U.seed_level == level &&
+                       (uint32_t)(UDSMillis() - U.seed_ms) < UDSOTA_SA_SEED_VALID_MS;
     U.seed_valid = false;
     UDSErr_t rc = UDS_NRC_RequestSequenceError;
     if (fresh && U.sec_ecdsa) {
         const int v = ecdsa_check(U.seed, level, key);
         rc = (v == 1) ? UDS_PositiveResponse : (v < 0) ? UDS_NRC_ConditionsNotCorrect : UDS_NRC_InvalidKey;
     } else if (fresh) {
-        uint8_t expect[KEY_LEN];
+        uint8_t expect[UDSOTA_KEY_LEN];
         volatile uint8_t diff = 0;
         if (!hmac_key(U.seed, level, expect)) {
             rc = UDS_NRC_ConditionsNotCorrect;
         } else {
-            for (size_t i = 0; i < KEY_LEN; i++) {
+            for (size_t i = 0; i < UDSOTA_KEY_LEN; i++) {
                 diff |= (uint8_t)(expect[i] ^ key[i]);   /* constant time */
             }
             rc = (diff == 0u) ? UDS_PositiveResponse : UDS_NRC_InvalidKey;
@@ -1064,7 +1044,7 @@ bool udsota_event(UDSServer_t *srv, UDSEvent_t ev, void *arg, UDSErr_t *rc)
         break;
     case UDS_EVT_SecAccessRequestSeed: {
         UDSSecAccessRequestSeedArgs_t *a = arg;
-        if (!U.sec_on || (a->level != LEVEL_EXT && a->level != LEVEL_PROG)) {
+        if (!U.sec_on || (a->level != UDSOTA_SA_SEED_EXTENDED && a->level != UDSOTA_SA_SEED_PROGRAMMING)) {
             return false;
         }
         *rc = on_security(srv, a->level, NULL, a->len, true, a);
@@ -1072,7 +1052,7 @@ bool udsota_event(UDSServer_t *srv, UDSEvent_t ev, void *arg, UDSErr_t *rc)
     }
     case UDS_EVT_SecAccessValidateKey: {
         const UDSSecAccessValidateKeyArgs_t *a = arg;
-        if (!U.sec_on || (a->level != LEVEL_EXT && a->level != LEVEL_PROG)) {
+        if (!U.sec_on || (a->level != UDSOTA_SA_SEED_EXTENDED && a->level != UDSOTA_SA_SEED_PROGRAMMING)) {
             return false;
         }
         *rc = on_security(srv, a->level, a->key, a->len, false, NULL);
@@ -1114,7 +1094,7 @@ bool udsota_event(UDSServer_t *srv, UDSEvent_t ev, void *arg, UDSErr_t *rc)
                   ? UDS_NRC_RequestOutOfRange
                   : as_err(request_download(srv, a->dataFormatIdentifier, (uint32_t)a->addr, (uint32_t)a->size));
         if (*rc == UDS_PositiveResponse) {
-            a->maxNumberOfBlockLength = MAX_BLOCK;
+            a->maxNumberOfBlockLength = UDSOTA_DL_MAX_BLOCK_LEN;
         }
         break;
     }
@@ -1167,7 +1147,7 @@ int udsota_init(const udsota_cfg_t *cfg)
     }
     if (cfg->device_id == NULL) {
         U.devid_len = udsota_plat_mac(U.devid);
-    } else if (cfg->device_id_len >= 1u && cfg->device_id_len <= ID_MAX) {
+    } else if (cfg->device_id_len >= 1u && cfg->device_id_len <= UDSOTA_KEYS_ID_MAX) {
         memcpy(U.devid, cfg->device_id, cfg->device_id_len);
         U.devid_len = cfg->device_id_len;
     }
@@ -1178,12 +1158,13 @@ int udsota_init(const udsota_cfg_t *cfg)
     if (U.devid_len == 0u) {
         LOGW("no device ID (a bad device_id_len, or no MAC)");
     } else if (U.sec_ecdsa) {
-        if (cfg->key_pubkey != NULL && cfg->key_pubkey_len == 65u && udsota_psa_lock(UDSOTA_PSA_WAIT_FOREVER)) {
+        if (cfg->key_pubkey != NULL && cfg->key_pubkey_len == UDSOTA_KEYS_PUBKEY_LEN &&
+            udsota_psa_lock(UDSOTA_PSA_WAIT_FOREVER)) {
             U.key_ok = udsota_plat_ecdsa_key(cfg->key_pubkey) == 0;
             udsota_psa_unlock();
         }
     } else if (U.sec_on && cfg->key_label != NULL && cfg->key_master != NULL) {
-        uint8_t msg[LABEL_MAX + ID_MAX];
+        uint8_t msg[LABEL_MAX + UDSOTA_KEYS_ID_MAX];
         const size_t ln = strnlen(cfg->key_label, LABEL_MAX + 1u);
         if (ln <= LABEL_MAX && udsota_psa_lock(UDSOTA_PSA_WAIT_FOREVER)) {
             memcpy(msg, cfg->key_label, ln);
@@ -1342,7 +1323,7 @@ static void worker(void *arg)
     }
 #endif
 #if CONFIG_SECURE_SIGNED_ON_UPDATE
-    s.flags = 0x01u;                                     /* images are signature-checked */
+    s.flags = UDSOTA_STATUS_SIG_CHECKED;
 #endif
     taskENTER_CRITICAL(&s_mux);
     s_st = s;
@@ -1581,17 +1562,18 @@ int udsota_plat_ecdsa_key(const uint8_t *pubkey)
     psa_set_key_algorithm(&attr, PSA_ALG_ECDSA(PSA_ALG_SHA_256));
     psa_set_key_type(&attr, PSA_KEY_TYPE_ECC_PUBLIC_KEY(PSA_ECC_FAMILY_SECP_R1));
     psa_set_key_bits(&attr, 256);
-    return (psa_import_key(&attr, pubkey, 65, &s_pub) == PSA_SUCCESS) ? 0 : -1;
+    return (psa_import_key(&attr, pubkey, UDSOTA_KEYS_PUBKEY_LEN, &s_pub) == PSA_SUCCESS) ? 0 : -1;
 }
 
-int udsota_plat_ecdsa(const uint8_t *msg, size_t n, const uint8_t sig[64])
+int udsota_plat_ecdsa(const uint8_t *msg, size_t n, const uint8_t sig[UDSOTA_KEYS_SIG_LEN])
 {
     uint8_t hash[32];
     size_t hn = 0;
     if (psa_hash_compute(PSA_ALG_SHA_256, msg, n, hash, sizeof hash, &hn) != PSA_SUCCESS) {
         return -1;
     }
-    const psa_status_t st = psa_verify_hash(s_pub, PSA_ALG_ECDSA(PSA_ALG_SHA_256), hash, hn, sig, 64);
+    const psa_status_t st =
+        psa_verify_hash(s_pub, PSA_ALG_ECDSA(PSA_ALG_SHA_256), hash, hn, sig, UDSOTA_KEYS_SIG_LEN);
     return (st == PSA_SUCCESS) ? 1 : (st == PSA_ERROR_INSUFFICIENT_MEMORY || st == PSA_ERROR_HARDWARE_FAILURE) ? -1 : 0;
 }
 

@@ -917,8 +917,9 @@ int main(void)
     }
     s_ecdsa = false;
 
-    /* The ECDSA mode verifies SIG_TAG || seed || level || ID length || ID. For the client's known seed (10..1F), level
-     * 03 and this device's MAC that is the client's SIG_MSG_L3 (client/tests/test_udsota.py), the bytes it signs. */
+    /* The ECDSA mode verifies UDSOTA_KEYS_SIG_TAG || seed || level || ID length || ID. For the client's known seed
+     * (10..1F), level 03 and this device's MAC that is the client's SIG_MSG_L3 (client/tests/test_udsota.py), the bytes
+     * it signs. */
     {
         static const uint8_t sig_msg_l3[] = {
             0x75, 0x64, 0x73, 0x6f, 0x74, 0x61, 0x2d, 0x32, 0x37, 0x2d, 0x65, 0x63, 0x64, 0x73, 0x61, 0x2d, 0x76, 0x31,
