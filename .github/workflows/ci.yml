@@ -1,5 +1,6 @@
-# udsota: the host test, the client's tests and the release tool's, the client against udsota_lite_server, and the
-# ESP32 example built with a throwaway signing key.
+# udsota: the host test, the client's tests and the release tool's, the client against udsota_lite_server, the CANDash
+# example built with a throwaway signing key, and what a release of this commit would carry (release-assets.yml): the
+# client's wheel and sdist and examples/esp32's image for esp32s3 and esp32.
 name: ci
 on: [push, pull_request]
 jobs:
@@ -50,3 +51,7 @@ jobs:
           espsecure.py generate_signing_key --version 2 examples/candash_ws43/secrets/dev_signing_key.pem
           idf.py -C examples/candash_ws43 -B build build
           idf.py -C examples/candash_ws43 -B build-ws43b -DPOC_BOARD=ws43b build
+  release-assets:
+    uses: ./.github/workflows/release-assets.yml
+    with:
+      ref: ${{ github.sha }}
