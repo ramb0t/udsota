@@ -30,6 +30,13 @@
 #include <stdint.h>
 #include "iso14229.h"
 
+/* The udsota release this header belongs to, for an #if on the release a feature arrived in. tools/release.py sets
+ * all four at each cut, and its check fails when they disagree with the tag (RELEASING.md). */
+#define UDSOTA_VERSION_MAJOR 0
+#define UDSOTA_VERSION_MINOR 14
+#define UDSOTA_VERSION_PATCH 2
+#define UDSOTA_VERSION       "0.14.2"
+
 /* ---- The image descriptor ----
  * Every image says which board, partition layout and CAN IDs it is for, at offset 288 (right after ESP-IDF's
  * esp_app_desc_t), so a device refuses a wrong image before erasing anything. Place it once, at file scope in the
