@@ -1,8 +1,9 @@
-# udsota: the host test, the client's tests and the release tool's, the client against udsota_lite_server (gcc and
-# clang builds of each), the CANDash example built with a throwaway signing key for the ws43, the ws43b and the ws43 at
-# -O2, and what a release of this commit would carry (release-assets.yml): the client's wheel and sdist and
-# examples/esp32's image for esp32s3 and esp32. Every image build fails on a compiler warning, and every image must
-# pass udsota's image rules (tools/image_check.c) while a copy with a broken descriptor must not.
+# udsota: the host test and the fuzzer's replay, the client's tests and the release tool's, the client against
+# udsota_lite_server (gcc and clang builds of each, and the fuzzer's libFuzzer build on clang), the CANDash example
+# built with a throwaway signing key for the ws43, the ws43b and the ws43 at -O2, and what a release of this commit
+# would carry (release-assets.yml): the client's wheel and sdist and examples/esp32's image for esp32s3 and esp32.
+# Every image build fails on a compiler warning, and every image must pass udsota's image rules (tools/image_check.c)
+# while a copy with a broken descriptor must not.
 name: ci
 on: [push, pull_request]
 jobs:
@@ -15,9 +16,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: The vendored iso14229 files match iso14229/SHA256SUMS
         run: cd iso14229 && sha256sum -c SHA256SUMS
-      - run: cmake -S . -B build && cmake --build build -j && ctest --test-dir build --output-on-failure
+      - run: |
+          cmake -S . -B build -DUDSOTA_FUZZ_LIBFUZZER="$FUZZ_LIBFUZZER"
+          cmake --build build -j && ctest --test-dir build --output-on-failure
         env:
           CC: ${{ matrix.cc }}
+          FUZZ_LIBFUZZER: ${{ matrix.cc == 'clang' && 'ON' || 'OFF' }}
   client:
     runs-on: ubuntu-latest
     steps:

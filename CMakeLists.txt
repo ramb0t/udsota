@@ -59,6 +59,41 @@ target_link_options(udsota_lite_server PRIVATE -fsanitize=address,undefined -fno
 set_source_files_properties(test/e2e/lite_server.c test/e2e/lite_platform.c PROPERTIES COMPILE_OPTIONS
                             "-Wall;-Wextra;-Werror")
 
+# The fuzzer (test/fuzz_udsota.c): CAN frames through iso14229's isotp-c into UDSServerPoll and udsota, under ASan and
+# UBSan. Each run replays its seeds, their mutants and random programs, the same every time, and fails unless the
+# seeds reach a whole update over DFI 00 and 10 and a refused first block. -DUDSOTA_FUZZ_CORPUS=<dir> replays that
+# corpus too (fuzz_udsota_corpus). -DUDSOTA_FUZZ_LIBFUZZER=ON (clang) also builds fuzz_udsota_libfuzzer, the same
+# harness as a libFuzzer target, and runs it once over the seeds: fuzz_udsota --write-seeds <dir> starts a corpus.
+set(UDSOTA_FUZZ_CORPUS "" CACHE PATH "A corpus directory for fuzz_udsota_corpus to replay (none when empty)")
+option(UDSOTA_FUZZ_LIBFUZZER "Build fuzz_udsota_libfuzzer, the fuzzer as a libFuzzer target (clang only)" OFF)
+function(udsota_fuzz name sanitizers)
+    add_executable(${name} test/fuzz_udsota.c udsota.c iso14229/iso14229.c test/miniz/miniz.c)
+    target_include_directories(${name} PRIVATE . iso14229 test/miniz)
+    target_compile_definitions(${name} PRIVATE UDS_SYS=UDS_SYS_UNIX UDS_AUTOSELECT_TP=0 UDS_TP_ISOTP_C
+                                               UDS_CUSTOM_MILLIS _DEFAULT_SOURCE UDSOTA_TEST MINIZ_NO_STDIO
+                                               MINIZ_NO_TIME MINIZ_NO_ARCHIVE_APIS MINIZ_NO_ZLIB_APIS ${ARGN})
+    target_compile_options(${name} PRIVATE -fsanitize=${sanitizers} -fno-sanitize-recover=all -fno-omit-frame-pointer)
+    target_link_options(${name} PRIVATE -fsanitize=${sanitizers} -fno-sanitize-recover=all)
+endfunction()
+set_source_files_properties(test/fuzz_udsota.c PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror")
+udsota_fuzz(fuzz_udsota address,undefined)
+add_test(NAME fuzz_udsota COMMAND fuzz_udsota)
+set_tests_properties(fuzz_udsota PROPERTIES TIMEOUT 600)
+if(UDSOTA_FUZZ_CORPUS)
+    add_test(NAME fuzz_udsota_corpus COMMAND fuzz_udsota ${UDSOTA_FUZZ_CORPUS})
+    set_tests_properties(fuzz_udsota_corpus PROPERTIES TIMEOUT 1800)
+endif()
+if(UDSOTA_FUZZ_LIBFUZZER)
+    if(NOT CMAKE_C_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "UDSOTA_FUZZ_LIBFUZZER needs clang: ${CMAKE_C_COMPILER_ID} has no -fsanitize=fuzzer")
+    endif()
+    udsota_fuzz(fuzz_udsota_libfuzzer fuzzer,address,undefined UDSOTA_FUZZ_LIBFUZZER)
+    add_test(NAME fuzz_udsota_seeds COMMAND fuzz_udsota --write-seeds ${CMAKE_CURRENT_BINARY_DIR}/fuzz_seeds)
+    add_test(NAME fuzz_udsota_libfuzzer COMMAND fuzz_udsota_libfuzzer -runs=0 ${CMAKE_CURRENT_BINARY_DIR}/fuzz_seeds)
+    set_tests_properties(fuzz_udsota_seeds PROPERTIES FIXTURES_SETUP fuzz_seeds)
+    set_tests_properties(fuzz_udsota_libfuzzer PROPERTIES FIXTURES_REQUIRED fuzz_seeds)
+endif()
+
 # isotp-c's timers across the 2^31 us point, at -O2, where the -fwrapv above matters.
 add_executable(test_isotp_wrap test/test_isotp_wrap.c iso14229/iso14229.c)
 target_include_directories(test_isotp_wrap PRIVATE iso14229)
