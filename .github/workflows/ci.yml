@@ -52,9 +52,11 @@ jobs:
           UDSOTA_LITE_SERVER: ${{ github.workspace }}/build/udsota_lite_server
       - name: Set up vcan0
         run: |
-          sudo apt-get update
-          sudo apt-get install -y linux-modules-extra-$(uname -r)
-          sudo modprobe vcan
+          if ! sudo modprobe vcan; then
+            sudo apt-get update
+            sudo apt-get install -y linux-modules-extra-$(uname -r)
+            sudo modprobe vcan
+          fi
           sudo ip link add dev vcan0 type vcan
           sudo ip link set up vcan0
       - name: Load the kernel ISO-TP module, where the kernel has one (the udsota command's tests need it)
