@@ -1,6 +1,6 @@
 # CANDash ws43 example
 
-udsota-lite and iso14229 in one ESP-IDF app for the CANDash ws43 (Waveshare ESP32-S3-Touch-LCD-4.3) or ws43b (the 4.3B). It carries CANDash's image identity (project `candash`, hw_id 1 or 2, layout 1, CAN IDs 0x7E6/0x7EE), so CANDash's own updater installs it and it installs CANDash back. The [top-level README](../../README.md) explains how the pieces fit.
+udsota and iso14229 in one ESP-IDF app for the CANDash ws43 (Waveshare ESP32-S3-Touch-LCD-4.3) or ws43b (the 4.3B). It carries CANDash's image identity (project `candash`, hw_id 1 or 2, layout 1, CAN IDs 0x7E6/0x7EE), so CANDash's own updater installs it and it installs CANDash back. The [top-level README](../../README.md) explains how the pieces fit.
 
 `components/udsota` is a link to the repository root, which is the component. Besides the integration, `main/main.c` sets up the board's CAN: TWAI at 250 kbit/s, on the ws43 on GPIO20/19 with the CH422G expander's EXIO5 set to select CAN (the transceiver shares those pins with USB), on the ws43b on GPIO15/16.
 

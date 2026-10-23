@@ -1,6 +1,6 @@
 # Third-party code
 
-udsota-lite vendors two libraries, both unmodified and each under its own MIT licence, which applies to its files only.
+udsota vendors two libraries, both unmodified and each under its own MIT licence, which applies to its files only.
 
 **iso14229** by driftregion and contributors: the single-file amalgamation `iso14229.c` and `iso14229.h`, with the isotp-c it embeds, and its licence, in `iso14229/`. They are upstream's committed files at `d018adc7015a88d7a4f164418fcb7e7927e5aa77`, upstream main of 2026-09-29, untagged. `iso14229/SHA256SUMS` holds their hashes, and CI fails if they change. The header's `UDS_LIB_VERSION` says 0.11.0, but the tag 0.11.0 is an earlier commit (8a7eb23d, whose header says 0.10.2); this one is 31 commits past it. Upstream CI passed at this commit: GitHub Actions unit tests (run 36615027352: linux, windows, arduino, esp32 on ESP-IDF 5.2), static analysis (run 36615027250, whose lint job checks the amalgamation against `src/`), and CircleCI.
 
