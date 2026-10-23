@@ -16,7 +16,21 @@ udsota --profile <CANDash>/tools/udsota-candash.toml flash --compress build/cand
 
 For `-O2`, as CANDash ships, add `-DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.o2"` and give the build its own `-DSDKCONFIG=<build dir>/sdkconfig`, since the project's sdkconfig keeps `-Og`. For the ws43b, add `-DPOC_BOARD=ws43b`; its sdkconfig stays in its build directory, because its console is native USB. Don't power a ws43b with its DI0/DI1 inputs wired: the example drives them high as CANDash does, and CANDash warns that this may damage the CH422G or the optocoupler.
 
-The version keeps CANDash's `0.5.0` core, because a device takes a dev build only when its `X.Y.Z` is at least the running one's. For ECDSA 0x27 instead of CANDash's HMAC master, add `-DPOC_PUBKEY_DIR=<dir>` with the `udsota_pubkey.h` that `udsota keygen` writes, and give the client a profile whose `[security]` has `mode = "ecdsa"` and the private key.
+The version keeps CANDash's `0.5.0` core, because a device takes a dev build only when its `X.Y.Z` is at least the running one's. For ECDSA 0x27 instead of CANDash's HMAC master, add `-DPOC_PUBKEY_DIR=<dir>` with the `udsota_pubkey.h` that `udsota keygen` writes, and give the client a profile whose `[security]` has `mode = "ecdsa"` and the private key. `-DPOC_ALLOW_DOWNGRADE=1` sets `cfg.allow_downgrade`, so the image also takes an older one.
+
+## Bench results (2026-10-23)
+
+On a ws43b, on lite-main 5d37be5 plus the `POC_ALLOW_DOWNGRADE` switch, at `-O2` with CANDash's signing key and HMAC master. The client was 0.14.2 with CANDash's profile, over PCAN at 250 kbit/s, all over CAN. The run started and ended on CANDash v0.5.0-108, and its `info` afterwards matched the start except for the counters and F1F0's other slot.
+
+| Test | Result |
+|---|---|
+| CANDash v0.5.0-108 → 0.5.0-lite.20, DEFLATE | 199 KB in 147.5 s, confirmed |
+| lite.20 → 0.4.9-lite.20, switch off | Refused at the first block, `7F 36 31`; F1F1 DL_NOT_NEWER; nothing changed |
+| lite.20 → 0.5.0-lite.21 (switch on), DEFLATE, HMAC unlock | 199 KB in 21.2 s, confirmed |
+| lite.21 → 0.4.9-lite.20, switch on | 199 KB in 21.1 s, confirmed |
+| 0.4.9-lite.20 → CANDash v0.5.0-108 | 707 KB in 75.6 s, confirmed; config hash unchanged |
+
+The lite → lite updates ran 0x27, FF01 and F001 through `udsota_psa_lock`.
 
 ## Bench results (2026-10-19)
 
@@ -35,7 +49,7 @@ Everything since fa70d8d that a bench can show passed on a ws43b, on 5f67e56 wit
 | lite → lite.7 (ECDSA), unlocked before ConfirmImage | The unlock took 0.49 s; confirmed |
 | lite.7 → CANDash v0.5.0-39, plain, ECDSA unlock | 1.25 MB in 306 blocks, so the block counter wrapped; 145 s of transfer, 180 s for the whole flash |
 
-Not shown on hardware: `udsota_end_session` (this example never calls it), `udsota_poll`'s 24.86-day case, and `allow_downgrade` set. a362e5c changes nothing in this example's image.
+Not shown on hardware: `udsota_end_session` (this example never calls it), and `udsota_poll`'s 24.86-day case; `allow_downgrade` ran on 2026-10-23. a362e5c changes nothing in this example's image.
 
 ## Bench results (2026-09-30)
 

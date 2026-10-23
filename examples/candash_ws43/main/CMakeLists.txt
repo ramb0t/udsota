@@ -13,3 +13,8 @@ if(DEFINED POC_PUBKEY_DIR AND EXISTS "${POC_PUBKEY_DIR}/udsota_pubkey.h")
     target_include_directories(${COMPONENT_LIB} PRIVATE "${POC_PUBKEY_DIR}")
     target_compile_definitions(${COMPONENT_LIB} PRIVATE POC_HAVE_PUBKEY=1)
 endif()
+
+# -DPOC_ALLOW_DOWNGRADE=1: the first-block check also takes an older image (cfg.allow_downgrade).
+if(POC_ALLOW_DOWNGRADE)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE POC_ALLOW_DOWNGRADE=1)
+endif()
