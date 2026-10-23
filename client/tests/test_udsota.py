@@ -34,7 +34,7 @@ from udsoncan.connections import BaseConnection, IsoTPSocketConnection
 from udsoncan.exceptions import TimeoutException
 
 import udsota
-from udsota import cli, config, delta, dtc, errors, keys, pack, profile, transport, update, wire
+from udsota import cli, config, delta, dtc, errors, image, keys, pack, profile, transport, update, wire
 from udsota.image import parse_image
 from udsota.uds import BUSY_BACKOFF_S, KEEPALIVE_S, SA_DELAY_S, SIG_P2_S, Uds
 
@@ -109,9 +109,9 @@ CFG_COMMIT_RID, CFG_HASH_DID, CFG_STATUS_DID = 0x1234, 0xF1B0, 0xF1B2   # CONF's
 CFG_VALUES = {0x0200: b"\x01", 0x0201: b"\x07\xd0", 0x0202: b"\xaa\xbb", 0x0205: b"\x2a"}   # 0x0203 is absent
 
 
-# The ecdsa mode's known answers, pinned in udsota_keys.c (KAT_SIG_*) and test/test_udsota_keys.c too: the
-# message for SEED, level 0x03 and MAC, its SHA-256, and the test key (private scalar 01 02 .. 20) with its
-# signature over that message.
+# The ecdsa mode's known answers: the message for SEED, level 0x03 and MAC, which test/test_udsota.c checks is the
+# message udsota.c verifies, its SHA-256, and the test key (private scalar 01 02 .. 20) with its signature over that
+# message.
 SIG_MSG_L3 = bytes.fromhex("7564736f74612d32372d65636473612d7631101112131415161718191a1b1c1d1e1f0306020000000001")
 SIG_DIGEST_L3 = "af914ba6ad030d8ac102fe70ba98255a9e50ad7c45373941db3d4aaac246b4ce"
 KAT_SCALAR = int.from_bytes(bytes(range(1, 33)), "big")
@@ -627,8 +627,8 @@ def test_seed_key_vectors(level):
     assert keys.seed_key(keys.derive_k_dev(MASTER, P.security.label, MAC), SEED, level, MAC) == KEYS[level]
 
 
-# Check the core's known-answer test (udsota_keys.c, KAT_*): label udsota-kat, master 0..31, ID 02:00:00:00:00:01,
-# seed 0x10..0x1F. The C self-test and test/test_udsota_keys.c pin the same bytes.
+# Check the hmac mode's known answers: label udsota-kat, master 0..31, ID 02:00:00:00:00:01, seed 0x10..0x1F.
+# test/test_udsota.c pins the ecdsa mode's message, not these; test_e2e_lite.py unlocks udsota.c's hmac mode.
 def test_core_kat_vectors():
     k_dev = keys.derive_k_dev(MASTER, b"udsota-kat", MAC)
     assert k_dev.hex() == "7bac00ce789369a8fb6f3ce1d1fbe7fea02cd3cdbed02a23a0a48a9d1a268757"
@@ -656,7 +656,7 @@ def test_load_master_refuses_anything_else(tmp_path, content):
 
 # ---- keys: the ecdsa mode ----
 
-# Check the signed message and its SHA-256 against the bytes udsota_keys.c builds (test/test_udsota_keys.c pins them).
+# Check the signed message and its SHA-256 against the bytes udsota.c verifies (test/test_udsota.c pins them).
 def test_sig_message_known_answer():
     m = keys.sig_message(SEED, 0x03, MAC)
     assert m == SIG_MSG_L3 and hashlib.sha256(m).hexdigest() == SIG_DIGEST_L3
@@ -671,8 +671,8 @@ def test_sig_message_refuses_bad_input(seed, device_id):
         keys.sig_message(seed, 0x03, device_id)
 
 
-# Check the device's ECDSA self-test vector (udsota_keys.c KAT_SIG_*): the test scalar's public point, and a
-# signature that verifies over the level-3 message and not over the level-1 one.
+# Check the test key the client's ecdsa tests sign with: the test scalar's public point, and a signature that
+# verifies over the level-3 message and not over the level-1 one.
 def test_sig_self_test_vector():
     assert keys.public_point(ec.derive_private_key(KAT_SCALAR, ec.SECP256R1())) == KAT_PUB
     assert ecdsa_valid(KAT_PUB, KAT_SIG_L3, SIG_MSG_L3)
@@ -1177,7 +1177,9 @@ def test_decode_result_counters():
     assert counters["seq_errors"] == 0x0102 and counters["resp_frames_dropped"] == 0x0F10
 
 
-WIRE_H = pathlib.Path(__file__).resolve().parents[2] / "components" / "udsota" / "include" / "udsota_wire.h"
+REPO = pathlib.Path(__file__).resolve().parents[2]
+# v0.14.2's wire contract, frozen: what units still on a v0.14.x server answer with, which wire.py must keep matching.
+WIRE_H = REPO / "test" / "fixtures" / "wire-v0.14" / "udsota_wire.h"
 # The #defines wire.py mirrors, by the name wire.py gives each.
 WIRE_DEFINES = {"UDSOTA_DID_ACTIVE_SESSION": "DID_SESSION", "UDSOTA_DID_SW_VERSION": "DID_VERSION",
                 "UDSOTA_DID_SERIAL": "DID_DEVICE_ID", "UDSOTA_DID_STATUS": "DID_STATUS",
@@ -1200,12 +1202,13 @@ WIRE_DEFINES = {"UDSOTA_DID_ACTIVE_SESSION": "DID_SESSION", "UDSOTA_DID_SW_VERSI
                 "UDSOTA_DTC_RECORD_ALL": "DTC_RECORD_ALL", "UDSOTA_DTC_GROUP_ALL": "DTC_GROUP_ALL"}
 
 
-# Where udsota_wire.h's own #includes resolve: it is an umbrella over the server's and the updater's wire headers.
-WIRE_DIRS = (WIRE_H.parent, WIRE_H.parents[1] / "server" / "include", WIRE_H.parents[1] / "update" / "include")
+# Where udsota_wire.h's own #includes resolve: it is an umbrella over the server's and the updater's wire headers,
+# frozen side by side.
+WIRE_DIRS = (WIRE_H.parent,)
 
 
 # udsota_wire.h without comments, each udsota header it includes spliced in at its #include, recursively and once
-# each, or a skip when the checkout has no components/ (a wheel-only install).
+# each, or a skip when the checkout has no test/fixtures/ (a wheel-only install).
 def wire_header():
     if not WIRE_H.is_file():
         pytest.skip("no %s (not a repo checkout)" % WIRE_H)
@@ -1225,7 +1228,7 @@ def wire_header():
     return expand(WIRE_H)
 
 
-# Check wire.py's reason names match udsota_reason_t in udsota_wire.h, by name and value.
+# Check wire.py's reason names match udsota_reason_t in v0.14.2's udsota_wire.h, by name and value.
 def test_reason_names_match_udsota_wire():
     body = re.search(r"typedef enum \{([^}]*)\} udsota_reason_t;", wire_header()).group(1)
     names, value = [], -1
@@ -1238,8 +1241,8 @@ def test_reason_names_match_udsota_wire():
     assert wire.reason_name(len(wire.DL_REASONS)) == "reason 0x%02X" % len(wire.DL_REASONS)
 
 
-# Check the DIDs, RIDs, NRCs, download format, DTC numbers and status flags wire.py mirrors match udsota_wire.h's
-# #defines.
+# Check the DIDs, RIDs, NRCs, download format, DTC numbers and status flags wire.py mirrors match v0.14.2's
+# udsota_wire.h #defines.
 def test_wire_numbers_match_udsota_wire():
     defines = {m[1]: int(m[2], 0) for m in re.finditer(r"#define\s+(UDSOTA_\w+)\s+(0x[0-9A-Fa-f]+|\d+)u?\b",
                                                       wire_header())}
@@ -1247,6 +1250,100 @@ def test_wire_numbers_match_udsota_wire():
     assert defines["UDSOTA_DL_MAX_BLOCK_LEN"] - 2 == wire.DL_MAX_DATA
     flags = {v for k, v in defines.items() if k.startswith("UDSOTA_STATUS_") and k != "UDSOTA_STATUS_LEN"}
     assert flags == set(wire.STATUS_FLAGS)
+
+
+UDSOTA_H, ISO14229_H = REPO / "udsota.h", REPO / "iso14229" / "iso14229.h"
+# What wire.py mirrors that this server has no number for: F1F2, delta, the DTC services and the boot-loop flag
+# (0x02) belong to v0.14.2's server, and iso14229 takes any ALFID. The v0.14.x test above still checks them.
+NOT_IN_UDSOTA_H = {"UDSOTA_DID_COUNTERS", "UDSOTA_DL_DFI_DELTA", "UDSOTA_DL_DFI_DELTA_DEFLATE", "UDSOTA_DL_ALFID",
+                   "UDSOTA_RDTC_COUNT_BY_MASK", "UDSOTA_RDTC_BY_MASK", "UDSOTA_RDTC_EXT_DATA", "UDSOTA_RDTC_SUPPORTED",
+                   "UDSOTA_DTC_RECORD_ALL", "UDSOTA_DTC_GROUP_ALL"}
+# The NRCs in WIRE_DEFINES, which this server takes from iso14229.h.
+NRC_ISO14229 = {"UDSOTA_NRC_BUSY_REPEAT": "UDS_NRC_BusyRepeatRequest",
+                "UDSOTA_NRC_SERVICE_NOT_SUPPORTED": "UDS_NRC_ServiceNotSupported",
+                "UDSOTA_NRC_CONDITIONS_NOT_CORRECT": "UDS_NRC_ConditionsNotCorrect",
+                "UDSOTA_NRC_REQUEST_SEQUENCE_ERROR": "UDS_NRC_RequestSequenceError",
+                "UDSOTA_NRC_REQUEST_OUT_OF_RANGE": "UDS_NRC_RequestOutOfRange",
+                "UDSOTA_NRC_TIME_DELAY_NOT_EXPIRED": "UDS_NRC_RequiredTimeDelayNotExpired",
+                "UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE": "UDS_NRC_GeneralProgrammingFailure",
+                "UDSOTA_NRC_SUBFUNC_NOT_SUPPORTED": "UDS_NRC_SubFunctionNotSupported",
+                "UDSOTA_NRC_RESPONSE_TOO_LONG": "UDS_NRC_ResponseTooLong"}
+# The client's own copy of each udsota.h wire number outside WIRE_DEFINES: lengths, levels and offsets.
+CLIENT_NUMBERS = {"UDSOTA_DL_MAX_BLOCK_LEN": wire.DL_MAX_DATA + 2,
+                  "UDSOTA_SA_SEED_EXTENDED": PE.security.level_extended,         # the profile's default levels
+                  "UDSOTA_SA_SEED_PROGRAMMING": PE.security.level_programming,
+                  "UDSOTA_SEED_LEN": keys.SEED_LEN, "UDSOTA_KEY_LEN": keys.KEY_LEN, "UDSOTA_KEYS_SIG_LEN": keys.SIG_LEN,
+                  "UDSOTA_KEYS_SIG_TAG": keys.SIG_TAG.decode(), "UDSOTA_KEYS_PUBKEY_LEN": keys.PUBKEY_LEN,
+                  "UDSOTA_KEYS_ID_MAX": keys.ID_MAX, "UDSOTA_IMG_DESC_OFFSET": image.DESC_OFFSET}
+# udsota.h's wire numbers the client never sends or reads, which must equal v0.14.2's instead.
+SERVER_ONLY = {"UDSOTA_RID_GET_RESUME_POINT", "UDSOTA_RESUME_NOT_AVAILABLE", "UDSOTA_DL_Z_BOUND",
+               "UDSOTA_SA_SEED_VALID_MS"}
+
+
+# udsota.h's text, or a skip when the checkout has none (a wheel-only install).
+def udsota_h():
+    if not UDSOTA_H.is_file():
+        pytest.skip("no %s (not a repo checkout)" % UDSOTA_H)
+    return UDSOTA_H.read_text()
+
+
+# The UDSOTA_ #defines in comment-free text as {name: value}: an int, a string literal's text, or anything else
+# (a function-like macro's parameters and body) as its text after the name, whitespace collapsed.
+def udsota_defines(text):
+    out = {}
+    for m in re.finditer(r"^[ \t]*#define[ \t]+(UDSOTA_\w+)(.*)$", text, flags=re.M):
+        v = None if m[2].startswith("(") else re.fullmatch(r"\s*(?:(0x[0-9A-Fa-f]+|\d+)u?|\"([^\"]*)\")\s*", m[2])
+        out[m[1]] = " ".join(m[2].split()) if v is None else int(v[1], 0) if v[1] else v[2]
+    return out
+
+
+# udsota.h's "Wire contract" block as udsota_defines gives it.
+def udsota_h_wire_block():
+    text = udsota_h()
+    start = text.index("---- Wire contract ----")
+    return udsota_defines(re.sub(r"/\*.*?\*/", "", text[start:text.index("/* ---- ", start)], flags=re.S))
+
+
+# Check this server's wire numbers, udsota.h's "Wire contract" block and the NRCs and sessions it takes from
+# iso14229.h, match wire.py's and the client's other copies, and that every name on either side is accounted for.
+def test_wire_numbers_match_udsota_h():
+    block = udsota_h_wire_block()
+    flags = {k for k in block if k.startswith("UDSOTA_STATUS_")}
+    unmapped = set(block) - set(WIRE_DEFINES) - set(CLIENT_NUMBERS) - SERVER_ONLY - flags
+    assert not unmapped, "udsota.h wire numbers the client test doesn't map: %s" % sorted(unmapped)
+    assert {c: block[c] for c in block.keys() & WIRE_DEFINES} == \
+        {c: getattr(wire, WIRE_DEFINES[c]) for c in block.keys() & WIRE_DEFINES}
+    assert {c: block[c] for c in CLIENT_NUMBERS} == CLIENT_NUMBERS
+    assert set(WIRE_DEFINES) - set(block) == set(NRC_ISO14229) | NOT_IN_UDSOTA_H
+    assert {block[k] for k in flags} == set(wire.STATUS_FLAGS) - {0x02}
+    if not ISO14229_H.is_file():
+        pytest.skip("no %s (not a repo checkout)" % ISO14229_H)
+    iso = ISO14229_H.read_text()
+    nrcs = {m[1]: int(m[2], 0) for m in re.finditer(r"\b(UDS_NRC_\w+)\s*=\s*(0x[0-9A-Fa-f]+)", iso)}
+    assert {c: nrcs[n] for c, n in NRC_ISO14229.items()} == {c: getattr(wire, WIRE_DEFINES[c]) for c in NRC_ISO14229}
+    sessions = {m[1]: int(m[2]) for m in re.finditer(r"#define\s+(UDS_LEV_DS_\w+)\s+(\d+)U\b", iso)}
+    assert (sessions["UDS_LEV_DS_PRGS"], sessions["UDS_LEV_DS_EXTDS"]) == (wire.SESSION_PROGRAMMING,
+                                                                          wire.SESSION_EXTENDED)
+
+
+# Check udsota.h's wire numbers no client copy covers (F000 and its status, the seed lifetime, the DEFLATE overrun
+# bound) match v0.14.2's udsota_wire.h, so a tester sees the same from either server.
+def test_server_only_numbers_match_udsota_wire():
+    block, v014 = udsota_h_wire_block(), udsota_defines(wire_header())
+    assert {k: block[k] for k in SERVER_ONLY} == {k: v014.get(k) for k in SERVER_ONLY}
+
+
+# Check wire.py's reason names match udsota_reason_t in udsota.h, by name and value, counting from its last entry.
+def test_reason_names_match_udsota_h():
+    text = re.sub(r"/\*.*?\*/", "", udsota_h(), flags=re.S)
+    body = re.search(r"typedef enum \{([^}]*)\} udsota_reason_t;", text)[1]
+    names, value = [], -1
+    for item in (x.strip() for x in body.split(",") if x.strip()):
+        m = re.fullmatch(r"UDSOTA_(\w+)(?:\s*=\s*(\w+))?", item)
+        value = int(m[2], 0) if m[2] else value + 1
+        names.append((m[1], value))
+    assert [(wire.reason_name(v), v) for _, v in names] == names
+    assert names[-1][1] == len(wire.DL_REASONS) - 1
 
 
 # ---- the update sequence ----

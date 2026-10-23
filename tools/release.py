@@ -18,7 +18,7 @@ TAG = re.compile(r"v(\d+\.\d+\.\d+)")
 HEADING = re.compile(r"^## \[(?P<version>[^\]]+)\] - (?P<date>.+)$", re.M)
 DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 CLIENT_VERSION = re.compile(r'^__version__ = "([^"]+)"', re.M)
-HEADER = "components/udsota/include/udsota.h"
+HEADER = "udsota.h"
 HEADER_VERSION = re.compile(r'^(#define UDSOTA_VERSION[ \t]+)"([^"]*)"', re.M)
 HEADER_PARTS = [re.compile(r"^(#define UDSOTA_VERSION_%s[ \t]+)(\d+)" % p, re.M) for p in ("MAJOR", "MINOR", "PATCH")]
 RELATIVE_LINK = re.compile(r"\]\((?![a-z][a-z0-9+.-]*:)([^)\s]+)\)")

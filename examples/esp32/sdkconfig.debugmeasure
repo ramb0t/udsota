@@ -1,3 +1,0 @@
-# Bench measurement: update timings, stack headroom, internal heap and whether flash writes run with the cache off,
-# logged at INFO. List this file after sdkconfig.defaults and any other fragment in SDKCONFIG_DEFAULTS.
-CONFIG_UDSOTA_ESP32_DEBUG_MEASURE=y

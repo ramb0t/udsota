@@ -13,7 +13,7 @@ udsota uses [semantic versioning](https://semver.org). While it is 0.x:
 
 From 1.0 the usual rules apply: major for breaking, minor for additive, patch for fixes.
 
-**One version, in four places that agree:** the tag `vX.Y.Z`, the dated CHANGELOG heading `## [X.Y.Z] - YYYY-MM-DD`, `__version__` in `client/udsota/__init__.py`, and `UDSOTA_VERSION` with `UDSOTA_VERSION_MAJOR`, `_MINOR` and `_PATCH` in `components/udsota/include/udsota.h`. `python tools/release.py check vX.Y.Z` checks all four, and the release workflow runs it before it publishes anything.
+**One version, in four places that agree:** the tag `vX.Y.Z`, the dated CHANGELOG heading `## [X.Y.Z] - YYYY-MM-DD`, `__version__` in `client/udsota/__init__.py`, and `UDSOTA_VERSION` with `UDSOTA_VERSION_MAJOR`, `_MINOR` and `_PATCH` in `udsota.h`. `python tools/release.py check vX.Y.Z` checks all four, and the release workflow runs it before it publishes anything.
 
 The example's `PROJECT_VER` in `examples/esp32/CMakeLists.txt` is something else: the firmware image's version, which the device's anti-downgrade rule compares. It does not follow the library's version.
 

@@ -1,4 +1,4 @@
-"""SecurityAccess keys (udsota_keys.c). The hmac mode: K_dev = HMAC-SHA256(master, label || device ID), and the
+"""SecurityAccess keys (udsota.c). The hmac mode: K_dev = HMAC-SHA256(master, label || device ID), and the
 0x27 key is the first 16 bytes of HMAC-SHA256(K_dev, seed || level || device ID). The ecdsa mode: the key is a
 P-256 ECDSA signature, raw r || s, over SHA-256 of "udsota-27-ecdsa-v1" || seed || level || len(ID) || ID, made
 with a private key the device never holds; `keygen` makes that key pair."""
@@ -59,7 +59,7 @@ class DeviceKeys:
         return seed_key(self.k_dev, seed, level, self.device_id)
 
 
-# The ecdsa mode's signed message (udsota_keys_sig_msg): tag || seed || level || len(device_id) || device_id.
+# The ecdsa mode's signed message (udsota.c's ecdsa_check): tag || seed || level || len(device_id) || device_id.
 def sig_message(seed, level, device_id):
     if len(seed) != SEED_LEN or len(device_id) > ID_MAX:
         raise UpdateFailed("the seed must be %d bytes and the device ID at most %d" % (SEED_LEN, ID_MAX))

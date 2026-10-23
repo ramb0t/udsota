@@ -1,4 +1,4 @@
-# 4 MB flash with two OTA slots and otadata (partitions.csv).
+# 4 MB flash with two OTA slots and otadata (partitions.csv). No target: idf.py set-target picks it.
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
@@ -6,5 +6,5 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # A new image boots pending verify and the client's ConfirmImage keeps it; a reset before that boots the old one.
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 
-# A 1 ms tick lets the diag task sleep exactly to its deadlines (the first 0x78 goes at 40 ms, inside P2's 50 ms).
+# A 1 ms tick, so the server task's 1 ms wait for a frame is one tick and a finished flash job is answered within it.
 CONFIG_FREERTOS_HZ=1000

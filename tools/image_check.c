@@ -1,50 +1,110 @@
-/* image_check: runs the ESP32 port's first-block check on a built image, on the host, so CI can prove a
- * real ESP-IDF build still carries a header and descriptor that udsota accepts.
+/* image_check: udsota's own image rules (check_first in udsota.c) run on a built image, on the host, so CI proves a
+ * real ESP-IDF build carries a header and descriptor that a unit of that board accepts.
  *
- *   image_check <image.bin> <chip_id> [product hw_id layout req_id resp_id slot_size]
+ *   image_check <image.bin> <product>
  *
- * chip_id is ESP-IDF's esp_chip_id_t (esp32 0x0000, esp32s3 0x0009). The optional arguments default to
- * examples/esp32's values: example 1 1 0x710 0x718 0x1E0000. Exits 0 when the image is accepted, else the
- * udsota_reason_t it was refused with (2 when the file cannot be read). */
+ * One executable per chip and board (CMakeLists.txt's udsota_image_check): CHIP_ID is ESP-IDF's esp_chip_id_t
+ * (esp32 0, esp32s3 9), IMAGE_CHECK_HW, _LAYOUT, _REQ and _RESP make the descriptor a unit's running image carries,
+ * and IMAGE_CHECK_SLOT is its slot size. The product goes through udsota_init's cfg, and the running version is
+ * 0.0.0, a dev build, so any parseable version is newer. esp_ota_check_image_validity's chip revision and flash mode
+ * rules are the device's and are not run. Exits 0 when the image is accepted, else the udsota_reason_t it was refused
+ * with, or 100 on a usage error, an unreadable image or a failed udsota_init. */
 #include <stdio.h>
-#include <stdlib.h>
+#include <string.h>
+#include "udsota.h"
 
-#include "udsota_esp32_image.h"
+UDSOTA_IMAGE_DESC(IMAGE_CHECK_HW, IMAGE_CHECK_LAYOUT, IMAGE_CHECK_REQ, IMAGE_CHECK_RESP);
+udsota_reason_t udsota_test_check_first(const uint8_t *b, size_t len, uint32_t size);
 
-/* Parses argv[i] as a number (decimal or 0x hex), or returns def when the argument is absent. */
-static unsigned long arg_num(int argc, char **argv, int i, unsigned long def)
+#define FIRST 320u                 /* the bytes check_first reads */
+
+uint32_t UDSMillis(void)
 {
-    return i < argc ? strtoul(argv[i], NULL, 0) : def;
+    return 0;
 }
 
-/* Reads the image's first block and size, runs the check against the given context and reports it. */
+/* A unit that runs a dev build at 0.0.0 with an empty inactive slot whose writes fail. Only init and the image rules
+ * call into it: nothing downloads. */
+int udsota_plat_start(void) { return 0; }
+int udsota_plat_run(int (*job)(void)) { (void)job; return -1; }
+int udsota_plat_poll(void) { return -1; }
+void udsota_plat_abort(void) {}
+bool udsota_plat_compatible(const uint8_t *first, size_t len) { (void)first; (void)len; return true; }
+int udsota_plat_begin(uint32_t size) { (void)size; return UDSOTA_DL_FLASH_ERROR; }
+int udsota_plat_write(const uint8_t *d, size_t n) { (void)d; (void)n; return UDSOTA_DL_FLASH_ERROR; }
+int udsota_plat_end(void) { return UDSOTA_DL_ABORTED; }
+int udsota_plat_activate(void) { return UDSOTA_DL_ABORTED; }
+int udsota_plat_confirm(void) { return 0; }
+void udsota_plat_unverify(void) {}
+void udsota_plat_status(udsota_status_t *out)
+{
+    memset(out, 0, sizeof *out);
+    out->other_slot_state = UDSOTA_OTHER_EMPTY;
+}
+uint32_t udsota_plat_slot_size(void) { return IMAGE_CHECK_SLOT; }
+const char *udsota_plat_version(void) { return "0.0.0-image-check"; }
+const char *udsota_plat_project(void) { return "image-check"; }
+const uint8_t *udsota_plat_sha(void)
+{
+    static const uint8_t sha[32];
+    return sha;
+}
+size_t udsota_plat_mac(uint8_t out[16])
+{
+    memset(out, 0, 6);
+    return 6;
+}
+bool udsota_plat_rng16(uint8_t out[16])
+{
+    memset(out, 0, 16);
+    return false;
+}
+bool udsota_plat_hmac(const uint8_t *key, size_t key_len, const uint8_t *msg, size_t msg_len, uint8_t out[32])
+{
+    (void)key;
+    (void)key_len;
+    (void)msg;
+    (void)msg_len;
+    memset(out, 0, 32);
+    return false;
+}
+int udsota_plat_ecdsa_key(const uint8_t *pubkey) { (void)pubkey; return -1; }
+int udsota_plat_ecdsa(const uint8_t *msg, size_t n, const uint8_t sig[64])
+{
+    (void)msg;
+    (void)n;
+    (void)sig;
+    return -1;
+}
+
+/* Reads the image's first bytes and size, starts udsota as that unit and runs the image rules on them. */
 int main(int argc, char **argv)
 {
-    if (argc < 3) {
-        fprintf(stderr, "usage: %s <image.bin> <chip_id> [product hw_id layout req_id resp_id slot_size]\n", argv[0]);
-        return 2;
+    if (argc != 3) {
+        fprintf(stderr, "usage: %s <image.bin> <product>\n", argv[0]);
+        return 100;
     }
     FILE *f = fopen(argv[1], "rb");
-    uint8_t block[UDSOTA_IMAGE_MIN_LEN];
-    if (f == NULL || fread(block, 1, sizeof block, f) != sizeof block || fseek(f, 0, SEEK_END) != 0) {
-        fprintf(stderr, "image_check: cannot read the first %u bytes of %s\n", (unsigned)sizeof block, argv[1]);
-        return 2;
+    uint8_t first[FIRST];
+    long size = -1;
+    if (f != NULL && fread(first, 1, sizeof first, f) == sizeof first && fseek(f, 0, SEEK_END) == 0) {
+        size = ftell(f);
     }
-    long size = ftell(f);
-    fclose(f);
-
-    udsota_image_ctx_t ctx = {
-        .product = argc > 3 ? argv[3] : "example",
-        .hw_id = (uint8_t)arg_num(argc, argv, 4, 1),
-        .partition_layout_id = (uint8_t)arg_num(argc, argv, 5, 1),
-        .diag_request_id = (uint16_t)arg_num(argc, argv, 6, 0x710),
-        .diag_response_id = (uint16_t)arg_num(argc, argv, 7, 0x718),
-        .slot_size = (uint32_t)arg_num(argc, argv, 8, 0x1E0000),
-    };
-    bool release = false;
-    udsota_reason_t r = udsota_esp32_image_check(block, sizeof block, (uint32_t)size,
-                                                 (uint16_t)strtoul(argv[2], NULL, 0), &ctx, &release);
-    printf("%s: %ld bytes, reason %d (%s), %s image\n", argv[1], size, (int)r, r == 0 ? "accepted" : "refused",
-           release ? "release" : "dev");
+    if (f != NULL) {
+        fclose(f);
+    }
+    if (size < (long)sizeof first || (unsigned long)size > UINT32_MAX) {
+        fprintf(stderr, "image_check: cannot read the first %u bytes of %s\n", FIRST, argv[1]);
+        return 100;
+    }
+    if (udsota_init(&(udsota_cfg_t){.product = argv[2]}) != 0) {
+        fprintf(stderr, "image_check: udsota_init failed\n");
+        return 100;
+    }
+    const udsota_reason_t r = udsota_test_check_first(first, sizeof first, (uint32_t)size);
+    printf("%s: %ld bytes, project %.32s, version %.32s, for chip %u hw %u layout %u 0x%03X/0x%03X: reason %d (%s)\n",
+           argv[1], size, (const char *)&first[32 + 48], (const char *)&first[32 + 16], (unsigned)CHIP_ID,
+           (unsigned)IMAGE_CHECK_HW, (unsigned)IMAGE_CHECK_LAYOUT, (unsigned)IMAGE_CHECK_REQ,
+           (unsigned)IMAGE_CHECK_RESP, (int)r, r == UDSOTA_DL_OK ? "accepted" : "refused");
     return (int)r;
 }
