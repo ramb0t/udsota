@@ -105,8 +105,10 @@ def parse_line(line):
                        is_extended_id=len(ident) == 8)
 
 
-# A server binary in pipe mode: frames in on its stdin, out on its stdout, its log in log_path. tap(msg) sees every
-# frame the client sends before the server does, and every frame the server sent is kept in sent.
+# A server binary in pipe mode: frames in on its stdin, out on its stdout, its log in log_path. For fault injection,
+# drop(msg) -> True keeps a response frame from the client (kept in dropped; release() hands one on later), tap(msg)
+# sees every frame the client sends before the server does, and drop_tx(msg) -> True keeps one from the server (kept
+# in dropped_tx). Every frame the server sent is kept in sent.
 class DemoServer:
     # Start binary with args; the log goes to log_path.
     def __init__(self, binary, args, log_path):
@@ -115,26 +117,37 @@ class DemoServer:
             self.proc = subprocess.Popen([binary, *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                          stderr=err, bufsize=0)
         self.rx = queue.Queue()
-        self.sent, self.tap = [], None
+        self.sent, self.dropped, self.drop, self.tap = [], [], None, None
+        self.dropped_tx, self.drop_tx = [], None
         self._wlock = threading.Lock()
         self._reader = threading.Thread(target=self._read, daemon=True)
         self._reader.start()
 
-    # Reader thread: every stdout line becomes a frame for the client.
+    # Reader thread: every stdout line becomes a frame for the client, unless drop() takes it.
     def _read(self):
         for raw in self.proc.stdout:
             msg = parse_line(raw.decode())
             self.sent.append(msg)
+            if self.drop is not None and self.drop(msg):
+                self.dropped.append(msg)
+                continue
             self.rx.put(msg)
 
     # Write one frame to the server, after tap() has seen it.
     def send(self, msg):
         if self.tap is not None:
             self.tap(msg)
+        if self.drop_tx is not None and self.drop_tx(msg):
+            self.dropped_tx.append(msg)
+            return
         line = "%03X#%s\n" % (msg.arbitration_id, bytes(msg.data).hex().upper())
         with self._wlock:
             self.proc.stdin.write(line.encode())
             self.proc.stdin.flush()
+
+    # Hand a dropped frame to the client after all, as if it had been delayed.
+    def release(self, msg):
+        self.rx.put(msg)
 
     # The next frame from the server, or None after timeout seconds.
     def recv(self, timeout=None):
