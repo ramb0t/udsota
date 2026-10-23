@@ -4,6 +4,8 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ## [Unreleased]
 
+- Internal: the tests 0.15.0 left for 0.15.x are in. `test_udsota` checks the gate's refusal at every `udsota_op_t` (a 36's 0x21 ends only the transfer), `cfg.progress`'s reports over whole plain and compressed updates, F000, and every reason a download can end with on the wire, FLASH_ERROR, VERIFY_FAILED and NO_MEMORY among them, with the compressed cases of BAD_HEADER, BAD_PROJECT, BAD_STREAM and ABORTED; `test_udsota_no_rollback` runs it on a platform without rollback, where a new image runs UNDEFINED. `test_e2e_lite.py` runs 24 of v0.14's 46 pipe cases and `test_e2e_lite_vcan.py` 3 of its 8 vcan cases, on vcan0 in CI; the rest test what lite dropped or what iso14229 answers otherwise.
+
 ## [0.15.0] - 2026-10-23
 
 udsota is now `udsota.c` and `udsota.h`, answering updates inside the app's own [iso14229](https://github.com/driftregion/iso14229) UDS server, which it vendors, in place of udsota's own server, ISO-TP adapter and ESP32 port. **Breaking** for every app and for some testers: [MIGRATING.md](MIGRATING.md) maps each change, and [docs/wire.md](docs/wire.md) is the new wire reference. The client is unchanged and still updates units on a 0.14.x server.

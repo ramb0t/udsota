@@ -3,7 +3,10 @@
  * ECDSA). A tester sends raw requests on a clock the test sets. It covers a whole update (10 02, 27 03/04, 34, 36s
  * through 0x78, 37, FF01, F001 and the restart, F002 after it), a compressed one, the image rules (case by case on
  * the first block too), a corrupt and a short compressed stream, security off, the message the ECDSA mode verifies,
- * the PSA lock, and the edges where udsota keeps itself in step with iso14229. */
+ * the PSA lock, and the edges where udsota keeps itself in step with iso14229. Then the gate's refusal at each
+ * udsota_op_t, cfg.progress's reports over whole updates, F000, and each way a plain or compressed download fails, with
+ * the reason F1F1 gives. test_udsota_no_rollback is this file with TEST_ROLLBACK 0: the platform reports what ESP-IDF
+ * does without CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE, a new image running UNDEFINED, never pending verify. */
 #include <assert.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -18,6 +21,10 @@
 #define TESTER 0x7E0u
 #define SERVER 0x7E8u
 #define SLOT   (256u * 1024u)
+#ifndef TEST_ROLLBACK
+#define TEST_ROLLBACK 1                   /* 0: ESP-IDF without rollback, where an activated image runs UNDEFINED */
+#endif
+#define NEW_IMAGE_STATE (TEST_ROLLBACK ? UDSOTA_IMG_PENDING_VERIFY : UDSOTA_IMG_UNDEFINED)   /* after its restart */
 
 UDSOTA_IMAGE_DESC(1, 1, TESTER, SERVER);
 void udsota_test_reboot(void);
@@ -69,7 +76,22 @@ static struct {
     uint8_t  ecdsa_msg[64];            /* the last message the ECDSA check verified */
     size_t   ecdsa_len;
     const char *version;               /* the running image's version */
+    bool     fail_begin, fail_write, refuse_run, no_slot;   /* faults: the slot won't open or take a write, the worker
+                                                               takes no job, there is no inactive slot */
+    int      begins;
 } P = {.delay = 80, .version = "0.4.1-lite.1"};
+
+/* calloc, through -Wl,--wrap=calloc; its one caller is udsota's inflater window. s_calloc_fail fails the next one. */
+static bool s_calloc_fail;
+void *__real_calloc(size_t n, size_t size);
+void *__wrap_calloc(size_t n, size_t size)
+{
+    if (s_calloc_fail) {
+        s_calloc_fail = false;
+        return NULL;
+    }
+    return __real_calloc(n, size);
+}
 
 static void psa_call(int which)
 {
@@ -82,7 +104,7 @@ static void psa_call(int which)
 int udsota_plat_start(void) { return 0; }
 int udsota_plat_run(int (*job)(void))
 {
-    if (P.job != NULL) {
+    if (P.job != NULL || P.refuse_run) {
         return -1;
     }
     P.job = job;
@@ -110,7 +132,8 @@ void udsota_plat_abort(void)
 bool udsota_plat_compatible(const uint8_t *first, size_t len) { (void)first; (void)len; return true; }
 int udsota_plat_begin(uint32_t size)
 {
-    if (size > SLOT || P.st.boot_slot != P.st.running_slot) {
+    P.begins++;
+    if (P.fail_begin || size > SLOT || P.st.boot_slot != P.st.running_slot) {
         return UDSOTA_DL_FLASH_ERROR;
     }
     memset(P.slot, 0xFF, sizeof P.slot);
@@ -121,7 +144,7 @@ int udsota_plat_begin(uint32_t size)
 }
 int udsota_plat_write(const uint8_t *d, size_t n)
 {
-    if (!P.open || P.pos + n > SLOT) {
+    if (!P.open || P.fail_write || P.pos + n > SLOT) {
         return UDSOTA_DL_FLASH_ERROR;
     }
     memcpy(&P.slot[P.pos], d, n);
@@ -156,7 +179,7 @@ int udsota_plat_confirm(void)
 }
 void udsota_plat_unverify(void) { P.verified = false; }
 void udsota_plat_status(udsota_status_t *out) { *out = P.st; }
-uint32_t udsota_plat_slot_size(void) { return SLOT; }
+uint32_t udsota_plat_slot_size(void) { return P.no_slot ? 0u : SLOT; }
 const char *udsota_plat_version(void) { return P.version; }
 const char *udsota_plat_project(void) { return "udsota-test"; }
 const uint8_t *udsota_plat_sha(void)
@@ -223,7 +246,10 @@ static const uint8_t k_pub[65] = {0x04};
 static UDSServer_t s_srv;
 static UDSTp_t    *s_tester;
 static int         s_resets;
-static uint8_t     s_gate_36;             /* the gate's answer to CONTINUE_TRANSFER */
+static int         s_ctx;                 /* cfg.ctx: every callback gets &s_ctx */
+static udsota_op_t s_gate_op;             /* the step the gate refuses, with s_gate_nrc; 0 = none */
+static uint8_t     s_gate_nrc;
+static int         s_gate_asked[UDSOTA_OP_CONFIRM + 1];
 static bool        s_allow_downgrade;     /* cfg.allow_downgrade at the next boot */
 static bool        s_ecdsa;               /* the ECDSA mode at the next boot, with k_pub */
 static bool        s_no_keys;             /* no keys at the next boot: security off */
@@ -255,13 +281,41 @@ static UDSErr_t app_fn(UDSServer_t *srv, UDSEvent_t ev, void *arg)
 
 static uint8_t gate(void *ctx, udsota_op_t op)
 {
-    (void)ctx;
-    return (op == UDSOTA_OP_CONTINUE_TRANSFER) ? s_gate_36 : 0u;
+    CHECK(ctx == &s_ctx && op >= UDSOTA_OP_ENTER_EXTENDED && op <= UDSOTA_OP_CONFIRM);
+    s_gate_asked[op]++;
+    return (op == s_gate_op) ? s_gate_nrc : 0u;
+}
+
+/* cfg.progress's reports since the last boot or progress_clear(), and the last one. */
+#define REPORTS 256
+static struct {
+    udsota_progress_t r[REPORTS], last;
+    int               n;
+} s_prog;
+
+static void on_progress(void *ctx, const udsota_progress_t *p)
+{
+    CHECK(ctx == &s_ctx);
+    if (s_prog.n < REPORTS) {
+        s_prog.r[s_prog.n] = *p;
+    }
+    s_prog.n++;
+    s_prog.last = *p;
+}
+
+static void progress_clear(void)
+{
+    s_prog.n = 0;
+}
+
+static bool same_progress(const udsota_progress_t *a, const udsota_progress_t *b)
+{
+    return a->stage == b->stage && a->done == b->done && a->total == b->total && a->last_reason == b->last_reason;
 }
 
 static void do_reset(void *ctx)
 {
-    (void)ctx;
+    CHECK(ctx == &s_ctx);
     s_resets++;
 }
 
@@ -279,7 +333,8 @@ static void boot(void)
     s_srv.fn = app_fn;
     s_srv.p2_ms = 5;                              /* as the examples set it */
     udsota_cfg_t cfg = {.key_label = k_label, .key_master = k_master, .key_master_len = sizeof k_master,
-                        .gate = gate, .reset = do_reset, .allow_downgrade = s_allow_downgrade};
+                        .gate = gate, .progress = on_progress, .reset = do_reset, .ctx = &s_ctx,
+                        .allow_downgrade = s_allow_downgrade};
     if (s_no_keys) {
         cfg.key_label = NULL;
         cfg.key_master = NULL;
@@ -290,6 +345,7 @@ static void boot(void)
     }
     assert(udsota_init(&cfg) == 0);
     CHECK(udsota_test_psa_depth() == 0);
+    memset(&s_prog, 0, sizeof s_prog);
     g_now += 1500u;                               /* past iso14229's 1 s boot delay for 0x27 */
 }
 
@@ -322,6 +378,9 @@ static int xfer(const uint8_t *req, size_t len, uint8_t *resp, size_t max)
                 continue;
             }
             CHECK(udsota_test_psa_depth() == s_app_psa);   /* udsota's locks and unlocks balance */
+            udsota_progress_t now;
+            udsota_progress(&now);
+            CHECK(same_progress(&now, &s_prog.last));      /* cfg.progress has told of every change */
             return (int)n;
         }
     }
@@ -432,6 +491,52 @@ static void refused(const uint8_t *img, uint8_t reason)
     CHECK(block(1, img, 0, 4093, resp, sizeof resp) == 3 && resp[0] == 0x7F && resp[2] == 0x31);
     const uint8_t req[] = {0x22, 0xF1, 0xF1};
     CHECK(xfer(req, sizeof req, resp, sizeof resp) == 8 && memcmp(resp, want, sizeof want) == 0);
+}
+
+/* F1F1 says reason, after bytes received. */
+static bool result_is(uint8_t reason, uint32_t bytes)
+{
+    static const uint8_t req[] = {0x22, 0xF1, 0xF1};
+    const uint8_t want[] = {0x62, 0xF1, 0xF1, reason, (uint8_t)(bytes >> 24), (uint8_t)(bytes >> 16),
+                            (uint8_t)(bytes >> 8), (uint8_t)bytes};
+    uint8_t resp[64];
+    const int n = xfer(req, sizeof req, resp, sizeof resp);
+    if (n == 8 && memcmp(resp, want, sizeof want) == 0) {
+        return true;
+    }
+    fprintf(stderr, "  F1F1: %d bytes, reason %d after %u, want %u after %u\n", n, (n == 8) ? resp[3] : -1,
+            (n == 8) ? (unsigned)((uint32_t)resp[4] << 24 | (uint32_t)resp[5] << 16 | resp[6] << 8 | resp[7]) : 0u,
+            reason, (unsigned)bytes);
+    return false;
+}
+
+/* 10 02 and the programming level's unlock. */
+static void programming(void)
+{
+    EXPECT(B(0x10, 0x02), B(0x50, 0x02));
+    unlock(0x03);
+}
+
+/* ms milliseconds of passes with no request; 200 lets a scheduled reset happen. */
+static void run_for(int ms)
+{
+    for (int i = 0; i < ms; i++) {
+        g_now++;
+        tick();
+    }
+}
+
+/* A raw DEFLATE stream of one final stored block: d's n bytes as they are, after a 5-byte header. */
+static size_t stored(uint8_t *out, const uint8_t *d, uint16_t n)
+{
+    const uint16_t nlen = (uint16_t)~n;
+    out[0] = 0x01;
+    out[1] = (uint8_t)n;
+    out[2] = (uint8_t)(n >> 8);
+    out[3] = (uint8_t)nlen;
+    out[4] = (uint8_t)(nlen >> 8);
+    memcpy(&out[5], d, n);
+    return 5u + n;
 }
 
 /* ---- The first-block rules, case by case ----
@@ -591,6 +696,397 @@ static void first_block_cases(void)
     P.version = "0.4.1-lite.1";
 }
 
+/* ---- The gate at each udsota_op_t ----
+ * The gate refuses one step at a time with GATE_NRC. Each refusal is that request's answer and changes nothing else:
+ * the session, its unlock, the slots and F1F1 stay, and the request passes once the gate allows it. A 34 asks the gate
+ * only once access passes. A 36's 0x21 ends the transfer (iso14229 ends it on any NRC) but keeps the session and its
+ * unlock, so a new 34 needs no key; any other NRC also ends the session, as main's case shows. */
+#define GATE_NRC 0x88u                            /* vehicle speed too high */
+
+static void gate_cases(const uint8_t *im, size_t len)
+{
+    uint8_t resp[64];
+    P.expect = im;
+    P.expect_len = len;
+    s_gate_nrc = GATE_NRC;
+    boot();
+    s_gate_op = UDSOTA_OP_ENTER_EXTENDED;
+    EXPECT(B(0x10, 0x03), B(0x7F, 0x10, GATE_NRC));
+    EXPECT(B(0x22, 0xF1, 0x86), B(0x62, 0xF1, 0x86, 0x01));
+    s_gate_op = UDSOTA_OP_ENTER_PROGRAMMING;
+    EXPECT(B(0x10, 0x03), B(0x50, 0x03));
+    unlock(0x01);
+    EXPECT(B(0x10, 0x02), B(0x7F, 0x10, GATE_NRC));
+    EXPECT(B(0x22, 0xF1, 0x86), B(0x62, 0xF1, 0x86, 0x03));
+    CHECK(s_srv.securityLevel == UDSOTA_SA_SEED_EXTENDED);
+
+    s_gate_op = UDSOTA_OP_START_DOWNLOAD;
+    EXPECT(B(0x10, 0x02), B(0x50, 0x02));
+    const int asked = s_gate_asked[UDSOTA_OP_START_DOWNLOAD];
+    EXPECT(B(0x34, 0x00, 0x44, 0, 0, 0, 0, 0, 0, 0x20, 0x00), B(0x7F, 0x34, 0x33));
+    CHECK(s_gate_asked[UDSOTA_OP_START_DOWNLOAD] == asked);
+    unlock(0x03);
+    EXPECT(B(0x34, 0x00, 0x44, 0, 0, 0, 0, 0, 0, 0x20, 0x00), B(0x7F, 0x34, GATE_NRC));
+    CHECK(s_gate_asked[UDSOTA_OP_START_DOWNLOAD] == asked + 1 && !udsota_busy());
+    EXPECT(B(0x36, 0x01, 0x00), B(0x7F, 0x36, 0x70));   /* no transfer opened */
+    CHECK(result_is(UDSOTA_DL_OK, 0));
+
+    s_gate_op = 0;
+    request_download((uint32_t)len, 0x00);
+    CHECK(block(1, im, 0, 4093, resp, sizeof resp) == 2 && resp[0] == 0x76);
+    s_gate_op = UDSOTA_OP_ENTER_EXTENDED;         /* mid-download: the download and its unlock go on */
+    const int aborts = P.aborts;
+    EXPECT(B(0x10, 0x03), B(0x7F, 0x10, GATE_NRC));
+    CHECK(udsota_busy() && P.aborts == aborts && s_srv.securityLevel == UDSOTA_SA_SEED_PROGRAMMING);
+    CHECK(result_is(UDSOTA_DL_OK, 4093));
+    CHECK(block(2, im, 4093, 4093, resp, sizeof resp) == 2 && resp[0] == 0x76 && resp[1] == 2);
+    s_gate_op = UDSOTA_OP_CONTINUE_TRANSFER;
+    s_gate_nrc = 0x21;
+    CHECK(block(3, im, 8186, 6, resp, sizeof resp) == 3 && resp[0] == 0x7F && resp[2] == 0x21);
+    s_gate_op = 0;
+    s_gate_nrc = GATE_NRC;
+    CHECK(!udsota_busy() && P.aborts == aborts + 1 && s_srv.securityLevel == UDSOTA_SA_SEED_PROGRAMMING);
+    EXPECT(B(0x22, 0xF1, 0x86), B(0x62, 0xF1, 0x86, 0x02));
+    CHECK(result_is(UDSOTA_DL_ABORTED, 8186));
+    CHECK(block(4, im, 8186, 6, resp, sizeof resp) == 3 && resp[0] == 0x7F && resp[2] == 0x70);
+
+    /* The whole update after it, with no new key: the gate is asked at each 34, every 36 and F001. A 34 it refuses
+     * after FF01's pass leaves the image verified. */
+    const int starts = s_gate_asked[UDSOTA_OP_START_DOWNLOAD], blocks = s_gate_asked[UDSOTA_OP_CONTINUE_TRANSFER],
+              asks = s_gate_asked[UDSOTA_OP_ACTIVATE];
+    const int activations = P.activations;
+    int resets = s_resets;
+    request_download((uint32_t)len, 0x00);
+    send_all(im, len);
+    EXPECT(B(0x37), B(0x77));
+    EXPECT(B(0x31, 0x01, 0xFF, 0x01), B(0x71, 0x01, 0xFF, 0x01, 0x00));
+    s_gate_op = UDSOTA_OP_START_DOWNLOAD;
+    EXPECT(B(0x34, 0x00, 0x44, 0, 0, 0, 0, 0, 0, 0x20, 0x00), B(0x7F, 0x34, GATE_NRC));
+    CHECK(P.verified && !udsota_busy() && result_is(UDSOTA_DL_OK, (uint32_t)len));
+    s_gate_op = UDSOTA_OP_ACTIVATE;
+    EXPECT(B(0x31, 0x01, 0xF0, 0x01), B(0x7F, 0x31, GATE_NRC));
+    run_for(200);
+    CHECK(P.activations == activations && P.st.boot_slot == 0 && s_resets == resets);
+    s_gate_op = 0;
+    EXPECT(B(0x31, 0x01, 0xF0, 0x01), B(0x71, 0x01, 0xF0, 0x01));
+    run_for(200);
+    CHECK(P.activations == activations + 1 && s_resets > resets);   /* iso14229 asks again each pass */
+    CHECK(s_gate_asked[UDSOTA_OP_START_DOWNLOAD] == starts + 2 &&
+          s_gate_asked[UDSOTA_OP_CONTINUE_TRANSFER] == blocks + (int)((len + 4092u) / 4093u) &&
+          s_gate_asked[UDSOTA_OP_ACTIVATE] == asks + 2);
+
+    /* After the restart: F002, then 11 01. */
+    P.st.running_slot = 1;
+    P.st.running_state = NEW_IMAGE_STATE;
+    boot();
+    const int confirms = P.confirms;
+    resets = s_resets;
+    EXPECT(B(0x10, 0x03), B(0x50, 0x03));
+    unlock(0x01);
+    s_gate_op = UDSOTA_OP_CONFIRM;
+    EXPECT(B(0x31, 0x01, 0xF0, 0x02), B(0x7F, 0x31, GATE_NRC));
+    CHECK(P.confirms == confirms && udsota_unconfirmed() == TEST_ROLLBACK &&
+          s_srv.securityLevel == UDSOTA_SA_SEED_EXTENDED);
+    s_gate_op = 0;
+    EXPECT(B(0x31, 0x01, 0xF0, 0x02), B(0x71, 0x01, 0xF0, 0x02));
+    CHECK(P.confirms == confirms + TEST_ROLLBACK && !udsota_unconfirmed());
+    s_gate_op = UDSOTA_OP_RESET;
+    EXPECT(B(0x11, 0x01), B(0x7F, 0x11, GATE_NRC));
+    run_for(200);
+    CHECK(s_resets == resets);
+    s_gate_op = 0;
+    EXPECT(B(0x11, 0x01), B(0x51, 0x01));
+    run_for(200);
+    CHECK(s_resets > resets);
+    for (int op = UDSOTA_OP_ENTER_EXTENDED; op <= UDSOTA_OP_CONFIRM; op++) {
+        CHECK(s_gate_asked[op] > 0);
+    }
+    P.st = (udsota_status_t){.running_slot = 0, .boot_slot = 0, .running_state = UDSOTA_IMG_VALID};
+}
+
+/* ---- F000, the resume point ----
+ * Reserved: always FF, after the checks every programming routine makes, and the download it comes in the middle of
+ * goes on with no progress report. */
+static void resume_point_cases(const uint8_t *im, size_t len)
+{
+    uint8_t resp[64];
+    P.expect = im;
+    P.expect_len = len;
+    boot();
+    EXPECT(B(0x31, 0x01, 0xF0, 0x00), B(0x7F, 0x31, 0x7F));
+    EXPECT(B(0x10, 0x03), B(0x50, 0x03));
+    EXPECT(B(0x31, 0x01, 0xF0, 0x00), B(0x7F, 0x31, 0x31));
+    EXPECT(B(0x31, 0x02, 0xF0, 0x00), B(0x7F, 0x31, 0x12));
+    EXPECT(B(0x10, 0x02), B(0x50, 0x02));
+    EXPECT(B(0x31, 0x01, 0xF0, 0x00), B(0x7F, 0x31, 0x33));
+    unlock(0x03);
+    EXPECT(B(0x31, 0x01, 0xF0, 0x00, 0x01), B(0x7F, 0x31, 0x13));
+    EXPECT(B(0x31, 0x01, 0xF0, 0x00), B(0x71, 0x01, 0xF0, 0x00, UDSOTA_RESUME_NOT_AVAILABLE));
+    request_download((uint32_t)len, 0x00);
+    CHECK(block(1, im, 0, 4093, resp, sizeof resp) == 2 && resp[0] == 0x76);
+    const int reports = s_prog.n;
+    EXPECT(B(0x31, 0x01, 0xF0, 0x00), B(0x71, 0x01, 0xF0, 0x00, UDSOTA_RESUME_NOT_AVAILABLE));
+    CHECK(s_prog.n == reports && udsota_busy());
+    CHECK(block(2, im, 4093, 4093, resp, sizeof resp) == 2 && resp[0] == 0x76 && resp[1] == 2);
+    CHECK(result_is(UDSOTA_DL_OK, 8186));
+}
+
+/* ---- cfg.progress ----
+ * The reports since progress_clear(): each one's done is at most its total, both are 0 outside ERASING and WRITING,
+ * total is then memorySize and done is 0 while ERASING. No report repeats the one before it, except that a compressed
+ * block may write nothing new; within WRITING, done rises with every plain block and never falls. A download that
+ * reached its verify ends WRITING at done == total. The stages run as want says, a letter per run of reports: Idle,
+ * Erasing, Writing, Verifying, Activating. */
+static bool reports_ok(const char *want, uint32_t total, bool compressed)
+{
+    char got[32];
+    size_t k = 0;
+    const int n = (s_prog.n < REPORTS) ? s_prog.n : REPORTS;
+    bool ok = s_prog.n <= REPORTS;
+    for (int i = 0; i < n; i++) {
+        const udsota_progress_t *p = &s_prog.r[i], *q = (i > 0) ? &s_prog.r[i - 1] : NULL;
+        const bool moving = p->stage == UDSOTA_STAGE_ERASING || p->stage == UDSOTA_STAGE_WRITING;
+        ok = ok && p->total == (moving ? total : 0u) && p->done <= p->total;
+        ok = ok && (p->stage != UDSOTA_STAGE_ERASING || p->done == 0u);
+        if (q != NULL && p->stage == UDSOTA_STAGE_WRITING && q->stage == UDSOTA_STAGE_WRITING) {
+            ok = ok && (compressed ? p->done >= q->done : p->done > q->done);
+        } else if (q != NULL) {
+            ok = ok && !same_progress(p, q);
+        }
+        if ((q == NULL || q->stage != p->stage) && k + 1u < sizeof got) {
+            got[k++] = "IEWVA"[p->stage];
+        }
+        if (p->stage == UDSOTA_STAGE_WRITING && i + 1 < n && s_prog.r[i + 1].stage == UDSOTA_STAGE_VERIFYING) {
+            ok = ok && p->done == total;
+        }
+    }
+    got[k] = '\0';
+    ok = ok && strcmp(got, want) == 0;
+    if (!ok) {
+        fprintf(stderr, "  progress: %d reports, stages %s, want %s\n", s_prog.n, got, want);
+    }
+    return ok;
+}
+
+static int reports_of(udsota_stage_t stage)
+{
+    int n = 0;
+    for (int i = 0; i < s_prog.n && i < REPORTS; i++) {
+        n += s_prog.r[i].stage == stage;
+    }
+    return n;
+}
+
+/* A plain update through its restart, a compressed one to its verify, a refused first block and a session change
+ * mid-download; IDLE's last_reason is then F1F1's. */
+static void progress_cases(const uint8_t *img, size_t len, const uint8_t *z, size_t zlen, const uint8_t *wrong)
+{
+    uint8_t resp[64];
+    P.expect = img;
+    P.expect_len = len;
+    boot();
+    programming();
+    request_download((uint32_t)len, 0x00);
+    send_all(img, len);
+    EXPECT(B(0x37), B(0x77));
+    EXPECT(B(0x31, 0x01, 0xFF, 0x01), B(0x71, 0x01, 0xFF, 0x01, 0x00));
+    EXPECT(B(0x31, 0x01, 0xF0, 0x01), B(0x71, 0x01, 0xF0, 0x01));
+    run_for(200);
+    CHECK(reports_ok("EWVIA", (uint32_t)len, false));
+    CHECK(reports_of(UDSOTA_STAGE_WRITING) == (int)((len + 4092u) / 4093u));   /* one per block */
+    CHECK(reports_of(UDSOTA_STAGE_IDLE) == 1 && s_prog.r[s_prog.n - 2].last_reason == UDSOTA_DL_OK);
+
+    P.st = (udsota_status_t){.running_slot = 0, .boot_slot = 0, .running_state = UDSOTA_IMG_VALID};
+    boot();
+    programming();
+    request_download((uint32_t)len, 0x10);
+    send_all(z, zlen);
+    EXPECT(B(0x37), B(0x77));
+    EXPECT(B(0x31, 0x01, 0xFF, 0x01), B(0x71, 0x01, 0xFF, 0x01, 0x00));
+    CHECK(reports_ok("EWVI", (uint32_t)len, true) && s_prog.last.last_reason == UDSOTA_DL_OK);
+
+    progress_clear();
+    refused(wrong, UDSOTA_DL_BAD_PROJECT);
+    CHECK(reports_ok("EI", 8192u, false) && s_prog.last.last_reason == UDSOTA_DL_BAD_PROJECT);
+
+    progress_clear();
+    request_download((uint32_t)len, 0x00);
+    CHECK(block(1, img, 0, 4093, resp, sizeof resp) == 2 && resp[0] == 0x76);
+    EXPECT(B(0x10, 0x03), B(0x50, 0x03));
+    CHECK(reports_ok("EWI", (uint32_t)len, false) && s_prog.last.last_reason == UDSOTA_DL_ABORTED);
+    CHECK(result_is(UDSOTA_DL_ABORTED, 4093));
+}
+
+/* ---- Why a plain download fails ----
+ * Each way, with its answer and F1F1's reason and byte count: no inactive slot (the 34's 0x22), a slot that won't open
+ * or take a write and a worker that takes no job (the 36's 0x72), an image that fails its verify and the PSA lock held
+ * through FF01 (status 08) or F001 (0x72; the image is then no longer verified, so F001 and FF01 answer 0x24 until a
+ * new download), and a block past memorySize (0x71). */
+static void reason_cases(const uint8_t *im, size_t len)
+{
+    uint8_t resp[64];
+    P.expect = im;
+    P.expect_len = len;
+    boot();
+    programming();
+    P.no_slot = true;
+    EXPECT(B(0x34, 0x00, 0x44, 0, 0, 0, 0, 0, 0, 0x20, 0x00), B(0x7F, 0x34, 0x22));
+    P.no_slot = false;
+    CHECK(result_is(UDSOTA_DL_FLASH_ERROR, 0) && !udsota_busy());
+
+    P.fail_begin = true;
+    request_download((uint32_t)len, 0x00);
+    CHECK(block(1, im, 0, 4093, resp, sizeof resp) == 3 && resp[0] == 0x7F && resp[2] == 0x72);
+    P.fail_begin = false;
+    CHECK(result_is(UDSOTA_DL_FLASH_ERROR, 0) && !udsota_busy());
+    CHECK(block(2, im, 4093, 4093, resp, sizeof resp) == 3 && resp[0] == 0x7F && resp[2] == 0x70);
+
+    int aborts = P.aborts;
+    request_download((uint32_t)len, 0x00);
+    CHECK(block(1, im, 0, 4093, resp, sizeof resp) == 2 && resp[0] == 0x76);
+    P.fail_write = true;
+    CHECK(block(2, im, 4093, 4093, resp, sizeof resp) == 3 && resp[0] == 0x7F && resp[2] == 0x72);
+    P.fail_write = false;
+    CHECK(result_is(UDSOTA_DL_FLASH_ERROR, 4093) && P.aborts == aborts + 1 && !udsota_busy());
+
+    request_download((uint32_t)len, 0x00);
+    CHECK(block(1, im, 0, 4093, resp, sizeof resp) == 2 && resp[0] == 0x76);
+    P.refuse_run = true;                          /* after a job that passed, so a stale result would read as one */
+    CHECK(block(2, im, 4093, 4093, resp, sizeof resp) == 3 && resp[0] == 0x7F && resp[2] == 0x72 && s_pendings == 0);
+    P.refuse_run = false;
+    CHECK(result_is(UDSOTA_DL_FLASH_ERROR, 4093) && !udsota_busy());
+
+    P.expect_len = 0;                             /* the platform's verify fails */
+    request_download((uint32_t)len, 0x00);
+    send_all(im, len);
+    EXPECT(B(0x37), B(0x77));
+    EXPECT(B(0x31, 0x01, 0xFF, 0x01), B(0x71, 0x01, 0xFF, 0x01, UDSOTA_DL_VERIFY_FAILED));
+    P.expect_len = len;
+    CHECK(result_is(UDSOTA_DL_VERIFY_FAILED, (uint32_t)len));
+    EXPECT(B(0x31, 0x01, 0xF0, 0x01), B(0x7F, 0x31, 0x24));
+    EXPECT(B(0x31, 0x01, 0xFF, 0x01), B(0x7F, 0x31, 0x24));
+
+    const int ends = P.psa_calls[PSA_END];
+    request_download((uint32_t)len, 0x00);
+    send_all(im, len);
+    EXPECT(B(0x37), B(0x77));
+    CHECK(udsota_psa_lock(0));
+    s_app_psa = 1;
+    EXPECT(B(0x31, 0x01, 0xFF, 0x01), B(0x71, 0x01, 0xFF, 0x01, UDSOTA_DL_VERIFY_FAILED));
+    udsota_psa_unlock();
+    s_app_psa = 0;
+    CHECK(P.psa_calls[PSA_END] == ends && result_is(UDSOTA_DL_VERIFY_FAILED, (uint32_t)len));
+
+    const int activations = P.activations, activates = P.psa_calls[PSA_ACTIVATE];
+    request_download((uint32_t)len, 0x00);
+    send_all(im, len);
+    EXPECT(B(0x37), B(0x77));
+    EXPECT(B(0x31, 0x01, 0xFF, 0x01), B(0x71, 0x01, 0xFF, 0x01, 0x00));
+    CHECK(udsota_psa_lock(0));
+    s_app_psa = 1;
+    EXPECT(B(0x31, 0x01, 0xF0, 0x01), B(0x7F, 0x31, 0x72));
+    udsota_psa_unlock();
+    s_app_psa = 0;
+    CHECK(P.activations == activations && P.psa_calls[PSA_ACTIVATE] == activates && P.st.boot_slot == 0);
+    EXPECT(B(0x31, 0x01, 0xF0, 0x01), B(0x7F, 0x31, 0x24));
+    EXPECT(B(0x31, 0x01, 0xFF, 0x01), B(0x7F, 0x31, 0x24));
+    CHECK(result_is(UDSOTA_DL_OK, (uint32_t)len));
+
+    aborts = P.aborts;
+    request_download((uint32_t)len, 0x00);
+    CHECK(block(1, im, 0, 4093, resp, sizeof resp) == 2 && resp[0] == 0x76);
+    CHECK(block(2, im, 4093, 4093, resp, sizeof resp) == 2 && resp[0] == 0x76);
+    CHECK(block(3, im, 0, len - 8186u + 1u, resp, sizeof resp) == 3 && resp[0] == 0x7F && resp[2] == 0x71);
+    CHECK(result_is(UDSOTA_DL_ABORTED, 8186) && P.aborts == aborts + 1 && !udsota_busy());
+}
+
+/* ---- Compressed downloads, case by case ----
+ * A stream may run past memorySize up to UDSOTA_DL_Z_BOUND, so an incompressible image installs; past the bound
+ * iso14229 answers 0x71 (ABORTED). The image rules and the slot apply at the 36 whose stream reaches the image's 320th
+ * byte (0x31 with the rule's reason; 0x72, FLASH_ERROR, for a slot that won't open), and nothing is erased before. A
+ * stream that inflates past memorySize ends BAD_STREAM at its 36, and one that ends before the rules had their bytes
+ * BAD_HEADER, for an image of any memorySize (0x31); one that ends short of memorySize or with bytes after its end ends
+ * BAD_STREAM at the 37 (0x72). No memory for the inflater refuses the 34 (0x22, NO_MEMORY). */
+static void compress_cases(const uint8_t *img, size_t img_len, const uint8_t *im, const uint8_t *wrong, size_t len)
+{
+    static uint8_t noise[8192], s[8192 + 5], tail[1600];
+    uint8_t resp[64];
+    uint32_t x = 1;
+    assert(len == sizeof noise);
+    for (size_t i = 0; i < sizeof noise; i++) {
+        x = x * 1103515245u + 12345u;
+        noise[i] = (uint8_t)(x >> 24);
+    }
+    stamp(noise, "0.4.1-lite.2", "udsota-test");
+    P.expect = noise;
+    P.expect_len = len;
+    boot();
+    programming();
+    request_download((uint32_t)len, 0x10);
+    size_t n = stored(s, noise, (uint16_t)len);
+    send_all(s, n);
+    EXPECT(B(0x37), B(0x77));
+    EXPECT(B(0x31, 0x01, 0xFF, 0x01), B(0x71, 0x01, 0xFF, 0x01, 0x00));
+    CHECK(P.pos == len && memcmp(P.slot, noise, len) == 0);
+
+    /* memorySize 400: the bound is 1474 bytes, and the first 36 may carry only 400. */
+    memset(tail, 0, sizeof tail);
+    (void)stored(tail, im, 400);
+    request_download(400, 0x10);
+    CHECK(block(1, tail, 0, 300, resp, sizeof resp) == 2 && resp[0] == 0x76);
+    CHECK(block(2, tail, 300, 1174, resp, sizeof resp) == 2 && resp[0] == 0x76);
+    EXPECT(B(0x37), B(0x7F, 0x37, 0x72));
+    CHECK(result_is(UDSOTA_DL_BAD_STREAM, 1474));
+    request_download(400, 0x10);
+    CHECK(block(1, tail, 0, 300, resp, sizeof resp) == 2 && resp[0] == 0x76);
+    CHECK(block(2, tail, 300, 1175, resp, sizeof resp) == 3 && resp[0] == 0x7F && resp[2] == 0x71);
+    CHECK(result_is(UDSOTA_DL_ABORTED, 300) && !udsota_busy());
+
+    size_t zlen = 0;
+    uint8_t *z = tdefl_compress_mem_to_heap(img, img_len, &zlen, TDEFL_DEFAULT_MAX_PROBES);
+    assert(z != NULL);
+    request_download((uint32_t)len, 0x10);
+    CHECK(block(1, z, 0, (zlen < 4093u) ? zlen : 4093u, resp, sizeof resp) == 3 && resp[0] == 0x7F &&
+          resp[2] == 0x31);
+    CHECK(result_is(UDSOTA_DL_BAD_STREAM, 0));
+    mz_free(z);
+
+    n = stored(s, im, (uint16_t)len);
+    request_download((uint32_t)len + 1u, 0x10);
+    send_all(s, n);
+    EXPECT(B(0x37), B(0x7F, 0x37, 0x72));
+    CHECK(result_is(UDSOTA_DL_BAD_STREAM, (uint32_t)n));
+
+    const int begins = P.begins;
+    n = stored(s, im, 100);
+    request_download((uint32_t)len, 0x10);
+    CHECK(block(1, s, 0, n, resp, sizeof resp) == 3 && resp[0] == 0x7F && resp[2] == 0x31);
+    CHECK(result_is(UDSOTA_DL_BAD_HEADER, 0));
+    request_download(100, 0x10);
+    CHECK(block(1, s, 0, 100, resp, sizeof resp) == 2 && resp[0] == 0x76);
+    CHECK(block(2, s, 100, n - 100u, resp, sizeof resp) == 3 && resp[0] == 0x7F && resp[2] == 0x31);
+    CHECK(result_is(UDSOTA_DL_BAD_HEADER, 100));
+
+    n = stored(s, wrong, (uint16_t)len);
+    request_download((uint32_t)len, 0x10);
+    CHECK(block(1, s, 0, 4093, resp, sizeof resp) == 3 && resp[0] == 0x7F && resp[2] == 0x31);
+    CHECK(result_is(UDSOTA_DL_BAD_PROJECT, 0) && P.begins == begins);
+
+    n = stored(s, im, (uint16_t)len);
+    P.fail_begin = true;
+    request_download((uint32_t)len, 0x10);
+    CHECK(block(1, s, 0, 4093, resp, sizeof resp) == 3 && resp[0] == 0x7F && resp[2] == 0x72);
+    P.fail_begin = false;
+    CHECK(result_is(UDSOTA_DL_FLASH_ERROR, 0) && P.begins == begins + 1);
+
+    s_calloc_fail = true;
+    EXPECT(B(0x34, 0x10, 0x44, 0, 0, 0, 0, 0, 0, 0x20, 0x00), B(0x7F, 0x34, 0x22));
+    CHECK(!s_calloc_fail && result_is(UDSOTA_DL_NO_MEMORY, 0) && !udsota_busy());
+    request_download((uint32_t)len, 0x10);
+    send_all(s, n);
+    EXPECT(B(0x37), B(0x77));
+}
+
 int main(void)
 {
     static uint8_t img[100000], other[8192];
@@ -681,15 +1177,26 @@ int main(void)
     }
     CHECK(s_resets >= 1);
 
-    /* After the restart: the new image runs pending verify; F002 in the extended session confirms it. */
+    /* After the restart: the new image runs pending verify; F002 in the extended session confirms it. Without
+     * rollback it runs UNDEFINED, which counts as confirmed: the slots are settled at once, and F002 answers
+     * positive without a job. */
     P.st.running_slot = 1;
-    P.st.running_state = UDSOTA_IMG_PENDING_VERIFY;
+    P.st.running_state = NEW_IMAGE_STATE;
     boot();
+    CHECK(udsota_unconfirmed() == TEST_ROLLBACK);
+#if TEST_ROLLBACK
     EXPECT(B(0x10, 0x02), B(0x7F, 0x10, 0x22));   /* slots not settled */
+#else
+    EXPECT(B(0x22, 0xF1, 0xF0), B(0x62, 0xF1, 0xF0, 0x01, UDSOTA_IMG_UNDEFINED, 0x01));
+    EXPECT(B(0x10, 0x02), B(0x50, 0x02));
+#endif
     EXPECT(B(0x10, 0x03), B(0x50, 0x03));
     EXPECT(B(0x31, 0x01, 0xF0, 0x02), B(0x71, 0x01, 0xF0, 0x02));
-    CHECK(P.confirms == 1 && P.st.running_state == UDSOTA_IMG_VALID);
+    CHECK(P.confirms == TEST_ROLLBACK &&
+          P.st.running_state == (TEST_ROLLBACK ? UDSOTA_IMG_VALID : UDSOTA_IMG_UNDEFINED));
+    CHECK(!udsota_unconfirmed());
     EXPECT(B(0x31, 0x01, 0xF0, 0x02), B(0x71, 0x01, 0xF0, 0x02));   /* idempotent */
+    CHECK(P.confirms == TEST_ROLLBACK);
     unlock(0x01);
     EXPECT(B(0x11, 0x01), B(0x51, 0x01));
     for (int ms = 0; ms < 200; ms++) {
@@ -716,9 +1223,10 @@ int main(void)
     unlock(0x03);
     request_download(sizeof img, 0x00);
     CHECK(block(1, img, 0, 4093, resp, sizeof resp) == 2 && resp[0] == 0x76);
-    s_gate_36 = 0x22;
+    s_gate_op = UDSOTA_OP_CONTINUE_TRANSFER;
+    s_gate_nrc = 0x22;
     CHECK(block(2, img, 4093, 4093, resp, sizeof resp) == 3 && resp[0] == 0x7F && resp[2] == 0x22);
-    s_gate_36 = 0;
+    s_gate_op = 0;
     EXPECT(B(0x22, 0xF1, 0x86), B(0x62, 0xF1, 0x86, 0x01));
     EXPECT(B(0x22, 0xF1, 0xF1), B(0x62, 0xF1, 0xF1, UDSOTA_DL_ABORTED, 0, 0, 0x0F, 0xFD));
     EXPECT(B(0x10, 0x03), B(0x50, 0x03));
@@ -986,6 +1494,24 @@ int main(void)
         EXPECT(B(0x22, 0xF1, 0xF1), B(0x62, 0xF1, 0xF1, UDSOTA_DL_BAD_STREAM));
         EXPECT(B(0x31, 0x01, 0xFF, 0x01), B(0x7F, 0x31, 0x24));
         CHECK(P.psa_calls[PSA_END] == ends);
+        mz_free(z);
+    }
+
+    /* The gate at each step, F000, cfg.progress, and each way a plain or compressed download fails. */
+    {
+        static uint8_t small[8192], wrong[8192];
+        memcpy(small, img, sizeof small);
+        stamp(small, "0.4.1-lite.2", "udsota-test");
+        memcpy(wrong, img, sizeof wrong);
+        stamp(wrong, "0.4.1-lite.2", "another-project");
+        size_t zlen = 0;
+        uint8_t *z = tdefl_compress_mem_to_heap(img, sizeof img, &zlen, TDEFL_DEFAULT_MAX_PROBES);
+        assert(z != NULL);
+        gate_cases(small, sizeof small);
+        resume_point_cases(small, sizeof small);
+        progress_cases(img, sizeof img, z, zlen, wrong);
+        reason_cases(small, sizeof small);
+        compress_cases(img, sizeof img, small, wrong, sizeof small);
         mz_free(z);
     }
 
