@@ -1,16 +1,19 @@
 /* udsota_lite_server: udsota on unmodified iso14229 as an app runs it, on a Linux host, for the client's end-to-end
- * test (client/tests/test_e2e_lite.py). It plays examples/candash_ws43's main.c with the example profile's identity:
- * CAN frames arrive on stdin and leave on stdout, one per line as `710#0322F18C` (the framing of the client tests'
- * PipeTransport), through isotp-c; UDSServerPoll, then udsota_poll, runs about every millisecond; and the event
- * callback hands each event to udsota_event() first, then serves the app's own: F191, and config writes (2E, a commit
- * routine, a status DID and a hash DID) as the profile's [dids] and [config] describe them. A restart (11 01, or
- * F001's answer) is a boot in-process after --boot-ms of silence: lite_platform.c's slots, then udsota and iso14229
- * from scratch.
+ * tests (client/tests/test_e2e_lite.py and test_e2e_lite_vcan.py). It plays examples/candash_ws43's main.c with the
+ * example profile's identity: CAN frames arrive on stdin and leave on stdout, one per line as `710#0322F18C` (the
+ * framing of the client tests' PipeTransport), or on a vcan interface with --can, through isotp-c; UDSServerPoll,
+ * then udsota_poll, runs about every millisecond; and the event callback hands each event to udsota_event() first,
+ * then serves the app's own: F191, and config writes (2E, a commit routine, a status DID and a hash DID) as the
+ * profile's [dids] and [config] describe them. A restart (11 01, or F001's answer) is a boot in-process after
+ * --boot-ms of silence: lite_platform.c's slots, then udsota and iso14229 from scratch.
  *
- *     udsota_lite_server --image FILE [--soak-ms N] [--boot-ms N] [-v]
+ *     udsota_lite_server --image FILE [--can IFNAME] [--soak-ms N] [--boot-ms N] [--drop-fc-after N] [-v]
  *
- * FILE is the app slot 0 runs, confirmed. --soak-ms makes the app's gate refuse F002 (0x22) for that long after each
- * boot. -v logs every frame on stderr. stdin's EOF stops the server. */
+ * FILE is the app slot 0 runs, confirmed. --can serves on IFNAME through a CAN_RAW socket instead of the pipe; it is
+ * built only where linux/can/raw.h is, and refuses any interface but a vcan. --soak-ms makes the app's gate refuse
+ * F002 (0x22) for that long after each boot. --drop-fc-after loses the FC sent after a request's Nth CF, once (N a
+ * multiple of isotp-c's block size, 8). -v logs every frame on stderr. stdin's EOF (in pipe mode), SIGTERM or SIGINT
+ * stops the server. */
 #include <errno.h>
 #include <getopt.h>
 #include <poll.h>
@@ -21,6 +24,15 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef LITE_SOCKETCAN
+#include <net/if.h>
+#include <sys/socket.h>
+#include <linux/can.h>
+#include <linux/can/raw.h>
+#include <linux/if_link.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#endif
 #include "iso14229.h"
 #include "lite_platform.h"
 #include "sha256_host.h"
@@ -68,6 +80,9 @@ static UDSTpISOTpC_t s_tp;
 static uint64_t      s_boot_ms, s_boot_until;
 static uint32_t      s_soak_ms, s_silence_ms = BOOT_MS;
 static bool          s_booting, s_reset, s_verbose;
+static int           s_can_fd = -1;          /* the CAN_RAW socket with --can, else -1 (the pipe) */
+static uint32_t      s_drop_fc_after, s_cfs;  /* --drop-fc-after's N, and the CFs of the request coming in */
+static volatile sig_atomic_t s_stop;
 
 static uint64_t mono_us(void)
 {
@@ -94,13 +109,13 @@ static void log_frame(const char *dir, uint32_t id, const uint8_t *data, uint8_t
     fputc('\n', stderr);
 }
 
-/* ---- isotp-c's platform hooks: stdout is the bus out ---- */
+/* ---- The bus ---- */
 
-int isotp_user_send_can(const uint32_t arbitration_id, const uint8_t *data, const uint8_t size, void *arg)
+/* One frame out as a pipe line on stdout; false when the client is gone. */
+static bool pipe_send(uint32_t id, const uint8_t *data, uint8_t size)
 {
-    (void)arg;
     char line[32];
-    int n = snprintf(line, sizeof line, "%03X#", (unsigned)arbitration_id);
+    int n = snprintf(line, sizeof line, "%03X#", (unsigned)id);
     for (uint8_t i = 0; i < size && i < 8u; i++) {
         n += snprintf(&line[n], sizeof line - (size_t)n, "%02X", data[i]);
     }
@@ -111,9 +126,128 @@ int isotp_user_send_can(const uint32_t arbitration_id, const uint8_t *data, cons
             continue;
         }
         if (w <= 0) {
-            return ISOTP_RET_ERROR;      /* the client is gone */
+            return false;
         }
         off += (int)w;
+    }
+    return true;
+}
+
+#ifdef LITE_SOCKETCAN
+/* The attribute of this type among the rtattrs in [p, p + len), or NULL; a malformed list ends the search. */
+static const struct rtattr *rta_find(const uint8_t *p, size_t len, unsigned short type)
+{
+    while (len >= sizeof(struct rtattr)) {
+        const struct rtattr *a = (const struct rtattr *)(const void *)p;
+        if (a->rta_len < sizeof *a || a->rta_len > len) {
+            return NULL;
+        }
+        if ((a->rta_type & NLA_TYPE_MASK) == type) {
+            return a;
+        }
+        const size_t step = RTA_ALIGN(a->rta_len);
+        if (step >= len) {
+            return NULL;
+        }
+        p += step;
+        len -= step;
+    }
+    return NULL;
+}
+
+/* True when ifname is a vcan. The kernel's rtnetlink link kind (the "vcan" that `ip -details link show` prints) is
+ * the only test that tells one apart: ARPHRD_CAN is the type of every CAN interface, real or virtual, and the absence
+ * of /sys/class/net/<if>/device would pass slcan, a real bus behind a serial adapter. Fails closed: an unknown
+ * interface, a netlink error or a reply without IFLA_INFO_KIND is not a vcan. */
+static bool is_vcan(const char *ifname)
+{
+    const unsigned idx = if_nametoindex(ifname);
+    const int fd = (idx != 0u) ? socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE) : -1;
+    if (fd < 0) {
+        return false;
+    }
+    struct {
+        struct nlmsghdr  nh;
+        struct ifinfomsg ifi;
+    } req = {
+        .nh = {.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg)), .nlmsg_type = RTM_GETLINK,
+               .nlmsg_flags = NLM_F_REQUEST, .nlmsg_seq = 1u},
+        .ifi = {.ifi_family = AF_UNSPEC, .ifi_index = (int)idx},
+    };
+    struct sockaddr_nl kernel = {.nl_family = AF_NETLINK};
+    static union {
+        struct nlmsghdr nh;
+        uint8_t         buf[32768];
+    } rsp;
+    ssize_t n = -1;
+    if (sendto(fd, &req, req.nh.nlmsg_len, 0, (struct sockaddr *)&kernel, sizeof kernel) ==
+        (ssize_t)req.nh.nlmsg_len) {
+        n = recv(fd, rsp.buf, sizeof rsp.buf, 0);
+    }
+    close(fd);
+    const size_t head = NLMSG_LENGTH(sizeof(struct ifinfomsg));
+    if (n < (ssize_t)head || rsp.nh.nlmsg_type != RTM_NEWLINK || rsp.nh.nlmsg_len < head ||
+        rsp.nh.nlmsg_len > (size_t)n) {
+        return false;
+    }
+    const size_t at = NLMSG_ALIGN(head);                     /* the link's attributes follow the ifinfomsg */
+    const size_t at_len = rsp.nh.nlmsg_len > at ? rsp.nh.nlmsg_len - at : 0u;
+    const struct rtattr *info = rta_find(rsp.buf + at, at_len, IFLA_LINKINFO);
+    const struct rtattr *kind = (info != NULL) ? rta_find((const uint8_t *)RTA_DATA(info), RTA_PAYLOAD(info),
+                                                          IFLA_INFO_KIND)
+                                               : NULL;
+    static const char vcan[] = "vcan";
+    return kind != NULL && RTA_PAYLOAD(kind) >= sizeof vcan && memcmp(RTA_DATA(kind), vcan, sizeof vcan) == 0;
+}
+
+/* A CAN_RAW socket on the vcan ifname that hears only standard frames on the request ID, or -1 (logged). */
+static int can_open(const char *ifname)
+{
+    if (!is_vcan(ifname)) {
+        fprintf(stderr, "udsota_lite_server: %s is not a vcan interface; --can serves only on vcan\n", ifname);
+        return -1;
+    }
+    const int fd = socket(PF_CAN, SOCK_RAW | SOCK_CLOEXEC, CAN_RAW);
+    const struct can_filter flt = {.can_id = REQ_ID, .can_mask = CAN_SFF_MASK | CAN_EFF_FLAG | CAN_RTR_FLAG};
+    struct sockaddr_can addr = {.can_family = AF_CAN, .can_ifindex = (int)if_nametoindex(ifname)};
+    if (fd < 0 || setsockopt(fd, SOL_CAN_RAW, CAN_RAW_FILTER, &flt, sizeof flt) != 0 ||
+        bind(fd, (struct sockaddr *)&addr, sizeof addr) != 0) {
+        fprintf(stderr, "udsota_lite_server: no CAN_RAW socket on %s: %s\n", ifname, strerror(errno));
+        if (fd >= 0) {
+            close(fd);
+        }
+        return -1;
+    }
+    return fd;
+}
+
+/* One frame out on the socket; false when the write fails. */
+static bool can_send(uint32_t id, const uint8_t *data, uint8_t size)
+{
+    struct can_frame cf = {.can_id = id & CAN_SFF_MASK, .can_dlc = size < 8u ? size : 8u};
+    memcpy(cf.data, data, cf.can_dlc);
+    return write(s_can_fd, &cf, sizeof cf) == (ssize_t)sizeof cf;
+}
+#endif
+
+/* ---- isotp-c's platform hooks: stdout or the socket is the bus out ---- */
+
+/* The FC after a request's --drop-fc-after'th CF is lost (reported sent), once. */
+int isotp_user_send_can(const uint32_t arbitration_id, const uint8_t *data, const uint8_t size, void *arg)
+{
+    (void)arg;
+    if (size >= 1u && (data[0] >> 4) == 3u && s_drop_fc_after != 0u && s_cfs == s_drop_fc_after) {
+        s_drop_fc_after = 0u;
+        fprintf(stderr, "udsota_lite_server: --drop-fc-after: losing the FC after CF %u\n", (unsigned)s_cfs);
+        return ISOTP_RET_OK;
+    }
+#ifdef LITE_SOCKETCAN
+    const bool sent = (s_can_fd >= 0) ? can_send(arbitration_id, data, size) : pipe_send(arbitration_id, data, size);
+#else
+    const bool sent = pipe_send(arbitration_id, data, size);
+#endif
+    if (!sent) {
+        return ISOTP_RET_ERROR;          /* the client or the socket is gone */
     }
     log_frame("tx", arbitration_id, data, size);
     return ISOTP_RET_OK;
@@ -330,8 +464,20 @@ static int hexval(char ch)
                                     : -1;
 }
 
-/* One pipe line, `<3 hex digits>#<0 to 8 hex bytes>`: a frame on the request ID goes to isotp-c, unless the server
- * is restarting; any other frame is dropped, and a malformed line is logged and dropped. */
+/* One frame from the bus: on the request ID it goes to isotp-c, unless the server is restarting, and its CFs are
+ * counted for --drop-fc-after; any other frame is dropped. */
+static void on_frame(uint32_t id, const uint8_t *data, uint8_t len)
+{
+    if (id != REQ_ID || s_booting) {
+        return;
+    }
+    const uint8_t pci = (len >= 1u) ? (uint8_t)(data[0] >> 4) : 0xFFu;
+    s_cfs = (pci == 1u) ? 0u : (pci == 2u) ? s_cfs + 1u : s_cfs;
+    log_frame("rx", id, data, len);
+    isotp_on_can_message(&s_tp.phys_link, data, len);
+}
+
+/* One pipe line, `<3 hex digits>#<0 to 8 hex bytes>`, to on_frame; a malformed line is logged and dropped. */
 static void on_line(const char *s)
 {
     uint32_t id = 0;
@@ -351,10 +497,7 @@ static void on_line(const char *s)
         fprintf(stderr, "udsota_lite_server: dropped a malformed line\n");
         return;
     }
-    if (id == REQ_ID && !s_booting) {
-        log_frame("rx", id, data, len);
-        isotp_on_can_message(&s_tp.phys_link, data, len);
-    }
+    on_frame(id, data, len);
 }
 
 /* Splits stdin's bytes into lines; a partial line waits for the next read, and an over-long one is dropped. */
@@ -382,18 +525,47 @@ static void take(const char *buf, size_t n)
     }
 }
 
-/* Serves until stdin's EOF: frames into isotp-c, then UDSServerPoll and udsota_poll, at least every millisecond. */
+#ifdef LITE_SOCKETCAN
+/* Every frame the socket holds to on_frame; false when a read fails. */
+static bool can_take(void)
+{
+    for (;;) {
+        struct can_frame cf;
+        const ssize_t n = recv(s_can_fd, &cf, sizeof cf, MSG_DONTWAIT);
+        if (n < 0) {
+            return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
+        }
+        if ((size_t)n == sizeof cf && (cf.can_id & (CAN_EFF_FLAG | CAN_RTR_FLAG | CAN_ERR_FLAG)) == 0u &&
+            cf.can_dlc <= 8u) {
+            on_frame(cf.can_id & CAN_SFF_MASK, cf.data, cf.can_dlc);
+        }
+    }
+}
+#else
+static bool can_take(void)
+{
+    return false;                                        /* never called: s_can_fd stays -1 */
+}
+#endif
+
+/* Serves until stdin's EOF (in pipe mode) or a stop signal: frames into isotp-c, then UDSServerPoll and udsota_poll,
+ * at least every millisecond. */
 static int serve(void)
 {
     boot();
-    for (;;) {
-        struct pollfd p = {.fd = STDIN_FILENO, .events = POLLIN};
+    while (!s_stop) {
+        struct pollfd p = {.fd = s_can_fd >= 0 ? s_can_fd : STDIN_FILENO, .events = POLLIN};
         const int r = poll(&p, 1, 1);
         if (r < 0 && errno != EINTR) {
             perror("udsota_lite_server: poll");
             return 1;
         }
-        if (r > 0) {
+        if (r > 0 && s_can_fd >= 0) {
+            if (!can_take()) {
+                perror("udsota_lite_server: recv");
+                return 1;
+            }
+        } else if (r > 0) {
             char buf[4096];
             const ssize_t n = read(STDIN_FILENO, buf, sizeof buf);
             if (n == 0) {
@@ -420,6 +592,13 @@ static int serve(void)
             fprintf(stderr, "udsota_lite_server: restarting\n");
         }
     }
+    return 0;
+}
+
+static void on_stop(int sig)
+{
+    (void)sig;
+    s_stop = 1;
 }
 
 /* A decimal number up to max for option opt; exits 2 otherwise. */
@@ -451,16 +630,20 @@ int main(int argc, char **argv)
 {
     static const struct option opts[] = {
         {"image", required_argument, NULL, 'i'}, {"soak-ms", required_argument, NULL, 's'},
-        {"boot-ms", required_argument, NULL, 'b'}, {NULL, 0, NULL, 0},
+        {"boot-ms", required_argument, NULL, 'b'}, {"can", required_argument, NULL, 'c'},
+        {"drop-fc-after", required_argument, NULL, 'd'}, {NULL, 0, NULL, 0},
     };
-    static const char usage[] = "usage: udsota_lite_server --image FILE [--soak-ms N] [--boot-ms N] [-v]\n";
-    const char *image_path = NULL;
+    static const char usage[] = "usage: udsota_lite_server --image FILE [--can IFNAME] [--soak-ms N] [--boot-ms N] "
+                                "[--drop-fc-after N] [-v]\n";
+    const char *image_path = NULL, *ifname = NULL;
     int c;
     while ((c = getopt_long(argc, argv, "v", opts, NULL)) != -1) {
         switch (c) {
         case 'i': image_path = optarg; break;
         case 's': s_soak_ms = number("--soak-ms", optarg, 600000u); break;
         case 'b': s_silence_ms = number("--boot-ms", optarg, 60000u); break;
+        case 'c': ifname = optarg; break;
+        case 'd': s_drop_fc_after = number("--drop-fc-after", optarg, 4095u); break;
         case 'v': s_verbose = true; break;
         default:  fputs(usage, stderr); return 2;
         }
@@ -478,11 +661,29 @@ int main(int argc, char **argv)
         lite_plat_close();
         return 2;
     }
+    if (ifname != NULL) {
+#ifdef LITE_SOCKETCAN
+        s_can_fd = can_open(ifname);
+#else
+        fputs("udsota_lite_server: built without SocketCAN (no linux/can/raw.h), so no --can\n", stderr);
+#endif
+        if (s_can_fd < 0) {
+            lite_plat_close();
+            return 2;
+        }
+    }
     signal(SIGPIPE, SIG_IGN);
-    fprintf(stderr, "udsota_lite_server: iso14229 %s, pipe on stdin/stdout, IDs 0x%03X/0x%03X, soak %u ms\n",
-            UDS_LIB_VERSION, REQ_ID, RESP_ID, (unsigned)s_soak_ms);
+    const struct sigaction stop = {.sa_handler = on_stop};   /* no SA_RESTART: poll returns, the loop sees s_stop */
+    sigaction(SIGTERM, &stop, NULL);
+    sigaction(SIGINT, &stop, NULL);
+    fprintf(stderr, "udsota_lite_server: iso14229 %s, %s%s, IDs 0x%03X/0x%03X, soak %u ms\n", UDS_LIB_VERSION,
+            ifname != NULL ? "SocketCAN on " : "pipe on stdin/stdout", ifname != NULL ? ifname : "", REQ_ID, RESP_ID,
+            (unsigned)s_soak_ms);
     const int rc = serve();
     udsota_test_reboot();                                /* frees an inflater left open */
     lite_plat_close();
+    if (s_can_fd >= 0) {
+        close(s_can_fd);
+    }
     return rc;
 }

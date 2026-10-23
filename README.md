@@ -113,7 +113,7 @@ udsota never changes iso14229's code. Where iso14229 has no call for what an upd
 | [`examples/candash_ws43`](examples/candash_ws43/README.md) | An app on the CANDash ws43 or ws43b (ESP32-S3) with CANDash's identity, so updates go both ways |
 | `test/test_udsota.c` | The host test: updates through iso14229's mock transport into a RAM slot, plain and raw DEFLATE, under ASan and UBSan |
 | `test/fuzz_udsota.c` | The fuzzer: CAN frames through iso14229's isotp-c into udsota, its seeds, their mutants and random programs, the same in every ctest run, under ASan and UBSan; with `-DUDSOTA_FUZZ_LIBFUZZER=ON` (clang) also a libFuzzer target |
-| `test/e2e/` | `udsota_lite_server`: udsota and iso14229 as a Linux process with RAM A/B slots, for the client's end-to-end test |
+| `test/e2e/` | `udsota_lite_server`: udsota and iso14229 as a Linux process with RAM A/B slots, for the client's end-to-end tests over a frame pipe or on a vcan |
 | `tools/` | `release.py` ([RELEASING.md](RELEASING.md)), and `image_check.c`: udsota's image rules run on a built image, which CI runs on every example image |
 | [`client/`](client/README.md) | The `udsota` command-line tool, for Linux with SocketCAN; it also updates units still on a 0.14.x server |
 | [`docs/wire.md`](docs/wire.md) | The wire reference: services, DIDs, routines, NRCs, reasons, timing, the descriptor, the 0x27 keys and flashing without the client |
@@ -121,7 +121,7 @@ udsota never changes iso14229's code. Where iso14229 has no call for what an upd
 
 ```sh
 cmake -S . -B build && cmake --build build -j && ctest --test-dir build   # the host test and the fuzzer; also builds udsota_lite_server
-pip install "./client[diff]" pytest && python -m pytest client/tests      # the client's tests, and the end-to-end test
+pip install "./client[diff]" pytest && python -m pytest client/tests      # the client's tests, and the end-to-end tests
 ```
 
 What changed in each release is in the [changelog](CHANGELOG.md). MIT licence. Third-party code is listed in [THIRD_PARTY.md](THIRD_PARTY.md).

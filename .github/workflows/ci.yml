@@ -1,9 +1,9 @@
 # udsota: the host test and the fuzzer's replay, the client's tests and the release tool's, the client against
-# udsota_lite_server (gcc and clang builds of each, and the fuzzer's libFuzzer build on clang), the CANDash example
-# built with a throwaway signing key for the ws43, the ws43b and the ws43 at -O2, and what a release of this commit
-# would carry (release-assets.yml): the client's wheel and sdist and examples/esp32's image for esp32s3 and esp32.
-# Every image build fails on a compiler warning, and every image must pass udsota's image rules (tools/image_check.c)
-# while a copy with a broken descriptor must not.
+# udsota_lite_server over the pipe and on vcan0 (gcc and clang builds of each, and the fuzzer's libFuzzer build on
+# clang), the CANDash example built with a throwaway signing key for the ws43, the ws43b and the ws43 at -O2, and what a
+# release of this commit would carry (release-assets.yml): the client's wheel and sdist and examples/esp32's image for
+# esp32s3 and esp32. Every image build fails on a compiler warning, and every image must pass udsota's image rules
+# (tools/image_check.c) while a copy with a broken descriptor must not.
 name: ci
 on: [push, pull_request]
 jobs:
@@ -50,6 +50,23 @@ jobs:
       - run: python -m pip install "./client[diff]" pytest && python -m pytest -q -rsx client/tests/test_e2e_lite.py
         env:
           UDSOTA_LITE_SERVER: ${{ github.workspace }}/build/udsota_lite_server
+      - name: Set up vcan0
+        run: |
+          if ! sudo modprobe vcan; then
+            sudo apt-get update
+            sudo apt-get install -y linux-modules-extra-$(uname -r)
+            sudo modprobe vcan
+          fi
+          sudo ip link add dev vcan0 type vcan
+          sudo ip link set up vcan0
+      - name: Load the kernel ISO-TP module, where the kernel has one (the udsota command's tests need it)
+        continue-on-error: true
+        run: sudo modprobe can-isotp
+      - name: Run the end-to-end tests on vcan0 (UDSOTA_VCAN makes a missing vcan fail, not skip)
+        run: python -m pytest -q -rsx client/tests/test_e2e_lite_vcan.py
+        env:
+          UDSOTA_LITE_SERVER: ${{ github.workspace }}/build/udsota_lite_server
+          UDSOTA_VCAN: vcan0
   esp32:
     runs-on: ubuntu-latest
     container: espressif/idf:v6.1

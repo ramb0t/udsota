@@ -33,26 +33,38 @@ enable_testing()
 set_source_files_properties(iso14229/iso14229.c PROPERTIES COMPILE_OPTIONS "-fwrapv")   # as the component does
 
 # iso14229 on its mock transport with a clock the test sets, udsota over the test's platform, and miniz's tinfl
-# (tdefl too, to make a raw-DEFLATE image).
-add_executable(test_udsota test/test_udsota.c udsota.c iso14229/iso14229.c test/miniz/miniz.c)
-target_include_directories(test_udsota PRIVATE . iso14229 test/miniz)
-target_compile_definitions(test_udsota PRIVATE UDS_SYS=UDS_SYS_UNIX UDS_AUTOSELECT_TP=0 UDS_TP_ISOTP_MOCK
-                                               UDS_CUSTOM_MILLIS _DEFAULT_SOURCE UDSOTA_TEST MINIZ_NO_STDIO MINIZ_NO_TIME
-                                               MINIZ_NO_ARCHIVE_APIS MINIZ_NO_ZLIB_APIS)
-# ASan and UBSan, the first report ending the test.
-target_compile_options(test_udsota PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer)
-target_link_options(test_udsota PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=all)
+# (tdefl too, to make a raw-DEFLATE image), under ASan and UBSan, the first report ending the test. calloc goes through
+# the test, which can fail one to refuse the inflater its memory. test_udsota_no_rollback is the same test on a
+# platform that reports what ESP-IDF does without CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE.
+function(udsota_test name)
+    add_executable(${name} test/test_udsota.c udsota.c iso14229/iso14229.c test/miniz/miniz.c)
+    target_include_directories(${name} PRIVATE . iso14229 test/miniz)
+    target_compile_definitions(${name} PRIVATE UDS_SYS=UDS_SYS_UNIX UDS_AUTOSELECT_TP=0 UDS_TP_ISOTP_MOCK
+                                               UDS_CUSTOM_MILLIS _DEFAULT_SOURCE UDSOTA_TEST MINIZ_NO_STDIO
+                                               MINIZ_NO_TIME MINIZ_NO_ARCHIVE_APIS MINIZ_NO_ZLIB_APIS ${ARGN})
+    target_compile_options(${name} PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=all
+                                           -fno-omit-frame-pointer)
+    target_link_options(${name} PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=all -Wl,--wrap=calloc)
+    add_test(NAME ${name} COMMAND ${name})
+endfunction()
 set_source_files_properties(udsota.c test/test_udsota.c PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror")
-add_test(NAME test_udsota COMMAND test_udsota)
+udsota_test(test_udsota)
+udsota_test(test_udsota_no_rollback TEST_ROLLBACK=0)
 
-# The app on a host for the client's end-to-end test (client/tests/test_e2e_lite.py): udsota on iso14229 over
-# isotp-c, CAN frames on stdin and stdout, two RAM slots, every timer on CLOCK_MONOTONIC, ASan and UBSan.
+# The app on a host for the client's end-to-end tests (client/tests/test_e2e_lite.py, test_e2e_lite_vcan.py): udsota
+# on iso14229 over isotp-c, CAN frames on stdin and stdout or, where linux/can/raw.h is, on a vcan with --can, two RAM
+# slots, every timer on CLOCK_MONOTONIC, ASan and UBSan.
+include(CheckIncludeFile)
+check_include_file(linux/can/raw.h UDSOTA_HAVE_SOCKETCAN)
 add_executable(udsota_lite_server test/e2e/lite_server.c test/e2e/lite_platform.c test/e2e/sha256_host.c
                test/e2e/hmac_sha256_host.c udsota.c iso14229/iso14229.c test/miniz/miniz.c)
 target_include_directories(udsota_lite_server PRIVATE . iso14229 test/miniz test/e2e)
 target_compile_definitions(udsota_lite_server PRIVATE UDS_SYS=UDS_SYS_UNIX UDS_AUTOSELECT_TP=0 UDS_TP_ISOTP_C
                                                       UDS_CUSTOM_MILLIS _DEFAULT_SOURCE UDSOTA_TEST MINIZ_NO_STDIO
                                                       MINIZ_NO_TIME MINIZ_NO_ARCHIVE_APIS MINIZ_NO_ZLIB_APIS)
+if(UDSOTA_HAVE_SOCKETCAN)
+    target_compile_definitions(udsota_lite_server PRIVATE LITE_SOCKETCAN)
+endif()
 target_compile_options(udsota_lite_server PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=all
                                                   -fno-omit-frame-pointer)
 target_link_options(udsota_lite_server PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=all)
