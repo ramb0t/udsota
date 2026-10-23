@@ -4,6 +4,8 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-10-23
+
 udsota is now `udsota.c` and `udsota.h`, answering updates inside the app's own [iso14229](https://github.com/driftregion/iso14229) UDS server, which it vendors, in place of udsota's own server, ISO-TP adapter and ESP32 port. **Breaking** for every app and for some testers: [MIGRATING.md](MIGRATING.md) maps each change, and [docs/wire.md](docs/wire.md) is the new wire reference. The client is unchanged and still updates units on a 0.14.x server.
 
 ### Changed
