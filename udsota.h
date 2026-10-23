@@ -40,8 +40,8 @@
 /* ---- Wire contract ----
  * The numbers a tester sees, under the names udsota v0.14.2 gave them. client/udsota/wire.py, keys.py and image.py
  * mirror them, and client/tests/test_udsota.py checks each against its client copy, or against v0.14.2's for the few
- * the client never uses: changing one needs a matching client change and a CHANGELOG entry. NRCs and sessions are iso14229's (UDS_NRC_*, UDS_LEV_DS_*), and the download reasons are
- * udsota_reason_t below. */
+ * the client never uses: changing one needs a matching client change and a CHANGELOG entry. NRCs and sessions are
+ * iso14229's (UDS_NRC_*, UDS_LEV_DS_*), and the download reasons are udsota_reason_t below. */
 #define UDSOTA_DID_ACTIVE_SESSION   0xF186u   /* 1 B: the active session */
 #define UDSOTA_DID_SW_VERSION       0xF189u   /* the running image's version string */
 #define UDSOTA_DID_SERIAL           0xF18Cu   /* the device ID the keys bind to */

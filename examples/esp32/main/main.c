@@ -39,7 +39,7 @@ static const char *TAG = "example";
 #define RX_QUEUE_LEN        32u      /* received frames between the TWAI ISR and the server task */
 #define SERVER_STACK        8192u    /* 0x27's key check runs here once keys are set */
 #define SERVER_PRIO         5
-#define HEALTHY_AFTER_MS    10000u   /* this example's health rule: ten seconds up without a crash */
+#define STATE_LOG_AFTER_MS  10000u   /* how long app_main waits before logging the slot state */
 
 _Static_assert(TX_SLOTS <= 32u, "one bit per slot in s_tx_busy");
 _Static_assert(EXAMPLE_REQ_ID <= 0x7FFu && EXAMPLE_RESP_ID <= 0x7FFu, "udsota uses 11-bit IDs");
@@ -275,7 +275,7 @@ static esp_err_t server_start(void)
     return ESP_OK;
 }
 
-/* Boot order: settings, CAN, the updater, then the health decision. */
+/* Boot order: settings, CAN, the updater, then a log of the slot state. */
 void app_main(void)
 {
     /* ... load the app's stored settings (NVS) here ... */
@@ -293,7 +293,7 @@ void app_main(void)
      * and the client's ConfirmImage (31 01 F002) keeps it. The app never calls
      * esp_ota_mark_app_valid_cancel_rollback() itself; it holds the confirm with its gate if it wants a say. A reset
      * before the confirm boots the previous image again. */
-    vTaskDelay(pdMS_TO_TICKS(HEALTHY_AFTER_MS));
+    vTaskDelay(pdMS_TO_TICKS(STATE_LOG_AFTER_MS));
     ESP_LOGI(TAG, "running%s", udsota_unconfirmed() ? "; image not yet confirmed, a reset rolls it back" : "");
 
     /* The local status snapshot, for a UI or a log: what F1F0 reports. Any task may read it. */

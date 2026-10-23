@@ -73,7 +73,7 @@ The 1 ms wait needs `CONFIG_FREERTOS_HZ=1000`, as both examples' `sdkconfig.defa
 | `stmin_monitor` | gone, with rxwatch and its median rule |
 | `level_extended`, `level_programming` | fixed at 01 and 03 (`UDSOTA_SA_SEED_EXTENDED`, `_PROGRAMMING`) |
 | `hw_id`, `layout_id` | the running image's descriptor; log `udsota_image_desc.hw_id` |
-| `key_label`, `key_master`, `key_master_len`, `key_pubkey`, `key_pubkey_len`, `device_id`, `device_id_len` | `udsota_cfg_t`, same meaning. A malformed key now leaves security on with no key that matches, where 0.14 refused to start |
+| `key_label`, `key_master`, `key_master_len`, `key_pubkey`, `key_pubkey_len`, `device_id`, `device_id_len` | `udsota_cfg_t`, same meaning. A malformed key now leaves security on with no key that matches, where 0.14 refused to start. Nor is PSA self-tested first: 0.14 turned 0x27 off when its HMAC or ECDSA known-answer test failed, and 0.15 has no such test |
 | `product` | `udsota_cfg_t.product`; NULL now means this image's own project name, where 0.14 skipped the check |
 | `allow_downgrade` | `udsota_cfg_t.allow_downgrade` |
 | `dtc_availability_mask`, `dtc_format` | gone: 0x19 is the app's `UDS_EVT_ReadDTCInformation` |
