@@ -22,7 +22,7 @@ names = { 1 = "devkit" }              # board name for each hw_id; flash refuses
 
 # [security] turns on SecurityAccess (0x27): without it the tool never unlocks. It has two modes, which must match
 # the server's. In mode "hmac" (the default) the key for each seed is derived from a 32-byte master key file, the
-# label and the device ID, as udsota_keys.c does; every device holds that master too. In mode "ecdsa" (recommended)
+# label and the device ID, as udsota.c does; every device holds that master too. In mode "ecdsa" (recommended)
 # the key is a P-256 signature over the seed, level and device ID made with a private key only the tester holds;
 # the device holds just the public key (`udsota keygen --out DIR` makes the pair).
 # [security]
