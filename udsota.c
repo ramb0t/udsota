@@ -1414,6 +1414,13 @@ udsota_reason_t udsota_test_check_first(const uint8_t *b, size_t len, uint32_t s
 {
     return check_first(b, len, size);
 }
+
+/* The image bytes a coded download holds in zbuf, and zbuf's size, which they never pass (the fuzzer checks). */
+size_t udsota_test_held(size_t *cap)
+{
+    *cap = sizeof U.zbuf;
+    return U.z.held;
+}
 #endif
 
 /* ==== 7. The ESP-IDF platform ==== */

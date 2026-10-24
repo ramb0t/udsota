@@ -109,11 +109,13 @@ target_link_options(udsota_lite_server PRIVATE -fsanitize=address,undefined -fno
 set_source_files_properties(test/e2e/lite_server.c test/e2e/lite_platform.c PROPERTIES COMPILE_OPTIONS
                             "-Wall;-Wextra;-Werror")
 
-# The fuzzer (test/fuzz_udsota.c): CAN frames through iso14229's isotp-c into UDSServerPoll and udsota, under ASan and
-# UBSan. Each run replays its seeds, their mutants and random programs, the same every time, and fails unless the
-# seeds reach a whole update over DFI 00 and 10 and a refused first block. -DUDSOTA_FUZZ_CORPUS=<dir> replays that
-# corpus too (fuzz_udsota_corpus). -DUDSOTA_FUZZ_LIBFUZZER=ON (clang) also builds fuzz_udsota_libfuzzer, the same
-# harness as a libFuzzer target, and runs it once over the seeds: fuzz_udsota --write-seeds <dir> starts a corpus.
+# The fuzzer (test/fuzz_udsota.c): CAN frames through iso14229's isotp-c into UDSServerPoll and udsota, with delta
+# downloads, under ASan and UBSan. Each run replays its seeds, their mutants, random programs and mutants of a delta's
+# patch, the same every time, and fails unless the seeds reach a whole update over DFI 00, 10 and 30, a refused first
+# block and a delta refused at its base. -DUDSOTA_FUZZ_CORPUS=<dir> replays that corpus too (fuzz_udsota_corpus).
+# fuzz_udsota_nodelta is the same harness on udsota built without UDSOTA_DELTA, as every app is by default, with 50
+# mutants a seed. -DUDSOTA_FUZZ_LIBFUZZER=ON (clang) also builds fuzz_udsota_libfuzzer, the same harness as a
+# libFuzzer target, and runs it once over the seeds: fuzz_udsota --write-seeds <dir> starts a corpus.
 set(UDSOTA_FUZZ_CORPUS "" CACHE PATH "A corpus directory for fuzz_udsota_corpus to replay (none when empty)")
 option(UDSOTA_FUZZ_LIBFUZZER "Build fuzz_udsota_libfuzzer, the fuzzer as a libFuzzer target (clang only)" OFF)
 function(udsota_fuzz name sanitizers)
@@ -127,8 +129,11 @@ function(udsota_fuzz name sanitizers)
 endfunction()
 set_source_files_properties(test/fuzz_udsota.c PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror")
 udsota_fuzz(fuzz_udsota address,undefined)
+udsota_with_delta(fuzz_udsota)
 add_test(NAME fuzz_udsota COMMAND fuzz_udsota)
 set_tests_properties(fuzz_udsota PROPERTIES TIMEOUT 600)
+udsota_fuzz(fuzz_udsota_nodelta address,undefined)
+add_test(NAME fuzz_udsota_nodelta COMMAND fuzz_udsota_nodelta --mutations 50)
 if(UDSOTA_FUZZ_CORPUS)
     add_test(NAME fuzz_udsota_corpus COMMAND fuzz_udsota ${UDSOTA_FUZZ_CORPUS})
     set_tests_properties(fuzz_udsota_corpus PROPERTIES TIMEOUT 1800)
@@ -138,6 +143,7 @@ if(UDSOTA_FUZZ_LIBFUZZER)
         message(FATAL_ERROR "UDSOTA_FUZZ_LIBFUZZER needs clang: ${CMAKE_C_COMPILER_ID} has no -fsanitize=fuzzer")
     endif()
     udsota_fuzz(fuzz_udsota_libfuzzer fuzzer,address,undefined UDSOTA_FUZZ_LIBFUZZER)
+    udsota_with_delta(fuzz_udsota_libfuzzer)
     add_test(NAME fuzz_udsota_seeds COMMAND fuzz_udsota --write-seeds ${CMAKE_CURRENT_BINARY_DIR}/fuzz_seeds)
     add_test(NAME fuzz_udsota_libfuzzer COMMAND fuzz_udsota_libfuzzer -runs=0 ${CMAKE_CURRENT_BINARY_DIR}/fuzz_seeds)
     set_tests_properties(fuzz_udsota_seeds PROPERTIES FIXTURES_SETUP fuzz_seeds)

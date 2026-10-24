@@ -8,11 +8,13 @@
  * An input is a program of ops (op_t): a request (waited for, or not), the key for the last seed, a raw frame of any
  * PCI and DLC, a wait the server polls through, a clock jump it sleeps through, the tester's and the platform's
  * behaviour (the MODE_ bits), a gate refusal, a power cycle into a udsota_cfg_t (the BOOT_ bits), and the app ending
- * the session. Every program starts from a fresh boot. The built-in seeds update over DFI 00 and 10, are refused at a
- * first block and on bad streams, and walk the routines, the DIDs, 0x27, the sessions, the worker's failures and
- * ISO-TP's edges. Each run replays them, then deterministic mutants of them (bytes flipped and set, ops inserted,
- * deleted, repeated and spliced from other seeds; most bytes are 36 payloads, so most edits mutate an image or a
- * DEFLATE stream) and random programs.
+ * the session. Every program starts from a fresh boot. The built-in seeds update over DFI 00, 10 and 30 (a delta from
+ * the running slot), are refused at a first block, at a delta's base and on bad streams, and walk the routines, the
+ * DIDs, 0x27, the sessions, the worker's failures and ISO-TP's edges. Each run replays them, then deterministic
+ * mutants of them (bytes flipped and set, ops inserted, deleted, repeated and spliced from other seeds; most bytes are
+ * 36 payloads, so most edits mutate an image, a DEFLATE stream or a delta stored in one), random programs, and deltas
+ * whose patch is mutated before it is deflated (bits flipped, bytes set, inserted and deleted, the patch cut short or
+ * run on, its header edited), each sent in 36s of random lengths.
  *
  * Checked throughout, beside ASan and UBSan: every frame the server sends is on the response ID with a valid PCI, an
  * SF of 1-7 bytes, CFs in sequence and only as the tester's FCs allow, and never sooner than their STmin; every final
@@ -20,19 +22,25 @@
  * request whenever it can only be that request's (udsota's DIDs at their lengths, 74 20 0F FF, the routines' status);
  * udsota holds the PSA lock for every PSA call and never between polls; nothing is written to flash before the
  * image's first bytes pass udsota's rules, nor past the announced size; nothing is activated that did not verify;
- * udsota_busy is true whenever the worker has a job; udsota_unconfirmed matches the slots; and progress never reports
- * done past total. The seeds alone must also reach a verified update over DFI 00 and DFI 10, an activation and a
- * confirm, a refused first block, a bad stream and the worker's failures.
+ * udsota_busy is true whenever the worker has a job; udsota_unconfirmed matches the slots; progress never reports
+ * done past total; a coded download never holds more image bytes than its buffer; every base read udsota asks for
+ * lies within int's range; a delta writes nothing unless the running image is its base and that base's hash reads;
+ * and no 37 passes in a download whose base read was refused. The seeds alone must also reach a verified update over
+ * DFI 00, 10 and 30, an activation and a confirm, a refused first block, a delta refused at its base, a bad stream and
+ * the worker's failures.
  *
  *     fuzz_udsota [--mutations N] [--seed S] [-v] [--write-seeds DIR] [FILE|DIR ...]
  *
- * With FILEs it replays those programs (a libFuzzer corpus, say) instead. --seed starts the mutation PRNG elsewhere,
- * -v traces every frame, and --write-seeds writes the seed programs to DIR, as a corpus to start libFuzzer from.
+ * With FILEs it replays those programs (a libFuzzer corpus, say) instead. --mutations makes N mutants of each seed
+ * (600) and 5N of the delta's patch, --seed starts the mutation PRNG elsewhere, -v traces every frame, and
+ * --write-seeds writes the seed programs to DIR, as a corpus to start libFuzzer from.
  * A failing program is written to fuzz_udsota-fail.bin in the current directory; replay it with -v. Built with
  * UDSOTA_FUZZ_LIBFUZZER (CMakeLists.txt; clang only) the file is a libFuzzer target over the same programs, with
- * mutate() as half its mutator. */
+ * mutate() as half its mutator. Built without UDSOTA_DELTA=1 (fuzz_udsota_nodelta), every DFI 30 34 is refused and
+ * the seeds need not reach DFI 30 or BAD_BASE. */
 #include <dirent.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -60,11 +68,14 @@
 #define PROG_MAX   65536u
 #define MUTATIONS_DEFAULT 600u
 #define RANDOM_PROGRAMS   2000u
+#define DELTA_PER_MUTANT  5u      /* mutants of the delta's patch, for each mutant of a seed */
+#define PATCH_CAP         8192u   /* a delta's uncompressed patch (g_dp: 6,100 bytes), mutated */
 
 UDSOTA_IMAGE_DESC(HW_ID, LAYOUT_ID, REQ_ID, RESP_ID);
 void udsota_test_reboot(void);
 int  udsota_test_psa_depth(void);
 udsota_reason_t udsota_test_check_first(const uint8_t *b, size_t len, uint32_t size);
+size_t udsota_test_held(size_t *cap);
 
 /* ---- The program ---- */
 
@@ -96,6 +107,8 @@ enum {           /* OP_BOOT */
     BOOT_DOWNGRADE  = 0x04u,   /* cfg.allow_downgrade */
     BOOT_PRODUCT    = 0x08u,   /* cfg.product names another project */
     BOOT_DEVICE_ID  = 0x10u,   /* cfg.device_id: 16 bytes, not the MAC */
+    BOOT_NO_DELTA   = 0x20u,   /* cfg.allow_delta off */
+    BOOT_NO_HASH    = 0x40u,   /* the running image's hash can't be read */
 };
 
 /* ---- Results ---- */
@@ -103,8 +116,9 @@ enum {           /* OP_BOOT */
 static struct {
     unsigned long programs, ops, polls, frames_in, frames_out, answers, pendings, unanswered, reboots;
     unsigned long pos[256], neg[256];          /* final answers by request SID */
-    unsigned long verified[2], activated, confirmed;   /* verified: [0] DFI 00, [1] DFI 10 */
+    unsigned long verified[3], activated, confirmed;   /* verified: [0] DFI 00, [1] DFI 10, [2] DFI 30 */
     unsigned long reasons[16];                 /* each udsota_reason_t cfg.progress reported */
+    unsigned long wrong_base;                  /* of reasons[BAD_BASE], those with the running image's hash readable */
 } G;
 
 static const uint8_t *g_prog;                  /* the program running, for a failure report */
@@ -179,6 +193,12 @@ static uint8_t  g_base[IMG_LEN];               /* slot 0's at power-on: 1.0.0, a
 static uint8_t  g_img[IMG_LEN];                /* the update: 1.0.1, a release */
 static uint8_t *g_z;                           /* g_img as raw DEFLATE */
 static size_t   g_zlen;
+static uint8_t  g_dp[PATCH_CAP];               /* the delta that rebuilds g_img from slot 0 at power-on, uncompressed */
+static size_t   g_dplen;
+static uint8_t *g_dz;                          /* g_dp as raw DEFLATE: a DFI 30 download */
+static size_t   g_dzlen;
+static uint8_t  g_ds[PATCH_CAP + 5u];          /* g_dp in one stored DEFLATE block, so edits to it edit the patch */
+static size_t   g_dslen;
 
 /* An ESP-IDF image header, app descriptor and udsota descriptor, as udsota's image rules read them, then filler that
  * DEFLATE halves (4 bits a byte). */
@@ -208,6 +228,8 @@ static void stamp(uint8_t *img, const char *version, uint8_t hw, uint8_t flags, 
 
 /* ---- The platform ---- */
 
+static UDSServer_t s_srv;              /* the app's server, here so that the platform can read the 34 it is taking */
+
 static struct {
     uint8_t  slot[2][SLOT];
     bool     aborted[2];               /* the bootloader rolled this slot's image back */
@@ -215,7 +237,9 @@ static struct {
     bool     open, verified;           /* the other slot is being written; it passed FF01 */
     uint32_t size, pos;                /* the open image's announced size, and the bytes written to it */
     bool     first_written;
-    bool     compressed;               /* the open image came by DFI 10 */
+    uint8_t  dfi;                      /* the download's: 0 DFI 00, 1 DFI 10, 2 DFI 30 (G.verified's index) */
+    bool     base_refused;             /* a base read was refused in this download */
+    bool     no_hash;                  /* the running image's hash can't be read (BOOT_NO_HASH) */
     int    (*job)(void);
     uint64_t job_at_us;
     int      result;
@@ -231,6 +255,14 @@ static void psa_call(const char *what)
 static unsigned other(void)
 {
     return 1u - P.running;
+}
+
+/* A coded download's image bytes in udsota's buffer: never more than it holds. */
+static void held_ok(const char *where)
+{
+    size_t cap;
+    const size_t held = udsota_test_held(&cap);
+    REQUIRE(held <= cap, "udsota holds %zu image bytes in a %zu-byte buffer, at %s", held, cap, where);
 }
 
 /* One of the running image's esp_app_desc_t strings (32 bytes at off), NUL-terminated. */
@@ -279,6 +311,7 @@ int udsota_plat_poll(void)
         int (*job)(void) = P.job;
         P.job = NULL;
         P.result = job();
+        held_ok("a job's end");
     }
     return (P.job != NULL) ? UDSOTA_PENDING : P.result;
 }
@@ -297,6 +330,8 @@ bool udsota_plat_compatible(const uint8_t *first, size_t len)
 
 int udsota_plat_begin(uint32_t size)
 {
+    REQUIRE(P.dfi != 2u || (memcmp(P.slot[P.running], g_base, IMG_LEN) == 0 && !P.no_hash),
+            "a delta began writing with a running image other than g_base, every patch's base, or its hash unreadable");
     udsota_plat_abort();
     P.verified = false;
     if (size > SLOT || P.boot != P.running) {
@@ -313,6 +348,7 @@ int udsota_plat_begin(uint32_t size)
 
 int udsota_plat_write(const uint8_t *d, size_t n)
 {
+    held_ok("a write");
     if ((P.mode & MODE_FLASH_FAIL) != 0u || !P.open) {
         udsota_plat_abort();
         return UDSOTA_DL_FLASH_ERROR;
@@ -338,7 +374,7 @@ int udsota_plat_end(void)
     P.open = false;
     P.verified = P.pos == IMG_LEN && memcmp(P.slot[other()], g_img, IMG_LEN) == 0;
     if (P.verified) {
-        G.verified[P.compressed]++;
+        G.verified[P.dfi]++;
     }
     return P.verified ? UDSOTA_DL_OK : UDSOTA_DL_VERIFY_FAILED;
 }
@@ -361,9 +397,15 @@ int udsota_plat_confirm(void)
     return UDSOTA_DL_OK;
 }
 
+/* A 34 udsota took (its only call): a download of the 34's DFI starts, whether the tester sent it whole or as raw
+ * frames. */
 void udsota_plat_unverify(void)
 {
+    const uint8_t *r = s_srv.r.recv_buf;
+    REQUIRE(s_srv.r.recv_len >= 2u && r[0] == 0x34u, "udsota_plat_unverify outside a 34");
     P.verified = false;
+    P.dfi = r[1] == UDSOTA_DL_DFI_DEFLATE ? 1u : r[1] == UDSOTA_DL_DFI_DELTA_DEFLATE ? 2u : 0u;
+    P.base_refused = false;
 }
 
 void udsota_plat_status(udsota_status_t *out)
@@ -443,6 +485,36 @@ int udsota_plat_ecdsa(const uint8_t *msg, size_t n, const uint8_t sig[UDSOTA_KEY
     return (sig[0] == 0x5Au) ? 1 : 0;
 }
 
+/* A stand-in for the SHA-256 an image appends: the same function over its IMG_LEN bytes on both sides. */
+static void image_hash(const uint8_t *img, uint8_t out[32])
+{
+    stand_in_hmac(NULL, 0, img, IMG_LEN, out);
+}
+
+#if UDSOTA_DELTA
+/* A delta's base: the running slot, refused past its end as esp_partition_read refuses. udsota refuses an offset
+ * outside int's range itself, so none reaches the platform (a negative one would come cast, past 2^31). */
+bool udsota_plat_base_read(uint32_t off, void *buf, size_t n)
+{
+    held_ok("a base read");
+    REQUIRE((uint64_t)off + n <= (uint64_t)INT_MAX, "a base read of %zu bytes at %" PRIu32 ", outside int's range", n,
+            off);
+    if ((uint64_t)off + n > SLOT) {
+        P.base_refused = true;
+        return false;
+    }
+    memcpy(buf, &P.slot[P.running][off], n);
+    return true;
+}
+
+bool udsota_plat_base_hash(uint8_t out[32])
+{
+    held_ok("the base's hash");
+    image_hash(P.slot[P.running], out);
+    return !P.no_hash;
+}
+#endif
+
 /* ---- The app ---- */
 
 static const char    k_label[] = "udsota-fuzz";
@@ -450,7 +522,6 @@ static const char    k_long_label[] = "a label longer than udsota's 32 bytes";
 static const uint8_t k_master[32] = {1, 2, 3, 4, 5, 6, 7, 8};
 static const uint8_t k_pub[UDSOTA_KEYS_PUBKEY_LEN] = {0x04};
 
-static UDSServer_t   s_srv;
 static UDSTpISOTpC_t s_tp;
 static uint8_t       s_boot_flags, s_gate[8];
 static bool          s_reset;
@@ -493,6 +564,7 @@ static void progress(void *ctx, const udsota_progress_t *p)
             "progress stage %d, %" PRIu32 " of %" PRIu32 ", reason %u", (int)p->stage, p->done, p->total,
             p->last_reason);
     G.reasons[p->last_reason & 15u]++;
+    G.wrong_base += p->last_reason == UDSOTA_DL_BAD_BASE && !P.no_hash;
 }
 
 static void do_reset(void *ctx)
@@ -505,10 +577,12 @@ static void do_reset(void *ctx)
 static void boot(void)
 {
     plat_boot();
+    P.no_hash = (s_boot_flags & BOOT_NO_HASH) != 0u;
     udsota_test_reboot();
     udsota_cfg_t cfg = {.key_label = k_label, .key_master = k_master, .key_master_len = sizeof k_master,
                         .gate = gate, .progress = progress, .reset = do_reset,
                         .allow_downgrade = (s_boot_flags & BOOT_DOWNGRADE) != 0u,
+                        .allow_delta = (s_boot_flags & BOOT_NO_DELTA) == 0u,
                         .product = (s_boot_flags & BOOT_PRODUCT) != 0u ? "another-project" : NULL};
     switch (s_boot_flags & BOOT_KEYS_MASK) {
     case 1:
@@ -715,6 +789,7 @@ static void check_answer(const uint8_t *a, size_t n)
         break;
     case 0x37:
         REQUIRE(n == 1u, "37 answered with %zu bytes", n);
+        REQUIRE(!P.base_refused, "a 37 passed after a refused base read");
         break;
     case 0x3E:
         REQUIRE(n == 2u && a[1] == 0u, "3E answered with %zu bytes", n);
@@ -856,6 +931,7 @@ static void tick(void)
     REQUIRE(udsota_unconfirmed() == (P.boot == P.running && P.state == UDSOTA_IMG_PENDING_VERIFY),
             "udsota_unconfirmed disagrees with the slots");
     REQUIRE(udsota_busy() || P.job == NULL, "udsota_busy is false while the worker has a job");
+    held_ok("a poll");
     drain();
     if (s_reset) {
         reboot();
@@ -885,9 +961,6 @@ static void send_request(const uint8_t *msg, size_t n)
         T.outstanding = 0;                           /* the server holds no request: nothing older can be answered */
     }
     T.outstanding++;
-    if (msg[0] == 0x34u && n >= 2u) {
-        P.compressed = msg[1] == UDSOTA_DL_DFI_DEFLATE;   /* what a verify counts as */
-    }
     if (n <= 7u) {
         uint8_t sf[8] = {(uint8_t)n};
         memcpy(&sf[1], msg, n);
@@ -1184,6 +1257,70 @@ static void p_finish(void)
     REQ(0x10, 0x03);
     REQ(0x31, 0x01, 0xF0, 0x02);
     REQ(0x22, 0xF1, 0xF0);
+}
+
+/* A detools size: 6 bits and a sign bit in the first byte, then 7 bits a byte, each top bit saying another follows. */
+static size_t put_size(uint8_t *p, int32_t v)
+{
+    uint32_t u = (v < 0) ? (uint32_t)-(int64_t)v : (uint32_t)v;
+    size_t i = 0;
+    p[0] = (uint8_t)((u & 0x3Fu) | ((v < 0) ? 0x40u : 0u));
+    for (u >>= 6; u != 0u; u >>= 7) {
+        p[i++] |= 0x80u;
+        p[i] = (uint8_t)(u & 0x7Fu);
+    }
+    return i + 1u;
+}
+
+/* One chunk of a detools sequential patch: diff bytes added to the base's, extra bytes as they are, then the base's
+ * offset moved by adjust. */
+typedef struct {
+    uint32_t diff, extra;
+    int32_t  adjust;
+} chunk_t;
+
+/* g_dp's chunks. The seeks go far both ways, to the slot's last bytes and back, so an edited one lands past the slot
+ * or before its start. */
+static const chunk_t k_chunks[] = {{320, 0, 16000}, {700, 300, -16700}, {1500, 200, 30000}, {940, 100, -32000},
+                                   {1200, 740, 0}};
+
+/* The uncompressed delta, into out (PATCH_CAP bytes), that rebuilds to's IMG_LEN bytes from slot 0 at power-on
+ * (g_base, then FF) in n chunks, behind the header naming g_base; its length. */
+static size_t patch_of(uint8_t *out, const uint8_t *to, const chunk_t *c, size_t n)
+{
+    static const uint8_t magic[4] = {0x10, 0xDE, 0xCD, 0xFC};   /* 0xFCCDDE10, little-endian */
+    size_t k = 64;
+    int64_t from = 0;
+    uint32_t t = 0;
+    memset(out, 0, k);
+    memcpy(out, magic, sizeof magic);
+    image_hash(g_base, &out[4]);
+    out[k++] = 0x00;                                   /* sequential, uncompressed */
+    k += put_size(&out[k], (int32_t)IMG_LEN);
+    k += put_size(&out[k], 0);                         /* no data-format patch */
+    for (size_t i = 0; i < n; i++) {
+        k += put_size(&out[k], (int32_t)c[i].diff);
+        for (uint32_t j = 0; j < c[i].diff; j++, t++, from++) {
+            out[k++] = (uint8_t)(to[t] - (from >= 0 && from < (int64_t)IMG_LEN ? g_base[from] : 0xFFu));
+        }
+        k += put_size(&out[k], (int32_t)c[i].extra);
+        for (uint32_t j = 0; j < c[i].extra; j++, t++) {
+            out[k++] = to[t];
+        }
+        k += put_size(&out[k], c[i].adjust);
+        from += c[i].adjust;
+    }
+    if (t != IMG_LEN) {
+        fprintf(stderr, "fuzz_udsota: the delta's chunks don't make the image\n");
+        exit(2);
+    }
+    return k;
+}
+
+/* d's n bytes as raw DEFLATE in out, which holds max; its length, 0 when it doesn't fit. */
+static size_t deflated(uint8_t *out, size_t max, const uint8_t *d, size_t n)
+{
+    return tdefl_compress_mem_to_mem(out, max, d, n, TDEFL_DEFAULT_MAX_PROBES);
 }
 
 static void build_seeds(void)
@@ -1555,6 +1692,100 @@ static void build_seeds(void)
     REQ(0x31, 0x01, 0xFF, 0x01);
     REQ(0x22, 0xF1, 0xF0);
     seed_end();
+
+    /* 13: a whole update over DFI 30, the delta in two blocks; then, with the update running, the same delta names a
+     * base that is no longer there: BAD_BASE at its first block, before anything is erased. */
+    seed_begin();
+    p_unlock_programming();
+    p_download(UDSOTA_DL_DFI_DELTA_DEFLATE, IMG_LEN);
+    p_blocks(g_dz, g_dzlen, g_dzlen / 2u + 1u);
+    p_finish();
+    JUMP(1100);
+    p_unlock_programming();
+    p_download(UDSOTA_DL_DFI_DELTA_DEFLATE, IMG_LEN);
+    p_blocks(g_dz, g_dzlen, 4093u);
+    REQ(0x22, 0xF1, 0xF1);
+    seed_end();
+
+    /* 14: a whole update over DFI 30 on slow jobs, the delta in one stored DEFLATE block, so that the mutants' edits
+     * to it are edits to the patch: the block's head and the patch's header in the first 36, the rest in two. */
+    seed_begin();
+    MODE(0x02);
+    p_unlock_programming();
+    p_download(UDSOTA_DL_DFI_DELTA_DEFLATE, IMG_LEN);
+    p_block(0u, 1u, g_ds, 5u + 64u);
+    p_block(0u, 2u, &g_ds[69], 4093u);
+    p_block(0u, 3u, &g_ds[69u + 4093u], g_dslen - 69u - 4093u);
+    MODE(0x00);
+    p_finish();
+    seed_end();
+
+    /* 15: deltas refused: with allow_delta off, 0x31 to the 34; with the running image's hash unreadable, and with a
+     * wrong magic, at the first block, before anything is erased; one that rebuilds another board's image, at its
+     * first bytes; one with bytes after the patch's end; one cut short, at its 37; two whose base reads leave int's
+     * range, which udsota refuses before the platform sees them; and one whose seeks would pass INT_MAX. */
+    seed_begin();
+    BOOT(BOOT_NO_DELTA);
+    JUMP(1100);
+    p_unlock_programming();
+    p_download(UDSOTA_DL_DFI_DELTA_DEFLATE, IMG_LEN);
+    BOOT(BOOT_NO_HASH);
+    JUMP(1100);
+    p_unlock_programming();
+    p_download(UDSOTA_DL_DFI_DELTA_DEFLATE, IMG_LEN);
+    p_blocks(g_dz, g_dzlen, 4093u);
+    REQ(0x22, 0xF1, 0xF1);
+    BOOT(0x00);
+    JUMP(1100);
+    p_unlock_programming();
+    {
+        static uint8_t p[PATCH_CAP], z[PATCH_CAP + 1024u];
+        size_t n;
+        memcpy(p, g_dp, g_dplen);
+        p[0] ^= 0xFFu;
+        p_download(UDSOTA_DL_DFI_DELTA_DEFLATE, IMG_LEN);
+        p_blocks(z, deflated(z, sizeof z, p, g_dplen), 4093u);
+        REQ(0x22, 0xF1, 0xF1);
+        stamp(bad, "1.0.1", 2u, 0x01u, 2u);
+        n = patch_of(p, bad, k_chunks, sizeof k_chunks / sizeof k_chunks[0]);
+        p_download(UDSOTA_DL_DFI_DELTA_DEFLATE, IMG_LEN);
+        p_blocks(z, deflated(z, sizeof z, p, n), 4093u);
+        REQ(0x22, 0xF1, 0xF1);
+        memcpy(p, g_dp, g_dplen);
+        memset(&p[g_dplen], 0xAA, 16);
+        p_download(UDSOTA_DL_DFI_DELTA_DEFLATE, IMG_LEN);
+        p_blocks(z, deflated(z, sizeof z, p, g_dplen + 16u), 4093u);
+        REQ(0x37);
+        REQ(0x22, 0xF1, 0xF1);
+        p_download(UDSOTA_DL_DFI_DELTA_DEFLATE, IMG_LEN);
+        p_blocks(z, deflated(z, sizeof z, g_dp, 3000u), 4093u);
+        REQ(0x37);
+        REQ(0x22, 0xF1, 0xF1);
+        chunk_t c[17] = {{320, 0, -1000}, {5680, 0, 0}};   /* a read before the slot's start */
+        n = patch_of(p, g_img, c, 2);
+        p_download(UDSOTA_DL_DFI_DELTA_DEFLATE, IMG_LEN);
+        p_blocks(z, deflated(z, sizeof z, p, n), 4093u);
+        REQ(0x22, 0xF1, 0xF1);
+        int64_t left = INT_MAX - 64 - 320;               /* a read 64 bytes under INT_MAX: a detools size holds */
+        for (size_t i = 0; i < 16u; i++) {               /* 27 bits, so the seek takes 16 chunks */
+            const int32_t seek = (int32_t)(left < 0x7FFFFFF ? left : 0x7FFFFFF);
+            c[i] = (chunk_t){i == 0u ? 320u : 0u, 0, seek};
+            left -= seek;
+        }
+        c[16] = (chunk_t){5680, 0, 0};
+        n = patch_of(p, g_img, c, 17);
+        p_download(UDSOTA_DL_DFI_DELTA_DEFLATE, IMG_LEN);
+        p_blocks(z, deflated(z, sizeof z, p, n), 4093u);
+        REQ(0x22, 0xF1, 0xF1);
+        for (size_t i = 0; i < 16u; i++) {               /* 16 seeks of 2^27 - 1 after 320 bytes: past INT_MAX */
+            c[i].adjust = 0x7FFFFFF;
+        }
+        n = patch_of(p, g_img, c, 17);
+        p_download(UDSOTA_DL_DFI_DELTA_DEFLATE, IMG_LEN);
+        p_blocks(z, deflated(z, sizeof z, p, n), 4093u);
+        REQ(0x22, 0xF1, 0xF1);
+    }
+    seed_end();
 }
 
 /* ---- Mutation ---- */
@@ -1617,7 +1848,7 @@ static size_t random_op(uint8_t *out)
             break;
         }
         case 0x34: {
-            static const uint8_t DFI[] = {0x00, 0x10, 0x01, 0x11, 0x20};
+            static const uint8_t DFI[] = {0x00, 0x10, 0x01, 0x11, 0x20, 0x30};
             static const uint8_t ALFID[] = {0x44, 0x33, 0x11, 0x14, 0x41, 0x45, 0x00};
             static const uint32_t EDGE[] = {319, 320, 321, 4095, 4096, 4097, 8191, 8192};   /* IMAGE_MIN, BUF_LEN */
             const uint32_t pick = rnd() % 5u;
@@ -1635,9 +1866,9 @@ static size_t random_op(uint8_t *out)
             break;
         }
         case 0x36: {
-            const bool z = rnd() % 2u == 0u;
-            const uint8_t *src = z ? g_z : g_img;
-            const size_t src_len = z ? g_zlen : IMG_LEN;
+            const uint32_t which = rnd() % 3u;               /* the image, as it is or as DEFLATE, or the delta */
+            const uint8_t *src = which == 0u ? g_img : which == 1u ? g_z : g_dz;
+            const size_t src_len = which == 0u ? IMG_LEN : which == 1u ? g_zlen : g_dzlen;
             const size_t off = rnd() % 2u == 0u ? 0u : rnd() % src_len;
             size_t k = rnd() % 4u == 0u ? rnd() % 4094u : src_len - off;
             k = (k < 4093u) ? k : 4093u;
@@ -1775,6 +2006,84 @@ static size_t mutate(const uint8_t *seed, size_t len, uint8_t *out)
     return n;
 }
 
+#if !defined(UDSOTA_FUZZ_LIBFUZZER)
+/* Edits a delta's patch p (n bytes, PATCH_CAP of room) 1-4 times, as v0.14.2's fuzz_udsota_patch did: a bit flipped,
+ * a byte set, the patch cut, 16 bytes inserted, up to 32 deleted, a byte of its type and sizes set, one of its header's
+ * flipped, or up to 64 run on after its end; returns its new length. */
+static size_t mutate_patch(uint8_t *p, size_t n)
+{
+    for (unsigned e = 1u + rnd() % 4u; e > 0u && n > 0u; e--) {
+        const size_t at = rnd() % n;
+        switch (rnd() % 8u) {
+        case 0:
+            p[at] ^= (uint8_t)(1u << (rnd() % 8u));
+            break;
+        case 1:
+            p[at] = (uint8_t)rnd();
+            break;
+        case 2:
+            n = at;
+            break;
+        case 3:
+            if (n + 16u <= PATCH_CAP) {
+                memmove(&p[at + 16u], &p[at], n - at);
+                for (unsigned i = 0; i < 16u; i++) {
+                    p[at + i] = (uint8_t)rnd();
+                }
+                n += 16u;
+            }
+            break;
+        case 4: {
+            const size_t k = 1u + rnd() % 32u;
+            if (at + k <= n) {
+                memmove(&p[at], &p[at + k], n - at - k);
+                n -= k;
+            }
+            break;
+        }
+        case 5:                                                       /* after the 64-byte header */
+            if (n >= 72u) {
+                p[64u + rnd() % 8u] = (uint8_t)rnd();
+            }
+            break;
+        case 6:
+            p[rnd() % (n < 64u ? n : 64u)] ^= 0xFFu;
+            break;
+        default:
+            for (unsigned k = 1u + rnd() % 64u; k > 0u && n < PATCH_CAP; k--) {
+                p[n++] = (uint8_t)rnd();
+            }
+            break;
+        }
+    }
+    return n;
+}
+
+/* A mutant of the delta's patch, deflated and sent after a 34 for the image in 36s of random lengths, then the 37,
+ * FF01 and F1F1. The program is built after the seeds in their buffer, and dropped once run. */
+static void run_delta_mutant(void)
+{
+    static uint8_t p[PATCH_CAP], z[PATCH_CAP + 1024u];
+    memcpy(p, g_dp, g_dplen);
+    const size_t zn = deflated(z, sizeof z, p, mutate_patch(p, g_dplen));
+    const size_t mark = g_seeds_len;
+    p_unlock_programming();
+    p_download(UDSOTA_DL_DFI_DELTA_DEFLATE, IMG_LEN);
+    uint8_t bsc = 1;
+    for (size_t off = 0; off < zn; bsc++) {
+        size_t k = rnd() % 4u == 0u ? 1u + rnd() % 64u : 1u + rnd() % 4093u;
+        k = (k < zn - off) ? k : zn - off;
+        p_block(0u, bsc, &z[off], k);
+        off += k;
+    }
+    REQ(0x37);
+    REQ(0x31, 0x01, 0xFF, 0x01);
+    REQ(0x22, 0xF1, 0xF1);
+    run_program(&g_seeds[mark], g_seeds_len - mark);
+    g_seeds_len = mark;
+}
+#endif
+
 /* ---- Entry points ---- */
 
 static void harness_init(void)
@@ -1782,10 +2091,19 @@ static void harness_init(void)
     stamp(g_base, "1.0.0", HW_ID, 0x01u, 1u);
     stamp(g_img, "1.0.1", HW_ID, 0x01u, 2u);
     g_z = tdefl_compress_mem_to_heap(g_img, IMG_LEN, &g_zlen, TDEFL_DEFAULT_MAX_PROBES);
-    if (g_z == NULL || g_zlen < 600u) {
-        fprintf(stderr, "fuzz_udsota: no DEFLATE stream for the image\n");
+    g_dplen = patch_of(g_dp, g_img, k_chunks, sizeof k_chunks / sizeof k_chunks[0]);
+    g_dz = tdefl_compress_mem_to_heap(g_dp, g_dplen, &g_dzlen, TDEFL_DEFAULT_MAX_PROBES);
+    if (g_z == NULL || g_zlen < 600u || g_dz == NULL) {
+        fprintf(stderr, "fuzz_udsota: no DEFLATE stream for the image or the delta\n");
         exit(2);
     }
+    g_ds[0] = 0x01;                                    /* BFINAL, stored: LEN, NLEN, the bytes */
+    g_ds[1] = (uint8_t)g_dplen;
+    g_ds[2] = (uint8_t)(g_dplen >> 8);
+    g_ds[3] = (uint8_t)~g_dplen;
+    g_ds[4] = (uint8_t)(~g_dplen >> 8);
+    memcpy(&g_ds[5], g_dp, g_dplen);
+    g_dslen = 5u + g_dplen;
     build_seeds();
 }
 
@@ -1887,12 +2205,14 @@ static void coverage(void)
 {
     static const uint8_t SHOWN[] = {0x10, 0x11, 0x14, 0x19, 0x22, 0x27, 0x28, 0x2E, 0x31, 0x34, 0x35, 0x36, 0x37, 0x3E,
                                     0x85};
-    printf("fuzz_udsota: reached %lu verified updates over DFI 00 and %lu over DFI 10, %lu activated, %lu confirmed, "
-           "%lu restarts\n", G.verified[0], G.verified[1], G.activated, G.confirmed, G.reboots);
+    printf("fuzz_udsota: reached %lu verified updates over DFI 00, %lu over DFI 10 and %lu over DFI 30, %lu activated, "
+           "%lu confirmed, %lu restarts\n", G.verified[0], G.verified[1], G.verified[2], G.activated, G.confirmed,
+           G.reboots);
     printf("fuzz_udsota: download reasons reported:");
     for (unsigned i = 0; i < 16u; i++) {
         printf(" %u:%lu", i, G.reasons[i]);
     }
+    printf(", BAD_BASE %lu times with the running image's hash readable", G.wrong_base);
     printf("\nfuzz_udsota: answers by SID (positive/negative):");
     for (size_t i = 0; i < sizeof SHOWN; i++) {
         printf(" %02X:%lu/%lu", SHOWN[i], G.pos[SHOWN[i]], G.neg[SHOWN[i]]);
@@ -1910,6 +2230,10 @@ static void seed_floor(void)
                                       UDSOTA_DL_FLASH_ERROR, UDSOTA_DL_BAD_STREAM};
     bool ok = G.verified[0] != 0u && G.verified[1] != 0u && G.activated != 0u && G.confirmed != 0u &&
               G.pendings != 0u;
+#if UDSOTA_DELTA
+    ok = ok && G.verified[2] != 0u && G.wrong_base != 0u &&     /* BAD_BASE for a wrong base, and an unreadable hash */
+         G.reasons[UDSOTA_DL_BAD_BASE] > G.wrong_base;
+#endif
     for (size_t i = 0; i < sizeof SIDS; i++) {
         ok = ok && G.pos[SIDS[i]] != 0u && G.neg[SIDS[i]] != 0u;
     }
@@ -1977,11 +2301,16 @@ int main(int argc, char **argv)
             }
             run_program(buf, n);
         }
+        g_what = "delta mutant";
+        for (unsigned i = 0; i < DELTA_PER_MUTANT * mutations; i++) {
+            run_delta_mutant();
+        }
         coverage();
     }
     g_prog = NULL;
     udsota_test_reboot();                             /* frees an inflater left open */
     mz_free(g_z);
+    mz_free(g_dz);
     printf("fuzz_udsota: PASS %lu programs, %lu ops, %lu polls, %lu frames in, %lu out\n", G.programs, G.ops,
            G.polls, G.frames_in, G.frames_out);
     return 0;
