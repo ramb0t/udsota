@@ -8,7 +8,8 @@
  * the reason F1F1 gives. test_udsota_no_rollback is this file with TEST_ROLLBACK 0: the platform reports what ESP-IDF
  * does without CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE, a new image running UNDEFINED, never pending verify.
  * test_udsota_delta is this file with UDSOTA_DELTA 1 and detools: the device answers on the delta fixtures' CAN IDs,
- * its platform also holds a running image, the fixtures' base, and the delta cases run too. */
+ * its platform also holds a running image, the fixtures' base, and the delta cases run too: whole updates, each way a
+ * delta is refused, no memory at each of the 34's allocations, and aborts mid-patch. */
 #include <assert.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -20,6 +21,7 @@
 #include "miniz.h"
 #include "udsota.h"
 #if UDSOTA_DELTA
+#include <sys/mman.h>
 #include "fixtures/delta_fixtures.h"
 #endif
 
@@ -90,20 +92,59 @@ static struct {
                                                                takes no job, there is no inactive slot */
     int      begins;
 #if UDSOTA_DELTA
-    uint8_t  running[SLOT];            /* the running slot, a delta's base */
+    uint8_t *running;                  /* the running slot, a delta's base, mapped read-only once filled */
+    bool     no_base_hash;             /* a fault: the running image's hash can't be read */
 #endif
 } P = {.delay = 80, .version = "0.4.1-lite.1"};
 
-/* calloc, through -Wl,--wrap=calloc; its one caller is udsota's inflater window. s_calloc_fail fails the next one. */
-static bool s_calloc_fail;
+/* malloc, calloc and free, through -Wl,--wrap: their callers are udsota's inflater state and window, a delta's detools
+ * state, and tdefl. s_malloc_fail fails the nth malloc from now and s_calloc_fail the next calloc; s_live counts the
+ * blocks they gave that free has not taken back (tdefl's output, from realloc, is not one). */
+static int   s_malloc_fail;
+static bool  s_calloc_fail;
+static int   s_live;
+static void *s_blocks[16];
+void *__real_malloc(size_t size);
 void *__real_calloc(size_t n, size_t size);
+void  __real_free(void *p);
+
+static void *track(void *p)
+{
+    for (size_t i = 0; p != NULL && i < sizeof s_blocks / sizeof s_blocks[0]; i++) {
+        if (s_blocks[i] == NULL) {
+            s_blocks[i] = p;
+            s_live++;
+            return p;
+        }
+    }
+    assert(p == NULL);
+    return p;
+}
+
+void *__wrap_malloc(size_t size)
+{
+    if (s_malloc_fail > 0 && --s_malloc_fail == 0) {
+        return NULL;
+    }
+    return track(__real_malloc(size));
+}
 void *__wrap_calloc(size_t n, size_t size)
 {
     if (s_calloc_fail) {
         s_calloc_fail = false;
         return NULL;
     }
-    return __real_calloc(n, size);
+    return track(__real_calloc(n, size));
+}
+void __wrap_free(void *p)
+{
+    for (size_t i = 0; p != NULL && i < sizeof s_blocks / sizeof s_blocks[0]; i++) {
+        if (s_blocks[i] == p) {
+            s_blocks[i] = NULL;
+            s_live--;
+        }
+    }
+    __real_free(p);
 }
 
 static void psa_call(int which)
@@ -253,7 +294,7 @@ int udsota_plat_ecdsa(const uint8_t *msg, size_t n, const uint8_t sig[64])
 /* The running slot, bounded by its size; its image's appended SHA-256 is the fixtures' base hash. */
 bool udsota_plat_base_read(uint32_t off, void *buf, size_t n)
 {
-    if ((uint64_t)off + n > sizeof P.running) {
+    if ((uint64_t)off + n > SLOT) {
         return false;
     }
     memcpy(buf, &P.running[off], n);
@@ -262,7 +303,7 @@ bool udsota_plat_base_read(uint32_t off, void *buf, size_t n)
 bool udsota_plat_base_hash(uint8_t out[32])
 {
     memcpy(out, DELTA_BASE_HASH, 32);
-    return true;
+    return !P.no_base_hash;
 }
 #endif
 
@@ -1119,106 +1160,386 @@ static void compress_cases(const uint8_t *img, size_t img_len, const uint8_t *im
 
     s_calloc_fail = true;
     EXPECT(B(0x34, 0x10, 0x44, 0, 0, 0, 0, 0, 0, 0x20, 0x00), B(0x7F, 0x34, 0x22));
-    CHECK(!s_calloc_fail && result_is(UDSOTA_DL_NO_MEMORY, 0) && !udsota_busy());
+    CHECK(!s_calloc_fail && result_is(UDSOTA_DL_NO_MEMORY, 0) && !udsota_busy() && s_live == 0);
     request_download((uint32_t)len, 0x10);
     send_all(s, n);
     EXPECT(B(0x37), B(0x77));
 }
 
 #if UDSOTA_DELTA
-/* A delta whose uncompressed patch is pn's n bytes, as raw DEFLATE in one 36 after a 34 for size: the 36 is 0x31, F1F1
- * gives reason, and nothing was erased. */
-static void delta_refused(const uint8_t *pn, size_t n, uint32_t size, uint8_t reason)
-{
-    uint8_t resp[64];
-    size_t zlen = 0;
-    uint8_t *z = tdefl_compress_mem_to_heap(pn, n, &zlen, TDEFL_DEFAULT_MAX_PROBES);
-    assert(z != NULL && zlen <= 4093u);
-    const int begins = P.begins;
-    request_download(size, 0x30);
-    CHECK(block(1, z, 0, zlen, resp, sizeof resp) == 3 && resp[0] == 0x7F && resp[2] == 0x31);
-    CHECK(result_is(reason, 0) && P.begins == begins && !udsota_busy());
-    mz_free(z);
-}
-
 /* ---- Delta downloads (DFI 0x30) ----
- * The running image is DELTA_BASE, the release v0.2.0 of the product example, and DELTA_P30 rebuilds DELTA_NEW, v0.3.0,
- * from it, in 36s of 1, 7 or 4,093 bytes: the image installs and activates as a full one would. A one-byte 36 makes
- * detools' runs straddle zbuf's end. A patch for another base is refused at its 36 (0x31, BAD_BASE) before anything is
- * erased, and the image itself then installs in the same session; a wrong magic and a patch for another memorySize are
- * BAD_STREAM, also before the erase, and so are bytes after the patch's end, though after it. DFI 0x20 is 0x31 with delta on, and with
- * cfg.allow_delta off so is a 0x30 34. Nothing writes the running image. */
-static void delta_cases(void)
+ * The running slot holds DELTA_BASE, the release v0.2.0 of the product example, then FF to its end; DELTA_P30 rebuilds
+ * DELTA_NEW, v0.3.0, from it. The slot is mapped read-only once filled, so a write to it anywhere in the delta cases
+ * faults, and every case ends with udsota holding no memory once its download is over. */
+static uint8_t s_pn[16384];                       /* the uncompressed patch a case builds */
+
+/* A boot on the base, with delta allowed, in the programming session and unlocked. */
+static void delta_boot(void)
 {
-    static const size_t steps[] = {1, 7, 4093};
-    static uint8_t snap[SLOT], wrong[sizeof DELTA_PNONE + 2u];
-    memset(P.running, 0xFF, sizeof P.running);
-    memcpy(P.running, DELTA_BASE, sizeof DELTA_BASE);
-    CHECK(memcmp(&P.running[sizeof DELTA_BASE - 32u], DELTA_BASE_HASH, 32) == 0);   /* the hash the base appends */
-    memcpy(snap, P.running, sizeof snap);
-    P.version = "v0.2.0";
-    P.expect = DELTA_NEW;
-    P.expect_len = sizeof DELTA_NEW;
     P.st = (udsota_status_t){.running_slot = 0, .boot_slot = 0, .running_state = UDSOTA_IMG_VALID};
-    s_product = "example";
-    s_allow_delta = true;
     boot();
     programming();
+}
+
+/* d's n bytes as raw DEFLATE in out, which holds max; its length. */
+static size_t deflated(uint8_t *out, size_t max, const uint8_t *d, size_t n)
+{
+    const size_t len = tdefl_compress_mem_to_mem(out, max, d, n, TDEFL_DEFAULT_MAX_PROBES);
+    assert(len != 0u);
+    return len;
+}
+
+/* A detools size: 6 bits and a sign bit in the first byte, then 7 bits a byte, each top bit saying another follows. */
+static size_t put_size(uint8_t *p, int32_t v)
+{
+    uint32_t u = (v < 0) ? (uint32_t)-(int64_t)v : (uint32_t)v;
+    size_t i = 0;
+    p[0] = (uint8_t)((u & 0x3Fu) | ((v < 0) ? 0x40u : 0u));
+    for (u >>= 6; u != 0u; u >>= 7) {
+        p[i++] |= 0x80u;
+        p[i] = (uint8_t)(u & 0x7Fu);
+    }
+    return i + 1u;
+}
+
+/* One chunk of a detools sequential patch: diff bytes added to the base's, extra bytes as they are, then the base's
+ * offset moved by adjust. */
+typedef struct {
+    uint32_t diff, extra;
+    int32_t  adjust;
+} chunk_t;
+
+/* The uncompressed delta that rebuilds to's len bytes from the running slot in n chunks, behind the header naming
+ * DELTA_BASE, into s_pn; its length. Bytes the chunks take past to's end are 0, and so are base bytes outside the
+ * slot. */
+static size_t patch_of(const uint8_t *to, uint32_t len, const chunk_t *c, size_t n)
+{
+    static const uint8_t magic[4] = {0x10, 0xDE, 0xCD, 0xFC};   /* 0xFCCDDE10, little-endian */
+    size_t k = 64;
+    int64_t from = 0;
+    uint32_t t = 0;
+    memset(s_pn, 0, k);
+    memcpy(s_pn, magic, sizeof magic);
+    memcpy(&s_pn[4], DELTA_BASE_HASH, 32);
+    s_pn[k++] = 0x00;                             /* sequential, uncompressed */
+    k += put_size(&s_pn[k], (int32_t)len);
+    k += put_size(&s_pn[k], 0);                   /* no data-format patch */
+    for (size_t i = 0; i < n; i++) {
+        assert(k + 16u + c[i].diff + c[i].extra <= sizeof s_pn);
+        k += put_size(&s_pn[k], (int32_t)c[i].diff);
+        for (uint32_t j = 0; j < c[i].diff; j++, t++, from++) {
+            const uint8_t base = (from >= 0 && from < (int64_t)SLOT) ? P.running[from] : 0u;
+            s_pn[k++] = (uint8_t)(((t < len) ? to[t] : 0u) - base);
+        }
+        k += put_size(&s_pn[k], (int32_t)c[i].extra);
+        for (uint32_t j = 0; j < c[i].extra; j++, t++) {
+            s_pn[k++] = (t < len) ? to[t] : 0u;
+        }
+        k += put_size(&s_pn[k], c[i].adjust);
+        from += c[i].adjust;
+    }
+    return k;
+}
+
+/* A delta of pn's n bytes (the uncompressed patch), as raw DEFLATE in 36s after a 34 for size: one is 0x31, and F1F1
+ * gives reason after the bytes of those before it. erased: the image rules had passed and the slot was opened first;
+ * otherwise nothing was. */
+static void delta_refused(const uint8_t *pn, size_t n, uint32_t size, uint8_t reason, bool erased)
+{
+    static uint8_t z[sizeof s_pn];
+    uint8_t resp[64];
+    const size_t zlen = deflated(z, sizeof z, pn, n);
+    const int begins = P.begins;
+    size_t off = 0;
+    int got = 0;
+    request_download(size, 0x30);
+    for (uint8_t bsc = 1; off < zlen; bsc++) {
+        const size_t k = (zlen - off < 4093u) ? zlen - off : 4093u;
+        if ((got = block(bsc, z, off, k, resp, sizeof resp)) != 2 || resp[0] != 0x76) {
+            break;
+        }
+        off += k;
+    }
+    CHECK(got == 3 && resp[0] == 0x7F && resp[2] == 0x31);
+    CHECK(result_is(reason, (uint32_t)off) && P.begins == begins + (int)erased && !udsota_busy() && s_live == 0);
+}
+
+/* The rebuilt image installs as a full one would and activates. DELTA_P30 in 36s of 1, 7 or 4,093 bytes, which split
+ * the header and the DEFLATE stream at odd points and make detools' runs straddle zbuf's end; F1F1 counts the coded
+ * bytes, and cfg.progress the image's. A patch whose second chunk starts at byte 100 straddles it in one 36 too. The
+ * patch as stored DEFLATE inflates, and arrives, past memorySize, up to UDSOTA_DL_Z_BOUND of it, and past that is 0x71.
+ * A patch may read the running slot past the base image's end, up to the slot's. */
+static void delta_install_cases(void)
+{
+    static const size_t steps[] = {1, 7, 4093};
+    static uint8_t s[UDSOTA_DL_Z_BOUND(sizeof DELTA_NEW) + 1u], z[sizeof s_pn];
+    uint8_t resp[64];
+    delta_boot();
     const int activations = P.activations, resets = s_resets;
     for (size_t i = 0; i < sizeof steps / sizeof steps[0]; i++) {
+        progress_clear();
         request_download(sizeof DELTA_NEW, 0x30);
+        CHECK(s_live == 3);                       /* the inflater's state and window, and detools' */
         send_by(DELTA_P30, sizeof DELTA_P30, steps[i]);
         EXPECT(B(0x37), B(0x77));
-        CHECK(P.pos == sizeof DELTA_NEW && memcmp(P.slot, DELTA_NEW, sizeof DELTA_NEW) == 0);
+        CHECK(P.pos == sizeof DELTA_NEW && memcmp(P.slot, DELTA_NEW, sizeof DELTA_NEW) == 0 && s_live == 0);
         EXPECT(B(0x31, 0x01, 0xFF, 0x01), B(0x71, 0x01, 0xFF, 0x01, 0x00));
         CHECK(result_is(UDSOTA_DL_OK, sizeof DELTA_P30));
+        CHECK(steps[i] == 1u || reports_ok("EWVI", sizeof DELTA_NEW, true));   /* one-byte 36s report past REPORTS */
     }
     EXPECT(B(0x31, 0x01, 0xF0, 0x01), B(0x71, 0x01, 0xF0, 0x01));
     run_for(200);
     CHECK(P.activations == activations + 1 && P.st.boot_slot == 1 && s_resets > resets);
-    CHECK(memcmp(P.running, snap, sizeof snap) == 0);
 
-    P.st = (udsota_status_t){.running_slot = 0, .boot_slot = 0, .running_state = UDSOTA_IMG_VALID};
-    boot();
-    programming();
+    delta_boot();
+    const chunk_t at100[] = {{100, 0, 0}, {sizeof DELTA_NEW - 100u, 0, 0}};
+    size_t n = deflated(z, sizeof z, s_pn, patch_of(DELTA_NEW, sizeof DELTA_NEW, at100, 2));
+    request_download(sizeof DELTA_NEW, 0x30);
+    send_all(z, n);
+    EXPECT(B(0x37), B(0x77));
+    EXPECT(B(0x31, 0x01, 0xFF, 0x01), B(0x71, 0x01, 0xFF, 0x01, 0x00));
+    CHECK(P.pos == sizeof DELTA_NEW && memcmp(P.slot, DELTA_NEW, sizeof DELTA_NEW) == 0);
+
+    n = stored(s, DELTA_PNONE, sizeof DELTA_PNONE);
+    CHECK(sizeof DELTA_PNONE > sizeof DELTA_NEW && n > sizeof DELTA_NEW);
+    request_download(sizeof DELTA_NEW, 0x30);
+    send_all(s, n);
+    EXPECT(B(0x37), B(0x77));
+    EXPECT(B(0x31, 0x01, 0xFF, 0x01), B(0x71, 0x01, 0xFF, 0x01, 0x00));
+    CHECK(result_is(UDSOTA_DL_OK, (uint32_t)n));
+    memset(&s[n], 0, sizeof s - n);               /* then bytes after the stream, one past the bound */
+    request_download(sizeof DELTA_NEW, 0x30);
+    send_by(s, 3u * 4093u, 4093u);
+    CHECK(block(4, s, 3u * 4093u, sizeof s - 3u * 4093u, resp, sizeof resp) == 3 && resp[0] == 0x7F &&
+          resp[2] == 0x71);
+    CHECK(result_is(UDSOTA_DL_ABORTED, 3u * 4093u) && !udsota_busy() && s_live == 0);
+
+    const chunk_t to_end[] = {{0, 0, (int32_t)(SLOT - sizeof DELTA_NEW)}, {sizeof DELTA_NEW, 0, 0}};
+    n = deflated(z, sizeof z, s_pn, patch_of(DELTA_NEW, sizeof DELTA_NEW, to_end, 2));
+    request_download(sizeof DELTA_NEW, 0x30);
+    send_all(z, n);
+    EXPECT(B(0x37), B(0x77));
+    EXPECT(B(0x31, 0x01, 0xFF, 0x01), B(0x71, 0x01, 0xFF, 0x01, 0x00));
+    CHECK(P.pos == sizeof DELTA_NEW && memcmp(P.slot, DELTA_NEW, sizeof DELTA_NEW) == 0);
+}
+
+/* Each way a delta is refused, with F1F1's reason. Before anything is erased: a patch for another base, or a running
+ * image whose hash can't be read, is BAD_BASE (and the full image then installs in the same session); a wrong magic, a
+ * patch for another memorySize, an unknown patch type or compression, a data-format patch, a base read before the
+ * slot's start and a corrupt DEFLATE stream are BAD_STREAM, in the 36 that carries the bad byte even when it ends on
+ * it; a rebuilt first block the image rules refuse gets that rule's reason, and a patch that ends before 320 rebuilt
+ * bytes BAD_HEADER. After the erase: a base read past the slot's end, a chunk past the image's end, a stream corrupt
+ * after its first block, and bytes after the patch's end in the 36 that ends it or a later one are BAD_STREAM, and a
+ * slot that won't open or take a write FLASH_ERROR (0x72). A patch or a stream cut short (even after every image
+ * byte), and bytes after the stream, pass their 36s and fail the 37 (0x72, BAD_STREAM). DFI 0x20 is 0x31 with delta
+ * on, and with cfg.allow_delta off so is a 0x30 34. */
+static void delta_refusal_cases(void)
+{
+    static const struct {
+        uint16_t        at;
+        uint8_t         val;
+        udsota_reason_t want;
+    } rules[] = {
+        {0, 0xEA, UDSOTA_DL_BAD_HEADER},          /* the image magic */
+        {12, 0x02, UDSOTA_DL_BAD_HEADER},         /* the chip: an ESP32-S2 */
+        {80, 'E', UDSOTA_DL_BAD_PROJECT},         /* "Example" */
+        {294, 2, UDSOTA_DL_BAD_BOARD},
+        {295, 2, UDSOTA_DL_BAD_LAYOUT},
+        {296, 0x11, UDSOTA_DL_BAD_DIAG_IDS},      /* request ID 0x711 */
+        {51, '2', UDSOTA_DL_NOT_NEWER},           /* v0.2.0, the running release */
+    };
+    static uint8_t img[sizeof DELTA_NEW], s[sizeof DELTA_PNONE + 12u], z[4093];
+    uint8_t resp[64];
+    delta_boot();
     const int begins = P.begins;
-    memcpy(wrong, DELTA_PNONE, sizeof DELTA_PNONE);
-    wrong[4] ^= 0x01;                             /* the base's hash, after the magic */
-    delta_refused(wrong, sizeof DELTA_PNONE, sizeof DELTA_NEW, UDSOTA_DL_BAD_BASE);
+    memcpy(s_pn, DELTA_PNONE, sizeof DELTA_PNONE);
+    s_pn[4] ^= 0x01;                              /* the base's hash, after the magic */
+    delta_refused(s_pn, sizeof DELTA_PNONE, sizeof DELTA_NEW, UDSOTA_DL_BAD_BASE, false);
     request_download(sizeof DELTA_NEW, 0x00);
     send_all(DELTA_NEW, sizeof DELTA_NEW);
     EXPECT(B(0x37), B(0x77));
     EXPECT(B(0x31, 0x01, 0xFF, 0x01), B(0x71, 0x01, 0xFF, 0x01, 0x00));
-    CHECK(P.begins == begins + 1 && memcmp(P.running, snap, sizeof snap) == 0);
+    CHECK(P.begins == begins + 1);
+    P.no_base_hash = true;
+    delta_refused(DELTA_PNONE, sizeof DELTA_PNONE, sizeof DELTA_NEW, UDSOTA_DL_BAD_BASE, false);
+    P.no_base_hash = false;
 
-    memcpy(wrong, DELTA_PNONE, sizeof DELTA_PNONE);
-    wrong[0] ^= 0x01;                             /* the magic */
-    delta_refused(wrong, sizeof DELTA_PNONE, sizeof DELTA_NEW, UDSOTA_DL_BAD_STREAM);
-    delta_refused(DELTA_PNONE, sizeof DELTA_PNONE, sizeof DELTA_NEW + 1u, UDSOTA_DL_BAD_STREAM);
-    EXPECT(B(0x34, 0x20, 0x44, 0, 0, 0, 0, 0, 0, 0x2F, 0x30), B(0x7F, 0x34, 0x31));
-    CHECK(P.begins == begins + 1 && memcmp(P.running, snap, sizeof snap) == 0);
-
-    /* Two bytes after the patch's end: the image is rebuilt, and written, before they come. */
-    memcpy(wrong, DELTA_PNONE, sizeof DELTA_PNONE);
-    wrong[sizeof DELTA_PNONE] = wrong[sizeof DELTA_PNONE + 1u] = 0x00;
-    size_t zlen = 0;
-    uint8_t *z = tdefl_compress_mem_to_heap(wrong, sizeof wrong, &zlen, TDEFL_DEFAULT_MAX_PROBES);
-    assert(z != NULL && zlen <= 4093u);
-    uint8_t resp[64];
+    static const struct {
+        uint16_t at;
+        uint8_t  val;
+    } corrupt[] = {
+        {0, 0x11},                                /* the magic */
+        {64, 0x10},                               /* the patch type: in place */
+        {64, 0x01},                               /* the compression: heatshrink, not built */
+        {68, 0x01},                               /* a data-format patch of one byte */
+    };
+    for (size_t i = 0; i < sizeof corrupt / sizeof corrupt[0]; i++) {
+        memcpy(s_pn, DELTA_PNONE, sizeof DELTA_PNONE);
+        s_pn[corrupt[i].at] = corrupt[i].val;
+        delta_refused(s_pn, sizeof DELTA_PNONE, sizeof DELTA_NEW, UDSOTA_DL_BAD_STREAM, false);
+    }
+    delta_refused(DELTA_PNONE, sizeof DELTA_PNONE, sizeof DELTA_NEW + 1u, UDSOTA_DL_BAD_STREAM, false);
+    const chunk_t before[] = {{0, 0, -1}, {sizeof DELTA_NEW, 0, 0}};
+    delta_refused(s_pn, patch_of(DELTA_NEW, sizeof DELTA_NEW, before, 2), sizeof DELTA_NEW, UDSOTA_DL_BAD_STREAM,
+                  false);
+    size_t n = 0;
+    memcpy(z, DELTA_P30, sizeof DELTA_P30);
+    z[0] |= 0x06;                                 /* block type 3, which DEFLATE doesn't have */
     request_download(sizeof DELTA_NEW, 0x30);
-    CHECK(block(1, z, 0, zlen, resp, sizeof resp) == 3 && resp[0] == 0x7F && resp[2] == 0x31);
-    CHECK(result_is(UDSOTA_DL_BAD_STREAM, 0) && P.begins == begins + 2 && !udsota_busy());
-    mz_free(z);
+    CHECK(block(1, z, 0, sizeof DELTA_P30, resp, sizeof resp) == 3 && resp[0] == 0x7F && resp[2] == 0x31);
+    CHECK(result_is(UDSOTA_DL_BAD_STREAM, 0) && P.begins == begins + 1 && s_live == 0);
+    memcpy(s_pn, DELTA_PNONE, sizeof DELTA_PNONE);
+    s_pn[68] = 0x01;                              /* a data-format patch, as the last byte the first 36 inflates */
+    stored(s, s_pn, sizeof DELTA_PNONE);
+    request_download(sizeof DELTA_NEW, 0x30);
+    CHECK(block(1, s, 0, 5u + 69u, resp, sizeof resp) == 3 && resp[0] == 0x7F && resp[2] == 0x31);
+    CHECK(result_is(UDSOTA_DL_BAD_STREAM, 0) && P.begins == begins + 1 && !udsota_busy() && s_live == 0);
+
+    const chunk_t whole[] = {{sizeof DELTA_NEW, 0, 0}};
+    for (size_t i = 0; i < sizeof rules / sizeof rules[0]; i++) {
+        memcpy(img, DELTA_NEW, sizeof img);
+        img[rules[i].at] = rules[i].val;
+        delta_refused(s_pn, patch_of(img, sizeof img, whole, 1), sizeof img, rules[i].want, false);
+    }
+    const chunk_t short_image[] = {{300, 0, 0}};
+    delta_refused(s_pn, patch_of(DELTA_NEW, 300, short_image, 1), 300, UDSOTA_DL_BAD_HEADER, false);
+    delta_refused(DELTA_PNONE, 200, sizeof DELTA_NEW, UDSOTA_DL_BAD_HEADER, false);   /* 128 rebuilt bytes */
+    CHECK(P.begins == begins + 1);
+
+    const chunk_t past[] = {{0, 0, (int32_t)(SLOT - sizeof DELTA_NEW + 1u)}, {sizeof DELTA_NEW, 0, 0}};
+    delta_refused(s_pn, patch_of(DELTA_NEW, sizeof DELTA_NEW, past, 2), sizeof DELTA_NEW, UDSOTA_DL_BAD_STREAM, true);
+    const chunk_t beyond[] = {{sizeof DELTA_NEW, 1, 0}};
+    delta_refused(s_pn, patch_of(DELTA_NEW, sizeof DELTA_NEW, beyond, 1), sizeof DELTA_NEW, UDSOTA_DL_BAD_STREAM,
+                  true);
+    memcpy(s_pn, DELTA_PNONE, sizeof DELTA_PNONE);
+    s_pn[sizeof DELTA_PNONE] = s_pn[sizeof DELTA_PNONE + 1u] = 0x00;
+    delta_refused(s_pn, sizeof DELTA_PNONE + 2u, sizeof DELTA_NEW, UDSOTA_DL_BAD_STREAM, true);
     EXPECT(B(0x31, 0x01, 0xFF, 0x01), B(0x7F, 0x31, 0x24));
-    CHECK(memcmp(P.running, snap, sizeof snap) == 0);
 
+    /* A first stored block of 2,000 patch bytes, then a stored block whose length check fails. */
+    s[0] = 0x00;
+    s[1] = 2000u & 0xFFu, s[2] = 2000u >> 8, s[3] = (uint8_t)~(2000u & 0xFFu), s[4] = (uint8_t)~(2000u >> 8);
+    memcpy(&s[5], DELTA_PNONE, 2000);
+    memcpy(&s[2005], (const uint8_t[]){0x01, 0x02, 0x00, 0x02, 0x00, 0x00, 0x00}, 7);
+    request_download(sizeof DELTA_NEW, 0x30);
+    CHECK(block(1, s, 0, 2005, resp, sizeof resp) == 2 && resp[0] == 0x76);
+    CHECK(block(2, s, 2005, 7, resp, sizeof resp) == 3 && resp[0] == 0x7F && resp[2] == 0x31);
+    CHECK(result_is(UDSOTA_DL_BAD_STREAM, 2005) && P.begins == begins + 5 && s_live == 0);
+
+    /* The whole patch in a stored block that isn't the last, then a last one of 2 bytes, after the patch's end. */
+    n = stored(s, DELTA_PNONE, sizeof DELTA_PNONE);
+    s[0] = 0x00;
+    memcpy(&s[n], (const uint8_t[]){0x01, 0x02, 0x00, 0xFD, 0xFF, 0x00, 0x00}, 7);
+    request_download(sizeof DELTA_NEW, 0x30);
+    send_all(s, n);
+    CHECK(block((uint8_t)(n / 4093u + 2u), s, n, 7, resp, sizeof resp) == 3 && resp[0] == 0x7F && resp[2] == 0x31);
+    CHECK(result_is(UDSOTA_DL_BAD_STREAM, (uint32_t)n) && P.begins == begins + 6 && s_live == 0);
+
+    P.fail_begin = true;
+    request_download(sizeof DELTA_NEW, 0x30);
+    CHECK(block(1, DELTA_P30, 0, sizeof DELTA_P30, resp, sizeof resp) == 3 && resp[0] == 0x7F && resp[2] == 0x72);
+    P.fail_begin = false;
+    CHECK(result_is(UDSOTA_DL_FLASH_ERROR, 0) && s_live == 0);
+    P.fail_write = true;
+    request_download(sizeof DELTA_NEW, 0x30);
+    CHECK(block(1, DELTA_P30, 0, sizeof DELTA_P30, resp, sizeof resp) == 3 && resp[0] == 0x7F && resp[2] == 0x72);
+    P.fail_write = false;
+    CHECK(result_is(UDSOTA_DL_FLASH_ERROR, 0) && s_live == 0);
+
+    /* Cut short or followed by more: each 36 passes, and the 37 fails. */
+    const struct {
+        const uint8_t *d;
+        size_t         n;
+        bool           deflate;                   /* d is the patch, to deflate; else the stream as it is */
+    } at37[] = {
+        {DELTA_PNONE, 6000, true},                /* the patch, cut */
+        {DELTA_PNONE, sizeof DELTA_PNONE - 1u, true},   /* cut in its last adjustment, after every image byte */
+        {DELTA_P30, sizeof DELTA_P30 - 10u, false},   /* the stream, cut */
+        {s, sizeof DELTA_P30 + 1u, false},        /* a byte after the stream */
+    };
+    memcpy(s, DELTA_P30, sizeof DELTA_P30);
+    s[sizeof DELTA_P30] = 0x00;
+    for (size_t i = 0; i < sizeof at37 / sizeof at37[0]; i++) {
+        n = at37[i].deflate ? deflated(z, sizeof z, at37[i].d, at37[i].n) : at37[i].n;
+        request_download(sizeof DELTA_NEW, 0x30);
+        CHECK(block(1, at37[i].deflate ? z : at37[i].d, 0, n, resp, sizeof resp) == 2 && resp[0] == 0x76);
+        EXPECT(B(0x37), B(0x7F, 0x37, 0x72));
+        CHECK(result_is(UDSOTA_DL_BAD_STREAM, (uint32_t)n) && !udsota_busy() && s_live == 0);
+        EXPECT(B(0x31, 0x01, 0xFF, 0x01), B(0x7F, 0x31, 0x24));
+    }
+
+    EXPECT(B(0x34, 0x20, 0x44, 0, 0, 0, 0, 0, 0, 0x2F, 0x30), B(0x7F, 0x34, 0x31));
     s_allow_delta = false;
-    boot();
-    programming();
+    delta_boot();
     EXPECT(B(0x34, 0x30, 0x44, 0, 0, 0, 0, 0, 0, 0x2F, 0x30), B(0x7F, 0x34, 0x31));   /* memorySize 12080 */
-    CHECK(!udsota_busy() && result_is(UDSOTA_DL_OK, 0) && P.begins == begins + 2);
-    CHECK(memcmp(P.running, snap, sizeof snap) == 0);
+    CHECK(!udsota_busy() && result_is(UDSOTA_DL_OK, 0) && s_live == 0);
+    s_allow_delta = true;
+}
 
+/* No memory at each of the 34's allocations (the inflater's state, its window, detools' state) refuses it (0x22,
+ * NO_MEMORY) holding nothing, and a delta then installs. An abort mid-patch by 10 01, by S3 or by the gate frees all
+ * three, and F1F1 counts the coded bytes the 36s carried. */
+static void delta_memory_cases(void)
+{
+    static const struct {
+        int  malloc_nth;
+        bool calloc;
+    } fail[] = {{1, false}, {0, true}, {2, false}};
+    uint8_t resp[64];
+    delta_boot();
+    for (size_t i = 0; i < sizeof fail / sizeof fail[0]; i++) {
+        s_malloc_fail = fail[i].malloc_nth;
+        s_calloc_fail = fail[i].calloc;
+        EXPECT(B(0x34, 0x30, 0x44, 0, 0, 0, 0, 0, 0, 0x2F, 0x30), B(0x7F, 0x34, 0x22));
+        CHECK(s_malloc_fail == 0 && !s_calloc_fail && result_is(UDSOTA_DL_NO_MEMORY, 0) && !udsota_busy() &&
+              s_live == 0);
+    }
+    request_download(sizeof DELTA_NEW, 0x30);
+    send_all(DELTA_P30, sizeof DELTA_P30);
+    EXPECT(B(0x37), B(0x77));
+    EXPECT(B(0x31, 0x01, 0xFF, 0x01), B(0x71, 0x01, 0xFF, 0x01, 0x00));
+
+    for (int how = 0; how < 3; how++) {
+        const int aborts = P.aborts;
+        request_download(sizeof DELTA_NEW, 0x30);
+        CHECK(block(1, DELTA_P30, 0, 100, resp, sizeof resp) == 2 && resp[0] == 0x76);
+        CHECK(block(2, DELTA_P30, 100, 100, resp, sizeof resp) == 2 && resp[0] == 0x76);
+        CHECK(s_live == 3);
+        if (how == 0) {
+            EXPECT(B(0x10, 0x01), B(0x50, 0x01));
+        } else if (how == 1) {
+            run_for(5300);                        /* S3 */
+        } else {
+            s_gate_op = UDSOTA_OP_CONTINUE_TRANSFER;
+            s_gate_nrc = GATE_NRC;
+            CHECK(block(3, DELTA_P30, 200, 100, resp, sizeof resp) == 3 && resp[0] == 0x7F && resp[2] == GATE_NRC);
+            s_gate_op = 0;
+        }
+        EXPECT(B(0x22, 0xF1, 0x86), B(0x62, 0xF1, 0x86, 0x01));
+        CHECK(!udsota_busy() && P.aborts == aborts + 1 && s_live == 0 && result_is(UDSOTA_DL_ABORTED, 200));
+        programming();
+    }
+}
+
+/* The delta cases, on the base. */
+static void delta_cases(void)
+{
+    void *m = mmap(NULL, SLOT, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert(m != MAP_FAILED);
+    P.running = m;
+    memset(P.running, 0xFF, SLOT);
+    memcpy(P.running, DELTA_BASE, sizeof DELTA_BASE);
+    CHECK(memcmp(&P.running[sizeof DELTA_BASE - 32u], DELTA_BASE_HASH, 32) == 0);   /* the hash the base appends */
+    CHECK(mprotect(m, SLOT, PROT_READ) == 0);
+    P.version = "v0.2.0";
+    P.expect = DELTA_NEW;
+    P.expect_len = sizeof DELTA_NEW;
+    s_product = "example";
+    s_allow_delta = true;
+    delta_install_cases();
+    delta_refusal_cases();
+    delta_memory_cases();
+    s_allow_delta = false;
     s_product = NULL;
     P.version = "0.4.1-lite.1";
 }

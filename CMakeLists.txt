@@ -55,10 +55,10 @@ enable_testing()
 set_source_files_properties(iso14229/iso14229.c PROPERTIES COMPILE_OPTIONS "-fwrapv")   # as the component does
 
 # iso14229 on its mock transport with a clock the test sets, udsota over the test's platform, and miniz's tinfl
-# (tdefl too, to make a raw-DEFLATE image), under ASan and UBSan, the first report ending the test. calloc goes through
-# the test, which can fail one to refuse the inflater its memory. test_udsota_no_rollback is the same test on a
-# platform that reports what ESP-IDF does without CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE, and test_udsota_delta (below)
-# the same with delta downloads.
+# (tdefl too, to make a raw-DEFLATE image), under ASan and UBSan, the first report ending the test. malloc, calloc and
+# free go through the test, which can fail any one of the 34's allocations and counts the blocks udsota holds.
+# test_udsota_no_rollback is the same test on a platform that reports what ESP-IDF does without
+# CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE, and test_udsota_delta (below) the same with delta downloads.
 function(udsota_test name)
     add_executable(${name} test/test_udsota.c udsota.c iso14229/iso14229.c test/miniz/miniz.c)
     target_include_directories(${name} PRIVATE . iso14229 test/miniz)
@@ -67,7 +67,8 @@ function(udsota_test name)
                                                MINIZ_NO_TIME MINIZ_NO_ARCHIVE_APIS MINIZ_NO_ZLIB_APIS ${ARGN})
     target_compile_options(${name} PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=all
                                            -fno-omit-frame-pointer)
-    target_link_options(${name} PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=all -Wl,--wrap=calloc)
+    target_link_options(${name} PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=all -Wl,--wrap=malloc
+                                        -Wl,--wrap=calloc -Wl,--wrap=free)
     add_test(NAME ${name} COMMAND ${name})
 endfunction()
 set_source_files_properties(udsota.c test/test_udsota.c PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror")
