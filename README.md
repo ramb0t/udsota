@@ -63,7 +63,7 @@ flowchart TB
     updater --> worker --> idf
 ```
 
-An update runs `10 02`, `27 03/04`, `34`, `36`…, `37`, `31 01 FF01` (verify) and `31 01 F001` (activate; the device restarts), then `10 03` and `31 01 F002` (confirm). `udsota flash` in [`client/`](client/README.md) does all of it. The first block is held until its product, board, partition layout, CAN IDs, version and chip match this device, and only then does the slot start to fill. Blocks carry the image as it is (DFI 00) or as raw DEFLATE (DFI 10), which the ESP32's ROM inflates. Flash work runs on a worker task while iso14229 answers 0x78, and each block erases only the sectors it writes, so the erase is spread over the download. With `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`, an image that is never confirmed rolls back at the next reset. The [wire reference](docs/wire.md) has every byte, and the sequence for a flasher other than the client.
+An update runs `10 02`, `27 03/04`, `34`, `36`…, `37`, `31 01 FF01` (verify) and `31 01 F001` (activate; the device restarts), then `10 03` and `31 01 F002` (confirm). `udsota flash` in [`client/`](client/README.md) does all of it. The first block is held until its product, board, partition layout, CAN IDs, version and chip match this device, and only then does the slot start to fill. Blocks carry the image as it is (DFI 00) or as raw DEFLATE (DFI 10), which the ESP32's ROM inflates. A build that defines `UDSOTA_DELTA=1` and sets `cfg.allow_delta` also takes a delta (DFI 30): a patch from the running image, from which the device rebuilds the new one, so a small change costs kilobytes on the bus; the rebuilt image gets the same checks as any other. Flash work runs on a worker task while iso14229 answers 0x78, and each block erases only the sectors it writes, so the erase is spread over the download. With `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`, an image that is never confirmed rolls back at the next reset. The [wire reference](docs/wire.md) has every byte, and the sequence for a flasher other than the client.
 
 ## Adding it to a project
 
@@ -78,7 +78,13 @@ A version is `PROJECT_VER`. A clean `X.Y.Z` is a release, which a device takes o
 
 ## Known limits
 
-Four things udsota 0.14's own server had are gone: delta downloads (the client's `--diff-from` gets 0x31 to each delta `34` and sends the full image), the boot-loop breaker, the ISO-TP counters (F1F2) and functional addressing. The rest come from using iso14229 as it is, and each is a candidate for an upstream fix:
+Three things udsota 0.14's own server had are gone: the boot-loop breaker, the ISO-TP counters (F1F2) and functional addressing. Delta downloads are back as DFI 30 only, off by default, and DFI 20 (heatshrink) gets 0x31, so the client sends DFI 30 or the full image instead. Delta in this form has not yet run on hardware. Its own limits:
+
+- A delta can't resume: like every download here, one that is cut off starts again from its `34`.
+- The base must be the very `.bin` that was flashed, since the patch names it by the SHA-256 ESP-IDF appends to the image. A rebuild of the same source that is not byte-identical names another base: the device refuses it at the `36` that carries the patch's header, with 0x31 and DL_BAD_BASE, before anything is erased, and the client sends the full image. A copy signed again after the build is worse, because the signature sector comes after the appended SHA-256 and signing leaves that hash as it was: the base passes, the patch rebuilds the new image with the wrong signature sector, FF01 refuses it with reason 8 and the run fails. Keep the signed `.bin` exactly as flashed.
+- No run has used flash encryption, which CANDash can't build with. With it, each base read goes through a temporary map of the running slot, correct by ESP-IDF's source but slower.
+
+The rest come from using iso14229 as it is, and each is a candidate for an upstream fix:
 
 - S3 restarts only on `10` and `3E`, not on every request, so a tester keeps a session with `3E`; the client sends one before any request or 0x21 retry that comes 2 s or more after the last `10` or `3E`. During udsota's own flash job the tester waits on 0x78s and can't send one, so udsota holds the session itself, for up to 90 s.
 - While any job answers 0x78, udsota's or the app's, iso14229 reads no other request. Only the last request sent meanwhile is answered, after the job ends, where 0.14's server answered each with 0x21. An app's own 0x78 job gets no S3 hold, so the app restarts `srv->s3_session_timeout_timer` on each pass of its job, as udsota does for its own.
@@ -96,7 +102,7 @@ Four things udsota 0.14's own server had are gone: delta downloads (the client's
 udsota never changes iso14229's code. Where iso14229 has no call for what an update needs, udsota sets the server's state itself, here and nowhere else:
 
 - `securityLevel` and `xferIsActive`, cleared on every accepted `10 01/02/03` and S3 timeout, and `sessionType` too when udsota ends a session: its own, or the app's through `udsota_end_session`.
-- `xferTotalBytes`: a raw-DEFLATE download's byte limit, raised to the stream's bound, because iso14229 counts the bytes against memorySize, the inflated image's size.
+- `xferTotalBytes`: a raw-DEFLATE or delta download's byte limit, raised to the stream's bound, because iso14229 counts the bytes against memorySize, the image's size.
 - `ecuResetScheduled` and `ecuResetTimer`: the restart after ActivateImage, at least 60 ms after its answer. Unlike iso14229's own `11 01`, it keeps reading requests until then.
 - `s3_session_timeout_timer`, during udsota's own flash job.
 - `p2_timer`, `sec_access_boot_delay_timer` and `sec_access_auth_fail_timer`, in `udsota_poll`: each that has expired moves to now − 1 on every pass, which still reads as expired, so none gets old enough to wrap.
@@ -112,10 +118,10 @@ udsota never changes iso14229's code. Where iso14229 has no call for what an upd
 | `CMakeLists.txt` | The ESP-IDF component, or on a host the tests |
 | [`examples/esp32`](examples/esp32/README.md) | The smallest app, for any ESP32 with TWAI, with the client's `example` profile's identity; its image is the one a release carries |
 | [`examples/candash_ws43`](examples/candash_ws43/README.md) | An app on the CANDash ws43 or ws43b (ESP32-S3) with CANDash's identity, so updates go both ways |
-| `test/test_udsota.c` | The host test: updates through iso14229's mock transport into a RAM slot, plain and raw DEFLATE, under ASan and UBSan |
-| `test/fuzz_udsota.c` | The fuzzer: CAN frames through iso14229's isotp-c into udsota, its seeds, their mutants and random programs, the same in every ctest run, under ASan and UBSan; with `-DUDSOTA_FUZZ_LIBFUZZER=ON` (clang) also a libFuzzer target |
-| `test/e2e/` | `udsota_lite_server`: udsota and iso14229 as a Linux process with RAM A/B slots, for the client's end-to-end tests over a frame pipe or on a vcan |
-| `tools/` | `release.py` ([RELEASING.md](RELEASING.md)), and `image_check.c`: udsota's image rules run on a built image, which CI runs on every example image |
+| `test/test_udsota.c` | The host test: updates through iso14229's mock transport into a RAM slot, plain and raw DEFLATE, under ASan and UBSan; built again as `test_udsota_delta`, it also runs delta downloads from a running image on the fixtures `tools/make_delta_fixtures.py` writes |
+| `test/fuzz_udsota.c` | The fuzzer: CAN frames through iso14229's isotp-c into udsota built with delta downloads (`fuzz_udsota_nodelta` without), its seeds, their mutants, random programs and mutants of a delta's patch, the same in every ctest run, under ASan and UBSan; with `-DUDSOTA_FUZZ_LIBFUZZER=ON` (clang) also a libFuzzer target |
+| `test/e2e/` | `udsota_lite_server`: udsota and iso14229 as a Linux process with RAM A/B slots, for the client's end-to-end tests over a frame pipe or on a vcan; `-DUDSOTA_DELTA=ON` builds it with delta downloads |
+| `tools/` | `release.py` ([RELEASING.md](RELEASING.md)); `image_check.c`, udsota's image rules run on a built image, which CI runs on every example image; and `make_delta_fixtures.py`, which writes the delta tests' fixtures |
 | [`client/`](client/README.md) | The `udsota` command-line tool, for Linux with SocketCAN; it also updates units still on a 0.14.x server |
 | [`docs/wire.md`](docs/wire.md) | The wire reference: services, DIDs, routines, NRCs, reasons, timing, the descriptor, the 0x27 keys and flashing without the client |
 | [`MIGRATING.md`](MIGRATING.md) | From udsota 0.14's API, or from lite-v0.1.0, to this one |

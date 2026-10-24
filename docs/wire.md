@@ -15,14 +15,24 @@ udsota answers the requests of an update. iso14229 frames every request and answ
 | 22 | F186, F189, F18C, F1F0, F1F1, F1F3; one request may carry several DIDs, and every other DID is the app's | any | – |
 | 27 | with keys set, 01/02 in extended and 03/04 in programming; a requestSeed with no data, and a sendKey of exactly 16 bytes (HMAC) or 64 (ECDSA). Other levels, and every 27 without keys, are the app's | extended, programming | – |
 | 31 | 01 startRoutine on FF01, F000, F001 and F002; every other RID is the app's | per routine | per routine |
-| 34 | to address 0: DFI 00 (the image) or 10 (raw DEFLATE, RFC 1951), an ALFID whose nibbles are each 1–4 (the client sends 44), 0 < memorySize ≤ the slot, memorySize being the image's size either way; answers `74 20 0F FF`. A 34 to any other address is the app's | programming | programming |
+| 34 | to address 0: DFI 00 (the image), 10 (raw DEFLATE, RFC 1951) or, where the unit serves [delta downloads](#delta-downloads), 30 (a patch from the running image, as raw DEFLATE), an ALFID whose nibbles are each 1–4 (the client sends 44), 0 < memorySize ≤ the slot, memorySize being the image's size in every case; answers `74 20 0F FF`. A 34 to any other address is the app's | programming | programming |
 | 36 | in udsota's download: the block counter from 01, wrapping FF to 00, and 1 to 4093 data bytes | programming | programming |
-| 37 | in udsota's download, with no data: once every announced byte has arrived, or after DFI 10 once the stream has ended at exactly memorySize | programming | programming |
+| 37 | in udsota's download, with no data: once every announced byte has arrived, or after DFI 10 or 30 once the stream has ended at exactly memorySize bytes of image | programming | programming |
 | 3E | 00, or 80 with no answer; iso14229 answers it and restarts S3 | any | – |
 
 The key column applies with keys set; with none, no step needs a key and 27 is the app's. An accepted 10 01, 02 or 03 relocks, ends any transfer (the app's too) and discards the seed.
 
 iso14229 answers these itself, before udsota or the app sees them: 0x13 to a request too short to parse; 0x70 to a 36 or 37 with no transfer open; 0x24 to a 36 whose counter is not the next one, a repeat of the last included, which ends the transfer; 0x71 to a 36 past the transfer's size; 0x22 to a 34 while a transfer is open; 0x31 to a 31 with control type 00 or 04–7F; 0x37 to any 27 within 1 s of `UDSServerInit` and 0x36 within 1 s of any refused sendKey; `67 xx 00 00` to a requestSeed for the level already unlocked; and 0x14 to a 22 whose answer would pass 4095 bytes.
+
+## Delta downloads
+
+A unit built with `UDSOTA_DELTA=1` and `cfg.allow_delta` set also takes DFI 30, a patch from the image it runs, and rebuilds the new image from its running slot, so a small change costs kilobytes on the bus instead of the whole image. Any other unit answers a DFI 30 34 with 0x31, and every unit so answers DFI 20, the heatshrink form 0.14 also served. F1F0 doesn't say whether a unit serves delta: send the 34 and fall back on 0x31.
+
+The 34's memorySize is the rebuilt image's size, and the 36s may carry up to `UDSOTA_DL_Z_BOUND` of it, as for DFI 10. They carry one raw DEFLATE stream that inflates to a 64-byte header and then a detools 0.53.0 sequential patch, uncompressed, from the running image to the new one; `udsota pack --diff-from` and `flash --diff-from` write it (`client/udsota/delta.py`). The header is the magic 0xFCCDDE10, little-endian (`10 DE CD FC`), the base's SHA-256, and 28 reserved bytes, which the client writes as zeros. The base's SHA-256 is the 32 bytes ESP-IDF appends to the image, not F1F3's `app_elf_sha256`, so the base must be the very `.bin` that was flashed: a rebuild of the same source that is not byte-identical names another base. Signing an image again leaves that hash as it was, since the signature sector comes after it, so a re-signed copy passes the base check, and its patch rebuilds the new image with the wrong signature sector, which FF01 refuses with reason 8.
+
+The unit checks the header in the 36 that completes it, before any patch byte is used, so before the image rules and the erase. A wrong magic is reason 13. A base hash other than the running image's, or a running image with none, is reason 15. Either answers that 36 0x31 and ends the download with nothing erased; a full download still works in the same session. The patch reads only the running slot, anywhere up to the slot's end. The rebuilt image's first 320 bytes then pass the image rules as any image's, and FF01, activate and confirm are unchanged. The 37 passes once the stream and the patch have both ended, with exactly memorySize bytes rebuilt and nothing after either.
+
+A delta's flash work comes with the 36 that carries its patch bytes, and a short patch can rebuild most of an image in one 36, whose job erases and writes it under 0x78s up to the 90 s cap. Like every download here, a delta can't resume.
 
 ## Routines
 
@@ -58,7 +68,7 @@ The checks run in this order: 0x7F in the default session, 0x12 for sub-function
 | 7–14 | `other_elf_sha_prefix` | the first 8 bytes of the other slot's `app_elf_sha256` |
 | 15 | `flags` | 0x01 updates are signature-checked (`UDSOTA_STATUS_SIG_CHECKED`); other bits 0 |
 
-**F1F1** is the [reason](#reasons) in byte 0 and, in bytes 1–4, big-endian, the data bytes the 36s carried, compressed bytes after DFI 10. While FF01 runs it reads reason 10 until the verdict.
+**F1F1** is the [reason](#reasons) in byte 0 and, in bytes 1–4, big-endian, the data bytes the 36s carried, coded bytes after DFI 10 or 30. While FF01 runs it reads reason 10 until the verdict.
 
 ## Negative responses
 
@@ -68,14 +78,14 @@ Those udsota sends; the app's own services send theirs.
 |---|---|
 | 0x12 | 31 02 or 03 on udsota's RIDs |
 | 0x13 | a requestSeed with data, a sendKey of the wrong length (the seed stays), an option record on udsota's RIDs, a 36 with no data or over 4093, a 37 with data |
-| 0x22 | 10 02 or 34 while the slots are unsettled (an activated image waiting for its restart, or a running image still pending verify), a flash job runs or a download is open; 11 01, 27 or F001 while a flash job runs; 27 when no seed can be drawn or no key checked (keys unusable, or the app holds the PSA lock past 40 ms); a 34 with no inactive slot (F1F1 12) or no memory for the inflater (F1F1 14); F002 when the running image is not the boot image, or is neither valid nor pending verify; the gate's choice |
+| 0x22 | 10 02 or 34 while the slots are unsettled (an activated image waiting for its restart, or a running image still pending verify), a flash job runs or a download is open; 11 01, 27 or F001 while a flash job runs; 27 when no seed can be drawn or no key checked (keys unusable, or the app holds the PSA lock past 40 ms); a 34 with no inactive slot (F1F1 12) or no memory for the inflater or a delta's patch state (F1F1 14); F002 when the running image is not the boot image, or is neither valid nor pending verify; the gate's choice |
 | 0x24 | a sendKey with no live seed (none, another level's, or older than 30 s), a 37 before every byte of a DFI 00 download (which ends it), FF01 with no finished download, F001 before a passing FF01 |
-| 0x31 | a 34 with another DFI, size 0 or past the slot; a first block the [image rules](#reasons) refuse; a DEFLATE block that is corrupt or inflates past memorySize; one of udsota's RIDs in the wrong non-default session |
+| 0x31 | a 34 with another DFI (DFI 20 always, DFI 30 where the unit serves no delta), size 0 or past the slot; a first block the [image rules](#reasons) refuse; a DEFLATE block that is corrupt or inflates past memorySize; a delta block whose patch is for another base (F1F1 15) or is corrupt (F1F1 13); one of udsota's RIDs in the wrong non-default session |
 | 0x33 | 11 01 locked; 34, 36, 37, FF01, F000 or F001 without level 03 |
 | 0x35 | a wrong key |
-| 0x71 | a 36 past memorySize, or after DFI 10 past `UDSOTA_DL_Z_BOUND` of it (an eighth plus 1024 bytes over); the download ends |
-| 0x72 | a failed erase, write, activate or confirm, a DEFLATE 37 that fails (F1F1 names why), or a flash job past 90 s, which also ends the session |
-| 0x78 | a flash job still running: a 36's write, a DEFLATE 37, FF01, F001 or F002 |
+| 0x71 | a 36 past memorySize, or after DFI 10 or 30 past `UDSOTA_DL_Z_BOUND` of it (an eighth plus 1024 bytes over); the download ends |
+| 0x72 | a failed erase, write, activate or confirm, a DEFLATE or delta 37 that fails (F1F1 names why), or a flash job past 90 s, which also ends the session |
+| 0x78 | a flash job still running: a 36's write, a DEFLATE or delta 37, FF01, F001 or F002 |
 | 0x7E | a 27 level that belongs to the other session |
 | 0x7F | 11 01, 27 or udsota's RIDs in the default session; 34, 36 or 37 outside programming |
 
@@ -88,7 +98,7 @@ F1F1 byte 0 and FF01's status byte. The first-block rules (1–7) run on the ima
 | Code | Name | Meaning |
 |---|---|---|
 | 0 | `UDSOTA_DL_OK` | success |
-| 1 | `UDSOTA_DL_BAD_HEADER` | not an ESP-IDF image for this chip (image magic, segment count, SPI mode, chip ID, segment 0's length, app-descriptor magic), a chip revision or flash mode ESP-IDF refuses, a version that doesn't parse or a release flag that disagrees with it, or a DEFLATE stream that ends before 320 bytes |
+| 1 | `UDSOTA_DL_BAD_HEADER` | not an ESP-IDF image for this chip (image magic, segment count, SPI mode, chip ID, segment 0's length, app-descriptor magic), a chip revision or flash mode ESP-IDF refuses, a version that doesn't parse or a release flag that disagrees with it, or a DEFLATE stream or delta patch that ends before 320 bytes of image |
 | 2 | `UDSOTA_DL_BAD_PROJECT` | a project name other than `cfg.product`, or than this image's own when it is NULL |
 | 3 | `UDSOTA_DL_BAD_BOARD` | no descriptor (magic), descriptor version 0, or another `hw_id` |
 | 4 | `UDSOTA_DL_BAD_LAYOUT` | another `partition_layout_id` |
@@ -100,9 +110,9 @@ F1F1 byte 0 and FF01's status byte. The first-block rules (1–7) run on the ima
 | 10 | `UDSOTA_DL_WORKER_TIMEOUT` | a flash job passed 90 s, or its session ended while it ran |
 | 11 | `UDSOTA_DL_ABORTED` | ended early: a session change, S3, the gate, an overrun, an early 37, a block-counter mismatch, or any other NRC that ended iso14229's transfer |
 | 12 | `UDSOTA_DL_FLASH_ERROR` | an erase or write failed, no inactive slot, or the flash worker could not take the job |
-| 13 | `UDSOTA_DL_BAD_STREAM` | a DEFLATE stream that is corrupt, inflates past memorySize, or at the 37 has not ended at exactly memorySize or has bytes after its end |
-| 14 | `UDSOTA_DL_NO_MEMORY` | no memory for the inflater at the 34 |
-| 15 | `UDSOTA_DL_BAD_BASE` | reserved: delta downloads are gone |
+| 13 | `UDSOTA_DL_BAD_STREAM` | a DEFLATE stream that is corrupt, inflates past memorySize, or at the 37 has not ended at exactly memorySize or has bytes after its end; and for a delta, a header without the patch magic, a patch that is corrupt, is for an image of another size, reads outside the running slot or has bytes after its end, or at the 37 has not ended |
+| 14 | `UDSOTA_DL_NO_MEMORY` | no memory for the inflater, or a delta's patch state, at the 34 |
+| 15 | `UDSOTA_DL_BAD_BASE` | a delta patch made from another image than the running one, or a running image with no appended SHA-256 to compare; refused at the 36 before anything is erased |
 
 ## Timing
 
@@ -141,8 +151,8 @@ A flasher that is not the client, such as an edge device that fetches updates fr
 
 **Precheck**, in the default session. If F1F3 already reads the manifest's `image_elf_sha256`, there is nothing to send, or only ConfirmImage when F1F0 says the running image is pending verify. Any other pending-verify image must be confirmed or rolled back first. The board DID (`board_did`) must read `board`. If F1F0's other slot is verified since the last boot and its SHA prefix is the first 8 bytes of `image_elf_sha256`, skip the payloads and FF01: after 10 02 and the unlock, go straight to ActivateImage.
 
-**Download.** 10 02 and the programming unlock, then the payloads in manifest order until one is taken. Each goes as a 34 with the entry's `dfi`, ALFID 44, address 0 and `memory_size`; then 36 blocks of 4093 bytes, the counter from 01 wrapping FF to 00; then a 37. A 34 answered 0x31, as every delta entry is, or 0x22 with F1F1 reason 14, means the device can't take that payload now: try the next entry. Any other refusal stops the update, and F1F1 names why.
+**Download.** 10 02 and the programming unlock, then the payloads in manifest order until one is taken. Each goes as a 34 with the entry's `dfi`, ALFID 44, address 0 and `memory_size`; then 36 blocks of 4093 bytes, the counter from 01 wrapping FF to 00; then a 37. A 34 answered 0x31, as every DFI 20 entry is and every DFI 30 entry where the unit serves no delta, or 0x22 with F1F1 reason 14, means the device can't take that payload now: try the next entry. A delta's 36 answered 0x31 with F1F1 reason 15 means the unit runs another image than the patch's base: skip the other delta entries and send the first full one, in the same session. Any other refusal stops the update, and F1F1 names why.
 
-**Lost answers.** Nothing in the download may be resent. A resent 36 answers 0x24 and ends the transfer, and a resent 37 answers 0x70, even when the first copy succeeded. So when a 36 or 37 gets no answer, start the download again from its 34, in the same session and unlock if they still hold. A resent FF01 answers 00 again after a pass, and 0x24 after a failure, which F1F1 names.
+**Lost answers.** Nothing in the download may be resent. A resent 36 answers 0x24 and ends the transfer, and a resent 37 answers 0x70, even when the first copy succeeded. So when a 36 or 37 gets no answer, start the download again from its 34, in the same session and unlock if they still hold. When a delta's 36 gets no answer and F1F1 then reads reason 15, the lost answer was the base refusal: go on to the first full entry instead. Waiting out P2* for a lost answer can outlast S3 (5.1 s), so read F186 first and, if the session is no longer programming, enter it and unlock again. A resent FF01 answers 00 again after a pass, and 0x24 after a failure, which F1F1 names.
 
 **Verify, activate, confirm.** FF01 must answer status 00. ActivateImage (F001) answers and restarts the device, so wait about 3 s, then poll F1F3 until the device answers (the client allows 60 s). Any value but `image_elf_sha256` means it rolled back or never switched: stop. Finally 10 03 and ConfirmImage (F002), sent again every 2 s while it answers 0x22 and the product's own checks run; the client allows 120 s.

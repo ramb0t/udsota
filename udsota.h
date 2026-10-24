@@ -20,10 +20,11 @@
  * is the app's. An app that wants one of udsota's events first handles it before calling udsota_event, and one that
  * needs to know of a session change checks for UDS_EVT_DiagSessCtrl when udsota_event returns true.
  *
- * An update: 10 02, 27 03/04, 34 (DFI 00 plain or 10 raw DEFLATE), 36..., 37, 31 01 FF01 (verify), 31 01 F001
- * (activate: the device restarts), then 10 03 and 31 01 F002 (confirm). The image's first 320 bytes are checked
- * (project, board, partition layout, CAN IDs, version, chip) before anything is erased, and with
- * CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE an image that is never confirmed rolls back at the next reset. */
+ * An update: 10 02, 27 03/04, 34 (DFI 00 plain, 10 raw DEFLATE, or 30 a delta patch from the running image as raw
+ * DEFLATE, with UDSOTA_DELTA and cfg.allow_delta), 36..., 37, 31 01 FF01 (verify), 31 01 F001 (activate: the device
+ * restarts), then 10 03 and 31 01 F002 (confirm). The image's first 320 bytes are checked (project, board, partition
+ * layout, CAN IDs, version, chip) before anything is erased, and with CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE an image
+ * that is never confirmed rolls back at the next reset. */
 #pragma once
 #include <stdbool.h>
 #include <stddef.h>
