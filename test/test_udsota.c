@@ -1370,7 +1370,8 @@ static void delta_refusal_cases(void)
     } corrupt[] = {
         {0, 0x11},                                /* the magic */
         {64, 0x10},                               /* the patch type: in place */
-        {64, 0x01},                               /* the compression: heatshrink, not built */
+        {64, 0x01},                               /* the compression: LZMA, not built */
+        {64, 0x04},                               /* heatshrink, as esp_delta_ota's patches, not built */
         {68, 0x01},                               /* a data-format patch of one byte */
     };
     for (size_t i = 0; i < sizeof corrupt / sizeof corrupt[0]; i++) {
