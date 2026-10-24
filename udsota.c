@@ -279,7 +279,8 @@ static int base_seek(void *arg, int offset)
 
 /* Worker, detools' output: the rebuilt image's next n bytes into zbuf. detools writes runs of up to 128 bytes at any
  * alignment, so each is split where zbuf fills, as job_zwrite splits tinfl's. A patch for an image of another size than
- * memorySize is BAD_STREAM before its first byte reaches the image rules. */
+ * memorySize is BAD_STREAM before its first byte reaches the image rules. The memorySize bound is also what ends a
+ * chunk whose size has the sign bit: detools' own bound wraps and lets it run on once that many bytes are rebuilt. */
 static int patch_write(void *arg, const uint8_t *buf, size_t n)
 {
     (void)arg;

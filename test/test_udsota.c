@@ -1328,11 +1328,11 @@ static void delta_install_cases(void)
  * patch for another memorySize, an unknown patch type or compression, a data-format patch, a base read before the
  * slot's start and a corrupt DEFLATE stream are BAD_STREAM, in the 36 that carries the bad byte even when it ends on
  * it; a rebuilt first block the image rules refuse gets that rule's reason, and a patch that ends before 320 rebuilt
- * bytes BAD_HEADER. After the erase: a base read past the slot's end, a chunk past the image's end, a stream corrupt
- * after its first block, and bytes after the patch's end in the 36 that ends it or a later one are BAD_STREAM, and a
- * slot that won't open or take a write FLASH_ERROR (0x72). A patch or a stream cut short (even after every image
- * byte), and bytes after the stream, pass their 36s and fail the 37 (0x72, BAD_STREAM). DFI 0x20 is 0x31 with delta
- * on, and with cfg.allow_delta off so is a 0x30 34. */
+ * bytes BAD_HEADER. After the erase: a base read past the slot's end, a chunk past the image's end or one sized
+ * negative, a stream corrupt after its first block, and bytes after the patch's end in the 36 that ends it or a later
+ * one are BAD_STREAM, and a slot that won't open or take a write FLASH_ERROR (0x72). A patch or a stream cut short
+ * (even after every image byte), and bytes after the stream, pass their 36s and fail the 37 (0x72, BAD_STREAM). DFI
+ * 0x20 is 0x31 with delta on, and with cfg.allow_delta off so is a 0x30 34. */
 static void delta_refusal_cases(void)
 {
     static const struct {
@@ -1412,6 +1412,14 @@ static void delta_refusal_cases(void)
     const chunk_t beyond[] = {{sizeof DELTA_NEW, 1, 0}};
     delta_refused(s_pn, patch_of(DELTA_NEW, sizeof DELTA_NEW, beyond, 1), sizeof DELTA_NEW, UDSOTA_DL_BAD_STREAM,
                   true);
+    /* A chunk sized -5 after 400 rebuilt bytes passes detools' own bound, which wraps, and runs on with every byte
+     * after it: memorySize stops it, and nothing past it is written. */
+    const chunk_t first400[] = {{400, 0, 0}};
+    size_t neg = patch_of(DELTA_NEW, sizeof DELTA_NEW, first400, 1);
+    neg += put_size(&s_pn[neg], -5);
+    memset(&s_pn[neg], 0, sizeof DELTA_NEW - 400u + 128u);
+    delta_refused(s_pn, neg + sizeof DELTA_NEW - 400u + 128u, sizeof DELTA_NEW, UDSOTA_DL_BAD_STREAM, true);
+    CHECK(P.pos <= sizeof DELTA_NEW);
     memcpy(s_pn, DELTA_PNONE, sizeof DELTA_PNONE);
     s_pn[sizeof DELTA_PNONE] = s_pn[sizeof DELTA_PNONE + 1u] = 0x00;
     delta_refused(s_pn, sizeof DELTA_PNONE + 2u, sizeof DELTA_NEW, UDSOTA_DL_BAD_STREAM, true);
@@ -1425,7 +1433,7 @@ static void delta_refusal_cases(void)
     request_download(sizeof DELTA_NEW, 0x30);
     CHECK(block(1, s, 0, 2005, resp, sizeof resp) == 2 && resp[0] == 0x76);
     CHECK(block(2, s, 2005, 7, resp, sizeof resp) == 3 && resp[0] == 0x7F && resp[2] == 0x31);
-    CHECK(result_is(UDSOTA_DL_BAD_STREAM, 2005) && P.begins == begins + 5 && s_live == 0);
+    CHECK(result_is(UDSOTA_DL_BAD_STREAM, 2005) && P.begins == begins + 6 && s_live == 0);
 
     /* The whole patch in a stored block that isn't the last, then a last one of 2 bytes, after the patch's end. */
     n = stored(s, DELTA_PNONE, sizeof DELTA_PNONE);
@@ -1434,7 +1442,7 @@ static void delta_refusal_cases(void)
     request_download(sizeof DELTA_NEW, 0x30);
     send_all(s, n);
     CHECK(block((uint8_t)(n / 4093u + 2u), s, n, 7, resp, sizeof resp) == 3 && resp[0] == 0x7F && resp[2] == 0x31);
-    CHECK(result_is(UDSOTA_DL_BAD_STREAM, (uint32_t)n) && P.begins == begins + 6 && s_live == 0);
+    CHECK(result_is(UDSOTA_DL_BAD_STREAM, (uint32_t)n) && P.begins == begins + 7 && s_live == 0);
 
     P.fail_begin = true;
     request_download(sizeof DELTA_NEW, 0x30);
