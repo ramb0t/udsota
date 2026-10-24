@@ -1,7 +1,8 @@
 /* udsota: safe A/B firmware updates over UDS on iso14229's server (see udsota.h). One file:
  *   1. the limits and state; the wire contract is in udsota.h
  *   2. the image rules: what the first 320 bytes must say before anything is erased
- *   3. compressed downloads: raw DEFLATE through the ROM's tinfl into the image
+ *   3. coded downloads: raw DEFLATE through the ROM's tinfl into the image, or for a delta into detools, which
+ *      rebuilds the image from the running one
  *   4. 0x27 keys: HMAC per device, or ECDSA signatures, and the PSA lock around udsota's PSA calls
  *   5. the updater: 34, 36, 37, the routines, the DIDs and the session rules
  *   6. iso14229's events
@@ -10,6 +11,10 @@
 #include "udsota.h"
 #include <stdlib.h>
 #include <string.h>
+#if UDSOTA_DELTA
+#include <limits.h>
+#include "detools.h"
+#endif
 
 /* UDSOTA_DELTA=1 comes with detools' defines from udsota's CMakeLists, which also adds detools.c; without them it was
  * set where that CMakeLists never saw it, and the link would fail on detools_* instead. */
@@ -54,10 +59,14 @@ _Static_assert(sizeof(tinfl_decompressor) == 10992u && TINFL_LZ_DICT_SIZE == 327
 #define BUF_LEN         4096u
 #define IMAGE_MIN       320u       /* image header 24 + segment header 8 + esp_app_desc_t 256 + descriptor 32 */
 #define JOB_CAP_MS      90000u     /* the longest udsota holds a session for its own flash job */
+#define PATCH_MAGIC     0xFCCDDE10u   /* a delta patch's first 4 bytes, little-endian (esp_delta_ota's) */
+#define PATCH_HDR_LEN   64u        /* the magic, the base's appended SHA-256 and 28 reserved bytes */
+
+enum { DL_PLAIN, DL_DEFLATE, DL_DELTA };   /* a download's mode: the 34's DFI 00, 10 or 30 */
 
 typedef int (*done_fn)(int result, uint8_t *status, size_t *status_len);
 
-typedef struct {                   /* a compressed download: tinfl into buf, which holds the image's next bytes */
+typedef struct {                   /* a coded download: tinfl (then detools) into buf, the image's next bytes */
     tinfl_decompressor *r;
     uint8_t *dict;                 /* TINFL_LZ_DICT_SIZE bytes: tinfl's window, whose new bytes are copied out */
     size_t   dict_ofs, pend_ofs, pend;
@@ -66,6 +75,12 @@ typedef struct {                   /* a compressed download: tinfl into buf, whi
     size_t   held;                 /* bytes waiting in buf */
     bool     begun, ended, trailing;
     uint8_t  failed;               /* the first udsota_reason_t */
+#if UDSOTA_DELTA
+    struct detools_apply_patch_t *dt;   /* a delta's patch state, between tinfl and buf; NULL for DFI 10 */
+    uint8_t  hdr[PATCH_HDR_LEN];   /* the patch's header, checked before any byte reaches detools */
+    size_t   hdr_len;
+    int64_t  base_off;             /* where detools' next base read starts */
+#endif
 } zdl_t;
 
 static struct {
@@ -88,8 +103,9 @@ static struct {
     uint32_t       last_bytes;
     uint32_t       announced, received, written;
     bool           dl_active;      /* between an accepted 34 and 37 or an abort */
-    bool           ota_open;       /* an image is open on the flash side (from the first 36, or the 34 when compressed) */
-    bool           compressed, dl_complete, slot_verified, activating, reset_mine, close_pending;
+    bool           ota_open;       /* an image is open on the flash side (from the first 36, or the 34 when coded) */
+    uint8_t        mode;           /* DL_PLAIN, DL_DEFLATE or DL_DELTA */
+    bool           dl_complete, slot_verified, activating, reset_mine, close_pending;
     uint8_t        progress_stage, progress_reason;
     bool           progress_block;
     /* A job on the worker */
@@ -99,7 +115,7 @@ static struct {
     done_fn        job_done;
     size_t         blk_len;
     uint8_t        blk[BUF_LEN];   /* the 36 being written: the worker reads it */
-    uint8_t        zbuf[BUF_LEN];  /* a compressed download's image bytes on their way to flash */
+    uint8_t        zbuf[BUF_LEN];  /* a coded download's image bytes on their way to flash */
     zdl_t          z;
 } U;
 
@@ -187,27 +203,16 @@ static udsota_reason_t check_first(const uint8_t *b, size_t len, uint32_t size)
     return (size > udsota_plat_slot_size()) ? UDSOTA_DL_TOO_BIG : UDSOTA_DL_OK;
 }
 
-/* ==== 3. Compressed downloads (DFI 0x10: raw DEFLATE, memorySize the image's size) ==== */
+/* ==== 3. Coded downloads (DFI 0x10: raw DEFLATE; 0x30: a delta patch in it; memorySize the image's size) ==== */
 
 static void zdl_close(void)
 {
     free(U.z.r);
     free(U.z.dict);
+#if UDSOTA_DELTA
+    free(U.z.dt);
+#endif
     memset(&U.z, 0, sizeof U.z);
-}
-
-static udsota_reason_t zdl_open(void)
-{
-    zdl_close();
-    U.z.r = malloc(sizeof *U.z.r);
-    U.z.dict = calloc(1, TINFL_LZ_DICT_SIZE);   /* zeroed: a back-reference before the start reads zeros */
-    if (U.z.r == NULL || U.z.dict == NULL) {
-        zdl_close();
-        return UDSOTA_DL_NO_MEMORY;
-    }
-    tinfl_init(U.z.r);
-    U.z.status = TINFL_STATUS_NEEDS_MORE_INPUT;
-    return UDSOTA_DL_OK;
 }
 
 static uint8_t zdl_fail(udsota_reason_t r)
@@ -244,13 +249,145 @@ static uint8_t zdl_take(size_t n, bool last)
     return U.z.failed;
 }
 
-/* Worker: inflates n bytes of one 36 through tinfl's window, copying each run into zbuf. */
+#if UDSOTA_DELTA
+/* Worker, detools' base read: n bytes of the running image from the offset its seeks move unchecked, refused when that
+ * is negative or the read would pass INT_MAX, where detools' own int offset ends; the platform refuses a read past the
+ * slot. */
+static int base_read(void *arg, uint8_t *buf, size_t n)
+{
+    (void)arg;
+    if (U.z.base_off < 0 || (uint64_t)U.z.base_off + n > (uint64_t)INT_MAX ||
+        !udsota_plat_base_read((uint32_t)U.z.base_off, buf, n)) {
+        return -1;
+    }
+    U.z.base_off += (int64_t)n;
+    return 0;
+}
+
+/* Worker, detools' base seek: moves the offset the next read checks, never out of int's range, as detools adds the
+ * same offset to its own. */
+static int base_seek(void *arg, int offset)
+{
+    (void)arg;
+    const int64_t next = U.z.base_off + offset;
+    if (next < INT_MIN || next > INT_MAX) {
+        return -1;
+    }
+    U.z.base_off = next;
+    return 0;
+}
+
+/* Worker, detools' output: the rebuilt image's next n bytes into zbuf. detools writes runs of up to 128 bytes at any
+ * alignment, so each is split where zbuf fills, as job_zwrite splits tinfl's. A patch for an image of another size than
+ * memorySize is BAD_STREAM before its first byte reaches the image rules. */
+static int patch_write(void *arg, const uint8_t *buf, size_t n)
+{
+    (void)arg;
+    if (U.z.dt->to_size != U.announced) {
+        (void)zdl_fail(UDSOTA_DL_BAD_STREAM);
+        return -1;
+    }
+    while (n > 0u) {
+        size_t k = BUF_LEN - U.z.held;
+        k = (k < n) ? k : n;
+        if (k == 0u || U.z.produced + k > U.announced) {
+            (void)zdl_fail(UDSOTA_DL_BAD_STREAM);              /* past memorySize */
+            return -1;
+        }
+        memcpy(&U.zbuf[U.z.held], buf, k);
+        buf += k;
+        n -= k;
+        if (zdl_take(k, false) != UDSOTA_DL_OK) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Worker: n inflated patch bytes. The 64-byte header comes first, and no byte reaches detools before it passes: a wrong
+ * magic is BAD_STREAM, and a base other than the running image, or a running image whose hash can't be read, BAD_BASE,
+ * so a delta from another base is refused before the image rules and the erase. detools then rebuilds the image into
+ * zbuf: a corrupt patch, one for another size, a refused base read and any byte after the patch's end are BAD_STREAM,
+ * unless the image failed first (its rules, the flash). */
+static uint8_t patch_take(const uint8_t *d, size_t n)
+{
+    if (U.z.hdr_len < PATCH_HDR_LEN) {
+        const size_t want = PATCH_HDR_LEN - U.z.hdr_len, k = (n < want) ? n : want;
+        memcpy(&U.z.hdr[U.z.hdr_len], d, k);
+        U.z.hdr_len += k;
+        d += k;
+        n -= k;
+        if (U.z.hdr_len < PATCH_HDR_LEN) {
+            return UDSOTA_DL_OK;
+        }
+        if (le32(U.z.hdr) != PATCH_MAGIC) {
+            return zdl_fail(UDSOTA_DL_BAD_STREAM);
+        }
+        uint8_t base[32];
+        if (!udsota_plat_base_hash(base) || memcmp(base, &U.z.hdr[4], sizeof base) != 0) {
+            return zdl_fail(UDSOTA_DL_BAD_BASE);
+        }
+    }
+    if (n == 0u) {
+        return UDSOTA_DL_OK;
+    }
+    struct detools_apply_patch_t *dt = U.z.dt;
+    const bool ended = (dt->state == detools_apply_patch_state_done_t);
+    const int res = ended ? 0 : detools_apply_patch_process(dt, d, n);
+    const bool bad = ended || res < 0 || dt->state == detools_apply_patch_state_failed_t ||
+                     (dt->state != detools_apply_patch_state_init_t && dt->to_size != U.announced) ||
+                     dt->chunk.offset != n;            /* detools stops at its end: the rest came after it */
+    return (bad && U.z.failed == UDSOTA_DL_OK) ? zdl_fail(UDSOTA_DL_BAD_STREAM) : U.z.failed;
+}
+
+/* detools' state for a patch of unknown length: SIZE_MAX keeps its uncompressed reader's bound out of the way. */
+static bool patch_open(void)
+{
+    U.z.dt = malloc(sizeof *U.z.dt);
+    return U.z.dt != NULL &&
+           detools_apply_patch_init(U.z.dt, base_read, base_seek, SIZE_MAX, patch_write, NULL) == 0;
+}
+#endif
+
+/* The inflater, and for a delta detools' state after it; NO_MEMORY, holding nothing, when either can't be had. */
+static udsota_reason_t zdl_open(bool delta)
+{
+    zdl_close();
+    U.z.r = malloc(sizeof *U.z.r);
+    U.z.dict = calloc(1, TINFL_LZ_DICT_SIZE);   /* zeroed: a back-reference before the start reads zeros */
+    bool ok = U.z.r != NULL && U.z.dict != NULL;
+#if UDSOTA_DELTA
+    ok = ok && (!delta || patch_open());
+#else
+    ok = ok && !delta;
+#endif
+    if (!ok) {
+        zdl_close();
+        return UDSOTA_DL_NO_MEMORY;
+    }
+    tinfl_init(U.z.r);
+    U.z.status = TINFL_STATUS_NEEDS_MORE_INPUT;
+    return UDSOTA_DL_OK;
+}
+
+/* Worker: inflates n bytes of one 36 through tinfl's window, copying each run into zbuf, or for a delta handing it to
+ * the patch stage whole. Either way the size checks count image bytes. */
 static int job_zwrite(void)
 {
     const uint8_t *in = U.blk;
     size_t n = U.blk_len;
     while (U.z.failed == UDSOTA_DL_OK) {
         while (U.z.pend > 0u) {                                /* copy out what tinfl made */
+#if UDSOTA_DELTA
+            if (U.mode == DL_DELTA) {
+                const size_t k = U.z.pend;
+                U.z.pend = 0;
+                if (patch_take(&U.z.dict[U.z.pend_ofs], k) != UDSOTA_DL_OK) {
+                    return U.z.failed;
+                }
+                continue;
+            }
+#endif
             size_t k = BUF_LEN - U.z.held;
             k = (k < U.z.pend) ? k : U.z.pend;
             if (k == 0u || U.z.produced + k > U.announced) {
@@ -302,9 +439,21 @@ static int job_zwrite(void)
     return U.z.failed;
 }
 
-/* Worker, the 37: the stream ended at exactly memorySize bytes, all written, with nothing after it. */
+/* Worker, the 37: the stream ended at exactly memorySize bytes, all written, with nothing after it, and a delta's patch
+ * ended too. detools' uncompressed reader holds nothing back, so the 36s wrote every byte the patch makes: finalize
+ * only lets detools reach its end, and its result is no verdict, since with SIZE_MAX as the patch's length the reader's
+ * end always reports a corrupt patch. */
 static int job_zend(void)
 {
+#if UDSOTA_DELTA
+    if (U.mode == DL_DELTA && U.z.failed == UDSOTA_DL_OK) {
+        (void)detools_apply_patch_finalize(U.z.dt);
+        if (U.z.dt->state != detools_apply_patch_state_done_t || U.z.dt->to_offset != U.z.dt->to_size ||
+            U.z.dt->to_size != U.announced) {
+            (void)zdl_fail(UDSOTA_DL_BAD_STREAM);
+        }
+    }
+#endif
     if (U.z.failed == UDSOTA_DL_OK && U.z.ended && !U.z.trailing && U.z.produced == U.announced) {
         (void)zdl_take(0, true);
     }
@@ -529,8 +678,8 @@ static void dl_flash_failed(void)
     U.last_reason = UDSOTA_DL_FLASH_ERROR;
 }
 
-/* 34: access, then settled slots, an idle worker, no transfer and the gate, then DFI 00 or 10, address 0 and a
- * size that fits. */
+/* 34: access, then settled slots, an idle worker, no transfer and the gate, then DFI 00 or 10 (or 30, with delta
+ * downloads built in and allowed), address 0 and a size that fits. */
 static int request_download(const UDSServer_t *srv, uint8_t dfi, uint32_t addr, uint32_t size)
 {
     int rc = dl_access(srv);
@@ -547,8 +696,13 @@ static int request_download(const UDSServer_t *srv, uint8_t dfi, uint32_t addr, 
         U.last_reason = UDSOTA_DL_FLASH_ERROR;           /* no inactive slot */
         return UDS_NRC_ConditionsNotCorrect;
     }
-    if ((dfi != UDSOTA_DL_DFI && dfi != UDSOTA_DL_DFI_DEFLATE) || addr != 0u || size == 0u ||
-        size > udsota_plat_slot_size()) {
+    int mode = (dfi == UDSOTA_DL_DFI) ? DL_PLAIN : (dfi == UDSOTA_DL_DFI_DEFLATE) ? DL_DEFLATE : -1;
+#if UDSOTA_DELTA
+    if (dfi == UDSOTA_DL_DFI_DELTA_DEFLATE && U.cfg.allow_delta) {
+        mode = DL_DELTA;
+    }
+#endif
+    if (mode < 0 || addr != 0u || size == 0u || size > udsota_plat_slot_size()) {
         return UDS_NRC_RequestOutOfRange;
     }
     if (U.ota_open) {                                    /* a finished image that never passed FF01 */
@@ -556,8 +710,7 @@ static int request_download(const UDSServer_t *srv, uint8_t dfi, uint32_t addr, 
         settle();
         U.ota_open = false;
     }
-    const bool compressed = (dfi == UDSOTA_DL_DFI_DEFLATE);
-    if (compressed && zdl_open() != UDSOTA_DL_OK) {
+    if (mode != DL_PLAIN && zdl_open(mode == DL_DELTA) != UDSOTA_DL_OK) {
         U.last_reason = UDSOTA_DL_NO_MEMORY;
         U.last_bytes = 0;
         return UDS_NRC_ConditionsNotCorrect;
@@ -565,8 +718,8 @@ static int request_download(const UDSServer_t *srv, uint8_t dfi, uint32_t addr, 
     udsota_plat_unverify();
     U.slot_verified = false;
     U.dl_active = true;
-    U.ota_open = compressed;                             /* the inflater is held from here */
-    U.compressed = compressed;
+    U.ota_open = (mode != DL_PLAIN);                     /* the inflater is held from here */
+    U.mode = (uint8_t)mode;
     U.dl_complete = false;
     U.announced = size;
     U.received = U.written = 0u;
@@ -586,13 +739,13 @@ static int job_first(void)
     return (r != UDSOTA_DL_OK) ? UDSOTA_DL_FLASH_ERROR : udsota_plat_write(U.blk, U.blk_len);
 }
 
-/* 36's answer once the worker has written the block: positive, 0x72 for a flash failure, 0x31 for a compressed
- * block the image rules or the stream refused. */
+/* 36's answer once the worker has written the block: positive, 0x72 for a flash failure, 0x31 for a coded block the
+ * image rules, the stream or a delta's patch refused. */
 static int block_done(int result, uint8_t *status, size_t *status_len)
 {
     (void)status;
     *status_len = 0;
-    if (result != UDSOTA_DL_OK && U.compressed && result != UDSOTA_DL_FLASH_ERROR &&
+    if (result != UDSOTA_DL_OK && U.mode != DL_PLAIN && result != UDSOTA_DL_FLASH_ERROR &&
         result != UDSOTA_DL_NO_MEMORY) {
         abort_download();
         U.last_reason = (uint8_t)result;
@@ -603,7 +756,7 @@ static int block_done(int result, uint8_t *status, size_t *status_len)
         return UDS_NRC_GeneralProgrammingFailure;
     }
     U.received += (uint32_t)U.blk_len;
-    U.written = U.compressed ? U.z.written : U.written + (uint32_t)U.blk_len;
+    U.written = (U.mode != DL_PLAIN) ? U.z.written : U.written + (uint32_t)U.blk_len;
     U.progress_block = true;
     U.last_bytes = U.received;
     return 0;
@@ -631,18 +784,18 @@ static int transfer_data(UDSServer_t *srv, const uint8_t *data, size_t len, bool
         }
         return rc;
     }
-    const uint64_t limit = U.compressed ? UDSOTA_DL_Z_BOUND(U.announced) : U.announced;
+    const uint64_t limit = (U.mode != DL_PLAIN) ? UDSOTA_DL_Z_BOUND(U.announced) : U.announced;
     if ((uint64_t)U.received + len > limit) {
         abort_download();
         return UDS_NRC_TransferDataSuspended;
     }
-    if (U.compressed) {
+    if (U.mode != DL_PLAIN) {
         srv->xferTotalBytes = (limit > SIZE_MAX) ? SIZE_MAX : (size_t)limit;   /* iso14229 counts memorySize */
     }
     memcpy(U.blk, data, len);
     U.blk_len = len;
-    int (*job)(void) = U.compressed ? job_zwrite : job_write;
-    if (!U.compressed && !U.ota_open) {                  /* the first block: check it before anything is erased */
+    int (*job)(void) = (U.mode != DL_PLAIN) ? job_zwrite : job_write;
+    if (U.mode == DL_PLAIN && !U.ota_open) {             /* the first block: check it before anything is erased */
         const udsota_reason_t why = check_first(data, len, U.announced);
         if (why != UDSOTA_DL_OK) {
             abort_download();
@@ -681,7 +834,7 @@ static int zend_done(int result, uint8_t *status, size_t *status_len)
     return exit_ok();
 }
 
-/* 37: once every announced byte has arrived (else 0x24); a compressed stream must also end exactly. */
+/* 37: once every announced byte has arrived (else 0x24); a coded stream must also end exactly. */
 static int transfer_exit(const UDSServer_t *srv, size_t extra)
 {
     const int rc = dl_access(srv);
@@ -691,11 +844,11 @@ static int transfer_exit(const UDSServer_t *srv, size_t extra)
     if (extra != 0u) {
         return UDS_NRC_IncorrectMessageLengthOrInvalidFormat;
     }
-    if (!U.dl_active || (!U.compressed && U.received != U.announced)) {
+    if (!U.dl_active || (U.mode == DL_PLAIN && U.received != U.announced)) {
         return UDS_NRC_RequestSequenceError;
     }
     size_t none = 0;
-    return U.compressed ? run_job(job_zend, zend_done, 0x37, NULL, &none) : exit_ok();
+    return (U.mode != DL_PLAIN) ? run_job(job_zend, zend_done, 0x37, NULL, &none) : exit_ok();
 }
 
 /* ---- 31 01: FF01 verify, F000 resume point, F001 activate, F002 confirm ---- */

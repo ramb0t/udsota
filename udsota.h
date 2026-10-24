@@ -55,6 +55,8 @@
 #define UDSOTA_RESUME_NOT_AVAILABLE 0xFFu
 #define UDSOTA_DL_DFI               0x00u     /* 34's dataFormatIdentifier: the image as it is */
 #define UDSOTA_DL_DFI_DEFLATE       0x10u     /* raw DEFLATE (RFC 1951); memorySize is still the image's size */
+#define UDSOTA_DL_DFI_DELTA_DEFLATE 0x30u     /* a delta patch from the running image, as raw DEFLATE; memorySize the
+                                                 image's size (UDSOTA_DELTA and cfg.allow_delta, else 0x31) */
 #define UDSOTA_DL_MAX_BLOCK_LEN     4095u     /* 34's maxNumberOfBlockLength: SID, BSC and 4093 data bytes */
 #define UDSOTA_DL_Z_BOUND(size)     ((uint64_t)(size) + ((uint64_t)(size) >> 3) + 1024u)   /* the most bytes a
                                                  DEFLATE download of a size-byte image may take; past it, 0x71 */
@@ -138,9 +140,9 @@ typedef enum {
     UDSOTA_DL_WORKER_TIMEOUT,       /* 10: a flash job passed 90 s, or its session ended while it ran */
     UDSOTA_DL_ABORTED,              /* 11: ended early: a session change, S3, the gate, an overrun, or iso14229 */
     UDSOTA_DL_FLASH_ERROR,          /* 12: erase or write failed, or no inactive slot */
-    UDSOTA_DL_BAD_STREAM,           /* 13: a compressed download did not inflate to exactly the image */
-    UDSOTA_DL_NO_MEMORY,            /* 14: no memory for the inflater */
-    UDSOTA_DL_BAD_BASE,             /* 15: reserved (delta downloads) */
+    UDSOTA_DL_BAD_STREAM,           /* 13: a coded download did not inflate (or patch) to exactly the image */
+    UDSOTA_DL_NO_MEMORY,            /* 14: no memory for the inflater, or a delta's patch state */
+    UDSOTA_DL_BAD_BASE,             /* 15: a delta patch for another base than the running image, or no hash to tell */
 } udsota_reason_t;
 
 /* A download's progress, for a display. done and total are image bytes (0 outside ERASING and WRITING). */

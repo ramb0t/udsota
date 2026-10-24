@@ -1253,9 +1253,9 @@ def test_wire_numbers_match_udsota_wire():
 
 
 UDSOTA_H, ISO14229_H = REPO / "udsota.h", REPO / "iso14229" / "iso14229.h"
-# What wire.py mirrors that this server has no number for: F1F2, delta, the DTC services and the boot-loop flag
-# (0x02) belong to v0.14.2's server, and iso14229 takes any ALFID. The v0.14.x test above still checks them.
-NOT_IN_UDSOTA_H = {"UDSOTA_DID_COUNTERS", "UDSOTA_DL_DFI_DELTA", "UDSOTA_DL_DFI_DELTA_DEFLATE", "UDSOTA_DL_ALFID",
+# What wire.py mirrors that this server has no number for: F1F2, delta's DFI 0x20, the DTC services and the boot-loop
+# flag (0x02) belong to v0.14.2's server, and iso14229 takes any ALFID. The v0.14.x test above still checks them.
+NOT_IN_UDSOTA_H = {"UDSOTA_DID_COUNTERS", "UDSOTA_DL_DFI_DELTA", "UDSOTA_DL_ALFID",
                    "UDSOTA_RDTC_COUNT_BY_MASK", "UDSOTA_RDTC_BY_MASK", "UDSOTA_RDTC_EXT_DATA", "UDSOTA_RDTC_SUPPORTED",
                    "UDSOTA_DTC_RECORD_ALL", "UDSOTA_DTC_GROUP_ALL"}
 # The NRCs in WIRE_DEFINES, which this server takes from iso14229.h.
