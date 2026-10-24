@@ -7,13 +7,15 @@
  * profile's [dids] and [config] describe them. A restart (11 01, or F001's answer) is a boot in-process after
  * --boot-ms of silence: lite_platform.c's slots, then udsota and iso14229 from scratch.
  *
- *     udsota_lite_server --image FILE [--can IFNAME] [--soak-ms N] [--boot-ms N] [--drop-fc-after N] [-v]
+ *     udsota_lite_server --image FILE [--can IFNAME] [--soak-ms N] [--boot-ms N] [--drop-fc-after N] [--no-delta]
+ *                        [-v]
  *
  * FILE is the app slot 0 runs, confirmed. --can serves on IFNAME through a CAN_RAW socket instead of the pipe; it is
- * built only where linux/can/raw.h is, and refuses any interface but a vcan. --soak-ms makes the app's gate refuse
- * F002 (0x22) for that long after each boot. --drop-fc-after loses the FC sent after a request's Nth CF, once (N a
- * multiple of isotp-c's block size, 8). -v logs every frame on stderr. stdin's EOF (in pipe mode), SIGTERM or SIGINT
- * stops the server. */
+ * built only where linux/can/raw.h is, and refuses any interface but a vcan. --soak-ms makes the app's gate refuse F002
+ * (0x22) for that long after each boot. --drop-fc-after loses the FC sent after a request's Nth CF, once (N a multiple
+ * of isotp-c's block size, 8). Built with -DUDSOTA_DELTA=ON, it serves delta downloads (DFI 0x30) from the running
+ * slot, and --no-delta clears cfg.allow_delta so that a delta 34 answers 0x31; the start-up line says which. -v logs
+ * every frame on stderr. stdin's EOF (in pipe mode), SIGTERM or SIGINT stops the server. */
 #include <errno.h>
 #include <getopt.h>
 #include <poll.h>
@@ -79,7 +81,7 @@ static UDSServer_t   s_srv;
 static UDSTpISOTpC_t s_tp;
 static uint64_t      s_boot_ms, s_boot_until;
 static uint32_t      s_soak_ms, s_silence_ms = BOOT_MS;
-static bool          s_booting, s_reset, s_verbose;
+static bool          s_booting, s_reset, s_verbose, s_no_delta;
 static int           s_can_fd = -1;          /* the CAN_RAW socket with --can, else -1 (the pipe) */
 static uint32_t      s_drop_fc_after, s_cfs;  /* --drop-fc-after's N, and the CFs of the request coming in */
 static volatile sig_atomic_t s_stop;
@@ -442,7 +444,7 @@ static void boot(void)
     C.applied = C.stored;
     C.staged_mask = 0u;
     const udsota_cfg_t cfg = {.key_label = KEY_LABEL, .key_master = k_master, .key_master_len = sizeof k_master,
-                              .gate = gate, .reset = do_reset};
+                              .gate = gate, .reset = do_reset, .allow_delta = !s_no_delta};
     udsota_test_reboot();
     if (udsota_init(&cfg) != 0) {
         fprintf(stderr, "udsota_lite_server: udsota_init failed\n");
@@ -631,10 +633,11 @@ int main(int argc, char **argv)
     static const struct option opts[] = {
         {"image", required_argument, NULL, 'i'}, {"soak-ms", required_argument, NULL, 's'},
         {"boot-ms", required_argument, NULL, 'b'}, {"can", required_argument, NULL, 'c'},
-        {"drop-fc-after", required_argument, NULL, 'd'}, {NULL, 0, NULL, 0},
+        {"drop-fc-after", required_argument, NULL, 'd'}, {"no-delta", no_argument, NULL, 'n'},
+        {NULL, 0, NULL, 0},
     };
     static const char usage[] = "usage: udsota_lite_server --image FILE [--can IFNAME] [--soak-ms N] [--boot-ms N] "
-                                "[--drop-fc-after N] [-v]\n";
+                                "[--drop-fc-after N] [--no-delta] [-v]\n";
     const char *image_path = NULL, *ifname = NULL;
     int c;
     while ((c = getopt_long(argc, argv, "v", opts, NULL)) != -1) {
@@ -644,6 +647,7 @@ int main(int argc, char **argv)
         case 'b': s_silence_ms = number("--boot-ms", optarg, 60000u); break;
         case 'c': ifname = optarg; break;
         case 'd': s_drop_fc_after = number("--drop-fc-after", optarg, 4095u); break;
+        case 'n': s_no_delta = true; break;
         case 'v': s_verbose = true; break;
         default:  fputs(usage, stderr); return 2;
         }
@@ -676,9 +680,9 @@ int main(int argc, char **argv)
     const struct sigaction stop = {.sa_handler = on_stop};   /* no SA_RESTART: poll returns, the loop sees s_stop */
     sigaction(SIGTERM, &stop, NULL);
     sigaction(SIGINT, &stop, NULL);
-    fprintf(stderr, "udsota_lite_server: iso14229 %s, %s%s, IDs 0x%03X/0x%03X, soak %u ms\n", UDS_LIB_VERSION,
-            ifname != NULL ? "SocketCAN on " : "pipe on stdin/stdout", ifname != NULL ? ifname : "", REQ_ID, RESP_ID,
-            (unsigned)s_soak_ms);
+    fprintf(stderr, "udsota_lite_server: iso14229 %s, %s%s, IDs 0x%03X/0x%03X, soak %u ms, delta downloads %s\n",
+            UDS_LIB_VERSION, ifname != NULL ? "SocketCAN on " : "pipe on stdin/stdout", ifname != NULL ? ifname : "",
+            REQ_ID, RESP_ID, (unsigned)s_soak_ms, !UDSOTA_DELTA ? "not built" : s_no_delta ? "off" : "on");
     const int rc = serve();
     udsota_test_reboot();                                /* frees an inflater left open */
     lite_plat_close();

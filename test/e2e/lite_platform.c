@@ -257,6 +257,30 @@ void udsota_plat_status(udsota_status_t *out)
     memcpy(out->other_elf_sha_prefix, &P.slot[o][APP_DESC + 144u], 8);
 }
 
+#if UDSOTA_DELTA
+/* The running slot, the base a delta rebuilds from, read up to the slot's end, past the image as on the device. */
+bool udsota_plat_base_read(uint32_t off, void *buf, size_t n)
+{
+    if ((uint64_t)off + n > LITE_SLOT_SIZE) {
+        return false;
+    }
+    memcpy(buf, &P.slot[P.running][off], n);
+    return true;
+}
+
+/* The SHA-256 the running image appends, as esp_image_get_metadata gives it; false for an image without one. */
+bool udsota_plat_base_hash(uint8_t out[32])
+{
+    const uint8_t *img = P.slot[P.running];
+    const size_t len = image_len(img, LITE_SLOT_SIZE);
+    if (len == 0u || img[23] != 1u) {
+        return false;
+    }
+    memcpy(out, &img[len - 32u], 32);
+    return true;
+}
+#endif
+
 uint32_t udsota_plat_slot_size(void)
 {
     return LITE_SLOT_SIZE;

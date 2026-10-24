@@ -1,7 +1,7 @@
 /* udsota_lite_server's platform under udsota (the udsota_plat_* functions in udsota.h): two RAM slots that boot as
  * ESP-IDF's bootloader does with rollback on, jobs whose results come 100 ms after they are queued (so iso14229
- * answers 0x78 first, as on the device), the running slot's image as this app's identity, and HMAC-SHA256 keys. No
- * ECDSA. */
+ * answers 0x78 first, as on the device), the running slot's image as this app's identity and, with UDSOTA_DELTA=1,
+ * as a delta's base, and HMAC-SHA256 keys. No ECDSA. */
 #pragma once
 #include <stdbool.h>
 #include <stddef.h>
