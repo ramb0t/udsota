@@ -57,7 +57,8 @@ set_source_files_properties(iso14229/iso14229.c PROPERTIES COMPILE_OPTIONS "-fwr
 # iso14229 on its mock transport with a clock the test sets, udsota over the test's platform, and miniz's tinfl
 # (tdefl too, to make a raw-DEFLATE image), under ASan and UBSan, the first report ending the test. calloc goes through
 # the test, which can fail one to refuse the inflater its memory. test_udsota_no_rollback is the same test on a
-# platform that reports what ESP-IDF does without CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE.
+# platform that reports what ESP-IDF does without CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE, and test_udsota_delta (below)
+# the same with delta downloads.
 function(udsota_test name)
     add_executable(${name} test/test_udsota.c udsota.c iso14229/iso14229.c test/miniz/miniz.c)
     target_include_directories(${name} PRIVATE . iso14229 test/miniz)
@@ -81,6 +82,8 @@ function(udsota_with_delta name)
     target_include_directories(${name} PRIVATE detools)
     target_compile_definitions(${name} PRIVATE ${UDSOTA_DELTA_DEFS})
 endfunction()
+udsota_test(test_udsota_delta)
+udsota_with_delta(test_udsota_delta)
 
 # The app on a host for the client's end-to-end tests (client/tests/test_e2e_lite.py, test_e2e_lite_vcan.py): udsota
 # on iso14229 over isotp-c, CAN frames on stdin and stdout or, where linux/can/raw.h is, on a vcan with --can, two RAM

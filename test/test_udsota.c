@@ -6,7 +6,9 @@
  * the PSA lock, and the edges where udsota keeps itself in step with iso14229. Then the gate's refusal at each
  * udsota_op_t, cfg.progress's reports over whole updates, F000, and each way a plain or compressed download fails, with
  * the reason F1F1 gives. test_udsota_no_rollback is this file with TEST_ROLLBACK 0: the platform reports what ESP-IDF
- * does without CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE, a new image running UNDEFINED, never pending verify. */
+ * does without CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE, a new image running UNDEFINED, never pending verify.
+ * test_udsota_delta is this file with UDSOTA_DELTA 1 and detools: the device answers on the delta fixtures' CAN IDs,
+ * its platform also holds a running image, the fixtures' base, and the delta cases run too. */
 #include <assert.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -17,9 +19,17 @@
 #include "iso14229.h"
 #include "miniz.h"
 #include "udsota.h"
+#if UDSOTA_DELTA
+#include "fixtures/delta_fixtures.h"
+#endif
 
+#if UDSOTA_DELTA
+#define TESTER 0x710u                     /* the delta fixtures' images answer here (client/tests/demo_server.py) */
+#define SERVER 0x718u
+#else
 #define TESTER 0x7E0u
 #define SERVER 0x7E8u
+#endif
 #define SLOT   (256u * 1024u)
 #ifndef TEST_ROLLBACK
 #define TEST_ROLLBACK 1                   /* 0: ESP-IDF without rollback, where an activated image runs UNDEFINED */
@@ -79,6 +89,9 @@ static struct {
     bool     fail_begin, fail_write, refuse_run, no_slot;   /* faults: the slot won't open or take a write, the worker
                                                                takes no job, there is no inactive slot */
     int      begins;
+#if UDSOTA_DELTA
+    uint8_t  running[SLOT];            /* the running slot, a delta's base */
+#endif
 } P = {.delay = 80, .version = "0.4.1-lite.1"};
 
 /* calloc, through -Wl,--wrap=calloc; its one caller is udsota's inflater window. s_calloc_fail fails the next one. */
@@ -236,6 +249,22 @@ int udsota_plat_ecdsa(const uint8_t *msg, size_t n, const uint8_t sig[64])
     memcpy(P.ecdsa_msg, msg, P.ecdsa_len);
     return (sig[0] == 0x5Au) ? 1 : 0;
 }
+#if UDSOTA_DELTA
+/* The running slot, bounded by its size; its image's appended SHA-256 is the fixtures' base hash. */
+bool udsota_plat_base_read(uint32_t off, void *buf, size_t n)
+{
+    if ((uint64_t)off + n > sizeof P.running) {
+        return false;
+    }
+    memcpy(buf, &P.running[off], n);
+    return true;
+}
+bool udsota_plat_base_hash(uint8_t out[32])
+{
+    memcpy(out, DELTA_BASE_HASH, 32);
+    return true;
+}
+#endif
 
 /* ---- The app ---- */
 
@@ -251,6 +280,8 @@ static udsota_op_t s_gate_op;             /* the step the gate refuses, with s_g
 static uint8_t     s_gate_nrc;
 static int         s_gate_asked[UDSOTA_OP_CONFIRM + 1];
 static bool        s_allow_downgrade;     /* cfg.allow_downgrade at the next boot */
+static bool        s_allow_delta;         /* cfg.allow_delta at the next boot */
+static const char *s_product;             /* cfg.product at the next boot */
 static bool        s_ecdsa;               /* the ECDSA mode at the next boot, with k_pub */
 static bool        s_no_keys;             /* no keys at the next boot: security off */
 static int         s_app_psa;             /* 1 while the app holds the PSA lock */
@@ -334,7 +365,7 @@ static void boot(void)
     s_srv.p2_ms = 5;                              /* as the examples set it */
     udsota_cfg_t cfg = {.key_label = k_label, .key_master = k_master, .key_master_len = sizeof k_master,
                         .gate = gate, .progress = on_progress, .reset = do_reset, .ctx = &s_ctx,
-                        .allow_downgrade = s_allow_downgrade};
+                        .allow_downgrade = s_allow_downgrade, .allow_delta = s_allow_delta, .product = s_product};
     if (s_no_keys) {
         cfg.key_label = NULL;
         cfg.key_master = NULL;
@@ -447,16 +478,23 @@ static int block(uint8_t bsc, const uint8_t *data, size_t off, size_t len, uint8
     return xfer(req, len + 2u, resp, max);
 }
 
-/* Every block of data, each answered 76; a 3E between blocks keeps the session (iso14229's S3 counts 10 and 3E). */
-static void send_all(const uint8_t *data, size_t len)
+/* All of data in 36s of step bytes, each answered 76; a 3E between blocks keeps the session (iso14229's S3 counts 10
+ * and 3E). */
+static void send_by(const uint8_t *data, size_t len, size_t step)
 {
     uint8_t resp[64], bsc = 1;
-    for (size_t off = 0; off < len; off += 4093u, bsc++) {
-        const size_t n = (len - off < 4093u) ? len - off : 4093u;
+    for (size_t off = 0; off < len; off += step, bsc++) {
+        const size_t n = (len - off < step) ? len - off : step;
         CHECK(block(bsc, data, off, n, resp, sizeof resp) == 2 && resp[0] == 0x76 && resp[1] == bsc);
         EXPECT(B(0x3E, 0x00), B(0x7E, 0x00));
         g_now += 1500u;
     }
+}
+
+/* Every block of data, each as long as the 34's maxNumberOfBlockLength allows. */
+static void send_all(const uint8_t *data, size_t len)
+{
+    send_by(data, len, 4093u);
 }
 
 /* An ESP-IDF image header, app descriptor and udsota descriptor, as the image rules read them. */
@@ -1087,6 +1125,105 @@ static void compress_cases(const uint8_t *img, size_t img_len, const uint8_t *im
     EXPECT(B(0x37), B(0x77));
 }
 
+#if UDSOTA_DELTA
+/* A delta whose uncompressed patch is pn's n bytes, as raw DEFLATE in one 36 after a 34 for size: the 36 is 0x31, F1F1
+ * gives reason, and nothing was erased. */
+static void delta_refused(const uint8_t *pn, size_t n, uint32_t size, uint8_t reason)
+{
+    uint8_t resp[64];
+    size_t zlen = 0;
+    uint8_t *z = tdefl_compress_mem_to_heap(pn, n, &zlen, TDEFL_DEFAULT_MAX_PROBES);
+    assert(z != NULL && zlen <= 4093u);
+    const int begins = P.begins;
+    request_download(size, 0x30);
+    CHECK(block(1, z, 0, zlen, resp, sizeof resp) == 3 && resp[0] == 0x7F && resp[2] == 0x31);
+    CHECK(result_is(reason, 0) && P.begins == begins && !udsota_busy());
+    mz_free(z);
+}
+
+/* ---- Delta downloads (DFI 0x30) ----
+ * The running image is DELTA_BASE, the release v0.2.0 of the product example, and DELTA_P30 rebuilds DELTA_NEW, v0.3.0,
+ * from it, in 36s of 1, 7 or 4,093 bytes: the image installs and activates as a full one would. A one-byte 36 makes
+ * detools' runs straddle zbuf's end. A patch for another base is refused at its 36 (0x31, BAD_BASE) before anything is
+ * erased, and the image itself then installs in the same session; a wrong magic and a patch for another memorySize are
+ * BAD_STREAM, also before the erase, and so are bytes after the patch's end, though after it. DFI 0x20 is 0x31 with delta on, and with
+ * cfg.allow_delta off so is a 0x30 34. Nothing writes the running image. */
+static void delta_cases(void)
+{
+    static const size_t steps[] = {1, 7, 4093};
+    static uint8_t snap[SLOT], wrong[sizeof DELTA_PNONE + 2u];
+    memset(P.running, 0xFF, sizeof P.running);
+    memcpy(P.running, DELTA_BASE, sizeof DELTA_BASE);
+    CHECK(memcmp(&P.running[sizeof DELTA_BASE - 32u], DELTA_BASE_HASH, 32) == 0);   /* the hash the base appends */
+    memcpy(snap, P.running, sizeof snap);
+    P.version = "v0.2.0";
+    P.expect = DELTA_NEW;
+    P.expect_len = sizeof DELTA_NEW;
+    P.st = (udsota_status_t){.running_slot = 0, .boot_slot = 0, .running_state = UDSOTA_IMG_VALID};
+    s_product = "example";
+    s_allow_delta = true;
+    boot();
+    programming();
+    const int activations = P.activations, resets = s_resets;
+    for (size_t i = 0; i < sizeof steps / sizeof steps[0]; i++) {
+        request_download(sizeof DELTA_NEW, 0x30);
+        send_by(DELTA_P30, sizeof DELTA_P30, steps[i]);
+        EXPECT(B(0x37), B(0x77));
+        CHECK(P.pos == sizeof DELTA_NEW && memcmp(P.slot, DELTA_NEW, sizeof DELTA_NEW) == 0);
+        EXPECT(B(0x31, 0x01, 0xFF, 0x01), B(0x71, 0x01, 0xFF, 0x01, 0x00));
+        CHECK(result_is(UDSOTA_DL_OK, sizeof DELTA_P30));
+    }
+    EXPECT(B(0x31, 0x01, 0xF0, 0x01), B(0x71, 0x01, 0xF0, 0x01));
+    run_for(200);
+    CHECK(P.activations == activations + 1 && P.st.boot_slot == 1 && s_resets > resets);
+    CHECK(memcmp(P.running, snap, sizeof snap) == 0);
+
+    P.st = (udsota_status_t){.running_slot = 0, .boot_slot = 0, .running_state = UDSOTA_IMG_VALID};
+    boot();
+    programming();
+    const int begins = P.begins;
+    memcpy(wrong, DELTA_PNONE, sizeof DELTA_PNONE);
+    wrong[4] ^= 0x01;                             /* the base's hash, after the magic */
+    delta_refused(wrong, sizeof DELTA_PNONE, sizeof DELTA_NEW, UDSOTA_DL_BAD_BASE);
+    request_download(sizeof DELTA_NEW, 0x00);
+    send_all(DELTA_NEW, sizeof DELTA_NEW);
+    EXPECT(B(0x37), B(0x77));
+    EXPECT(B(0x31, 0x01, 0xFF, 0x01), B(0x71, 0x01, 0xFF, 0x01, 0x00));
+    CHECK(P.begins == begins + 1 && memcmp(P.running, snap, sizeof snap) == 0);
+
+    memcpy(wrong, DELTA_PNONE, sizeof DELTA_PNONE);
+    wrong[0] ^= 0x01;                             /* the magic */
+    delta_refused(wrong, sizeof DELTA_PNONE, sizeof DELTA_NEW, UDSOTA_DL_BAD_STREAM);
+    delta_refused(DELTA_PNONE, sizeof DELTA_PNONE, sizeof DELTA_NEW + 1u, UDSOTA_DL_BAD_STREAM);
+    EXPECT(B(0x34, 0x20, 0x44, 0, 0, 0, 0, 0, 0, 0x2F, 0x30), B(0x7F, 0x34, 0x31));
+    CHECK(P.begins == begins + 1 && memcmp(P.running, snap, sizeof snap) == 0);
+
+    /* Two bytes after the patch's end: the image is rebuilt, and written, before they come. */
+    memcpy(wrong, DELTA_PNONE, sizeof DELTA_PNONE);
+    wrong[sizeof DELTA_PNONE] = wrong[sizeof DELTA_PNONE + 1u] = 0x00;
+    size_t zlen = 0;
+    uint8_t *z = tdefl_compress_mem_to_heap(wrong, sizeof wrong, &zlen, TDEFL_DEFAULT_MAX_PROBES);
+    assert(z != NULL && zlen <= 4093u);
+    uint8_t resp[64];
+    request_download(sizeof DELTA_NEW, 0x30);
+    CHECK(block(1, z, 0, zlen, resp, sizeof resp) == 3 && resp[0] == 0x7F && resp[2] == 0x31);
+    CHECK(result_is(UDSOTA_DL_BAD_STREAM, 0) && P.begins == begins + 2 && !udsota_busy());
+    mz_free(z);
+    EXPECT(B(0x31, 0x01, 0xFF, 0x01), B(0x7F, 0x31, 0x24));
+    CHECK(memcmp(P.running, snap, sizeof snap) == 0);
+
+    s_allow_delta = false;
+    boot();
+    programming();
+    EXPECT(B(0x34, 0x30, 0x44, 0, 0, 0, 0, 0, 0, 0x2F, 0x30), B(0x7F, 0x34, 0x31));   /* memorySize 12080 */
+    CHECK(!udsota_busy() && result_is(UDSOTA_DL_OK, 0) && P.begins == begins + 2);
+    CHECK(memcmp(P.running, snap, sizeof snap) == 0);
+
+    s_product = NULL;
+    P.version = "0.4.1-lite.1";
+}
+#endif
+
 int main(void)
 {
     static uint8_t img[100000], other[8192];
@@ -1126,6 +1263,11 @@ int main(void)
     EXPECT(B(0x27, 0x04, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16), B(0x7F, 0x27, 0x35));
     g_now += 1100u;
     unlock(0x03);
+
+    /* A DFI other than 00 and 10 is 0x31: heatshrink's 20 is gone, and 30 needs UDSOTA_DELTA and cfg.allow_delta. */
+    EXPECT(B(0x34, 0x20, 0x44, 0, 0, 0, 0, 0, 0, 0x10, 0), B(0x7F, 0x34, 0x31));
+    EXPECT(B(0x34, 0x30, 0x44, 0, 0, 0, 0, 0, 0, 0x10, 0), B(0x7F, 0x34, 0x31));
+    CHECK(!udsota_busy() && result_is(UDSOTA_DL_OK, 0));
 
     /* A resent block: iso14229 answers 0x24 and ends its transfer; udsota follows, so the next 36 is 0x70. */
     request_download(sizeof img, 0x00);
@@ -1514,6 +1656,9 @@ int main(void)
         compress_cases(img, sizeof img, small, wrong, sizeof small);
         mz_free(z);
     }
+#if UDSOTA_DELTA
+    delta_cases();
+#endif
 
     /* Every PSA call of the run held the lock, and each kind ran. */
     CHECK(P.psa_unlocked == 0 && udsota_test_psa_depth() == 0);
