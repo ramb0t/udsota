@@ -103,6 +103,15 @@ extern const udsota_image_desc_t udsota_image_desc;
 
 /* ---- Configuration ---- */
 
+/* Delta downloads: UDSOTA_DELTA=1, defined build-wide, compiles them in, with detools/detools.c and the two
+ * udsota_plat_base_* functions below; cfg.allow_delta then turns them on. Under ESP-IDF set it in the app's top-level
+ * CMakeLists before project(), with idf_build_set_property(COMPILE_DEFINITIONS UDSOTA_DELTA=1 APPEND): udsota's
+ * component reads that list for this exact entry to add detools, and udsota.c refuses to compile when it is set any
+ * other way. Unset or 0, udsota has no delta code and declares neither function. */
+#ifndef UDSOTA_DELTA
+#define UDSOTA_DELTA 0
+#endif
+
 /* The update steps the app's gate may refuse. */
 typedef enum {
     UDSOTA_OP_ENTER_EXTENDED = 1,   /* 10 03 */
@@ -159,6 +168,8 @@ typedef struct {
     const char    *product;                 /* the project name an image must carry; NULL = this image's own */
     bool           allow_downgrade;         /* take an older or same-version image too (a dev unit's choice; a release
                                                build leaves it off); every other image rule still applies */
+    bool           allow_delta;             /* serve delta downloads, rebuilt from the running image; only in a build
+                                               with UDSOTA_DELTA=1 */
     uint8_t      (*gate)(void *ctx, udsota_op_t op);                  /* nullable: 0 = allow, else the NRC */
     void         (*progress)(void *ctx, const udsota_progress_t *p);  /* nullable; from the server's task */
     void         (*reset)(void *ctx);       /* restarts after 11 01 or F001; NULL = esp_restart() */
@@ -242,3 +253,8 @@ bool        udsota_plat_hmac(const uint8_t *key, size_t key_len, const uint8_t *
 int         udsota_plat_ecdsa_key(const uint8_t *pubkey);          /* 0 once the key is usable */
 int         udsota_plat_ecdsa(const uint8_t *msg, size_t n,
                               const uint8_t sig[UDSOTA_KEYS_SIG_LEN]);   /* 1 valid, 0 not, -1 unknown */
+#if UDSOTA_DELTA
+/* A delta download's base, the running image, read from its slot inside jobs. */
+bool        udsota_plat_base_read(uint32_t off, void *buf, size_t n);   /* false past the slot's end or on error */
+bool        udsota_plat_base_hash(uint8_t out[32]);                /* the SHA-256 the running image appends */
+#endif

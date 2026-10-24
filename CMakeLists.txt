@@ -1,5 +1,13 @@
-# udsota. Under ESP-IDF this directory is the component: udsota.c and the vendored iso14229. On a host it builds the
-# host test and udsota_lite_server: cmake -S . -B build && cmake --build build && ctest --test-dir build
+# udsota. Under ESP-IDF this directory is the component: udsota.c and the vendored iso14229, and detools when the build
+# defines UDSOTA_DELTA=1. On a host it builds the host test and udsota_lite_server:
+# cmake -S . -B build && cmake --build build && ctest --test-dir build
+
+# Delta downloads: detools as they use it, uncompressed sequential patches only and no file I/O. udsota.c reads detools.h
+# under the same defines.
+set(UDSOTA_DELTA_DEFS UDSOTA_DELTA=1 DETOOLS_CONFIG_FILE_IO=0 DETOOLS_CONFIG_COMPRESSION_NONE=1
+                      DETOOLS_CONFIG_COMPRESSION_LZMA=0 DETOOLS_CONFIG_COMPRESSION_CRLE=0
+                      DETOOLS_CONFIG_COMPRESSION_HEATSHRINK=0)
+
 if(ESP_PLATFORM)
     # A clean [v]X.Y.Z PROJECT_VER is a release; UDSOTA_IMAGE_DESC stamps the flag into the image.
     idf_build_get_property(udsota_ver PROJECT_VER)
@@ -8,11 +16,25 @@ if(ESP_PLATFORM)
     else()
         set(udsota_release 0)
     endif()
-    idf_component_register(SRCS "udsota.c" "iso14229/iso14229.c"
+    # Delta downloads come only with UDSOTA_DELTA=1 in the build's COMPILE_DEFINITIONS, where udsota.c and the app
+    # both read it; detools.c is compiled only then. The app sets it before project(), with
+    # idf_build_set_property(COMPILE_DEFINITIONS UDSOTA_DELTA=1 APPEND), as this reads the list only here.
+    idf_build_get_property(udsota_build_defs COMPILE_DEFINITIONS)
+    set(udsota_srcs "udsota.c" "iso14229/iso14229.c")
+    set(udsota_priv_inc "")
+    if("UDSOTA_DELTA=1" IN_LIST udsota_build_defs)
+        list(APPEND udsota_srcs "detools/detools.c")
+        set(udsota_priv_inc "detools")
+    endif()
+    idf_component_register(SRCS ${udsota_srcs}
                            INCLUDE_DIRS "." "iso14229"
+                           PRIV_INCLUDE_DIRS ${udsota_priv_inc}
                            PRIV_REQUIRES app_update bootloader_support esp_app_format esp_partition esp_timer
                                          esp_hw_support esp_system mbedtls)
     target_compile_definitions(${COMPONENT_LIB} PUBLIC UDSOTA_IMG_RELEASE=${udsota_release})
+    if("UDSOTA_DELTA=1" IN_LIST udsota_build_defs)
+        target_compile_definitions(${COMPONENT_LIB} PRIVATE ${UDSOTA_DELTA_DEFS})
+    endif()
     # Keep the app's UDSOTA_IMAGE_DESC in every image: ESP-IDF places .rodata_custom_desc without KEEP, so under
     # --gc-sections it would go from a build that never reaches udsota_init (diagnostics compiled out, say), and units
     # would then refuse that image as BAD_BOARD.
@@ -51,6 +73,15 @@ set_source_files_properties(udsota.c test/test_udsota.c PROPERTIES COMPILE_OPTIO
 udsota_test(test_udsota)
 udsota_test(test_udsota_no_rollback TEST_ROLLBACK=0)
 
+# Delta downloads in a host target: UDSOTA_DELTA=1, detools and its defines. The target's platform supplies the two
+# udsota_plat_base_* functions. -DUDSOTA_DELTA=ON builds udsota_lite_server so.
+option(UDSOTA_DELTA "Build udsota_lite_server with delta downloads (UDSOTA_DELTA=1 and detools)" OFF)
+function(udsota_with_delta name)
+    target_sources(${name} PRIVATE detools/detools.c)
+    target_include_directories(${name} PRIVATE detools)
+    target_compile_definitions(${name} PRIVATE ${UDSOTA_DELTA_DEFS})
+endfunction()
+
 # The app on a host for the client's end-to-end tests (client/tests/test_e2e_lite.py, test_e2e_lite_vcan.py): udsota
 # on iso14229 over isotp-c, CAN frames on stdin and stdout or, where linux/can/raw.h is, on a vcan with --can, two RAM
 # slots, every timer on CLOCK_MONOTONIC, ASan and UBSan.
@@ -64,6 +95,9 @@ target_compile_definitions(udsota_lite_server PRIVATE UDS_SYS=UDS_SYS_UNIX UDS_A
                                                       MINIZ_NO_TIME MINIZ_NO_ARCHIVE_APIS MINIZ_NO_ZLIB_APIS)
 if(UDSOTA_HAVE_SOCKETCAN)
     target_compile_definitions(udsota_lite_server PRIVATE LITE_SOCKETCAN)
+endif()
+if(UDSOTA_DELTA)
+    udsota_with_delta(udsota_lite_server)
 endif()
 target_compile_options(udsota_lite_server PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=all
                                                   -fno-omit-frame-pointer)

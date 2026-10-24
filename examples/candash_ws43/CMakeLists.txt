@@ -33,4 +33,8 @@ idf_build_set_property(MINIMAL_BUILD ON)
 if(POC_BOARD STREQUAL "ws43b")
     idf_build_set_property(COMPILE_DEFINITIONS POC_BOARD_WS43B=1 APPEND)
 endif()
+# -DPOC_DELTA=1: udsota with delta downloads, which the app then turns on (cfg.allow_delta).
+if(POC_DELTA)
+    idf_build_set_property(COMPILE_DEFINITIONS UDSOTA_DELTA=1 APPEND)
+endif()
 project(candash)

@@ -5,17 +5,26 @@
  *   4. 0x27 keys: HMAC per device, or ECDSA signatures, and the PSA lock around udsota's PSA calls
  *   5. the updater: 34, 36, 37, the routines, the DIDs and the session rules
  *   6. iso14229's events
- *   7. the ESP-IDF platform: the flash worker on esp_ota_*, the slot status, identity and crypto
+ *   7. the ESP-IDF platform: the flash worker on esp_ota_*, the slot status, identity, crypto and a delta's base
  * iso14229 keeps ISO-TP, framing, timing, the 0x78 cadence and the 0x27 attempt delays; it is used as it is. */
 #include "udsota.h"
 #include <stdlib.h>
 #include <string.h>
+
+/* UDSOTA_DELTA=1 comes with detools' defines from udsota's CMakeLists, which also adds detools.c; without them it was
+ * set where that CMakeLists never saw it, and the link would fail on detools_* instead. */
+#if UDSOTA_DELTA && !defined(DETOOLS_CONFIG_COMPRESSION_HEATSHRINK)
+#error "UDSOTA_DELTA=1 without detools: set it as udsota.h says, or on a host with udsota_with_delta()"
+#endif
 
 #if defined(ESP_PLATFORM)
 #include "sdkconfig.h"
 #include "bootloader_random.h"
 #include "esp_app_desc.h"
 #include "esp_app_format.h"
+#if UDSOTA_DELTA
+#include "esp_image_format.h"
+#endif
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_ota_ops.h"
@@ -1267,6 +1276,11 @@ static int (*s_job)(void);
 static int s_result;
 static bool s_busy = true;                       /* until the worker has read the slots */
 static psa_key_id_t s_pub;
+#if UDSOTA_DELTA
+static const esp_partition_t *s_running;         /* a delta download's base */
+static uint8_t s_base_hash[32];
+static bool s_base_hash_ok;                      /* s_base_hash is read, and kept for the boot */
+#endif
 
 static uint8_t slot_of(const esp_partition_t *p)
 {
@@ -1351,6 +1365,9 @@ static void worker(void *arg)
 int udsota_plat_start(void)
 {
     const esp_partition_t *run = esp_ota_get_running_partition();
+#if UDSOTA_DELTA
+    s_running = run;
+#endif
     s_target = esp_ota_get_next_update_partition(NULL);
     if (s_target == NULL || s_target == run) {
         s_target = NULL;
@@ -1517,6 +1534,42 @@ void udsota_plat_status(udsota_status_t *out)
     *out = s_st;
     taskEXIT_CRITICAL(&s_mux);
 }
+
+#if UDSOTA_DELTA
+/* The worker, a delta download's base: n bytes of the running slot at off, bounded by the slot and not the image, so a
+ * signature block past the image reads too. esp_partition_read is esp_flash_read, or under flash encryption a map made
+ * and dropped for each read. Never hold a map of the slot: with XIP from PSRAM a held map turns the cache off for every
+ * erase and write. */
+bool udsota_plat_base_read(uint32_t off, void *buf, size_t n)
+{
+    return s_running != NULL && (uint64_t)off + n <= s_running->size &&
+           esp_partition_read(s_running, off, buf, n) == ESP_OK;
+}
+
+/* The worker, the base's identity: the SHA-256 the running image appends, as esp_image_get_metadata reads it, which
+ * hashes nothing and takes no PSA lock. The first call reads it and later ones reuse it, as the running image never
+ * changes. A base that no longer matches its stored hash only rebuilds an image FF01 refuses. */
+bool udsota_plat_base_hash(uint8_t out[32])
+{
+    if (!s_base_hash_ok && s_running != NULL) {
+        const esp_partition_pos_t pos = {.offset = s_running->address, .size = s_running->size};
+        esp_image_metadata_t md;
+        const esp_err_t err = esp_image_get_metadata(&pos, &md);
+        s_base_hash_ok = (err == ESP_OK && md.image.hash_appended == 1u);
+        if (s_base_hash_ok) {
+            memcpy(s_base_hash, md.image_digest, sizeof s_base_hash);
+        } else if (err != ESP_OK) {
+            LOGW("can't read the running image to match a delta's base against: %s", esp_err_to_name(err));
+        } else {
+            LOGW("the running image has no appended SHA-256 to match a delta's base against");
+        }
+    }
+    if (s_base_hash_ok) {
+        memcpy(out, s_base_hash, sizeof s_base_hash);
+    }
+    return s_base_hash_ok;
+}
+#endif
 
 uint32_t udsota_plat_slot_size(void) { return (s_target != NULL) ? s_target->size : 0u; }
 const char *udsota_plat_version(void) { return esp_app_get_description()->version; }

@@ -293,6 +293,9 @@ static esp_err_t server_start(void)
 #if defined(POC_ALLOW_DOWNGRADE)
         .allow_downgrade = true,
 #endif
+#if UDSOTA_DELTA
+        .allow_delta = true,
+#endif
     };
     if (udsota_init(&cfg) != 0) {
         ESP_LOGW(TAG, "udsota: no inactive slot or worker; downloads refused");

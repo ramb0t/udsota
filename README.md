@@ -108,7 +108,7 @@ udsota never changes iso14229's code. Where iso14229 has no call for what an upd
 |---|---|
 | `udsota.c`, `udsota.h` | The updater, iso14229's events and the ESP-IDF platform. `udsota.h` ends with the platform functions a port to another MCU would supply |
 | `iso14229/` | iso14229, vendored unmodified, with its MIT licence and `SHA256SUMS`, which CI checks; its commit is in [THIRD_PARTY.md](THIRD_PARTY.md) |
-| `detools/` | detools' C library, vendored unmodified, with its BSD-2-Clause licence and `SHA256SUMS`, which CI checks; its tag is in [THIRD_PARTY.md](THIRD_PARTY.md) |
+| `detools/` | detools' C library, vendored unmodified, with its BSD-2-Clause licence and `SHA256SUMS`, which CI checks, compiled only in a build that defines `UDSOTA_DELTA=1`; its tag is in [THIRD_PARTY.md](THIRD_PARTY.md) |
 | `CMakeLists.txt` | The ESP-IDF component, or on a host the tests |
 | [`examples/esp32`](examples/esp32/README.md) | The smallest app, for any ESP32 with TWAI, with the client's `example` profile's identity; its image is the one a release carries |
 | [`examples/candash_ws43`](examples/candash_ws43/README.md) | An app on the CANDash ws43 or ws43b (ESP32-S3) with CANDash's identity, so updates go both ways |
