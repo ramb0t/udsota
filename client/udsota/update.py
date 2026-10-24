@@ -160,7 +160,7 @@ def download(uds, image, drop_76=None, log=print, compress="none", clock=time.mo
         if send_payload(uds, image, patch, max_data, "delta", drop_76=drop_76, log=log, clock=clock):
             return
         log("the device is not running the base this patch was made from (0x36 answered 0x31, F1F1 DL_BAD_BASE; "
-            "for example a re-signed build of the same source): sending a full download")
+            "for example a rebuild of the same source that is not byte-identical): sending a full download")
         if reenter is not None and uds.read_did(DID_SESSION)[:1] != bytes([SESSION_PROGRAMMING]):
             log("the programming session ended while the answer was awaited: entering it again")
             reenter()

@@ -3875,8 +3875,9 @@ ESPRESSIF_PATCH = pathlib.Path(__file__).resolve().parents[2] / "test" / "fixtur
 DELTA_BASE, DELTA_NEW = delta_pair()
 
 
-# A re-signed build of base: the same app_elf_sha256, other bytes after it, so another appended SHA-256.
-def resigned(base):
+# A rebuild of base that is not byte-identical: the same app_elf_sha256, other bytes after it, so another appended
+# SHA-256.
+def rebuilt(base):
     img = bytearray(base)
     img[400] ^= 0xFF
     return reseal(img)
@@ -3922,7 +3923,7 @@ def test_flash_delta_uses_the_matching_base():
 # matching base has no valid appended SHA-256: each run is the full download.
 @pytest.mark.parametrize("bases, why", [
     ([("other.bin", build_image(version="v0.1.0"))], "no delta: none of the 1 base files has the running"),
-    ([("a.bin", DELTA_BASE), ("b.bin", resigned(DELTA_BASE))], "no delta: 2 different base files have the running"),
+    ([("a.bin", DELTA_BASE), ("b.bin", rebuilt(DELTA_BASE))], "no delta: 2 different base files have the running"),
     ([("a.bin", DELTA_BASE[:-1] + bytes([DELTA_BASE[-1] ^ 1]))], "no delta: the base a.bin has no valid appended"),
 ])
 def test_flash_delta_without_a_usable_base(bases, why):
@@ -4057,21 +4058,21 @@ def test_flash_delta_falls_back_on_0x31_at_the_34(served, dfis):
             in lines)
 
 
-# Check a 36 refused with 0x31 and F1F1 DL_BAD_BASE (the server runs a re-signed build: same app_elf_sha256, other
-# image) skips every other delta mode and sends the full download with a new 34; or, with the 7F 36 31 lost, the
-# resent block finds the download ended, 0x24 from a v0.14.x server and 0x70 from one on iso14229, and F1F1 reads
-# DL_BAD_BASE, and the same fallback follows. When S3 ended the session during the wait, as iso14229's does, the
-# client enters the programming session and unlocks again first.
+# Check a 36 refused with 0x31 and F1F1 DL_BAD_BASE (the server runs a rebuild that is not byte-identical: same
+# app_elf_sha256, other image) skips every other delta mode and sends the full download with a new 34; or, with the
+# 7F 36 31 lost, the resent block finds the download ended, 0x24 from a v0.14.x server and 0x70 from one on
+# iso14229, and F1F1 reads DL_BAD_BASE, and the same fallback follows. When S3 ended the session during the wait, as
+# iso14229's does, the client enters the programming session and unlocks again first.
 @pytest.mark.parametrize("lost, ended", [(False, 0x24), (True, 0x24), (True, 0x70), ("s3", 0x70)],
                          ids=["refused", "answer_lost", "answer_lost_0x70", "answer_lost_past_s3"])
 def test_flash_delta_wrong_base_falls_back_to_a_full_download(lost, ended):
-    d = delta_server(base=resigned(DELTA_BASE), lose_bad_base=lost, ended_nrc=ended)
+    d = delta_server(base=rebuilt(DELTA_BASE), lose_bad_base=lost, ended_nrc=ended)
     rc, lines = run_delta(d, [("a.bin", DELTA_BASE)], compress="auto")
     assert rc == 0 and d.dfis == [0x30, 0x10] and bytes(d.written) == DELTA_NEW
     assert any(ln.startswith("the device is not running the base this patch was made from") for ln in lines)
     again = "the programming session ended while the answer was awaited: entering it again"
     assert (again in lines, d.log.count((0x10, 0x02))) == ((True, 2) if lost == "s3" else (False, 1))
-    d = delta_server(base=resigned(DELTA_BASE), lose_bad_base=lost, ended_nrc=ended)
+    d = delta_server(base=rebuilt(DELTA_BASE), lose_bad_base=lost, ended_nrc=ended)
     assert run_delta(d, [("a.bin", DELTA_BASE)], compress="none")[0] == 0 and d.dfis == [0x20, 0x00]
 
 
@@ -4132,8 +4133,8 @@ def test_main_diff_from_a_directory(tmp_path, full_path, capsys, monkeypatch):
     master.write_bytes(MASTER)
     (bases / "old").mkdir(parents=True)
     (bases / "v0.2.0.bin").write_bytes(DELTA_BASE)
-    (bases / "old" / "resigned.bin").write_bytes(resigned(DELTA_BASE))
-    (bases / "resigned.img").write_bytes(resigned(DELTA_BASE))
+    (bases / "old" / "rebuilt.bin").write_bytes(rebuilt(DELTA_BASE))
+    (bases / "rebuilt.img").write_bytes(rebuilt(DELTA_BASE))
     d = delta_server(boot_silence=0, confirm_refusals=0)
     rc = cli.main(["--profile", full_path, "--master", str(master), "flash", str(img), "--diff-from", str(bases),
                    "--compress-auto"], transport=FakeTransport.on(d))
