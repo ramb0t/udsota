@@ -16,7 +16,7 @@ udsota --profile <CANDash>/tools/udsota-candash.toml flash --compress build/cand
 
 For `-O2`, as CANDash ships, add `-DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.o2"` and give the build its own `-DSDKCONFIG=<build dir>/sdkconfig`, since the project's sdkconfig keeps `-Og`. For the ws43b, add `-DPOC_BOARD=ws43b`; its sdkconfig stays in its build directory, because its console is native USB. Don't power a ws43b with its DI0/DI1 inputs wired: the example drives them high as CANDash does, and CANDash warns that this may damage the CH422G or the optocoupler.
 
-The version keeps CANDash's `0.5.0` core, because a device takes a dev build only when its `X.Y.Z` is at least the running one's. For ECDSA 0x27 instead of CANDash's HMAC master, add `-DPOC_PUBKEY_DIR=<dir>` with the `udsota_pubkey.h` that `udsota keygen` writes, and give the client a profile whose `[security]` has `mode = "ecdsa"` and the private key. `-DPOC_ALLOW_DOWNGRADE=1` sets `cfg.allow_downgrade`, so the image also takes an older one.
+The version keeps CANDash's `0.5.0` core, because a device takes a dev build only when its `X.Y.Z` is at least the running one's. For ECDSA 0x27 instead of CANDash's HMAC master, add `-DPOC_PUBKEY_DIR=<dir>` with the `udsota_pubkey.h` that `udsota keygen` writes, and give the client a profile whose `[security]` has `mode = "ecdsa"` and the private key. `-DPOC_ALLOW_DOWNGRADE=1` sets `cfg.allow_downgrade`, so the image also takes an older one. `-DPOC_DELTA=1` defines `UDSOTA_DELTA=1` build-wide and sets `cfg.allow_delta`.
 
 ## Bench results (2026-10-23)
 

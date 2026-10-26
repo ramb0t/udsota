@@ -16,8 +16,8 @@ from udsoncan.BaseService import BaseService
 from udsota import cli, delta, pack, profile, uds, update, wire
 from udsota.errors import NoResponse, Nrc
 
-from .demo_server import (EXAMPLE, LABEL, MASTER, SECURED, DemoServer, PipeTransport, build_image, elf_sha,
-                          image_file, read_state, run_cli)
+from .demo_server import (EXAMPLE, LABEL, MASTER, SECURED, DemoServer, PipeTransport, build_image, delta_pair,
+                          elf_sha, image_file, read_state, reseal, run_cli, serves_delta)
 
 BUILT = pathlib.Path(__file__).resolve().parents[2] / "build" / "udsota_lite_server"
 OLD = "v0.1.0"                     # the image slot 0 runs when the server starts
@@ -51,19 +51,42 @@ def binary():
     return str(BUILT)
 
 
-# Starts servers for a test, each with slot 0 running OLD, and stops them after it; each must exit 0, so a sanitizer
-# report fails the test. The client's waits follow the server's pace: a restart takes it 0.3 s (the client waits
-# 0.5 s, not 3 s), and a 0x37 is waited out for one keepalive period, not 10 s.
+# A skip naming what is missing, or a failure when $UDSOTA_LITE_SERVER is set (as CI sets it), so that a broken setup
+# cannot pass as skips.
+def missing(why):
+    if os.environ.get("UDSOTA_LITE_SERVER"):
+        pytest.fail(why)
+    pytest.skip(why)
+
+
+# A skip (or a failure, as missing) unless the client can build patches: flash --diff-from needs detools.
+def detools_or_skip():
+    if importlib.util.find_spec("detools") is None:
+        missing('flash --diff-from needs detools: pip install "./client[diff]"')
+
+
+# For the delta cases: a skip (or a failure, as missing) unless the client can build patches and the server serves
+# delta downloads.
+@pytest.fixture(scope="module")
+def served_delta(binary, tmp_path_factory):
+    detools_or_skip()
+    if not serves_delta(binary, tmp_path_factory.mktemp("delta")):
+        missing("udsota_lite_server serves no delta downloads: build it with cmake -DUDSOTA_DELTA=ON")
+
+
+# Starts servers for a test, each with slot 0 running OLD (or image), and stops them after it; each must exit 0, so a
+# sanitizer report fails the test. The client's waits follow the server's pace: a restart takes it 0.3 s (the client
+# waits 0.5 s, not 3 s), and a 0x37 is waited out for one keepalive period, not 10 s.
 @pytest.fixture
 def lite(binary, tmp_path, monkeypatch):
     monkeypatch.setattr(update, "REBOOT_WAIT_S", 0.5)
     monkeypatch.setattr(uds, "SA_DELAY_S", uds.KEEPALIVE_S)
     servers = []
 
-    def start(*args):
+    def start(*args, image=None):
         n = len(servers)
-        image = image_file(tmp_path, build_image(OLD), "running%d.bin" % n)
-        servers.append(DemoServer(binary, ["--image", image, *args], tmp_path / ("server%d.log" % n)))
+        path = image_file(tmp_path, build_image(OLD) if image is None else image, "running%d.bin" % n)
+        servers.append(DemoServer(binary, ["--image", path, *args], tmp_path / ("server%d.log" % n)))
         return servers[-1]
 
     yield start
@@ -209,15 +232,12 @@ def test_unconfirmed_image_rolls_back(lite, tmp_path):
     assert tuple(status["other_version"]) == (0, 2, 0) and version == OLD
 
 
-# Check flash --diff-from on lite, which has no delta downloads: the client builds patches from the running image,
-# both delta 34s (DFI 0x20 and 0x30) answer 0x31, and it sends the full image instead, which runs confirmed.
+# Check flash --diff-from on a server with delta downloads off (--no-delta, or a build without them): the client
+# builds patches from the running image, both delta 34s (DFI 0x20 and 0x30) answer 0x31, and it sends the full image
+# instead, which runs confirmed.
 def test_diff_from_falls_back_to_a_full_image(lite, tmp_path, capsys):
-    if importlib.util.find_spec("detools") is None:
-        why = 'flash --diff-from needs detools: pip install "./client[diff]"'
-        if os.environ.get("UDSOTA_LITE_SERVER"):
-            pytest.fail(why)
-        pytest.skip(why)
-    s = lite()
+    detools_or_skip()
+    s = lite("--no-delta")
     base = image_file(tmp_path, build_image(OLD), "base.bin")
     assert flash(s, secured(tmp_path), image_file(tmp_path, build_image("v0.2.0")), "--diff-from", base) == 0
     out = capsys.readouterr().out
@@ -512,6 +532,83 @@ def test_compressed_first_block_rules_refuse(lite, tmp_path):
         assert wire.decode_status(u.read_did(wire.DID_STATUS))["other_state"] == 0
 
 
+# ---- delta downloads (DFI 0x30) ----
+
+# delta_pair's 48 KB base (v0.2.0) and new image (v0.3.0), and their files under tmp_path.
+def pair(tmp_path):
+    base, new = delta_pair(payload=48 * 1024)
+    return base, new, image_file(tmp_path, base, "base.bin"), image_file(tmp_path, new, "new.bin")
+
+
+# The file under tmp_path of a rebuild of base that is not byte-identical: the running app_elf_sha256 but other
+# bytes, so another appended SHA-256.
+def rebuilt(tmp_path, base):
+    other = bytearray(base)
+    other[1000] ^= 0xFF
+    return image_file(tmp_path, reseal(other), "rebuilt.bin")
+
+
+# Check `flash --diff-from` end to end: the server, which runs the base from slot 1 after a full download, rebuilds
+# the new image into slot 0 from a patch of a few hundred bytes. The smaller mode, 0x30, goes first and is taken, no
+# full download follows, and the new image runs confirmed.
+def test_flash_delta_runs_the_whole_sequence(lite, served_delta, tmp_path, capsys):
+    s = lite()
+    base, new, base_path, new_path = pair(tmp_path)
+    prof = secured(tmp_path)
+    assert flash(s, prof, base_path, "--compress") == 0
+    assert read_state(s)[0]["running_slot"] == 1
+    capsys.readouterr()
+    sent = []
+    s.tap = sent.append
+    assert flash(s, prof, new_path, "--diff-from", base_path) == 0
+    assert [d for m in sent for d in pack.DFIS if is_34(m, d)] == [wire.DL_DFI_DELTA_DEFLATE]
+    out = capsys.readouterr().out
+    assert "delta, DFI 0x30" in out and "confirmed" in out
+    status, sha, version = read_state(s)
+    assert (status["running_slot"], status["running_state"], version, sha) == (0, VALID, "v0.3.0", elf_sha(new))
+
+
+# Check a base rebuilt not byte-identical is refused by the server before anything is erased, with F1F1 DL_BAD_BASE, and
+# the client then skips the other delta mode and sends the full download.
+def test_flash_delta_from_a_wrong_base_falls_back(lite, served_delta, tmp_path, capsys):
+    base, new, _, new_path = pair(tmp_path)
+    s = lite(image=base)
+    sent = []
+    s.tap = sent.append
+    assert flash(s, secured(tmp_path), new_path, "--diff-from", rebuilt(tmp_path, base)) == 0
+    assert [d for m in sent for d in pack.DFIS if is_34(m, d)] == [wire.DL_DFI_DELTA_DEFLATE, wire.DL_DFI]
+    assert "not running the base this patch was made from" in capsys.readouterr().out
+    assert read_state(s)[1:] == (elf_sha(new), "v0.3.0")
+
+
+# Check a delta download on lite's slow jobs, whose results come 100 ms after they are queued, as the ESP32's worker's
+# do: the 36 that rebuilds the image and the 37 that checks the patch's end both answer 0x78 first, and the update
+# completes.
+def test_flash_delta_on_slow_jobs(lite, served_delta, tmp_path):
+    base, new, base_path, new_path = pair(tmp_path)
+    s = lite(image=base)
+    sent = []
+    s.tap = sent.append
+    assert flash(s, secured(tmp_path), new_path, "--diff-from", base_path) == 0
+    assert [d for m in sent for d in pack.DFIS if is_34(m, d)] == [wire.DL_DFI_DELTA_DEFLATE]
+    assert all(any(is_nrc(m, sid, wire.NRC_PENDING) for m in s.sent) for sid in (0x36, 0x37))
+    assert read_state(s)[2] == "v0.3.0"
+
+
+# Check flash falls back the same way when the 0x31 naming DL_BAD_BASE is lost: the client resends the block, which
+# the ended download answers 0x70, and F1F1 still reads DL_BAD_BASE. S3 ended the session while the client waited
+# for the answer, so it enters the programming session again before the full download.
+def test_flash_delta_from_a_wrong_base_falls_back_after_a_lost_answer(lite, served_delta, tmp_path, capsys):
+    base, new, _, new_path = pair(tmp_path)
+    s = lite(image=base)
+    s.drop = lambda m: is_nrc(m, 0x36, wire.NRC_OUT_OF_RANGE) and not s.dropped
+    assert flash(s, secured(tmp_path), new_path, "--diff-from", rebuilt(tmp_path, base)) == 0
+    assert len(s.dropped) == 1 and any(is_nrc(m, 0x36, wire.NRC_NOT_ACCEPTED) for m in s.sent)
+    out = capsys.readouterr().out
+    assert "not running the base this patch was made from" in out and "entering it again" in out
+    assert read_state(s)[1:] == (elf_sha(new), "v0.3.0")
+
+
 # ---- pack: another flasher, from the payloads and manifest alone ----
 
 # `udsota pack new --out tmp_path/pack *args`; returns the output directory and the manifest.
@@ -521,23 +618,27 @@ def packed(tmp_path, new, *args):
     return out, json.loads((out / (pathlib.Path(new).stem + ".manifest.json")).read_text())
 
 
-# A flasher that is not this client, as docs/wire.md's "Flashing without the client" has it: it knows only the
-# manifest, the payload files and the key, and makes the Uds calls flash makes. The precheck, 10 02 and the
-# programming unlock, then each full payload in manifest order until one is taken (0x31, or 0x22 with DL_NO_MEMORY,
-# at the 34 moves on to the next); F1F1 after the 37 must count every payload byte. Then FF01, ActivateImage, F1F3
-# showing the new image, ConfirmImage. Returns the DFIs whose 34 was sent, and the F1F1 reasons that moved it on.
+# A flasher that is not this client, as docs/wire.md's "Flashing without the client" has it: it knows only the manifest,
+# the payload files and the key, and makes the Uds calls flash makes. The precheck, 10 02 and the programming unlock,
+# then each payload in manifest order (a delta only when F1F3 is its base) until one is taken: 0x31, or 0x22 with
+# DL_NO_MEMORY, at the 34 moves on to the next, and a 36 refused with DL_BAD_BASE (0x31, or after a lost answer 0x70 to
+# the resent block) to the next full one, in the programming session again if S3 ended it while the answer was awaited.
+# F1F1 after the 37 must count every payload byte. Then FF01, ActivateImage, F1F3 showing the new image, ConfirmImage.
+# Returns the DFIs whose 34 was sent, and the F1F1 reasons that moved it on.
 def flash_packed(server, prof, out, manifest):
-    tried, why, first = [], [], manifest["payloads"][0]
+    tried, why, bad_base, first = [], [], False, manifest["payloads"][0]
     with PipeTransport(prof, server) as t:
         u = t.uds()
         reason = lambda: wire.decode_result(u.read_did(wire.DID_RESULT))[0]
         state = wire.decode_status(u.read_did(wire.DID_STATUS))
-        assert u.read_did(wire.DID_RUNNING_SHA).hex() != first["image_elf_sha256"]
-        assert state["running_state"] != PENDING
+        running = u.read_did(wire.DID_RUNNING_SHA).hex()
+        assert running != first["image_elf_sha256"] and state["running_state"] != PENDING
         if first["board_did"] is not None:
             assert wire.cstr(u.read_did(first["board_did"])) == first["board"]
         update.enter_programming(u, prof, update.device_keys(u, prof, MASTER))
         for e in manifest["payloads"]:
+            if "base_elf_sha256" in e and (bad_base or e["base_elf_sha256"] != running):
+                continue
             data = (out / e["file"]).read_bytes()
             assert hashlib.sha256(data).hexdigest() == e["payload_sha256"]
             tried.append(e["dfi"])
@@ -548,8 +649,20 @@ def flash_packed(server, prof, out, manifest):
                     why.append(reason())
                     continue
                 raise
-            for n, off in enumerate(range(0, len(data), max_data), 1):
-                u.transfer(n & 0xFF, data[off:off + max_data])
+            try:
+                for n, off in enumerate(range(0, len(data), max_data), 1):
+                    try:
+                        u.transfer(n & 0xFF, data[off:off + max_data])
+                    except NoResponse:          # resent once, unchanged: the counter rule makes that safe
+                        u.transfer(n & 0xFF, data[off:off + max_data])
+            except Nrc as x:
+                if x.code in (wire.NRC_OUT_OF_RANGE, wire.NRC_NOT_ACCEPTED) and reason() == "DL_BAD_BASE":
+                    why.append("DL_BAD_BASE")
+                    bad_base = True
+                    if u.read_did(wire.DID_SESSION) != bytes([wire.SESSION_PROGRAMMING]):   # S3 ran out meanwhile
+                        update.enter_programming(u, prof, update.device_keys(u, prof, MASTER))
+                    continue
+                raise
             u.transfer_exit()
             assert wire.decode_result(u.read_did(wire.DID_RESULT)) == ("DL_OK", e["payload_size"])
             break
@@ -562,22 +675,55 @@ def flash_packed(server, prof, out, manifest):
     return tried, why
 
 
-# Check each full mode pack writes, sent by the flasher above, takes the server where `flash` of the same image in that
-# mode does: one 34, with that DFI, and the new image running and confirmed.
-@pytest.mark.parametrize("dfi", [wire.DL_DFI, wire.DL_DFI_DEFLATE])
-def test_packed_payload_updates_as_flash_does(lite, tmp_path, dfi):
-    by_flash, by_pack = lite(), lite()
+# For each DFI: pack's extra arguments, flash's, and the DFIs whose 34 both then send. A delta is from the running
+# base. 0x20 is packed with 0x10 behind it and flashed with --compress: its 34 answers 0x31 and 0x10 follows.
+PACKED = {wire.DL_DFI: (["--dfi", "0x00"], ["--no-compress"], [wire.DL_DFI]),
+          wire.DL_DFI_DEFLATE: (["--dfi", "0x10"], ["--compress"], [wire.DL_DFI_DEFLATE]),
+          wire.DL_DFI_DELTA: (["--dfi", "0x20", "--dfi", "0x10"], ["--diff-format", "heatshrink", "--compress"],
+                              [wire.DL_DFI_DELTA, wire.DL_DFI_DEFLATE]),
+          wire.DL_DFI_DELTA_DEFLATE: (["--dfi", "0x30"], ["--diff-format", "deflate"], [wire.DL_DFI_DELTA_DEFLATE])}
+
+
+# Check each mode pack writes, sent by the flasher above, takes the server where `flash` of the same image in that
+# mode does: the same 34s, the payload of the last one taken, and the new image running and confirmed. Both servers
+# run delta_pair's base.
+@pytest.mark.parametrize("dfi", pack.DFIS, ids=lambda d: "dfi%02x" % d)
+def test_packed_payload_updates_as_flash_does(lite, tmp_path, request, dfi):
+    if dfi in pack.DELTA_DFIS:
+        detools_or_skip()
+    if dfi == wire.DL_DFI_DELTA_DEFLATE:
+        request.getfixturevalue("served_delta")
+    base, new, base_path, new_path = pair(tmp_path)
+    pack_args, flash_args, dfis = PACKED[dfi]
+    delta_args = ["--diff-from", base_path] if dfi in pack.DELTA_DFIS else []
+    by_flash, by_pack = lite(image=base), lite(image=base)
     prof = secured(tmp_path)
-    new = image_file(tmp_path, z_image("v0.3.0"), "new.bin")
-    out, manifest = packed(tmp_path, new, "--dfi", "0x%02x" % dfi)
-    assert flash_packed(by_pack, profile.load(prof), out, manifest) == ([dfi], [])
+    out, manifest = packed(tmp_path, new_path, *pack_args, *delta_args)
+    assert [e["dfi"] for e in manifest["payloads"]] == dfis
+    assert flash_packed(by_pack, profile.load(prof), out, manifest) == (dfis, ["DL_OK"] * (len(dfis) - 1))
     sent = []
     by_flash.tap = sent.append
-    assert flash(by_flash, prof, new, {wire.DL_DFI: "--no-compress", wire.DL_DFI_DEFLATE: "--compress"}[dfi]) == 0
-    assert [d for d in pack.DFIS for m in sent if is_34(m, d)] == [dfi]
+    assert flash(by_flash, prof, new_path, *flash_args, *delta_args) == 0
+    assert [d for m in sent for d in pack.DFIS if is_34(m, d)] == dfis
     state = read_state(by_pack)
     assert state == read_state(by_flash)
-    assert (state[0]["running_state"], state[1], state[2]) == (VALID, elf_sha(z_image("v0.3.0")), "v0.3.0")
+    assert (state[0]["running_state"], state[1], state[2]) == (VALID, elf_sha(new), "v0.3.0")
+
+
+# Check the fallbacks the manifest allows: a base rebuilt not byte-identical has the running app_elf_sha256 but other
+# bytes, so the server refuses the first delta's 36 with DL_BAD_BASE, and the flasher skips the other delta and goes on
+# through the manifest to the full download. With that 0x31 lost, the resent block gets 0x70 and F1F1 still reads
+# DL_BAD_BASE, which moves it on the same way.
+@pytest.mark.parametrize("lose_answer", [False, True])
+def test_packed_delta_from_a_wrong_base_falls_back(lite, served_delta, tmp_path, lose_answer):
+    base, new, _, new_path = pair(tmp_path)
+    s = lite(image=base)
+    out, manifest = packed(tmp_path, new_path, "--diff-from", rebuilt(tmp_path, base))
+    if lose_answer:
+        s.drop = lambda m: is_nrc(m, 0x36, wire.NRC_OUT_OF_RANGE) and not s.dropped
+    assert flash_packed(s, profile.load(secured(tmp_path)), out, manifest) == \
+        ([wire.DL_DFI_DELTA_DEFLATE, wire.DL_DFI_DEFLATE], ["DL_BAD_BASE"])
+    assert len(s.dropped) == lose_answer and read_state(s)[1:] == (elf_sha(new), "v0.3.0")
 
 
 # ---- services udsota and the app don't serve ----

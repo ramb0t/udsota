@@ -1,8 +1,10 @@
 # Third-party code
 
-udsota vendors two libraries, both unmodified and each under its own MIT licence, which applies to its files only.
+udsota vendors three libraries, each unmodified and under its own licence, which applies to its files only.
 
 **iso14229** by driftregion and contributors: the single-file amalgamation `iso14229.c` and `iso14229.h`, with the isotp-c it embeds, and its licence, in `iso14229/`. They are upstream's committed files at `d018adc7015a88d7a4f164418fcb7e7927e5aa77`, upstream main of 2026-09-29, untagged. `iso14229/SHA256SUMS` holds their hashes, and CI fails if they change. The header's `UDS_LIB_VERSION` says 0.11.0, but the tag 0.11.0 is an earlier commit (8a7eb23d, whose header says 0.10.2); this one is 31 commits past it. Upstream CI passed at this commit: GitHub Actions unit tests (run 36615027352: linux, windows, arduino, esp32 on ESP-IDF 5.2), static analysis (run 36615027250, whose lint job checks the amalgamation against `src/`), and CircleCI.
+
+**detools** by Erik Moqvist: its C library's `detools.c` and `detools.h`, from upstream's `c/`, and its licence, in `detools/`. They are upstream's files at tag `0.53.0`, commit `150ae7ee8e066cefca9d8fe075d282d012556931`, the same release the client's `diff` extra pins. `detools/SHA256SUMS` holds their hashes, and CI fails if they change. The licence is BSD-2-Clause; its line for sais-lite (MIT) covers upstream's `bsdiff/sais.c`, which is not vendored. udsota compiles `detools.c` only in a build that defines `UDSOTA_DELTA=1`.
 
 **miniz** by Rich Geldreich, RAD Game Tools and Valve Software: release 3.0.2's amalgamated `miniz.c` and `miniz.h`, with its licence, in `test/miniz/`. Only the host builds use it. On the ESP32, udsota calls the ROM's copy of miniz's inflater, tinfl.
 

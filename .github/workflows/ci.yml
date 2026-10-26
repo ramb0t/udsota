@@ -1,8 +1,9 @@
-# udsota: the host test and the fuzzer's replay, the client's tests and the release tool's, the client against
-# udsota_lite_server over the pipe and on vcan0 (gcc and clang builds of each, and the fuzzer's libFuzzer build on
-# clang), the CANDash example built with a throwaway signing key for the ws43, the ws43b and the ws43 at -O2, and what a
-# release of this commit would carry (release-assets.yml): the client's wheel and sdist and examples/esp32's image for
-# esp32s3 and esp32. Every image build fails on a compiler warning, and every image must pass udsota's image rules
+# udsota: the host test with and without delta downloads and the fuzzer's replay with its delta seeds, the client's
+# tests and the release tool's, the client against udsota_lite_server, built with delta downloads, over the pipe and
+# on vcan0 (gcc and clang builds of each, and the fuzzer's libFuzzer build on clang), the CANDash example built with a
+# throwaway signing key for the ws43, the ws43b, the ws43 at -O2 and the ws43 with delta downloads, and what a release
+# of this commit would carry (release-assets.yml): the client's wheel and sdist and examples/esp32's image for esp32s3
+# and esp32. Every image build fails on a compiler warning, and every image must pass udsota's image rules
 # (tools/image_check.c) while a copy with a broken descriptor must not.
 name: ci
 on: [push, pull_request]
@@ -16,7 +17,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: The vendored iso14229 files match iso14229/SHA256SUMS
         run: cd iso14229 && sha256sum -c SHA256SUMS
-      - run: |
+      - name: The vendored detools files match detools/SHA256SUMS
+        run: cd detools && sha256sum -c SHA256SUMS
+      - name: The host tests, test_udsota_delta and the fuzzer's delta seeds among them
+        run: |
           cmake -S . -B build -DUDSOTA_FUZZ_LIBFUZZER="$FUZZ_LIBFUZZER"
           cmake --build build -j && ctest --test-dir build --output-on-failure
         env:
@@ -44,7 +48,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: cmake -S . -B build && cmake --build build -j --target udsota_lite_server && test -x build/udsota_lite_server
+      - run: |
+          cmake -S . -B build -DUDSOTA_DELTA=ON
+          cmake --build build -j --target udsota_lite_server && test -x build/udsota_lite_server
         env:
           CC: ${{ matrix.cc }}
       - run: python -m pip install "./client[diff]" pytest && python -m pytest -q -rsx client/tests/test_e2e_lite.py
@@ -72,7 +78,7 @@ jobs:
     container: espressif/idf:v6.1
     steps:
       - uses: actions/checkout@v4
-      - name: Build the CANDash example for the ws43, the ws43b and the ws43 at -O2, failing on any warning
+      - name: Build the CANDash example for the ws43, the ws43b, the ws43 at -O2 and with delta, failing on any warning
         shell: bash
         run: |
           . "$IDF_PATH/export.sh"
@@ -90,12 +96,16 @@ jobs:
           # override an option an sdkconfig already sets.
           build build-o2 -D SDKCONFIG="$PWD/build-o2/sdkconfig" -D SDKCONFIG_DEFAULTS="$p/sdkconfig.defaults;$p/sdkconfig.defaults.o2"
           grep -qx 'CONFIG_COMPILER_OPTIMIZATION_PERF=y' build-o2/sdkconfig || { echo "build-o2 is not -O2"; exit 1; }
+          # Delta downloads: UDSOTA_DELTA=1 build-wide, so detools.c is compiled under the same warning gate.
+          build build-delta -DPOC_DELTA=1
+          grep -q 'detools\.c' build-delta/compile_commands.json || { echo "build-delta has no detools.c"; exit 1; }
       - name: Collect the images for image-check
         run: |
           mkdir -p out
           cp build/candash.bin out/candash-ws43.bin
           cp build-ws43b/candash.bin out/candash-ws43b.bin
           cp build-o2/candash.bin out/candash-ws43-o2.bin
+          cp build-delta/candash.bin out/candash-ws43-delta.bin
       - uses: actions/upload-artifact@v4
         with:
           name: candash
@@ -132,3 +142,4 @@ jobs:
           check ws43 candash-ws43 candash
           check ws43b candash-ws43b candash
           check ws43 candash-ws43-o2 candash
+          check ws43 candash-ws43-delta candash

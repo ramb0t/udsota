@@ -187,7 +187,7 @@ class FakeServer:
                  lose_ff01_once=False, activate_nrcs=None, activate_fail=None, no_fc=None, security=True,
                  pubkey=None, cfg_keys=None, commit_status=0, compress=False, z_nomem=False, delta=(), base=None,
                  no_memory=(), lose_bad_base=False, dtcs=None, dtc_ext=None, dtc_avail=0x2F, dtc_format=0x00,
-                 level_extended=0x01, cfg_groups=(), s3_on=None):
+                 level_extended=0x01, cfg_groups=(), s3_on=None, ended_nrc=0x24):
         self.max_block, self.boot_silence, self.confirm_refusals = max_block, boot_silence, confirm_refusals
         self.running_state, self.sha, self.board = running_state, sha, board
         self.other_state, self.other_sha = other_state, other_sha
@@ -210,7 +210,9 @@ class FakeServer:
         self.dfi, self.zin = 0x00, bytearray()  # the open download's format, and its compressed bytes
         self.delta, self.base = tuple(delta), base   # the delta DFIs served, and the image their patches apply to
         self.no_memory = tuple(no_memory)       # delta DFIs whose 34 finds no memory: 0x22, F1F1 DL_NO_MEMORY
-        self.lose_bad_base = lose_bad_base      # the 7F 36 31 of a patch for another base is lost
+        self.lose_bad_base = lose_bad_base      # the 7F 36 31 of a patch for another base is lost; "s3": and S3 ends
+        self.ended_nrc = ended_nrc              # a 36 with no download open: 0x24 (v0.14.x) or 0x70 (iso14229, in
+                                                # any session)
         self.dfis = []                          # every 34's DFI, in order
         self.log, self.written, self.writes = [], bytearray(), 0
         self.silence, self.announced, self.next_bsc, self.last_bsc = 0, None, 1, None
@@ -246,6 +248,8 @@ class FakeServer:
             return []
         if (sid, arg) in self.nrc_once:
             return self.nrc(sid, self.nrc_once.pop((sid, arg)))
+        if sid == 0x36 and not self.dl_open and self.ended_nrc == 0x70:
+            return self.nrc(sid, 0x70)                  # iso14229 checks for a transfer before the session
         if self.session == 1 and sid in (0x11, 0x27, 0x31, 0x34, 0x36, 0x37):
             return self.nrc(sid, 0x7F)                  # serviceNotSupportedInActiveSession
         if self.security and sid in (0x34, 0x36, 0x37) and self.unlocked != 3:
@@ -287,7 +291,7 @@ class FakeServer:
         status = (bytes([1, self.running_state, boot_slot, self.other_state, 0, 3, 0]) + self.other_sha[:8]
                 + bytes([1]))
         result = bytes([self.last_dl[0]]) + self.last_dl[1].to_bytes(4, "big")
-        records = {0xF186: b"\x01", 0xF189: b"v0.2.9-3-gabc", 0xF18C: MAC, 0xF191: self.board,
+        records = {0xF186: bytes([self.session]), 0xF189: b"v0.2.9-3-gabc", 0xF18C: MAC, 0xF191: self.board,
                    0xF1B0: bytes(32), 0xF1F0: status, 0xF1B1: b"\x01\x02\x03", 0xF1F3: self.sha,
                    0xF1F1: result, 0xF1F2: bytes(16), **(self.cfg_keys or {}), **self.cfg_records(), **self.config}
         if did not in records:
@@ -364,7 +368,7 @@ class FakeServer:
     # 0x36 TransferData: repeat of the last counter answers without writing; a wrong one gets 0x73.
     def s36(self, req, bsc):
         if not self.dl_open:
-            return self.nrc(0x36, 0x24)
+            return self.nrc(0x36, self.ended_nrc)
         if bsc == self.mute_block:
             return []
         if bsc == self.last_bsc:
@@ -382,6 +386,8 @@ class FakeServer:
             if len(head) == delta.HEADER_LEN:
                 if head != delta.header(delta.validation_hash(self.base)):
                     self.dl_open, self.last_dl = False, (15, len(self.zin))    # DL_BAD_BASE
+                    if self.lose_bad_base == "s3":      # the wait for the lost answer outlasts S3
+                        self.session, self.unlocked = 1, 0
                     return [] if self.lose_bad_base else self.nrc(0x36, 0x31)
                 self.header_ok = True
         self.last_bsc, self.next_bsc = bsc, (bsc + 1) & 0xFF
@@ -1253,9 +1259,9 @@ def test_wire_numbers_match_udsota_wire():
 
 
 UDSOTA_H, ISO14229_H = REPO / "udsota.h", REPO / "iso14229" / "iso14229.h"
-# What wire.py mirrors that this server has no number for: F1F2, delta, the DTC services and the boot-loop flag
-# (0x02) belong to v0.14.2's server, and iso14229 takes any ALFID. The v0.14.x test above still checks them.
-NOT_IN_UDSOTA_H = {"UDSOTA_DID_COUNTERS", "UDSOTA_DL_DFI_DELTA", "UDSOTA_DL_DFI_DELTA_DEFLATE", "UDSOTA_DL_ALFID",
+# What wire.py mirrors that this server has no number for: F1F2, delta's DFI 0x20, the DTC services and the boot-loop
+# flag (0x02) belong to v0.14.2's server, and iso14229 takes any ALFID. The v0.14.x test above still checks them.
+NOT_IN_UDSOTA_H = {"UDSOTA_DID_COUNTERS", "UDSOTA_DL_DFI_DELTA", "UDSOTA_DL_ALFID",
                    "UDSOTA_RDTC_COUNT_BY_MASK", "UDSOTA_RDTC_BY_MASK", "UDSOTA_RDTC_EXT_DATA", "UDSOTA_RDTC_SUPPORTED",
                    "UDSOTA_DTC_RECORD_ALL", "UDSOTA_DTC_GROUP_ALL"}
 # The NRCs in WIRE_DEFINES, which this server takes from iso14229.h.
@@ -1321,6 +1327,7 @@ def test_wire_numbers_match_udsota_h():
     iso = ISO14229_H.read_text()
     nrcs = {m[1]: int(m[2], 0) for m in re.finditer(r"\b(UDS_NRC_\w+)\s*=\s*(0x[0-9A-Fa-f]+)", iso)}
     assert {c: nrcs[n] for c, n in NRC_ISO14229.items()} == {c: getattr(wire, WIRE_DEFINES[c]) for c in NRC_ISO14229}
+    assert nrcs["UDS_NRC_UploadDownloadNotAccepted"] == wire.NRC_NOT_ACCEPTED   # no v0.14.x name: iso14229's own
     sessions = {m[1]: int(m[2]) for m in re.finditer(r"#define\s+(UDS_LEV_DS_\w+)\s+(\d+)U\b", iso)}
     assert (sessions["UDS_LEV_DS_PRGS"], sessions["UDS_LEV_DS_EXTDS"]) == (wire.SESSION_PROGRAMMING,
                                                                           wire.SESSION_EXTENDED)
@@ -3868,8 +3875,9 @@ ESPRESSIF_PATCH = pathlib.Path(__file__).resolve().parents[2] / "test" / "fixtur
 DELTA_BASE, DELTA_NEW = delta_pair()
 
 
-# A re-signed build of base: the same app_elf_sha256, other bytes after it, so another appended SHA-256.
-def resigned(base):
+# A rebuild of base that is not byte-identical: the same app_elf_sha256, other bytes after it, so another appended
+# SHA-256.
+def rebuilt(base):
     img = bytearray(base)
     img[400] ^= 0xFF
     return reseal(img)
@@ -3915,7 +3923,7 @@ def test_flash_delta_uses_the_matching_base():
 # matching base has no valid appended SHA-256: each run is the full download.
 @pytest.mark.parametrize("bases, why", [
     ([("other.bin", build_image(version="v0.1.0"))], "no delta: none of the 1 base files has the running"),
-    ([("a.bin", DELTA_BASE), ("b.bin", resigned(DELTA_BASE))], "no delta: 2 different base files have the running"),
+    ([("a.bin", DELTA_BASE), ("b.bin", rebuilt(DELTA_BASE))], "no delta: 2 different base files have the running"),
     ([("a.bin", DELTA_BASE[:-1] + bytes([DELTA_BASE[-1] ^ 1]))], "no delta: the base a.bin has no valid appended"),
 ])
 def test_flash_delta_without_a_usable_base(bases, why):
@@ -4050,17 +4058,31 @@ def test_flash_delta_falls_back_on_0x31_at_the_34(served, dfis):
             in lines)
 
 
-# Check a 36 refused with 0x31 and F1F1 DL_BAD_BASE (the server runs a re-signed build: same app_elf_sha256, other
-# image) skips every other delta mode and sends the full download with a new 34; or, with the 7F 36 31 lost, the
-# resent block finds the download ended (0x24) and F1F1 reads DL_BAD_BASE, and the same fallback follows.
-@pytest.mark.parametrize("lost", [False, True], ids=["refused", "answer_lost"])
-def test_flash_delta_wrong_base_falls_back_to_a_full_download(lost):
-    d = delta_server(base=resigned(DELTA_BASE), lose_bad_base=lost)
+# Check a 36 refused with 0x31 and F1F1 DL_BAD_BASE (the server runs a rebuild that is not byte-identical: same
+# app_elf_sha256, other image) skips every other delta mode and sends the full download with a new 34; or, with the
+# 7F 36 31 lost, the resent block finds the download ended, 0x24 from a v0.14.x server and 0x70 from one on
+# iso14229, and F1F1 reads DL_BAD_BASE, and the same fallback follows. When S3 ended the session during the wait, as
+# iso14229's does, the client enters the programming session and unlocks again first.
+@pytest.mark.parametrize("lost, ended", [(False, 0x24), (True, 0x24), (True, 0x70), ("s3", 0x70)],
+                         ids=["refused", "answer_lost", "answer_lost_0x70", "answer_lost_past_s3"])
+def test_flash_delta_wrong_base_falls_back_to_a_full_download(lost, ended):
+    d = delta_server(base=rebuilt(DELTA_BASE), lose_bad_base=lost, ended_nrc=ended)
     rc, lines = run_delta(d, [("a.bin", DELTA_BASE)], compress="auto")
     assert rc == 0 and d.dfis == [0x30, 0x10] and bytes(d.written) == DELTA_NEW
     assert any(ln.startswith("the device is not running the base this patch was made from") for ln in lines)
-    d = delta_server(base=resigned(DELTA_BASE), lose_bad_base=lost)
+    again = "the programming session ended while the answer was awaited: entering it again"
+    assert (again in lines, d.log.count((0x10, 0x02))) == ((True, 2) if lost == "s3" else (False, 1))
+    d = delta_server(base=rebuilt(DELTA_BASE), lose_bad_base=lost, ended_nrc=ended)
     assert run_delta(d, [("a.bin", DELTA_BASE)], compress="none")[0] == 0 and d.dfis == [0x20, 0x00]
+
+
+# Check a 0x70 to a delta's 36 falls back only when F1F1 reads DL_BAD_BASE: with F1F1 on any other reason, here
+# DL_OK, the run stops naming the 0x70.
+def test_flash_delta_0x70_without_bad_base_stops():
+    d = delta_server(nrc_once={(0x36, 1): 0x70})
+    with pytest.raises(errors.UpdateFailed, match="answered NRC 0x70.*F1F1 reads DL_OK"):
+        run_delta(d, [("a.bin", DELTA_BASE)], compress="auto")
+    assert d.dfis == [0x30]
 
 
 # Check any other refusal stops the run: a 0x22 at the delta 34, and a patch the server cannot apply (0x72 at 37,
@@ -4111,8 +4133,8 @@ def test_main_diff_from_a_directory(tmp_path, full_path, capsys, monkeypatch):
     master.write_bytes(MASTER)
     (bases / "old").mkdir(parents=True)
     (bases / "v0.2.0.bin").write_bytes(DELTA_BASE)
-    (bases / "old" / "resigned.bin").write_bytes(resigned(DELTA_BASE))
-    (bases / "resigned.img").write_bytes(resigned(DELTA_BASE))
+    (bases / "old" / "rebuilt.bin").write_bytes(rebuilt(DELTA_BASE))
+    (bases / "rebuilt.img").write_bytes(rebuilt(DELTA_BASE))
     d = delta_server(boot_silence=0, confirm_refusals=0)
     rc = cli.main(["--profile", full_path, "--master", str(master), "flash", str(img), "--diff-from", str(bases),
                    "--compress-auto"], transport=FakeTransport.on(d))

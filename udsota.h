@@ -20,10 +20,11 @@
  * is the app's. An app that wants one of udsota's events first handles it before calling udsota_event, and one that
  * needs to know of a session change checks for UDS_EVT_DiagSessCtrl when udsota_event returns true.
  *
- * An update: 10 02, 27 03/04, 34 (DFI 00 plain or 10 raw DEFLATE), 36..., 37, 31 01 FF01 (verify), 31 01 F001
- * (activate: the device restarts), then 10 03 and 31 01 F002 (confirm). The image's first 320 bytes are checked
- * (project, board, partition layout, CAN IDs, version, chip) before anything is erased, and with
- * CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE an image that is never confirmed rolls back at the next reset. */
+ * An update: 10 02, 27 03/04, 34 (DFI 00 plain, 10 raw DEFLATE, or 30 a delta patch from the running image as raw
+ * DEFLATE, with UDSOTA_DELTA and cfg.allow_delta), 36..., 37, 31 01 FF01 (verify), 31 01 F001 (activate: the device
+ * restarts), then 10 03 and 31 01 F002 (confirm). The image's first 320 bytes are checked (project, board, partition
+ * layout, CAN IDs, version, chip) before anything is erased, and with CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE an image
+ * that is never confirmed rolls back at the next reset. */
 #pragma once
 #include <stdbool.h>
 #include <stddef.h>
@@ -55,6 +56,8 @@
 #define UDSOTA_RESUME_NOT_AVAILABLE 0xFFu
 #define UDSOTA_DL_DFI               0x00u     /* 34's dataFormatIdentifier: the image as it is */
 #define UDSOTA_DL_DFI_DEFLATE       0x10u     /* raw DEFLATE (RFC 1951); memorySize is still the image's size */
+#define UDSOTA_DL_DFI_DELTA_DEFLATE 0x30u     /* a delta patch from the running image, as raw DEFLATE; memorySize the
+                                                 image's size (UDSOTA_DELTA and cfg.allow_delta, else 0x31) */
 #define UDSOTA_DL_MAX_BLOCK_LEN     4095u     /* 34's maxNumberOfBlockLength: SID, BSC and 4093 data bytes */
 #define UDSOTA_DL_Z_BOUND(size)     ((uint64_t)(size) + ((uint64_t)(size) >> 3) + 1024u)   /* the most bytes a
                                                  DEFLATE download of a size-byte image may take; past it, 0x71 */
@@ -103,6 +106,15 @@ extern const udsota_image_desc_t udsota_image_desc;
 
 /* ---- Configuration ---- */
 
+/* Delta downloads: UDSOTA_DELTA=1, defined build-wide, compiles them in, with detools/detools.c and the two
+ * udsota_plat_base_* functions below; cfg.allow_delta then turns them on. Under ESP-IDF set it in the app's top-level
+ * CMakeLists before project(), with idf_build_set_property(COMPILE_DEFINITIONS UDSOTA_DELTA=1 APPEND): udsota's
+ * component reads that list for this exact entry to add detools, and udsota.c refuses to compile when it is set any
+ * other way. Unset or 0, udsota has no delta code and declares neither function. */
+#ifndef UDSOTA_DELTA
+#define UDSOTA_DELTA 0
+#endif
+
 /* The update steps the app's gate may refuse. */
 typedef enum {
     UDSOTA_OP_ENTER_EXTENDED = 1,   /* 10 03 */
@@ -129,9 +141,9 @@ typedef enum {
     UDSOTA_DL_WORKER_TIMEOUT,       /* 10: a flash job passed 90 s, or its session ended while it ran */
     UDSOTA_DL_ABORTED,              /* 11: ended early: a session change, S3, the gate, an overrun, or iso14229 */
     UDSOTA_DL_FLASH_ERROR,          /* 12: erase or write failed, or no inactive slot */
-    UDSOTA_DL_BAD_STREAM,           /* 13: a compressed download did not inflate to exactly the image */
-    UDSOTA_DL_NO_MEMORY,            /* 14: no memory for the inflater */
-    UDSOTA_DL_BAD_BASE,             /* 15: reserved (delta downloads) */
+    UDSOTA_DL_BAD_STREAM,           /* 13: a coded download did not inflate (or patch) to exactly the image */
+    UDSOTA_DL_NO_MEMORY,            /* 14: no memory for the inflater, or a delta's patch state */
+    UDSOTA_DL_BAD_BASE,             /* 15: a delta patch for another base than the running image, or no hash to tell */
 } udsota_reason_t;
 
 /* A download's progress, for a display. done and total are image bytes (0 outside ERASING and WRITING). */
@@ -159,6 +171,8 @@ typedef struct {
     const char    *product;                 /* the project name an image must carry; NULL = this image's own */
     bool           allow_downgrade;         /* take an older or same-version image too (a dev unit's choice; a release
                                                build leaves it off); every other image rule still applies */
+    bool           allow_delta;             /* serve delta downloads, rebuilt from the running image; only in a build
+                                               with UDSOTA_DELTA=1 */
     uint8_t      (*gate)(void *ctx, udsota_op_t op);                  /* nullable: 0 = allow, else the NRC */
     void         (*progress)(void *ctx, const udsota_progress_t *p);  /* nullable; from the server's task */
     void         (*reset)(void *ctx);       /* restarts after 11 01 or F001; NULL = esp_restart() */
@@ -242,3 +256,8 @@ bool        udsota_plat_hmac(const uint8_t *key, size_t key_len, const uint8_t *
 int         udsota_plat_ecdsa_key(const uint8_t *pubkey);          /* 0 once the key is usable */
 int         udsota_plat_ecdsa(const uint8_t *msg, size_t n,
                               const uint8_t sig[UDSOTA_KEYS_SIG_LEN]);   /* 1 valid, 0 not, -1 unknown */
+#if UDSOTA_DELTA
+/* A delta download's base, the running image, read from its slot inside jobs. */
+bool        udsota_plat_base_read(uint32_t off, void *buf, size_t n);   /* false past the slot's end or on error */
+bool        udsota_plat_base_hash(uint8_t out[32]);                /* the SHA-256 the running image appends */
+#endif

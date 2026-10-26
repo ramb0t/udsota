@@ -10,9 +10,10 @@ from .keys import DeviceKeys, SigningKeys
 from .pack import build_patch, encode, rank_deltas
 from .wire import (DID_COUNTERS, DID_DEVICE_ID, DID_RESULT, DID_RUNNING_SHA, DID_SESSION, DID_STATUS, DID_VERSION,
                    DL_DFI, DL_DFI_DEFLATE, DL_DFI_DELTA, DL_DFI_DELTA_DEFLATE, IMG_PENDING_VERIFY, IMG_STATES,
-                   NRC_CONDITIONS, NRC_OUT_OF_RANGE, NRC_PROGRAMMING_FAILURE, NRC_SEQUENCE, OTHER_VERIFIED,
-                   RID_ACTIVATE, RID_CHECK_DEPS, RID_CONFIRM, SESSION_EXTENDED, SESSION_PROGRAMMING, DECODE, cstr,
-                   decode_counters, decode_result, decode_status, describe_result, describe_status, reason_name)
+                   NRC_CONDITIONS, NRC_NOT_ACCEPTED, NRC_OUT_OF_RANGE, NRC_PROGRAMMING_FAILURE, NRC_SEQUENCE,
+                   OTHER_VERIFIED, RID_ACTIVATE, RID_CHECK_DEPS, RID_CONFIRM, SESSION_EXTENDED, SESSION_PROGRAMMING,
+                   DECODE, cstr, decode_counters, decode_result, decode_status, describe_result, describe_status,
+                   reason_name)
 
 REBOOT_WAIT_S = 3.0
 BOOT_TIMEOUT_S = 60.0
@@ -135,10 +136,12 @@ def open_download(uds, image, compress, log=print):
 # RequestDownload, every 0x36 block (counter from 1, wrapping 0xFF -> 0x00) and RequestTransferExit: first each
 # delta in deltas ((dfi, payload) pairs, plan_deltas) in turn, then the image compressed per compress
 # (open_download). A delta DFI the server answers 0x31, or 0x22 for memory, moves on to the next; a delta refused
-# for its base (send_payload) skips the rest and sends the image. drop_76 = N resends block N once as if its 76 were
+# for its base (send_payload) skips the rest and sends the image, after reenter() (enter_programming) when the
+# programming session has ended meanwhile: on a server on iso14229, whose S3 (5.1 s) restarts only on 10 and 3E, it
+# ends while the client waits P2* (5.5 s) for a lost answer. drop_76 = N resends block N once as if its 76 were
 # lost; an N past the last block is refused before any 0x36 (the CLI refuses it with deltas, whose size it can't
 # know before the 34).
-def download(uds, image, drop_76=None, log=print, compress="none", clock=time.monotonic, deltas=()):
+def download(uds, image, drop_76=None, log=print, compress="none", clock=time.monotonic, deltas=(), reenter=None):
     for dfi, patch in deltas:
         try:
             max_data = uds.request_download(len(image), dfi)
@@ -157,7 +160,10 @@ def download(uds, image, drop_76=None, log=print, compress="none", clock=time.mo
         if send_payload(uds, image, patch, max_data, "delta", drop_76=drop_76, log=log, clock=clock):
             return
         log("the device is not running the base this patch was made from (0x36 answered 0x31, F1F1 DL_BAD_BASE; "
-            "for example a re-signed build of the same source): sending a full download")
+            "for example a rebuild of the same source that is not byte-identical): sending a full download")
+        if reenter is not None and uds.read_did(DID_SESSION)[:1] != bytes([SESSION_PROGRAMMING]):
+            log("the programming session ended while the answer was awaited: entering it again")
+            reenter()
         break
     payload, max_data = open_download(uds, image, compress, log=log)
     send_payload(uds, image, payload, max_data, None if payload is image else "compressed", drop_76=drop_76,
@@ -167,7 +173,8 @@ def download(uds, image, drop_76=None, log=print, compress="none", clock=time.mo
 # The 0x36 blocks and the 0x37 of an open download of image carrying payload: the image itself (kind None), or it
 # coded as kind ("compressed" or "delta"), which ends with the time the coding saved. True when done; False when
 # a delta's 36 was refused with F1F1 DL_BAD_BASE, which ends the download on the server: 0x31, or, when that answer
-# was lost, 0x24 to the resent block, or for a block over 256 bytes a resend the ended download's ISO-TP refuses.
+# was lost, a refused resend of the block: 0x70 from a server on iso14229, which has no transfer open, 0x24 from a
+# v0.14.x one, or for a block over 256 bytes a resend a v0.14.x server's ISO-TP refuses.
 def send_payload(uds, image, payload, max_data, kind, drop_76=None, log=print, clock=time.monotonic):
     total = (len(payload) + max_data - 1) // max_data
     if drop_76 is not None and drop_76 > total:
@@ -191,8 +198,8 @@ def send_payload(uds, image, payload, max_data, kind, drop_76=None, log=print, c
     except Nrc as e:
         if kind is None:
             raise
-        # 0x24: the server's 0x31 was lost and the resent block found the download it had already ended.
-        if (kind == "delta" and e.sid == 0x36 and e.code in (NRC_OUT_OF_RANGE, NRC_SEQUENCE)
+        # 0x70 or 0x24: the server's 0x31 was lost and the resent block found the download it had already ended.
+        if (kind == "delta" and e.sid == 0x36 and e.code in (NRC_OUT_OF_RANGE, NRC_NOT_ACCEPTED, NRC_SEQUENCE)
                 and last_reason(uds) == "DL_BAD_BASE"):
             return False
         raise UpdateFailed("%s; %s" % (e, last_result(uds))) from e
@@ -408,7 +415,8 @@ def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep
         need_download, recovered, resent = not verified, False, False
         while True:
             if need_download:
-                download(uds, image, drop_76=drop_76, log=log, compress=compress, clock=clock, deltas=deltas)
+                download(uds, image, drop_76=drop_76, log=log, compress=compress, clock=clock, deltas=deltas,
+                         reenter=lambda: enter_programming(uds, profile, keys))
                 check_image(uds, log=log)
                 need_download, drop_76 = False, None   # the fault injection applies to the first download only
             try:

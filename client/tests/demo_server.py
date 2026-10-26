@@ -301,3 +301,12 @@ def image_file(tmp_path, data, name="image.bin"):
     p = tmp_path / name
     p.write_bytes(data)
     return str(p)
+
+
+# True when the udsota_lite_server at binary serves delta downloads, as its start-up line says (built with
+# -DUDSOTA_DELTA=ON, run without --no-delta): it starts once on an image under tmp_path and stops at stdin's EOF.
+def serves_delta(binary, tmp_path):
+    image = image_file(tmp_path, build_image("v0.1.0"), "probe.bin")
+    r = subprocess.run([binary, "--image", image], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                       timeout=10)
+    return r.returncode == 0 and "delta downloads on" in r.stderr

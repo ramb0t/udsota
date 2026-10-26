@@ -1,11 +1,13 @@
 """End-to-end over a virtual CAN bus: udsota_lite_server runs on vcan0 (or $UDSOTA_VCAN) through its CAN_RAW socket
-(--can), and the client flashes it two ways: over can-isotp's Python ISO-TP stack on a python-can SocketCAN bus,
-which needs only the vcan module (CI's e2e job runs this on GitHub's hosted runners), and as the real `udsota`
-command over the kernel's ISO-TP socket, which also needs can-isotp. Each skips when what it needs is missing, except
-that a missing vcan or server fails instead when $UDSOTA_VCAN is set, as CI sets it, so a broken setup
-cannot pass as skips. $UDSOTA_VCAN must name a vcan interface (vcan0, vcan1, ...), and the server refuses any other,
-as a test checks on lo: the tests never drive a real bus. The server is $UDSOTA_LITE_SERVER or
-build/udsota_lite_server, as for test_e2e_lite.py, built where linux/can/raw.h is."""
+(--can), and the client flashes it two ways: over can-isotp's Python ISO-TP stack on a python-can SocketCAN bus, which
+needs only the vcan module (CI's e2e job runs this on GitHub's hosted runners), and as the real `udsota` command over
+the kernel's ISO-TP socket, which also needs can-isotp; a delta download goes the first way too, against a server built
+with -DUDSOTA_DELTA=ON. Each skips when what it needs is missing, except that a missing vcan, server or delta build
+fails instead when $UDSOTA_VCAN is set, as CI sets it, so a broken setup cannot pass as skips. $UDSOTA_VCAN must name a
+vcan interface (vcan0, vcan1, ...), and the server refuses any other, as a test checks on lo: the tests never drive a
+real bus. The server is $UDSOTA_LITE_SERVER or build/udsota_lite_server, as for test_e2e_lite.py, built where
+linux/can/raw.h is."""
+import importlib.util
 import os
 import pathlib
 import signal
@@ -19,7 +21,8 @@ import pytest
 
 from udsota import update
 
-from .demo_server import EXAMPLE, LABEL, MASTER, SECURED, build_image, image_file, read_state, run_cli
+from .demo_server import (EXAMPLE, LABEL, MASTER, SECURED, build_image, delta_pair, elf_sha, image_file, read_state,
+                          run_cli, serves_delta)
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 BUILT = ROOT / "build" / "udsota_lite_server"
@@ -105,18 +108,18 @@ def link():
     lk.close()
 
 
-# Starts servers on the interface, each with slot 0 running v0.1.0, and returns once each is past iso14229's 1 s
-# 0x27 delay after boot, so that no unlock waits out a 0x37. After the test each is stopped with SIGTERM and must
-# exit 0, so a sanitizer report fails the test.
+# Starts servers on the interface, each with slot 0 running v0.1.0 (or image), and returns once each is past
+# iso14229's 1 s 0x27 delay after boot, so that no unlock waits out a 0x37. After the test each is stopped with
+# SIGTERM and must exit 0, so a sanitizer report fails the test.
 @pytest.fixture
 def vcan_lite(tmp_path):
     binary = vcan_or_skip()
     procs = []
 
-    def start(*args):
+    def start(*args, image=None):
         n = len(procs)
         log = tmp_path / ("server%d.log" % n)
-        image = image_file(tmp_path, build_image("v0.1.0"), "running%d.bin" % n)
+        image = image_file(tmp_path, build_image("v0.1.0") if image is None else image, "running%d.bin" % n)
         with open(log, "wb") as err:                      # the child keeps its own descriptor
             p = subprocess.Popen([binary, "--image", image, "--can", IFACE, *args], stdin=subprocess.DEVNULL,
                                  stdout=subprocess.DEVNULL, stderr=err)
@@ -168,6 +171,28 @@ def test_flash_over_vcan_with_python_isotp(vcan_lite, link, tmp_path, monkeypatc
     assert (status["running_slot"], status["running_state"], version) == (1, VALID, "v0.2.0")
     assert run_cli(link, argv) == 0
     assert "already runs this image" in capsys.readouterr().out
+
+
+# Check a delta download over vcan with the Python ISO-TP stack: the server runs delta_pair's base, and flash
+# --diff-from sends DFI 0x30, a patch of a few hundred bytes, from which the server rebuilds the new image, which then
+# runs confirmed. Needs detools and a server built with -DUDSOTA_DELTA=ON (else a skip, or a failure when
+# UDSOTA_VCAN is set).
+def test_flash_delta_over_vcan(vcan_lite, link, tmp_path, monkeypatch, capsys):
+    if importlib.util.find_spec("detools") is None:
+        missing('flash --diff-from needs detools: pip install "./client[diff]"')
+    if not serves_delta(server_or_skip(), tmp_path):
+        missing("udsota_lite_server serves no delta downloads: build it with cmake -DUDSOTA_DELTA=ON")
+    monkeypatch.setattr(update, "REBOOT_WAIT_S", 0.5)
+    base, new = delta_pair(payload=48 * 1024)
+    s = vcan_lite(image=base)
+    base_path, new_path = image_file(tmp_path, base, "base.bin"), image_file(tmp_path, new, "new.bin")
+    argv = ["--profile", secured(tmp_path), "--interface", IFACE, "flash", new_path, "--diff-from", base_path]
+    assert run_cli(link, argv) == 0, s.log.read_text()
+    out = capsys.readouterr().out
+    assert "delta, DFI 0x30" in out and "delta bytes in" in out and "confirmed" in out
+    assert "not running the base" not in out                 # no fallback to the full image
+    status, sha, version = read_state(link)
+    assert (status["running_slot"], status["running_state"], version, sha) == (1, VALID, "v0.3.0", elf_sha(new))
 
 
 # Check the server refuses --can on an interface that is not a vcan, here lo, before it opens a socket: it exits 2
