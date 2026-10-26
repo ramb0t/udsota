@@ -18,6 +18,21 @@ For `-O2`, as CANDash ships, add `-DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkco
 
 The version keeps CANDash's `0.5.0` core, because a device takes a dev build only when its `X.Y.Z` is at least the running one's. For ECDSA 0x27 instead of CANDash's HMAC master, add `-DPOC_PUBKEY_DIR=<dir>` with the `udsota_pubkey.h` that `udsota keygen` writes, and give the client a profile whose `[security]` has `mode = "ecdsa"` and the private key. `-DPOC_ALLOW_DOWNGRADE=1` sets `cfg.allow_downgrade`, so the image also takes an older one. `-DPOC_DELTA=1` defines `UDSOTA_DELTA=1` build-wide and sets `cfg.allow_delta`.
 
+## Bench results (2026-10-26)
+
+Delta downloads on a ws43b, on main f0fe53d with `-DPOC_DELTA=1`, at `-O2` with CANDash's signing key and HMAC master, and CANDash builds with `UDSOTA_DELTA=1` and `cfg.allow_delta` added. The client was main's, with CANDash's profile, over PCAN at 250 kbit/s, all over CAN. The run started on CANDash v0.5.0-53 and ended on CANDash v0.5.0-60 (Coulomb main, delta off), with identity, config and preferences unchanged.
+
+| Test | Result |
+|---|---|
+| CANDash v0.5.0-53 → 0.5.0-lite.40, DEFLATE | 202 KB in 149.4 s at CANDash's STmin of 5 ms, confirmed |
+| lite.40 → lite.41, delta | 1,007 B in one 36, 2.3 s including the rebuild and erase of the 331,776-byte image, confirmed |
+| lite.41 → lite.42, delta from a base rebuilt not byte-identical | First 36 refused, `7F 36 31`, F1F1 DL_BAD_BASE; the client sent the full image, 202 KB in 21.4 s, confirmed |
+| lite.42 → CANDash v0.5.0-59 with delta, DEFLATE | 709 KB in 75.8 s, confirmed |
+| CANDash v0.5.0-59 → v0.5.0-60 (Coulomb PR 221 → PR 222, its next dev build), delta | 15,158 B in four 36s, 18.4 s, the longest 6.1 s, confirmed; the full image takes about 9 minutes at STmin 5 ms |
+| CANDash v0.5.0-60 with delta → Coulomb main v0.5.0-60, delta | 33,511 B in nine 36s, 32.3 s, the longest 6.0 s, confirmed |
+
+The longest job, 6.1 s, is far inside the 90 s cap. The lite images carried a bench-only DID that kept its readings across the reset. Over the delta and the full download alike, the lowest internal heap stayed within 124 B of its value at the 34, and the udsota worker used at most 3,632 of its 8,192-byte stack. The free data-mmap pages dipped by the same 3 pages in both, so delta holds no map. CANDash's own lowest internal heap after each boot was 58,116 B or more; F015 can't be read during a download, because the reset that follows clears it. CANDash answered 0x22 to its first 15 confirms after every boot, full or delta, then confirmed.
+
 ## Bench results (2026-10-23)
 
 On a ws43b, on lite-main 5d37be5 plus the `POC_ALLOW_DOWNGRADE` switch, at `-O2` with CANDash's signing key and HMAC master. The client was 0.14.2 with CANDash's profile, over PCAN at 250 kbit/s, all over CAN. The run started and ended on CANDash v0.5.0-108, and its `info` afterwards matched the start except for the counters and F1F0's other slot.

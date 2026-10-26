@@ -78,7 +78,7 @@ A version is `PROJECT_VER`. A clean `X.Y.Z` is a release, which a device takes o
 
 ## Known limits
 
-Three things udsota 0.14's own server had are gone: the boot-loop breaker, the ISO-TP counters (F1F2) and functional addressing. Delta downloads are back as DFI 30 only, off by default, and DFI 20 (heatshrink) gets 0x31, so the client sends DFI 30 or the full image instead. Delta in this form has not yet run on hardware. Its own limits:
+Three things udsota 0.14's own server had are gone: the boot-loop breaker, the ISO-TP counters (F1F2) and functional addressing. Delta downloads are back as DFI 30 only, off by default, and DFI 20 (heatshrink) gets 0x31, so the client sends DFI 30 or the full image instead. Delta in this form has run on a ws43b, with CANDash and the example ([bench results](examples/candash_ws43/README.md#bench-results-2026-10-26)). Its own limits:
 
 - A delta can't resume: like every download here, one that is cut off starts again from its `34`.
 - The base must be the very `.bin` that was flashed, since the patch names it by the SHA-256 ESP-IDF appends to the image. A rebuild of the same source that is not byte-identical names another base: the device refuses it at the `36` that carries the patch's header, with 0x31 and DL_BAD_BASE, before anything is erased, and the client sends the full image. A copy signed again after the build is worse, because the signature sector comes after the appended SHA-256 and signing leaves that hash as it was: the base passes, the patch rebuilds the new image with the wrong signature sector, FF01 refuses it with reason 8 and the run fails. Keep the signed `.bin` exactly as flashed.
