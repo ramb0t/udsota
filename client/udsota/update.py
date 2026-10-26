@@ -171,10 +171,11 @@ def download(uds, image, drop_76=None, log=print, compress="none", clock=time.mo
 
 
 # The 0x36 blocks and the 0x37 of an open download of image carrying payload: the image itself (kind None), or it
-# coded as kind ("compressed" or "delta"), which ends with the time the coding saved. True when done; False when
-# a delta's 36 was refused with F1F1 DL_BAD_BASE, which ends the download on the server: 0x31, or, when that answer
-# was lost, a refused resend of the block: 0x70 from a server on iso14229, which has no transfer open, 0x24 from a
-# v0.14.x one, or for a block over 256 bytes a resend a v0.14.x server's ISO-TP refuses.
+# coded as kind ("compressed" or "delta"), which ends with the bytes sent and, compressed, the time saved; a delta's
+# time is mostly the server rebuilding and writing the image, not the bus, so it gives no full download's time. True
+# when done; False when a delta's 36 was refused with F1F1 DL_BAD_BASE, which ends the download on the server: 0x31,
+# or, when that answer was lost, a refused resend of the block: 0x70 from a server on iso14229, which has no transfer
+# open, 0x24 from a v0.14.x one, or for a block over 256 bytes a resend a v0.14.x server's ISO-TP refuses.
 def send_payload(uds, image, payload, max_data, kind, drop_76=None, log=print, clock=time.monotonic):
     total = (len(payload) + max_data - 1) // max_data
     if drop_76 is not None and drop_76 > total:
@@ -203,11 +204,13 @@ def send_payload(uds, image, payload, max_data, kind, drop_76=None, log=print, c
                 and last_reason(uds) == "DL_BAD_BASE"):
             return False
         raise UpdateFailed("%s; %s" % (e, last_result(uds))) from e
-    if kind is not None:
-        took = clock() - start
+    took = clock() - start
+    if kind == "compressed":
         log("sent %d %s bytes in %.1f s; the %d-byte image would take about %.1f s, so about %.1f s saved"
             % (len(payload), kind, took, len(image), took * len(image) / len(payload),
                took * (len(image) - len(payload)) / len(payload)))
+    elif kind == "delta":
+        log("sent %d delta bytes in %.1f s in place of the %d-byte image" % (len(payload), took, len(image)))
     return True
 
 

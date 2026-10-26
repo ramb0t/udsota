@@ -3906,7 +3906,7 @@ def test_heatshrink_patch_matches_espressif():
 
 # Check a delta download end to end: the one base whose app_elf_sha256 matches F1F3 is used (a copy of it under
 # another name is the same base; another image is ignored), the smaller 0x30 goes first, the server's slot ends up
-# holding the new image, and the mode, size and time saved are logged.
+# holding the new image, and the mode and size are logged, with no time-saved estimate.
 def test_flash_delta_uses_the_matching_base():
     d = delta_server()
     bases = [("other.bin", build_image(version="v0.1.0")), ("a.bin", DELTA_BASE), ("copy.bin", DELTA_BASE)]
@@ -3916,7 +3916,9 @@ def test_flash_delta_uses_the_matching_base():
     assert "delta base: a.bin" in lines
     assert "delta, DFI 0x30 (patch as raw DEFLATE): %d -> %d bytes (%.0f%%)" % (
         len(DELTA_NEW), len(p30), 100.0 * len(p30) / len(DELTA_NEW)) in lines
-    assert any(ln.startswith("sent %d delta bytes in" % len(p30)) and ln.endswith("s saved") for ln in lines)
+    sent = [ln for ln in lines if ln.startswith("sent %d delta bytes in" % len(p30))]
+    assert len(sent) == 1 and sent[0].endswith("s in place of the %d-byte image" % len(DELTA_NEW))
+    assert not any("saved" in ln for ln in lines)
 
 
 # Check no delta is sent, and why is logged, when no base matches F1F3, when different files match, and when the
