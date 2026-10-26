@@ -4,6 +4,8 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-10-26
+
 Delta downloads are back, as DFI 30 only: a unit rebuilds the new image from the one it runs, so a small change costs kilobytes on the bus instead of the whole image. They are off unless the app opts in twice, at build time and in its cfg. On a ws43b over CAN, CANDash's next dev build went over as a 15,158-byte patch in 18.4 s, where its full image takes about 9 minutes at CANDash's STmin of 5 ms.
 
 ### Added

@@ -34,9 +34,9 @@
 /* The udsota release this header belongs to, for an #if on the release a feature arrived in. tools/release.py sets
  * all four at each cut, and its check fails when they disagree with the tag (RELEASING.md). */
 #define UDSOTA_VERSION_MAJOR 0
-#define UDSOTA_VERSION_MINOR 15
+#define UDSOTA_VERSION_MINOR 16
 #define UDSOTA_VERSION_PATCH 0
-#define UDSOTA_VERSION       "0.15.0"
+#define UDSOTA_VERSION       "0.16.0"
 
 /* ---- Wire contract ----
  * The numbers a tester sees, under the names udsota v0.14.2 gave them. client/udsota/wire.py, keys.py and image.py
