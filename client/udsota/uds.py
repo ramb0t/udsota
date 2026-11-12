@@ -23,12 +23,13 @@ class Uds:
     # client: an open udsoncan Client; sleep and clock are injectable for tests.
     def __init__(self, client, sleep=time.sleep, clock=time.monotonic):
         self.client, self.sleep, self.clock = client, sleep, clock
-        self.in_session, self.kept, self.lost_7e, self.last_block = False, clock(), False, None
+        self.in_session, self.kept, self.unanswered, self.last_block = False, clock(), None, None
 
     # Send one request; return the positive response after its SID. Retries NRC 0x21 with backoff;
     # raises Nrc on other NRCs, NoResponse on a timeout, SendFailed when the send fails twice, and
     # UpdateFailed on an answer udsoncan cannot parse or that belongs to another service (a 3E 00 passes over it,
-    # and any request passes over the 7E of a keepalive that went unanswered, or the last block's 76 to its repeat).
+    # and any request passes over a late answer to the request that went unanswered, or the last block's 76 to its
+    # repeat).
     # In a non-default session, a 3E 00 goes before the request and before each 0x21 retry whenever the last 10 or 3E
     # is more than KEEPALIVE_S old, so a backoff cannot outlast S3. A late answer to an earlier send of this request
     # that lands on such a 3E is passed over, and the retry gets the server's answer to a repeat.
@@ -45,6 +46,7 @@ class Uds:
                 if stale is not None and stale(answer):
                     answer = self.await_answer(service, self.client.config["p2_timeout"], busy_ends=True, stale=stale)
                     if answer is None:
+                        self.unanswered = sid
                         raise NoResponse("no response to service 0x%02X after a late answer to an earlier one" % sid)
             except Nrc as e:
                 if e.code != NRC_BUSY or delay is None:
@@ -59,28 +61,35 @@ class Uds:
         raise AssertionError("unreachable")
 
     # Send req (resent as send_resending allows) and return its positive response after the SID; raise as request()
-    # does, with Nrc for 0x21 too.
+    # does, with Nrc for 0x21 too. A request that gets no answer, or whose send fails, is the one that went unanswered
+    # until another request is answered.
     def exchange(self, service, req):
         sid = service.request_id()
         try:
             return bytes(self.send_resending(req).data or b"")
+        except SendFailed:
+            self.unanswered = sid
+            raise
         except NegativeResponseException as e:
             self.settled(sid)
             raise Nrc(sid, e.response.code)
         except TimeoutException as e:
+            self.unanswered = sid
             raise NoResponse("no response to service 0x%02X: %s" % (sid, e))
         except UnexpectedResponseException as e:
             other = e.response.service.request_id()
             late_block = (other == 0x36 and e.response.positive and self.last_block is not None
                           and bytes(e.response.data or b"")[:1] == bytes([self.last_block]))
-            if sid != 0x3E and not (other == 0x3E and self.lost_7e) and not late_block:
+            if sid != 0x3E and other != self.unanswered and not late_block:
                 raise UpdateFailed("unexpected answer to service 0x%02X: %s" % (sid, e))
             # A late answer to an earlier request can come first: to the keepalive, a block's answer to its
-            # resend (see transfer); to any request, the 7E of a keepalive that went unanswered, or the last
-            # block's 76 to its resend. Pass over it and await this request's own answer within its P2, as if the
-            # stray frame had not come.
+            # resend (see transfer); to any request, the answer to the request that went unanswered (a keepalive's
+            # 7E, or the 7F 22 31 to a read the adapter held while the unit was off), or the last block's 76 to its
+            # resend. Pass over it and await this request's own answer within its P2, as if the stray frame had not
+            # come.
             late = self.await_answer(service, self.client.config["p2_timeout"], busy_ends=True)
             if late is None:
+                self.unanswered = sid
                 raise NoResponse("no response to service 0x%02X after an answer to service 0x%02X" % (sid, other))
             return late
         except InvalidResponseException as e:
@@ -88,12 +97,12 @@ class Uds:
 
     # The keepalive's 3E 00. One that gets no answer is not the failure of the request it goes ahead of: the request
     # goes at once, and the next one sends another 3E. Its 7E may still come, so the requests after it pass over a 7E
-    # until one of them is answered.
+    # until one of them is answered (exchange).
     def keep_alive(self):
         try:
             self.tester_present()
         except NoResponse:
-            self.lost_7e = True
+            pass
 
     # Track the session after a positive answer to sid with sub-function sub: a 10 or 3E restarts the keepalive
     # timer, 10 01 and 11 01 (the server restarts) leave the non-default session, and other 10s enter one.
@@ -107,11 +116,11 @@ class Uds:
             self.in_session = False
 
     # An answer to sid, positive or not, means no earlier answer is still on its way, since a server answers in order:
-    # no 76 to the last block's repeat, and no 7E unless sid is 3E (whose 7E may be an earlier 3E's). transfer() sets
-    # last_block again after each block's own answer.
+    # no 76 to the last block's repeat, and none to the request that went unanswered unless both are 3E (this 7E may
+    # be the earlier 3E's). transfer() sets last_block again after each block's own answer.
     def settled(self, sid):
-        if sid != 0x3E:
-            self.lost_7e = False
+        if not sid == self.unanswered == 0x3E:
+            self.unanswered = None
         self.last_block = None
 
     # The server restarted (it answers in the default session): no keepalive until the next 10.
@@ -175,29 +184,31 @@ class Uds:
     def session(self, n):
         return self.request(services.DiagnosticSessionControl, n)
 
-    # One try at session n on a unit that may not be listening yet: 10 n with its answer awaited window_s in place of
-    # both P2 and P2*, so a 0x78 with no 50 n after it does not hold the try either. True once a 50 n answers it. False
-    # when nothing does within window_s, and after window_s spent listening for a 50 n to an earlier send when the
-    # send failed or the answer was an NRC or another service's (one to a request that went out late), so tries never
-    # come faster than one per window_s.
+    # One try at session n on a unit that may not be listening yet: one 10 n, every wait for its answer window_s, in
+    # place of P2, of P2* after a 0x78, and of request()'s retries after 0x21, so no answer holds the try longer. True
+    # once a 50 n answers it. False when nothing does within window_s, and after window_s spent listening for a 50 n to
+    # an earlier send when the send failed or the answer was an NRC (0x21 among them) or another service's, so tries
+    # never come faster than one per window_s.
     def try_session(self, n, window_s):
+        service = services.DiagnosticSessionControl
         p2, p2_star = self.client.config["p2_timeout"], self.client.config["p2_star_timeout"]
         self.client.set_config("p2_timeout", window_s)
         self.client.set_config("p2_star_timeout", window_s)
         try:
-            return self.session(n)[:1] == bytes([n])
+            answer = self.exchange(service, Request(service=service, subfunction=n))
         except NoResponse:
             return False
         except UpdateFailed:
-            pass
+            answer = None
         finally:
             self.client.set_config("p2_timeout", p2)
             self.client.set_config("p2_star_timeout", p2_star)
-        try:
-            late = self.await_answer(services.DiagnosticSessionControl, window_s, pending_s=window_s)
-        except Nrc:
-            return False
-        if late is None or late[:1] != bytes([n]):
+        if answer is None:
+            try:
+                answer = self.await_answer(service, window_s, pending_s=window_s)
+            except Nrc:
+                return False
+        if answer is None or answer[:1] != bytes([n]):
             return False
         self.answered(0x10, n)
         return True
