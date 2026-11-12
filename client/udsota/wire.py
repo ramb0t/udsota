@@ -1,5 +1,5 @@
-"""The udsota wire contract, as udsota.h's "Wire contract" block and the NRCs and sessions it takes from iso14229.h
-give it, and as v0.14.2's udsota_wire.h gave it for units still on a v0.14.x server (test/fixtures/wire-v0.14/):
+"""The udsota wire contract, as udsota_wire.h and the NRCs and sessions udsota.h takes from iso14229.h give it, and
+as v0.14.2's own udsota_wire.h gave it for units still on a v0.14.x server (test/fixtures/wire-v0.14/):
 sessions, server-owned DIDs, routines, NRCs, the download format, the DTC services' numbers and the status, result,
 counter and DTC status layouts. DECODE and describe_result are Python-only: how info and config render DID
 records."""

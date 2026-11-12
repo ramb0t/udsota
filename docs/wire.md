@@ -2,7 +2,7 @@
 
 What a tester sees from a unit that runs udsota 0.15 or later inside its app's iso14229 server, byte for byte, and the sequence a flasher other than the client follows. Units still on a 0.14.x server answer as [v0.14.2's wire reference](https://github.com/ramb0t/udsota/blob/v0.14.2/components/udsota/README.md#wire-reference) says, and the client updates both.
 
-The numbers are `udsota.h`'s "Wire contract" block and `udsota_reason_t`; the NRCs and sessions are iso14229's `UDS_NRC_*` and `UDS_LEV_DS_*`. `client/tests/test_udsota.py` checks the client against all of them.
+The numbers are `udsota_wire.h`, which `udsota.h` includes, and `udsota.h`'s `udsota_reason_t`; the NRCs and sessions are iso14229's `UDS_NRC_*` and `UDS_LEV_DS_*`. `client/tests/test_udsota.py` checks the client against all of them.
 
 ## Services
 
@@ -138,14 +138,25 @@ ISO-TP is iso14229's isotp-c with its defaults unless the app defines others bui
 | 12 | `flags` | bit 0: a release build (a clean `[v]X.Y.Z` version); other bits 0 |
 | 13 | `reserved` | 19 zero bytes |
 
-An image that is not an ESP-IDF app, which the client takes with `[image] format = "bare"`, has no fixed offset: the descriptor opens a 128-byte block (`UDSOTA_BARE_DESC_LEN`) at the offset its profile's `desc_offset` names, with `desc_version` 1 or later, and the block's other fields stand in for `esp_app_desc_t`'s.
+An image that is not an ESP-IDF app, which the client takes with `[image] format = "bare"`, carries udsota's bare header in its place: 224 bytes (`UDSOTA_BARE_HDR_LEN`), little-endian, at the offset its profile's `header_offset` names. The firmware build fills `magic`, `header_version`, `flags` (0), the descriptor, `version` and `project`, and leaves the reserved and `signature` fields 0xFF; stamping writes `image_length`, `image_id` and `crc32`. The client refuses an image that is not stamped, and needs the descriptor's `desc_version` to be 1 or later.
 
 | Offset | Field | Value |
 |---|---|---|
-| 0 | descriptor | the 32 bytes above |
-| 32 | `version` | NUL-terminated ASCII: what F189 returns (`UDSOTA_BARE_VERSION_OFFSET`) |
-| 64 | `project` | NUL-terminated ASCII: the product name (`UDSOTA_BARE_PROJECT_OFFSET`) |
-| 96 | `image_id` | 32 opaque bytes: what F1F3 returns, in place of `app_elf_sha256` (`UDSOTA_BARE_IMAGE_ID_OFFSET`) |
+| 0 | `magic` | 0x55445342 ("UDSB"); a hex dump shows `42 53 44 55` |
+| 4 | `header_version` | 1 (16-bit) |
+| 6 | `flags` | 0 (16-bit). No bit is defined yet: a reader ignores a low-byte bit it does not know and refuses the image for a high-byte one |
+| 8 | `image_length` | the image's length in bytes from its first byte, the header included; a multiple of 4 |
+| 12 | `crc32` | CRC-32 as zlib computes it, over the image's bytes before this field followed by those after it, up to `image_length` |
+| 16 | reserved | 16 bytes of 0xFF |
+| 32 | descriptor | the 32 bytes above, opening the 128-byte block of the fields below (`UDSOTA_BARE_DESC_LEN`) |
+| 64 | `version` | 32 bytes, NUL-terminated ASCII: what F189 returns |
+| 96 | `project` | 32 bytes, NUL-terminated ASCII: the product name |
+| 128 | `image_id` | 32 bytes: the SHA-256 of the whole image with `image_id`, `crc32` and `signature` taken as 0xFF; what F1F3 returns, in place of `app_elf_sha256` |
+| 160 | `signature` | 64 bytes of 0xFF; reserved, no algorithm defined yet |
+
+Stamping pads the file with 0xFF to a multiple of 4 bytes, then writes `image_length`, then `image_id`, then `crc32`. It never touches the signature, and stamping a stamped image returns the same bytes. `udsota stamp` stamps a file, and a post-build script can call the client's `udsota.image.stamp(data, header_offset)` instead. `udsota_wire.h` names each offset (`UDSOTA_BARE_HDR_*`, and `UDSOTA_BARE_*` within the block).
+
+A unit's bootloader cannot be updated with its app, so the header keeps to these rules. A field defined in version 1 never moves or changes meaning, and a layout that breaks that gets another magic. A unit takes `header_version` 1 or later and ignores the reserved bytes and the signature it does not use; the client takes only the versions it knows, and refuses a high-byte flag as a unit does.
 
 ## Keys
 
@@ -172,6 +183,8 @@ A flasher that is not the client, such as an edge device that fetches updates fr
 A single-slot unit whose resident bootloader is its only UDS server, such as an STM32 bootloader on iso14229, serves the download, FF01 and F001 above from its bootloader, and the client drives it with `[update] flow = "bootloader"`. Its app answers two requests only: `10 02`, with `7F 10 78` before it resets into the bootloader, which then sends the `50 02` within P2*; and, once the app is healthy, a single-frame `22 F1F4`. `udsota.c` serves none of this.
 
 **Precheck.** First one `22 F1F4` in the default session: four bytes equal to the image ID's first four mean the app already runs the image and is healthy, so there is nothing to do and the app keeps running; anything else, or no answer, goes on to the `10 02`. Then, in the programming session: F1F0, F1F3, the board DID and F18C, then the programming unlock. F1F0 describes one slot: running slot 0 and boot slot 0, running state 3 only while the app is valid and never 2, other slot state 0. Flag 0x04 means the bootloader holds the unit there because its app failed to start; a reset releases it for another try. F1F3 reads 32 zero bytes while there is no valid app. If F1F3 already reads the image's ID, send `11 01` and go on to the proof of life.
+
+**Power-up window.** For about 200 ms after power-on the bootloader takes a `10 02`, answering `50 02` and staying in the bootloader, which is the only way in when the app passes its checks but cannot hand over. To use it, keep sending `10 02` while the unit is power-cycled, each within 50 ms of the last going unanswered, being refused or failing to send, and waiting no longer than that after a 0x78. While the unit is off nothing acknowledges the frame, so a send waits out the CAN stack's echo timeout and the frame stays queued until the unit's CAN comes up. The unit answers each `10 02` it receives, so discard the extra `50 02`s and let them stop before the next request.
 
 **Download, verify, activate** as in [Flashing without the client](#flashing-without-the-client), where address 0 in the 34 is the unit's update target. F001 answers, then resets into the app; without a passing FF01 it answers 0x24. There is no F002. F1F3 reads the new ID as soon as FF01 passes, so it can't tell whether an unanswered F001 landed: send F001 once more, and unless that one is answered positively, let F1F4 decide.
 

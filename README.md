@@ -2,7 +2,7 @@
 
 [![ci](https://github.com/ramb0t/udsota/actions/workflows/ci.yml/badge.svg)](https://github.com/ramb0t/udsota/actions/workflows/ci.yml)
 
-**Safe A/B firmware updates over CAN for an ESP32 that runs [iso14229](https://github.com/driftregion/iso14229)'s UDS server: two files, `udsota.c` and `udsota.h`, a call in the event callback you already have, and one after each `UDSServerPoll`.** Any UDS tester can then update the device. Each image is checked before anything is erased, verified before it boots, and rolled back if it is never confirmed. Up to 0.14 udsota was a UDS server of its own; [MIGRATING.md](MIGRATING.md) takes an app on that API to this one.
+**Safe A/B firmware updates over CAN for an ESP32 that runs [iso14229](https://github.com/driftregion/iso14229)'s UDS server: `udsota.c` and its headers `udsota.h` and `udsota_wire.h`, a call in the event callback you already have, and one after each `UDSServerPoll`.** Any UDS tester can then update the device. Each image is checked before anything is erased, verified before it boots, and rolled back if it is never confirmed. Up to 0.14 udsota was a UDS server of its own; [MIGRATING.md](MIGRATING.md) takes an app on that API to this one.
 
 ```c
 #include "udsota.h"
@@ -112,7 +112,7 @@ udsota never changes iso14229's code. Where iso14229 has no call for what an upd
 
 | Path | What it is |
 |---|---|
-| `udsota.c`, `udsota.h` | The updater, iso14229's events and the ESP-IDF platform. `udsota.h` ends with the platform functions a port to another MCU would supply |
+| `udsota.c`, `udsota.h`, `udsota_wire.h` | The updater, iso14229's events and the ESP-IDF platform. `udsota.h` ends with the platform functions a port to another MCU would supply; `udsota_wire.h`, which it includes, is the wire contract with no `#include` of its own, for a bootloader or tester to take alone |
 | `iso14229/` | iso14229, vendored unmodified, with its MIT licence and `SHA256SUMS`, which CI checks; its commit is in [THIRD_PARTY.md](THIRD_PARTY.md) |
 | `detools/` | detools' C library, vendored unmodified, with its BSD-2-Clause licence and `SHA256SUMS`, which CI checks, compiled only in a build that defines `UDSOTA_DELTA=1`; its tag is in [THIRD_PARTY.md](THIRD_PARTY.md) |
 | `CMakeLists.txt` | The ESP-IDF component, or on a host the tests |

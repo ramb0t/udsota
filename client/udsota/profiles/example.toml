@@ -9,15 +9,16 @@ resp_id = 0x718                       # the server's response ID
 deny_tx = []                          # IDs the tool must never transmit on, e.g. other nodes' diagnostic IDs
 
 [image]
-product = "example"                   # project name the image must carry: esp_app_desc_t's, or the bare block's
+product = "example"                   # project name the image must carry: esp_app_desc_t's, or the bare header's
 hw_ids = [1]                          # hw_id values in the udsota descriptor that this profile accepts
 layout_id = 1                         # partition layout ID the image must carry
 slot_size = 0x1E0000                  # largest image in bytes: examples/esp32's OTA slot (default 0x400000)
 # compression = "deflate"             # send the image as raw DEFLATE (DFI 0x10), as --compress does; "auto" as
 #                                     # --compress-auto, which falls back to uncompressed; default "none"
-# format = "bare"                     # an image that is not an ESP-IDF app, identified by its bare descriptor
-#                                     # block (docs/wire.md); default "esp-idf". Delta downloads need "esp-idf"
-# desc_offset = 0x200                 # format "bare" only, and required there: the block's offset in the file
+# format = "bare"                     # an image that is not an ESP-IDF app, identified by udsota's bare header
+#                                     # (docs/wire.md); default "esp-idf". Delta downloads need "esp-idf"
+# header_offset = 0x200               # format "bare" only, and required there: the header's offset in the file;
+#                                     # `udsota stamp` fills the header in after the build
 
 [board]
 did = 0xF191                          # a DID the server answers with its board name (ASCII)

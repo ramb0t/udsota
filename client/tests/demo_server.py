@@ -17,7 +17,7 @@ import isotp
 from udsoncan.client import Client
 from udsoncan.connections import PythonIsoTpConnection
 
-from udsota import cli, profile, transport, wire
+from udsota import cli, image, profile, transport, wire
 from udsota.uds import Uds
 
 MASTER = bytes(range(32))                # the key tests' master, and udsota_lite_server's
@@ -70,19 +70,32 @@ def build_image(version="v0.2.0", product="example", hw_id=1, layout=1, ids=(0x7
     return reseal(img)
 
 
-# A bare image ([image] format = "bare"): size bytes of a byte pattern with the 128-byte descriptor block at
-# desc_offset, its udsota_image_desc_t then version, project and image_id, each field overridable.
-def build_bare_image(desc_offset=0x200, size=4096, version="1.4.0", product="stm32boot", image_id=bytes(range(32)),
-                     hw_id=1, layout=1, ids=(0x710, 0x718), magic=0x5544534F, desc_version=1, release=None):
+# A bare image ([image] format = "bare"): size bytes of a byte pattern with udsota's bare header at header_offset,
+# its descriptor block's udsota_image_desc_t, version and project overridable, stamped (image.stamp) unless stamped
+# is False. hdr_magic and hdr_version replace the header's magic and header_version after stamping.
+def build_bare_image(header_offset=0x200, size=4096, version="1.4.0", product="stm32boot", hw_id=1, layout=1,
+                     ids=(0x710, 0x718), magic=0x5544534F, desc_version=1, release=None, stamped=True,
+                     hdr_magic=image.BARE_HDR_MAGIC, hdr_version=image.BARE_HDR_VERSION):
     img = bytearray((i * 7 + 13) & 0xFF for i in range(size))
-    block = bytearray(128)
+    hdr = bytearray(b"\xff" * image.BARE_HDR_LEN)
+    struct.pack_into("<IHH", hdr, 0, image.BARE_HDR_MAGIC, image.BARE_HDR_VERSION, 0)
+    blk = image.BARE_HDR_DESC_OFFSET
+    hdr[blk:blk + image.BARE_DESC_LEN] = bytes(image.BARE_DESC_LEN)
     flags = int(is_release(version) if release is None else release)
-    struct.pack_into("<IHBBHHB", block, 0, magic, desc_version, hw_id, layout, ids[0], ids[1], flags)
-    block[32:64] = version.encode().ljust(32, b"\0")
-    block[64:96] = product.encode().ljust(32, b"\0")
-    block[96:128] = image_id
-    img[desc_offset:desc_offset + 128] = block
+    struct.pack_into("<IHBBHHB", hdr, blk, magic, desc_version, hw_id, layout, ids[0], ids[1], flags)
+    hdr[blk + 32:blk + 64] = version.encode().ljust(32, b"\0")
+    hdr[blk + 64:blk + 96] = product.encode().ljust(32, b"\0")
+    hdr[blk + 96:blk + 128] = b"\xff" * 32
+    img[header_offset:header_offset + image.BARE_HDR_LEN] = hdr
+    img = bytearray(image.stamp(img, header_offset) if stamped else img)
+    struct.pack_into("<IH", img, header_offset, hdr_magic, hdr_version)
     return bytes(img)
+
+
+# A bare image's image ID, as F1F3 answers it once the image runs.
+def bare_id(img, header_offset=0x200):
+    at = header_offset + image.BARE_ID_OFFSET
+    return bytes(img[at:at + 32])
 
 
 # The app_elf_sha256 an image carries (what F1F3 answers once it runs).

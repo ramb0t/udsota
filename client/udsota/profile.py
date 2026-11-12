@@ -17,7 +17,7 @@ SLOT_SIZE_DEFAULT = 0x400000   # UDSOTA_SLOT_SIZE_DEFAULT
 KEYS = {"can": {"interface", "req_id", "resp_id", "deny_tx"},
         "security": {"mode", "label", "master_file", "private_key_file", "device_id_did", "level_extended",
                      "level_programming"},
-        "image": {"product", "hw_ids", "layout_id", "slot_size", "compression", "format", "desc_offset"},
+        "image": {"product", "hw_ids", "layout_id", "slot_size", "compression", "format", "header_offset"},
         "board": {"did", "names"},
         "busy": {"id", "byte", "values"},
         "preroll": {"tester_present_frames"},
@@ -34,7 +34,7 @@ BLOB_MAX = 4092   # the most one 0x2E carries: SID and DID plus 4092 bytes fill 
 
 SECURITY_MODES = {"hmac": ("label", "master_file"), "ecdsa": ("private_key_file",)}   # mode: its required keys
 COMPRESSION = ("none", "deflate", "auto")   # [image] compression: --no-compress, --compress and --compress-auto
-FORMATS = ("esp-idf", "bare")              # [image] format: an ESP-IDF app image, or one with a bare descriptor block
+FORMATS = ("esp-idf", "bare")              # [image] format: an ESP-IDF app image, or one with udsota's bare header
 FLOWS = ("app", "bootloader")              # [update] flow: an app-resident A/B updater, or a single-slot bootloader
 START_TIMEOUT_DEFAULT = 60                 # [update] start_timeout_s
 
@@ -129,7 +129,7 @@ class Profile:
     compression: str = "none"       # [image] compression: "none", "deflate" or "auto", as flash's compress
     dtcs: dict = field(default_factory=dict)   # [dtcs]: {(dtc, any_ftb): description} (dtc.parse_code)
     image_format: str = "esp-idf"   # [image] format: "esp-idf" or "bare" (image.parse_image)
-    desc_offset: int | None = None  # [image] desc_offset: the bare descriptor block's offset in the file
+    header_offset: int | None = None   # [image] header_offset: the bare header's offset in the file
     flow: str = "app"               # [update] flow: "app" or "bootloader" (update.flash)
     start_timeout_s: int = START_TIMEOUT_DEFAULT   # [update] start_timeout_s: the wait for F1F4 after activating
 
@@ -359,11 +359,11 @@ def from_dict(name, d):
     image_format = _str(name, img_t, "format") or "esp-idf"
     if image_format not in FORMATS:
         _bad(name, "[image] format must be one of %s" % ", ".join(FORMATS))
-    if image_format == "esp-idf" and "desc_offset" in img_t:
-        _bad(name, "[image] desc_offset is for format = \"bare\"")
-    if image_format == "bare" and "desc_offset" not in img_t:
-        _bad(name, "[image] format = \"bare\" needs desc_offset, the descriptor block's offset in the image")
-    desc_offset = _int(name, img_t, "desc_offset", 0, 0xFFFFFFFF)
+    if image_format == "esp-idf" and "header_offset" in img_t:
+        _bad(name, "[image] header_offset is for format = \"bare\"")
+    if image_format == "bare" and "header_offset" not in img_t:
+        _bad(name, "[image] format = \"bare\" needs header_offset, the bare header's offset in the image")
+    header_offset = _int(name, img_t, "header_offset", 0, 0xFFFFFFFF)
     upd_t = d.get("update", {})
     flow = _str(name, upd_t, "flow") or "app"
     if flow not in FLOWS:
@@ -387,7 +387,7 @@ def from_dict(name, d):
                    dids=dids, func_id=func_id, compression=compression,
                    quiet_bus=func_t is not None and _bool(name, func_t, "quiet_bus", False),
                    config=_config(name, d.get("config"), dids), dtcs=_dtcs(name, d.get("dtcs", {})),
-                   image_format=image_format, desc_offset=desc_offset, flow=flow, start_timeout_s=start_timeout_s)
+                   image_format=image_format, header_offset=header_offset, flow=flow, start_timeout_s=start_timeout_s)
 
 
 # Load a profile by name (a file in udsota/profiles) or by path (anything with a / or ending .toml).

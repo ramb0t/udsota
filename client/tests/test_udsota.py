@@ -39,7 +39,7 @@ from udsota import cli, config, delta, dtc, errors, image, keys, pack, profile, 
 from udsota.image import parse_image
 from udsota.uds import BUSY_BACKOFF_S, KEEPALIVE_S, SA_DELAY_S, SIG_P2_S, Uds
 
-from .demo_server import MASTER, build_bare_image, build_image, delta_pair, elf_sha, reseal
+from .demo_server import MASTER, bare_id, build_bare_image, build_image, delta_pair, elf_sha, reseal
 
 # Every optional table on, with the example IDs, label, product and board; a deny list and three boards so
 # the deny-list and board checks have something to refuse.
@@ -1169,7 +1169,7 @@ def test_parse_image_refuses_bad_images(image):
         parse_image(P, image)
 
 
-# A profile for bare images (a non-ESP unit): the block at 0x200, a 64 KiB slot, build_bare_image's identity.
+# A profile for bare images (a non-ESP unit): the header at 0x200, a 64 KiB slot, build_bare_image's identity.
 BARE = """
 [can]
 interface = "vcan0"
@@ -1178,42 +1178,137 @@ resp_id = 0x718
 
 [image]
 format = "bare"
-desc_offset = 0x200
+header_offset = 0x200
 product = "stm32boot"
 hw_ids = [1, 2]
 layout_id = 1
 slot_size = 0x10000
 """
 PB = profile.from_dict("bare", tomllib.loads(BARE))
+BARE_IMG = build_bare_image()
+HO = 0x200                              # PB's header_offset
 
 
-# Check a bare image parses from its descriptor block alone, wherever desc_offset puts it, its image_id standing in
-# for app_elf_sha256; and that an ESP-IDF image has no block where a bare profile looks.
-def test_parse_bare_image_reads_the_block():
-    assert parse_image(PB, build_bare_image(hw_id=2)) == \
-        image.ImageInfo("1.4.0", "stm32boot", bytes(range(32)), 2, 1, 4096)
-    for off in (0, 4096 - 128):
-        prof = dataclasses.replace(PB, desc_offset=off)
-        assert parse_image(prof, build_bare_image(desc_offset=off, image_id=NEW_SHA)).elf_sha == NEW_SHA
-    with pytest.raises(errors.Refused, match="no udsota image descriptor"):
+# Check a stamped bare image parses from its header alone, wherever header_offset puts it, its image_id standing in
+# for app_elf_sha256; and that an ESP-IDF image has no header where a bare profile looks.
+def test_parse_bare_image_reads_the_header():
+    img = build_bare_image(hw_id=2)
+    assert parse_image(PB, img) == image.ImageInfo("1.4.0", "stm32boot", bare_id(img), 2, 1, 4096)
+    for off in (0, 4096 - 224):
+        img = build_bare_image(header_offset=off)
+        assert parse_image(dataclasses.replace(PB, header_offset=off), img).elf_sha == bare_id(img, off)
+    with pytest.raises(errors.Refused, match=re.escape("no bare image header (magic UDSB) at header_offset 512")):
         parse_image(PB, make_image(project=b"stm32boot"))
 
 
-# Check each malformed or foreign bare image is refused, naming what is wrong and where.
+# An image of a stamped image's bytes with one byte at offset at flipped.
+def flipped(img, at):
+    img = bytearray(img)
+    img[at] ^= 0x01
+    return bytes(img)
+
+
+# Check each malformed, unstamped, changed or foreign bare image is refused, naming what is wrong and where: the
+# header's own checks first, each stamping check before the identity, and the slot size on the padded length.
 @pytest.mark.parametrize("data, why", [
-    (build_bare_image()[:0x200 + 127], "639 bytes, too short for the 128-byte descriptor block at desc_offset 512"),
-    (build_bare_image(magic=0), "no udsota image descriptor (magic UDSO) at desc_offset 512"),
-    (build_bare_image(magic=0x4F534455), "no udsota image descriptor (magic UDSO) at desc_offset 512"),
-    (build_bare_image(desc_version=0), "the image descriptor at desc_offset 512 has desc_version 0, not 1 or later"),
+    (BARE_IMG[:HO + 223], "735 bytes, too short for the 224-byte bare header at header_offset 512"),
+    (build_bare_image(hdr_magic=0), "no bare image header (magic UDSB) at header_offset 512"),
+    (build_bare_image(hdr_magic=0x42534455), "no bare image header (magic UDSB) at header_offset 512"),
+    (build_bare_image(hdr_version=2), "the bare header at header_offset 512 has header_version 2, not 1"),
+    (build_bare_image(hdr_version=0, stamped=False), "has header_version 0, not 1"),
+    (build_bare_image(stamped=False), "the bare header's image_length is 4294967295 and the file 4096 bytes: the "
+                                      "image is not stamped or was changed after stamping (`udsota stamp` stamps it)"),
+    (BARE_IMG + b"\xff" * 4, "image_length is 4096 and the file 4100 bytes: the image is not stamped"),
+    (BARE_IMG[:-4], "image_length is 4096 and the file 4092 bytes: the image is not stamped"),
+    (image.stamp(BARE_IMG + b"\xff" * 4, HO)[:-2], "image_length is 4100 and the file 4098 bytes"),
+    (flipped(BARE_IMG, 0), "the bare header's crc32 is 0x%08X and the image's 0x%08X: the image is not stamped or "
+                           "was changed after stamping (`udsota stamp` stamps it)"
+                           % (image.bare_crc(BARE_IMG, HO), image.bare_crc(flipped(BARE_IMG, 0), HO))),
+    (flipped(BARE_IMG, 4095), "the bare header's crc32 is"),
+    (flipped(BARE_IMG, HO + 0x20 + 33), "the bare header's crc32 is"),          # the version string
+    (flipped(BARE_IMG, HO + 0xA0), "the bare header's crc32 is"),               # the signature, under the CRC
+    (build_bare_image(magic=0), "no udsota image descriptor (magic UDSO) in the bare header at header_offset 512"),
+    (build_bare_image(magic=0x4F534455), "no udsota image descriptor (magic UDSO) in the bare header at header_offset"),
+    (build_bare_image(desc_version=0), "the image descriptor in the bare header at header_offset 512 has desc_version "
+                                       "0, not 1 or later"),
     (build_bare_image(product="other"), "image project is 'other', not 'stm32boot'"),
     (build_bare_image(ids=(0x720, 0x728)), "image answers on 0x720/0x728, not 0x710/0x718"),
     (build_bare_image(hw_id=9), "image hw_id 9 is not one of the profile's [1, 2]"),
     (build_bare_image(layout=2), "image layout 2 is not the profile's 1"),
-    (build_bare_image(size=0x10001), "image is 65537 bytes; the slot holds 65536"),
+    (build_bare_image(size=0x10001), "image is 65540 bytes; the slot holds 65536"),
 ])
 def test_parse_bare_image_refuses_bad_images(data, why):
     with pytest.raises(errors.Refused, match=re.escape(why)):
         parse_image(PB, data)
+
+
+# Check an image whose CRC was fixed after a change is still refused, by its image ID; and that a length not a
+# multiple of 4 is refused even when image_length and the CRC agree with it.
+def test_parse_bare_image_checks_the_id_and_the_padding():
+    img = bytearray(flipped(BARE_IMG, 100))
+    struct.pack_into("<I", img, HO + 12, image.bare_crc(img, HO))
+    with pytest.raises(errors.Refused, match=re.escape(
+            "the bare header's image_id %s... is not the image's %s...: the image is not stamped or was changed after "
+            "stamping (`udsota stamp` stamps it)" % (bare_id(BARE_IMG)[:4].hex(),
+                                                     image.bare_image_id(img, HO)[:4].hex()))):
+        parse_image(PB, bytes(img))
+    odd = bytearray(BARE_IMG[:-1])
+    struct.pack_into("<I", odd, HO + 8, len(odd))
+    odd[HO + 128:HO + 160] = image.bare_image_id(odd, HO)
+    struct.pack_into("<I", odd, HO + 12, image.bare_crc(odd, HO))
+    with pytest.raises(errors.Refused, match=re.escape("image is 4095 bytes, not a multiple of 4: the image is not "
+                                                       "stamped")):
+        parse_image(PB, bytes(odd))
+
+
+# ---- image.stamp ----
+
+# Check stamp pads with 0xFF to a multiple of 4, writes image_length, the image ID and the CRC to their known
+# answers, leaves every other byte (the signature among them) as it was, and returns a stamped image unchanged.
+@pytest.mark.parametrize("size", [4096, 4097, 4098, 4099])
+def test_stamp_writes_the_header(size):
+    raw = build_bare_image(size=size, stamped=False)
+    raw = raw[:HO + 0xA0] + bytes(range(64)) + raw[HO + 0xE0:]     # a signature stamp must not touch
+    img = image.stamp(raw, HO)
+    assert len(img) == (size + 3) & ~3 and img[size:] == b"\xff" * (len(img) - size)
+    assert struct.unpack_from("<I", img, HO + 8)[0] == len(img)
+    ident = bytearray(img)
+    for at, n in ((HO + 12, 4), (HO + 128, 32), (HO + 160, 64)):
+        ident[at:at + n] = b"\xff" * n
+    assert img[HO + 128:HO + 160] == hashlib.sha256(ident).digest()
+    assert struct.unpack_from("<I", img, HO + 12)[0] == zlib.crc32(img[:HO + 12] + img[HO + 16:])
+    assert img[HO + 160:HO + 224] == bytes(range(64))
+    changed = [i for i in range(size) if img[i] != raw[i]]
+    assert all(HO + 8 <= i < HO + 16 or HO + 128 <= i < HO + 160 for i in changed)
+    assert image.stamp(img, HO) == img
+    assert parse_image(PB, img).elf_sha == img[HO + 128:HO + 160]
+
+
+# Check stamp's helpers are the rule's known answers, and that the image ID ignores the fields it covers as 0xFF
+# while the CRC covers everything but its own field.
+def test_stamp_helpers():
+    img = BARE_IMG
+    assert image.bare_crc(img, HO) == zlib.crc32(img[:HO + 12] + img[HO + 16:])
+    sig = img[:HO + 160] + b"\x00" * 64 + img[HO + 224:]
+    assert image.bare_image_id(sig, HO) == image.bare_image_id(img, HO) == bare_id(img)
+    assert image.bare_crc(sig, HO) != image.bare_crc(img, HO)
+    crc = img[:HO + 12] + b"\0\0\0\0" + img[HO + 16:]
+    assert image.bare_crc(crc, HO) == image.bare_crc(img, HO) and image.bare_image_id(crc, HO) == bare_id(img)
+
+
+# Check stamp refuses a file too short for the header, a wrong magic and a header_version other than 1, as Refused.
+@pytest.mark.parametrize("data, why", [
+    (build_bare_image(stamped=False)[:HO + 223], "735 bytes, too short for the 224-byte bare header at header_offset"),
+    (b"", "0 bytes, too short for the 224-byte bare header at header_offset 512"),
+    (build_bare_image(stamped=False, hdr_magic=0x5544534F), "no bare image header (magic UDSB) at header_offset 512"),
+    (build_bare_image(stamped=False, hdr_version=0), "has header_version 0, not 1"),
+    (build_bare_image(stamped=False, hdr_version=2), "has header_version 2, not 1"),
+])
+def test_stamp_refuses(data, why):
+    with pytest.raises(errors.Refused, match=re.escape(why)):
+        image.stamp(data, HO)
+    with pytest.raises(errors.Refused, match="header_offset -1 is negative"):
+        image.stamp(BARE_IMG, -1)
 
 
 # ---- DID decoding ----
@@ -1312,7 +1407,7 @@ def test_wire_numbers_match_udsota_wire():
     assert flags == set(wire.STATUS_FLAGS) - {wire.STATUS_BOOT_HELD}
 
 
-UDSOTA_H, ISO14229_H = REPO / "udsota.h", REPO / "iso14229" / "iso14229.h"
+UDSOTA_H, UDSOTA_WIRE_H, ISO14229_H = REPO / "udsota.h", REPO / "udsota_wire.h", REPO / "iso14229" / "iso14229.h"
 # What wire.py mirrors that this server has no number for: F1F2, delta's DFI 0x20, the DTC services and the boot-loop
 # flag (0x02) belong to v0.14.2's server, and iso14229 takes any ALFID. The v0.14.x test above still checks them.
 NOT_IN_UDSOTA_H = {"UDSOTA_DID_COUNTERS", "UDSOTA_DL_DFI_DELTA", "UDSOTA_DL_ALFID",
@@ -1328,8 +1423,8 @@ NRC_ISO14229 = {"UDSOTA_NRC_BUSY_REPEAT": "UDS_NRC_BusyRepeatRequest",
                 "UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE": "UDS_NRC_GeneralProgrammingFailure",
                 "UDSOTA_NRC_SUBFUNC_NOT_SUPPORTED": "UDS_NRC_SubFunctionNotSupported",
                 "UDSOTA_NRC_RESPONSE_TOO_LONG": "UDS_NRC_ResponseTooLong"}
-# The client's own copy of each udsota.h wire number outside WIRE_DEFINES: lengths, levels, offsets, and F1F4, which
-# came after v0.14.2.
+# The client's own copy of each udsota_wire.h number outside WIRE_DEFINES: lengths, levels, offsets, the bare header,
+# and F1F4, which came after v0.14.2.
 CLIENT_NUMBERS = {"UDSOTA_DID_IMAGE_PREFIX": wire.DID_IMAGE_PREFIX, "UDSOTA_DL_MAX_BLOCK_LEN": wire.DL_MAX_DATA + 2,
                   "UDSOTA_SA_SEED_EXTENDED": PE.security.level_extended,         # the profile's default levels
                   "UDSOTA_SA_SEED_PROGRAMMING": PE.security.level_programming,
@@ -1338,17 +1433,37 @@ CLIENT_NUMBERS = {"UDSOTA_DID_IMAGE_PREFIX": wire.DID_IMAGE_PREFIX, "UDSOTA_DL_M
                   "UDSOTA_KEYS_ID_MAX": keys.ID_MAX, "UDSOTA_IMG_DESC_OFFSET": image.DESC_OFFSET,
                   "UDSOTA_BARE_DESC_LEN": image.BARE_DESC_LEN, "UDSOTA_BARE_VERSION_OFFSET": image.BARE_VERSION_OFFSET,
                   "UDSOTA_BARE_PROJECT_OFFSET": image.BARE_PROJECT_OFFSET,
-                  "UDSOTA_BARE_IMAGE_ID_OFFSET": image.BARE_IMAGE_ID_OFFSET}
-# udsota.h's wire numbers the client never sends or reads, which must equal v0.14.2's instead.
+                  "UDSOTA_BARE_IMAGE_ID_OFFSET": image.BARE_IMAGE_ID_OFFSET,
+                  "UDSOTA_BARE_HDR_MAGIC": image.BARE_HDR_MAGIC, "UDSOTA_BARE_HDR_VERSION": image.BARE_HDR_VERSION,
+                  "UDSOTA_BARE_HDR_LEN": image.BARE_HDR_LEN,
+                  "UDSOTA_BARE_HDR_LENGTH_OFFSET": image.BARE_HDR_LENGTH_OFFSET,
+                  "UDSOTA_BARE_HDR_CRC_OFFSET": image.BARE_HDR_CRC_OFFSET,
+                  "UDSOTA_BARE_HDR_DESC_OFFSET": image.BARE_HDR_DESC_OFFSET,
+                  "UDSOTA_BARE_HDR_SIG_OFFSET": image.BARE_HDR_SIG_OFFSET,
+                  "UDSOTA_BARE_HDR_SIG_LEN": image.BARE_HDR_SIG_LEN}
+# udsota_wire.h's numbers the client never sends or reads, which must equal v0.14.2's instead.
 SERVER_ONLY = {"UDSOTA_RID_GET_RESUME_POINT", "UDSOTA_RESUME_NOT_AVAILABLE", "UDSOTA_DL_Z_BOUND",
                "UDSOTA_SA_SEED_VALID_MS"}
 
 
-# udsota.h's text, or a skip when the checkout has none (a wheel-only install).
-def udsota_h():
+# A header's text, udsota.h's by default, or a skip when the checkout has no udsota.h (a wheel-only install); a
+# checkout with udsota.h and not the header asked for fails.
+def udsota_h(path=UDSOTA_H):
     if not UDSOTA_H.is_file():
         pytest.skip("no %s (not a repo checkout)" % UDSOTA_H)
-    return UDSOTA_H.read_text()
+    return path.read_text()
+
+
+# Check a checkout with udsota.h and no udsota_wire.h fails the header checks rather than skipping them.
+def test_udsota_h_missing_wire_h_fails(tmp_path):
+    udsota_h()   # skips this test only where udsota.h is missing too
+    try:
+        udsota_h(tmp_path / "udsota_wire.h")
+    except pytest.skip.Exception:
+        pytest.fail("a missing udsota_wire.h skipped the header checks")
+    except FileNotFoundError:
+        return
+    pytest.fail("a missing udsota_wire.h read as text")
 
 
 # The UDSOTA_ #defines in comment-free text as {name: value}: an int, a string literal's text, or anything else
@@ -1361,20 +1476,26 @@ def udsota_defines(text):
     return out
 
 
-# udsota.h's "Wire contract" block as udsota_defines gives it.
+# The wire contract, every UDSOTA_ #define in udsota_wire.h, as udsota_defines gives it.
 def udsota_h_wire_block():
-    text = udsota_h()
-    start = text.index("---- Wire contract ----")
-    return udsota_defines(re.sub(r"/\*.*?\*/", "", text[start:text.index("/* ---- ", start)], flags=re.S))
+    return udsota_defines(re.sub(r"/\*.*?\*/", "", udsota_h(UDSOTA_WIRE_H), flags=re.S))
 
 
-# Check this server's wire numbers, udsota.h's "Wire contract" block and the NRCs and sessions it takes from
-# iso14229.h, match wire.py's and the client's other copies, and that every name on either side is accounted for.
+# Check udsota_wire.h stands alone, with no #include, and that udsota.h includes it and defines none of its names.
+def test_udsota_wire_h_stands_alone():
+    wire_h, h = (re.sub(r"/\*.*?\*/", "", udsota_h(f), flags=re.S) for f in (UDSOTA_WIRE_H, UDSOTA_H))
+    assert not re.search(r"^[ \t]*#[ \t]*include", wire_h, flags=re.M)
+    assert re.search(r'^#include "udsota_wire\.h"', h, flags=re.M)
+    assert not udsota_defines(h).keys() & udsota_h_wire_block().keys()
+
+
+# Check this server's wire numbers, udsota_wire.h and the NRCs and sessions it takes from iso14229.h, match wire.py's
+# and the client's other copies, and that every name on either side is accounted for.
 def test_wire_numbers_match_udsota_h():
     block = udsota_h_wire_block()
     flags = {k for k in block if k.startswith("UDSOTA_STATUS_")}
     unmapped = set(block) - set(WIRE_DEFINES) - set(CLIENT_NUMBERS) - SERVER_ONLY - flags
-    assert not unmapped, "udsota.h wire numbers the client test doesn't map: %s" % sorted(unmapped)
+    assert not unmapped, "udsota_wire.h numbers the client test doesn't map: %s" % sorted(unmapped)
     assert {c: block[c] for c in block.keys() & WIRE_DEFINES} == \
         {c: getattr(wire, WIRE_DEFINES[c]) for c in block.keys() & WIRE_DEFINES}
     assert {c: block[c] for c in CLIENT_NUMBERS} == CLIENT_NUMBERS
@@ -1391,7 +1512,7 @@ def test_wire_numbers_match_udsota_h():
                                                                           wire.SESSION_EXTENDED)
 
 
-# Check udsota.h's wire numbers no client copy covers (F000 and its status, the seed lifetime, the DEFLATE overrun
+# Check udsota_wire.h's numbers no client copy covers (F000 and its status, the seed lifetime, the DEFLATE overrun
 # bound) match v0.14.2's udsota_wire.h, so a tester sees the same from either server.
 def test_server_only_numbers_match_udsota_wire():
     block, v014 = udsota_h_wire_block(), udsota_defines(wire_header())
@@ -2708,27 +2829,30 @@ def test_bad_profiles_are_refused(tmp_path, text, why):
         profile.load(str(p))
 
 
-# Check [image] format defaults to esp-idf with no desc_offset, and "bare" takes a desc_offset from 0 to 0xFFFFFFFF.
+# Check [image] format defaults to esp-idf with no header_offset, and "bare" takes a header_offset from 0 to
+# 0xFFFFFFFF.
 def test_image_format_profile_values():
-    assert (P.image_format, P.desc_offset) == ("esp-idf", None)
-    assert (profile.load("example").image_format, profile.load("example").desc_offset) == ("esp-idf", None)
+    assert (P.image_format, P.header_offset) == ("esp-idf", None)
+    assert (profile.load("example").image_format, profile.load("example").header_offset) == ("esp-idf", None)
     esp = profile.from_dict("e", tomllib.loads(FULL.replace("[image]\n", '[image]\nformat = "esp-idf"\n')))
-    assert (esp.image_format, esp.desc_offset) == ("esp-idf", None)
-    assert (PB.image_format, PB.desc_offset) == ("bare", 0x200)
+    assert (esp.image_format, esp.header_offset) == ("esp-idf", None)
+    assert (PB.image_format, PB.header_offset) == ("bare", 0x200)
     for off in (0, 0xFFFFFFFF):
-        assert profile.from_dict("b", tomllib.loads(BARE.replace("0x200", str(off)))).desc_offset == off
+        assert profile.from_dict("b", tomllib.loads(BARE.replace("0x200", str(off)))).header_offset == off
 
 
-# Check a bad [image] format or desc_offset is refused with its reason.
+# Check a bad [image] format or header_offset is refused with its reason, and desc_offset, which header_offset
+# replaced, as an unknown key.
 @pytest.mark.parametrize("old, new, why", [
     ('format = "bare"', 'format = "elf"', "[image] format must be one of esp-idf, bare"),
     ('format = "bare"', "format = 1", "format must be a non-empty string"),
-    ("desc_offset = 0x200\n", "", '[image] format = "bare" needs desc_offset'),
-    ('format = "bare"', 'format = "esp-idf"', '[image] desc_offset is for format = "bare"'),
-    ('format = "bare"\n', "", '[image] desc_offset is for format = "bare"'),
-    ("0x200", "-1", "desc_offset must be an integer from 0x0 to 0xFFFFFFFF"),
-    ("0x200", "0x100000000", "desc_offset must be an integer from 0x0 to 0xFFFFFFFF"),
-    ("0x200", '"0x200"', "desc_offset must be an integer from 0x0 to 0xFFFFFFFF"),
+    ("header_offset = 0x200\n", "", '[image] format = "bare" needs header_offset'),
+    ("header_offset = 0x200\n", "desc_offset = 0x200\n", "unknown key desc_offset in [image]"),
+    ('format = "bare"', 'format = "esp-idf"', '[image] header_offset is for format = "bare"'),
+    ('format = "bare"\n', "", '[image] header_offset is for format = "bare"'),
+    ("0x200", "-1", "header_offset must be an integer from 0x0 to 0xFFFFFFFF"),
+    ("0x200", "0x100000000", "header_offset must be an integer from 0x0 to 0xFFFFFFFF"),
+    ("0x200", '"0x200"', "header_offset must be an integer from 0x0 to 0xFFFFFFFF"),
 ])
 def test_bad_image_format_is_refused(old, new, why):
     with pytest.raises(errors.Refused, match="profile bare: " + re.escape(why)):
@@ -4429,15 +4553,16 @@ def test_pack_orders_deltas_as_flash_does(tmp_path):
 # ---- bare images: flash and pack ----
 
 # Check flash sends a bare image as it sends an ESP-IDF one, plain and compressed, and compares F1F3 with its
-# image_id. The block sits at 80 so that its image_id lands where FakeServer reads a written image's F1F3, 176..208.
+# image_id. The header sits at 48 so that its image_id lands where FakeServer reads a written image's F1F3, 176..208.
 def test_flash_bare_image():
-    prof = dataclasses.replace(PB, desc_offset=80)
-    img = build_bare_image(desc_offset=80, image_id=NEW_SHA)
+    prof = dataclasses.replace(PB, header_offset=48)
+    img = build_bare_image(header_offset=48)
+    ident = bare_id(img, 48)
     for compress, dfi in (("none", 0x00), ("deflate", 0x10)):
         d = FakeServer(security=False, compress=True)
         assert run_flash(d, img, prof=prof, compress=compress)[0] == 0
-        assert (d.dfi, bytes(d.written), d.sha) == (dfi, img, NEW_SHA)
-    d = FakeServer(security=False, sha=NEW_SHA)
+        assert (d.dfi, bytes(d.written), d.sha) == (dfi, img, ident)
+    d = FakeServer(security=False, sha=ident)
     assert run_flash(d, img, prof=prof)[0] == 0 and not any(x[0] == 0x34 for x in d.log)
 
 
@@ -4455,7 +4580,7 @@ def test_pack_bare_image(tmp_path, args, dfis):
     for e in m["payloads"]:
         data = (tmp_path / "out" / e["file"]).read_bytes()
         assert (e["memory_size"], e["image_elf_sha256"], e["image_version"], e["hw_id"]) == \
-            (len(img), bytes(range(32)).hex(), "1.4.0", 1)
+            (len(img), bare_id(img).hex(), "1.4.0", 1)
         assert (zlib.decompress(data, -15) if e["dfi"] == 0x10 else data) == img
 
 
@@ -4484,6 +4609,116 @@ def test_bare_image_refuses_delta(tmp_path, capsys, monkeypatch):
     with pytest.raises(errors.Refused, match=re.escape(why)):
         pack.pack(PB, build_bare_image(), "fw", tmp_path / "out", base=base.read_bytes())
     assert not (tmp_path / "out").exists()
+
+
+# ---- stamp ----
+
+# A bare profile and an unstamped image written to tmp_path, for the stamp command's tests: (profile, fw.bin, raw).
+def stamp_files(tmp_path, size=4097):
+    prof, fw, raw = tmp_path / "bare.toml", tmp_path / "fw.bin", build_bare_image(size=size, stamped=False)
+    prof.write_text(BARE)
+    fw.write_bytes(raw)
+    return prof, fw, raw
+
+
+# The names in directory d, to show stamp left no temporary file.
+def names(d):
+    return sorted(f.name for f in d.iterdir())
+
+
+# Check stamp stamps FILE in place, keeping its permissions, logs the length, CRC and image ID prefix, opens no bus,
+# and leaves a stamped file as it is when run again.
+def test_stamp_command_in_place(tmp_path, capsys):
+    prof, fw, raw = stamp_files(tmp_path)
+    fw.chmod(0o640)
+    assert cli.main(["--profile", str(prof), "stamp", str(fw)], transport=no_transport) == 0
+    img = fw.read_bytes()
+    assert img == image.stamp(raw, HO) and stat.S_IMODE(fw.stat().st_mode) == 0o640
+    assert capsys.readouterr().out == "stamped %s: 4100 bytes, crc32 0x%08X, image ID %s...\n" % (
+        fw, image.bare_crc(img, HO), bare_id(img)[:4].hex())
+    assert cli.main(["--profile", str(prof), "stamp", str(fw)], transport=no_transport) == 0
+    assert fw.read_bytes() == img and names(tmp_path) == ["bare.toml", "fw.bin"]
+
+
+# Check stamp --out writes the stamped image there, replacing a file already there, and leaves FILE as it was.
+def test_stamp_command_out(tmp_path):
+    prof, fw, raw = stamp_files(tmp_path)
+    out = tmp_path / "fw.stamped.bin"
+    for _ in range(2):
+        assert cli.main(["--profile", str(prof), "stamp", str(fw), "--out", str(out)], transport=no_transport) == 0
+        assert (fw.read_bytes(), out.read_bytes()) == (raw, image.stamp(raw, HO))
+    assert names(tmp_path) == ["bare.toml", "fw.bin", "fw.stamped.bin"]
+
+
+# Check stamp refuses (exit 2) an esp-idf profile, an unreadable FILE, a header stamp refuses, and an image that
+# fails the profile's checks once stamped, writing nothing.
+@pytest.mark.parametrize("edit, why", [
+    (lambda prof, fw: prof.write_text(BARE.replace('format = "bare"\nheader_offset = 0x200\n', "")),
+     'profile bare: stamp is for [image] format = "bare", and its format is "esp-idf"'),
+    (lambda prof, fw: fw.unlink(), "cannot read %s"),
+    (lambda prof, fw: fw.write_bytes(build_bare_image(stamped=False, hdr_magic=0)),
+     "no bare image header (magic UDSB) at header_offset 512"),
+    (lambda prof, fw: fw.write_bytes(build_bare_image(stamped=False, product="other")),
+     "image project is 'other', not 'stm32boot'"),
+    (lambda prof, fw: fw.write_bytes(build_bare_image(stamped=False)[:HO + 100]),
+     "image is 612 bytes, too short for the 224-byte bare header at header_offset 512"),
+])
+def test_stamp_command_refuses(tmp_path, capsys, edit, why):
+    prof, fw, _ = stamp_files(tmp_path)
+    edit(prof, fw)
+    before = fw.read_bytes() if fw.exists() else None
+    assert cli.main(["--profile", str(prof), "stamp", str(fw), "--out", str(tmp_path / "o.bin")],
+                    transport=no_transport) == 2
+    assert ("udsota: " + (why % fw if "%s" in why else why)) in capsys.readouterr().err
+    assert (fw.read_bytes() if fw.exists() else None) == before and not (tmp_path / "o.bin").exists()
+    if before is not None:
+        assert cli.main(["--profile", str(prof), "stamp", str(fw)], transport=no_transport) == 2
+        assert fw.read_bytes() == before
+
+
+# Check a failed write leaves FILE as it was and no temporary file behind: the replace failing, and --out in a
+# directory that does not exist.
+def test_stamp_command_is_atomic(tmp_path, capsys, monkeypatch):
+    prof, fw, raw = stamp_files(tmp_path)
+
+    def fail(src, dst):
+        raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+    monkeypatch.setattr(os, "replace", fail)
+    assert cli.main(["--profile", str(prof), "stamp", str(fw)], transport=no_transport) == 2
+    assert "udsota: cannot write %s: No space left on device" % fw in capsys.readouterr().err
+    assert fw.read_bytes() == raw and names(tmp_path) == ["bare.toml", "fw.bin"]
+    monkeypatch.undo()
+    assert cli.main(["--profile", str(prof), "stamp", str(fw), "--out", str(tmp_path / "no" / "o.bin")],
+                    transport=no_transport) == 2
+    assert "cannot write %s" % (tmp_path / "no" / "o.bin") in capsys.readouterr().err
+    assert fw.read_bytes() == raw and names(tmp_path) == ["bare.toml", "fw.bin"]
+
+
+# Check stamp through a symlink, as FILE or as --out, stamps the link's target and keeps the link.
+def test_stamp_command_through_symlink(tmp_path):
+    prof, fw, raw = stamp_files(tmp_path)
+    link = tmp_path / "latest.bin"
+    link.symlink_to(fw.name)
+    assert cli.main(["--profile", str(prof), "stamp", str(link)], transport=no_transport) == 0
+    assert link.is_symlink() and fw.read_bytes() == image.stamp(raw, HO)
+    fw.write_bytes(raw)
+    out, target = tmp_path / "out.bin", tmp_path / "target.bin"
+    target.write_bytes(b"old")
+    out.symlink_to(target.name)
+    assert cli.main(["--profile", str(prof), "stamp", str(fw), "--out", str(out)], transport=no_transport) == 0
+    assert out.is_symlink() and target.read_bytes() == image.stamp(raw, HO) and fw.read_bytes() == raw
+    assert names(tmp_path) == ["bare.toml", "fw.bin", "latest.bin", "out.bin", "target.bin"]
+
+
+# Check stamp --out naming a directory, "." or "/" among them, is refused (exit 2), writing nothing.
+@pytest.mark.parametrize("out", [".", "/", "sub"])
+def test_stamp_command_refuses_a_directory(tmp_path, capsys, monkeypatch, out):
+    prof, fw, raw = stamp_files(tmp_path)
+    (tmp_path / "sub").mkdir()
+    monkeypatch.chdir(tmp_path)
+    assert cli.main(["--profile", str(prof), "stamp", str(fw), "--out", out], transport=no_transport) == 2
+    assert "udsota: cannot write %s: it is a directory" % out in capsys.readouterr().err
+    assert fw.read_bytes() == raw and names(tmp_path) == ["bare.toml", "fw.bin", "sub"] and not names(tmp_path / "sub")
 
 
 # ---- [update] flow = "bootloader": a single-slot unit whose bootloader is its only UDS server ----
@@ -4573,12 +4808,13 @@ class BootloaderUnit(FakeServer):
 
 
 UPDATE_BL = '\n[update]\nflow = "bootloader"\n'
-# BARE under the bootloader flow, its block at 80 so that the image_id lands where BootloaderUnit reads a written
+# BARE under the bootloader flow, its header at 48 so that the image_id lands where BootloaderUnit reads a written
 # image's ID, 176..208; and FULL under it, for [security] and [board].
-BARE_BL = BARE.replace("0x200", "80") + UPDATE_BL
+BARE_BL = BARE.replace("0x200", "48") + UPDATE_BL
 PBL = profile.from_dict("bare-boot", tomllib.loads(BARE_BL))
 PFB = profile.from_dict("full-boot", tomllib.loads(FULL + UPDATE_BL))
-BL_IMG = build_bare_image(desc_offset=80, size=4800, image_id=NEW_SHA)
+BL_IMG = build_bare_image(header_offset=48, size=4800)
+BL_ID = bare_id(BL_IMG, 48)         # BL_IMG's image ID
 BL_PRECHECK = [(0x22, 0xF1F4), (0x10, 2), (0x22, 0xF1F0), (0x22, 0xF1F3)]   # F1F4 to the app, then the hop
 POLLS = [(0x22, 0xF1F4)] * 3        # the app answers the third, after start_silence
 
@@ -4606,17 +4842,17 @@ def test_bootloader_flow_flashes_a_bare_image():
     rc, ft, lines = run_boot(d, quiet=quiet)
     assert rc == 0
     assert d.log == BL_PRECHECK + DOWNLOAD + POLLS
-    assert bytes(d.written) == BL_IMG and d.in_app and d.sha == NEW_SHA and events == [1, len(d.log)]
+    assert bytes(d.written) == BL_IMG and d.in_app and d.sha == BL_ID and events == [1, len(d.log)]
     assert ft.sleeps == [update.REBOOT_WAIT_S] + [update.BOOT_POLL_S] * 2
-    assert lines[0] == "image 1.4.0 for hw_id 1, 4800 bytes, image ID a0a1a2a3a4a5a6a7"
-    assert lines[-1] == "the app runs the new image (F1F4 a0a1a2a3) and reports healthy"
+    assert lines[0] == "image 1.4.0 for hw_id 1, 4800 bytes, image ID %s" % BL_ID[:8].hex()
+    assert lines[-1] == "the app runs the new image (F1F4 %s) and reports healthy" % BL_ID[:4].hex()
 
 
 # Check an image a unit in its bootloader already holds gets 11 01 and the F1F4 proof, no download; a held unit is told
 # so, and that the reset releases it for another try.
 @pytest.mark.parametrize("held", [False, True])
 def test_bootloader_flow_already_installed_resets_into_it(held):
-    d = BootloaderUnit(security=False, in_app=False, held=held, sha=NEW_SHA)
+    d = BootloaderUnit(security=False, in_app=False, held=held, sha=BL_ID)
     rc, _, lines = run_boot(d)
     assert rc == 0 and d.log == BL_PRECHECK + [(0x11, 1)] + POLLS and d.in_app and not d.held
     text = "\n".join(lines)
@@ -4634,16 +4870,17 @@ def test_bootloader_flow_flashes_a_held_unit():
 
 # Check a healthy app already running the image is left running: one F1F4 read in the default session, then nothing.
 def test_bootloader_flow_healthy_app_with_the_image_is_left_running():
-    d, entered = BootloaderUnit(security=False, sha=NEW_SHA), []
+    d, entered = BootloaderUnit(security=False, sha=BL_ID), []
     rc, _, lines = run_boot(d, quiet=lambda: entered.append(1) or contextlib.nullcontext())
     assert rc == 0 and d.log == [(0x22, 0xF1F4)] and d.in_app and not entered
-    assert lines[-1] == "the unit's app already runs this image (F1F4 a0a1a2a3) and reports healthy: nothing to do"
+    assert lines[-1] == "the unit's app already runs this image (F1F4 %s) and reports healthy: nothing to do" % \
+        BL_ID[:4].hex()
 
 
 # Check the first F1F4 read leads to the 10 02 whenever it does not read the image's prefix: a silent app, a
 # bootloader answering 0x31, and an app running another image.
 @pytest.mark.parametrize("kw", [dict(app_silent=True, start_silence=0), dict(in_app=False),
-                                dict(app_prefix=b"\xde\xad\xbe\xef", sha=NEW_SHA)])
+                                dict(app_prefix=b"\xde\xad\xbe\xef", sha=BL_ID)])
 def test_bootloader_flow_first_f1f4_without_the_image_goes_on(kw):
     d = BootloaderUnit(security=False, **kw)
     with contextlib.suppress(errors.UpdateFailed):   # the silent app and the other image fail later, at F1F4
@@ -4675,7 +4912,7 @@ def test_bootloader_flow_nrc_to_the_resent_activate_waits_for_f1f4(nrc):
 @pytest.mark.parametrize("kw, why", [
     (dict(lose_activate=2), r"ActivateImage got no answer and the unit is still in its bootloader \(F1F4 answered "
                             r"0x31\): run flash again; F1F0: "),
-    (dict(in_app=False, sha=NEW_SHA, app_fails=True), r"the unit is back in its bootloader \(F1F4 answered 0x31\): "
+    (dict(in_app=False, sha=BL_ID, app_fails=True), r"the unit is back in its bootloader \(F1F4 answered 0x31\): "
                                                       r"the app did not start; F1F0: "),
 ])
 def test_bootloader_flow_bootloader_answering_f1f4_names_the_cause(kw, why):
@@ -4746,7 +4983,7 @@ def test_bootloader_flow_silent_app_times_out(timeout):
 def test_bootloader_flow_other_prefix_fails():
     d = BootloaderUnit(security=False, app_prefix=b"\xde\xad\xbe\xef")
     with pytest.raises(errors.UpdateFailed, match="^the app runs another image: F1F4 reads deadbeef, not the new "
-                                                  "image's a0a1a2a3$"):
+                                                  "image's %s$" % BL_ID[:4].hex()):
         run_boot(d)
 
 
@@ -4822,7 +5059,315 @@ def test_main_bootloader_flow_flash_end_to_end(tmp_path, monkeypatch):
     d = BootloaderUnit(security=False, start_silence=0)
     assert cli.main(["--profile", str(tmp_path / "boot.toml"), "flash", str(tmp_path / "fw.bin")],
                     transport=FakeTransport.on(d)) == 0
-    assert d.log == BL_PRECHECK + DOWNLOAD + [(0x22, 0xF1F4)] and d.sha == NEW_SHA
+    assert d.log == BL_PRECHECK + DOWNLOAD + [(0x22, 0xF1F4)] and d.sha == BL_ID
+
+
+# ---- flash --wait-for-unit: 10 02 into a bootloader's power-up window ----
+
+# A TimedConnection whose server may answer late: an answer given as (delay_s, payload) arrives delay_s after the
+# request, and a wait takes fake time up to the next arrival. empty_rxqueue, which udsoncan calls before each send,
+# drops only what has arrived, as the kernel socket's queue would. Each send takes send_s of fake time first. A send
+# the server fails with OSError takes its no_ack_s (the kernel's echo timeout) more, and still queues the answers the
+# error carries as held (a frame the kernel held until the server came on). With monitor, every frame is shown to it
+# as it is taken or dropped.
+class LateConnection(TimedConnection):
+    # Wrap server on ft's clock.
+    def __init__(self, server, ft, monitor=None, send_s=0.0):
+        super().__init__(server, ft)
+        self.monitor, self.send_s = monitor, send_s
+
+    # Queue the server's answers to payload at their arrival times.
+    def specific_send(self, payload, timeout=None):
+        self.ft.t += self.send_s
+        t = self.ft.t
+        try:
+            answers = self.server.handle(bytes(payload))
+        except OSError as e:
+            self.enqueue(t, getattr(e, "held", []))
+            self.ft.t += getattr(self.server, "no_ack_s", 0.0)
+            raise
+        self.enqueue(t, answers)
+
+    # Queue answers to a send at t, each arriving then or as (delay_s, payload) delay_s later.
+    def enqueue(self, t, answers):
+        for a in answers:
+            self.queue.append((t + a[0], a[1]) if isinstance(a, tuple) else (t, a))
+        self.queue = deque(sorted(self.queue, key=lambda e: e[0]))
+
+    # Drop what has arrived.
+    def empty_rxqueue(self):
+        while self.queue and self.queue[0][0] <= self.ft.t:
+            self.seen(self.queue.popleft()[1])
+
+    # The next answer to arrive within timeout, the clock moved to its arrival; else the timeout passes.
+    def specific_wait_frame(self, timeout=None):
+        timeout = timeout or 0.0
+        if not self.queue or self.queue[0][0] > self.ft.t + timeout:
+            self.ft.t += timeout
+            raise TimeoutException("stub: no answer within %.3f s" % timeout)
+        t, frame = self.queue.popleft()
+        self.ft.t = max(self.ft.t, t)
+        self.seen(frame)
+        return frame
+
+    # Show frame to the monitor as a 0x718 frame.
+    def seen(self, frame):
+        if self.monitor is not None:
+            self.monitor.on_frame(can.Message(arbitration_id=0x718, is_extended_id=False, data=frame[:8]))
+
+
+# A Uds over a LateConnection to server on ft's clock, through a GuardedConnection with monitor when given.
+def late_uds(server, ft, monitor=None, send_s=0.0):
+    server.clock = ft.clock
+    conn = LateConnection(server, ft, monitor, send_s)
+    if monitor is not None:
+        conn = transport.GuardedConnection(conn, monitor)
+    client = Client(conn, config=transport.client_config())
+    client.open()
+    return Uds(client, sleep=ft.sleep, clock=ft.clock)
+
+
+# Make uds's tries fail the test past far more than one per WAIT_RETRY_S over seconds, rather than hang it on a wait
+# whose fake clock no longer moves; returns uds.
+def cap_tries(uds, seconds):
+    real, calls = uds.try_session, []
+
+    # One try, counted.
+    def capped(n, window_s):
+        calls.append(n)
+        assert len(calls) <= 4 * seconds / update.WAIT_RETRY_S + 10, "the wait does not end"
+        return real(n, window_s)
+
+    uds.try_session = capped
+    return uds
+
+
+# Run flash --wait-for-unit seconds under the bootloader flow (PBL, BL_IMG) over a LateConnection, its tries capped;
+# returns (rc, log lines).
+def run_wait(unit, seconds=10, ft=None, monitor=None, send_s=0.0):
+    ft, lines = ft or FakeTime(), []
+    uds = cap_tries(late_uds(unit, ft, monitor, send_s), seconds)
+    rc = update.flash(uds, PBL, BL_IMG, None, sleep=ft.sleep, clock=ft.clock, log=lines.append, wait_for_unit=seconds)
+    return rc, lines
+
+
+# A BootloaderUnit that is off until its clock reaches on_at: each request before then is lost, or with no_ack fails
+# to send, as a frame no node acknowledges does (OSError ECOMM, from the kernel's missing echo), taking no_ack_s of fake
+# time. A 10 02 whose send fails within held_s of on_at is held by the kernel and answered at on_at. With app, a 10 02
+# before on_at gets those answers instead, as from an app that cannot hand over. Then its bootloader runs, in its
+# power-up window, and answers the first 10 02 with 50 02 and extra more, 50 ms (its P2) apart: its answers to earlier
+# 10 02s it also got. tries holds the time of every 10 02 sent, failed sends included.
+class PoweredUpUnit(BootloaderUnit):
+    # BootloaderUnit's knobs, plus the ones above.
+    def __init__(self, on_at=1.0, no_ack=False, no_ack_s=0.0, held_s=0.0, app=None, extra=0, **kw):
+        super().__init__(in_app=False, security=False, **kw)
+        self.on_at, self.no_ack, self.no_ack_s, self.held_s = on_at, no_ack, no_ack_s, held_s
+        self.app, self.extra, self.tries = app, extra, []
+
+    # Nothing (or the app's answers to 10 02) while off; the bootloader's answers after.
+    def handle(self, req):
+        if bytes(req) == b"\x10\x02":
+            self.tries.append(self.clock())
+        if self.clock() < self.on_at:
+            if self.no_ack:
+                e = OSError(errno.ECOMM, os.strerror(errno.ECOMM))
+                if bytes(req) == b"\x10\x02" and self.on_at - self.clock() <= self.held_s:
+                    e.held = [(self.on_at - self.clock(), a) for a in super().handle(req)]
+                raise e
+            self.log.append((req[0], self.request_arg(req)))
+            return list(self.app) if self.app is not None and bytes(req) == b"\x10\x02" else []
+        return super().handle(req)
+
+    # 10 as FakeServer's; the first 50 02 brings the extra ones.
+    def s10(self, req, sub):
+        answer = super().s10(req, sub)
+        if answer[0][0] == 0x50:
+            answer += [(0.05 * (k + 1), answer[0]) for k in range(self.extra)]
+            self.extra = 0
+        return answer
+
+
+# Check a unit that answers nothing for a while, then 50 02 from its power-up window, is flashed: F1F4 once, a 10 02
+# with its P2, then after the prompt 10 02 again each time the last goes unanswered, never more than WAIT_RETRY_S
+# apart, then the bootloader flow as usual.
+def test_wait_for_unit_catches_the_power_up_window():
+    d = PoweredUpUnit(on_at=1.0)
+    rc, lines = run_wait(d)
+    n = len(d.tries)
+    assert rc == 0 and n >= 10 and d.tries[-1] >= 1.0
+    assert d.tries[1] - d.tries[0] == pytest.approx(transport.P2_S)
+    assert all(b - a <= update.WAIT_RETRY_S + 1e-9 for a, b in zip(d.tries[1:], d.tries[2:]))
+    assert d.log == [(0x22, 0xF1F4)] + [(0x10, 2)] * n + BL_PRECHECK[2:] + DOWNLOAD + POLLS
+    assert lines[1] == "waiting up to 10 s for the unit: power-cycle it now"
+    assert lines[2] == "10 02 answered after %.1f s, at try %d" % (d.tries[-1] - d.tries[1], n)
+    assert bytes(d.written) == BL_IMG and d.in_app
+
+
+# Check an app that answers each 10 02 before the power-cycle with an NRC, or with 7F 10 78 and no 50 02 after it (one
+# that resets back into itself), holds no try after the first longer than WAIT_RETRY_S, so the 10 02 that meets the
+# power-up window comes within WAIT_RETRY_S of it. The second frame of a pair stands for an answer to an earlier send,
+# met in the listen after the first.
+@pytest.mark.parametrize("app", [[b"\x7f\x10\x22"], [b"\x7f\x10\x22", (0.02, b"\x7f\x10\x22")], [b"\x7f\x10\x78"],
+                                 [b"\x7f\x10\x22", b"\x7f\x10\x78"]], ids=["nrc", "nrc-then-nrc", "78", "nrc-then-78"])
+def test_wait_for_unit_tries_every_50_ms_through_app_answers(app):
+    d = PoweredUpUnit(on_at=6.0, app=app)
+    rc, _ = run_wait(d)
+    assert rc == 0 and d.in_app
+    assert all(b - a <= update.WAIT_RETRY_S + 1e-9 for a, b in zip(d.tries[1:], d.tries[2:]))
+    assert 0 <= d.tries[-1] - d.on_at <= update.WAIT_RETRY_S + 1e-9
+
+
+# Check a 10 02 whose send failed but that the kernel held until the unit came on, its 50 02 arriving in the listen
+# after the failure, enters the session as a 10 02 answered at once does, that P2 and P2* are as they were after the
+# tries, and that the 50 02 to the resend is passed over.
+def test_wait_for_unit_takes_a_held_sends_late_answer():
+    ft, d, lines = FakeTime(), PoweredUpUnit(on_at=1.02, no_ack=True, held_s=update.WAIT_RETRY_S), []
+    uds = cap_tries(late_uds(d, ft), 10)
+    update.wait_for_power_up(uds, 10, log=lines.append, clock=ft.clock)
+    assert uds.in_session and uds.kept == pytest.approx(1.02)
+    assert uds.client.config["p2_timeout"] == transport.P2_S
+    assert uds.client.config["p2_star_timeout"] == transport.P2_STAR_S
+    assert lines[1].endswith("; passed over 1 later answers")
+
+
+# Check a try answered 50 03 to its 10 02 does not count as entering session 2.
+def test_try_session_needs_its_own_session():
+    d = FakeServer(security=False)
+    d.s10 = lambda req, sub: [b"\x50\x03\x00\x32\x01\xf4"]
+    assert not late_uds(d, FakeTime()).try_session(2, update.WAIT_RETRY_S)
+
+
+# Check the 50 02s that follow the first, the unit's answers to earlier 10 02s, are passed over before the next request,
+# and the second-tester monitor counts them as ours; and (the known positive) that without that drain one of them is
+# taken for a later request's answer and fails the run.
+@pytest.mark.parametrize("drained", [True, False])
+def test_wait_for_unit_passes_over_the_later_50_02s(monkeypatch, drained):
+    if not drained:
+        monkeypatch.setattr(Uds, "drain", lambda self, settle_s, max_s: 0)
+    ft = FakeTime()
+    mon = transport.SecondTesterMonitor(0x718, clock=ft.clock)
+    d = PoweredUpUnit(on_at=1.0, extra=3)
+    if not drained:
+        with pytest.raises(errors.UpdateFailed, match="unexpected answer to service 0x"):
+            run_wait(d, ft=ft, monitor=mon, send_s=0.001)
+        return
+    rc, lines = run_wait(d, ft=ft, monitor=mon, send_s=0.001)
+    assert rc == 0 and mon.alarm is None and d.in_app
+    assert lines[2].endswith("; passed over 3 later answers")
+    assert d.log[len(d.tries) + 1:] == BL_PRECHECK[2:] + DOWNLOAD + POLLS
+
+
+# Check a unit that answers the first 10 02 is flashed with no prompt to power-cycle it and with the requests of a run
+# without --wait-for-unit: a live app that answers 7F 10 78, its 50 02 coming 1 s later, long past WAIT_RETRY_S, and a
+# unit already in its bootloader.
+@pytest.mark.parametrize("live_app", [True, False])
+def test_wait_for_unit_waits_out_a_live_apps_handover(live_app):
+    if live_app:
+        d = BootloaderUnit(security=False)
+        real = d.handle
+        d.handle = lambda req: [(1.0, a) if a[0] == 0x50 else a for a in real(req)]
+    else:
+        d = PoweredUpUnit(on_at=0.0)
+    rc, lines = run_wait(d)
+    assert rc == 0 and d.log == BL_PRECHECK + DOWNLOAD + POLLS
+    assert not any("power-cycle" in line for line in lines)
+
+
+# Check sends that fail while the unit is off (no ACK, so no echo) are tries like any other: each failed 10 02 (sent
+# twice, as any failed send) is followed WAIT_RETRY_S later by the next, and the unit is flashed once it is on.
+def test_wait_for_unit_tolerates_failed_sends():
+    d = PoweredUpUnit(on_at=1.0, no_ack=True)
+    rc, _ = run_wait(d)
+    times = sorted(set(d.tries))
+    assert rc == 0 and len(times) >= 10 and d.in_app
+    assert all(b - a <= update.WAIT_RETRY_S + 1e-9 for a, b in zip(times, times[1:]))
+    assert d.log == [(0x10, 2)] + BL_PRECHECK[2:] + DOWNLOAD + POLLS   # the F1F4 and the failed 10 02s never arrived
+
+
+# Check an answer for another service ahead of the 50 02, here the bootloader's 0x31 to the F1F4 the kernel held
+# unacknowledged until the unit came on, is passed over within the try: the 50 02 behind it answers it.
+def test_wait_for_unit_passes_over_another_services_late_answer():
+    d = PoweredUpUnit(on_at=1.0)
+    real = d.s10
+    d.s10 = lambda req, sub: [b"\x7f\x22\x31"] + real(req, sub)
+    rc, lines = run_wait(d)
+    assert rc == 0 and d.log[len(d.tries) + 1:] == BL_PRECHECK[2:] + DOWNLOAD + POLLS
+    assert lines[2] == "10 02 answered after %.1f s, at try %d" % (d.tries[-1] - d.tries[1], len(d.tries))
+
+
+# Check a unit that never answers fails the given seconds after the prompt with the message, the tries after the first
+# bounded by one per WAIT_RETRY_S, whether its sends are lost or fail.
+@pytest.mark.parametrize("no_ack", [False, True])
+def test_wait_for_unit_gives_up_at_the_deadline(no_ack):
+    ft, d = FakeTime(), PoweredUpUnit(on_at=float("inf"), no_ack=no_ack)
+    with pytest.raises(errors.UpdateFailed, match=r"^no 10 02 was answered within 2 s \((\d+) tries\)$") as e:
+        run_wait(d, seconds=2, ft=ft)
+    tries = int(re.search(r"\((\d+) tries", str(e.value)).group(1))
+    assert 2 / update.WAIT_RETRY_S + 1 <= tries <= 2 / update.WAIT_RETRY_S + 2
+    sends = 2 if no_ack else 1
+    assert len(d.tries) == tries * sends
+    assert ft.t - d.tries[sends] < 2 + 2 * update.WAIT_RETRY_S
+
+
+# Check that while nothing acknowledges the frame, each failed send takes the kernel's echo timeout (2 s), so a try,
+# sent twice, takes about 4 s and the run gives up up to one try past the given seconds.
+def test_wait_for_unit_overshoots_by_a_try_without_acks():
+    ft, d = FakeTime(), PoweredUpUnit(on_at=float("inf"), no_ack=True, no_ack_s=2.0)
+    with pytest.raises(errors.UpdateFailed, match=r"^no 10 02 was answered within 1 s \(2 tries\)$"):
+        run_wait(d, seconds=1, ft=ft)
+    assert d.tries == [4.0, 6.0, 8.0, 10.0]   # after the F1F4's two sends; the prompt at 8 s
+    assert ft.t - 8.0 <= 1 + 2 * d.no_ack_s + update.WAIT_RETRY_S
+
+
+# Check Uds.drain passes over frames until settle_s passes with none, the monitor counting the wait as ours (frames
+# 0.5 s apart, past its GRACE_S, would raise its alarm otherwise), and stops after max_s however many come.
+def test_drain_settles_counts_as_ours_and_is_bounded():
+    ft, d = FakeTime(), FakeServer(security=False)
+    mon = transport.SecondTesterMonitor(0x718, clock=ft.clock)
+    uds = late_uds(d, ft, mon)
+    uds.session(2)
+    conn, t0, late = uds.client.conn.inner, ft.t, b"\x50\x02\x00\x32\x01\xf4"
+    conn.queue.extend((t0 + 0.5 * k, late) for k in range(1, 5))
+    assert uds.drain(1.0, 5.0) == 4
+    assert mon.alarm is None and ft.t == pytest.approx(t0 + 3.0)
+    t0 = ft.t
+    conn.queue.extend((t0 + 0.15 * k, late) for k in range(1, 100))
+    assert uds.drain(update.WAIT_SETTLE_S, update.WAIT_DRAIN_S) == 13
+    assert ft.t - t0 == pytest.approx(update.WAIT_DRAIN_S) and mon.alarm is None
+
+
+# Check --wait-for-unit with the default flow is refused (exit 2) before any bus opens.
+def test_main_wait_for_unit_needs_the_bootloader_flow(tmp_path, full_path, capsys):
+    good = tmp_path / "good.bin"
+    good.write_bytes(make_image())
+    assert cli.main(["--profile", full_path, "flash", str(good), "--wait-for-unit", "5"], transport=no_transport) == 2
+    assert 'profile full: --wait-for-unit is for [update] flow = "bootloader"' in capsys.readouterr().err
+    with pytest.raises(errors.Refused, match=re.escape(update.WAIT_NEEDS_BOOTLOADER)):
+        run_flash(FakeServer(), wait_for_unit=5)
+
+
+# Check --wait-for-unit takes whole seconds from 1 to 600 and refuses anything else.
+def test_wait_for_unit_flag(capsys):
+    for text, seconds in (("1", 1), ("600", 600)):
+        assert cli.parse_args(["--profile", "x", "flash", "x.bin", "--wait-for-unit", text]).wait_for_unit == seconds
+    assert cli.parse_args(["--profile", "x", "flash", "x.bin"]).wait_for_unit is None
+    for text in ("0", "601", "2.5", "ten"):
+        with pytest.raises(SystemExit):
+            cli.parse_args(["--profile", "x", "flash", "x.bin", "--wait-for-unit", text])
+        assert "%s is not a whole number of seconds from 1 to 600" % text in capsys.readouterr().err
+
+
+# Check main passes --wait-for-unit to flash under the bootloader flow: a live app's handover answers the first 10 02,
+# so there is no prompt to power-cycle.
+def test_main_wait_for_unit_end_to_end(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(update, "REBOOT_WAIT_S", 0.0)
+    (tmp_path / "boot.toml").write_text(BARE_BL)
+    (tmp_path / "fw.bin").write_bytes(BL_IMG)
+    d = BootloaderUnit(security=False, start_silence=0)
+    assert cli.main(["--profile", str(tmp_path / "boot.toml"), "flash", str(tmp_path / "fw.bin"),
+                     "--wait-for-unit", "5"], transport=FakeTransport.on(d)) == 0
+    assert d.log == BL_PRECHECK + DOWNLOAD + [(0x22, 0xF1F4)]
+    assert "power-cycle" not in capsys.readouterr().out
 
 
 # Check [update] defaults to flow "app" with start_timeout_s 60, and "bootloader" takes 1 to 600.
@@ -4860,3 +5405,32 @@ def test_example_update_comments_load():
     live = re.sub(r"(?m)^# (?=\[update\]$|flow |start_timeout_s )", "", text)
     e = profile.from_dict("example", tomllib.loads(live))
     assert (e.flow, e.start_timeout_s) == ("bootloader", 60)
+
+
+# Check example.toml's commented format and header_offset load once uncommented.
+def test_example_bare_comments_load():
+    text = (profile.PROFILE_DIR / "example.toml").read_text()
+    live = re.sub(r"(?m)^# (?=format |header_offset )", "", text)
+    e = profile.from_dict("example", tomllib.loads(live))
+    assert (e.image_format, e.header_offset) == ("bare", 0x200)
+
+
+# Check the bare header's flags: a bit in the high byte is one a reader must understand, so stamp and parse_image
+# refuse it, stamped or not; a bit in the low byte is ignorable, and the image stamps and parses as without it.
+@pytest.mark.parametrize("flags", [0x0100, 0x8000, 0x8001])
+def test_bare_header_must_understand_flags_are_refused(flags):
+    for stamped in (False, True):
+        img = bytearray(build_bare_image(stamped=stamped))
+        struct.pack_into("<H", img, HO + 6, flags)
+        with pytest.raises(errors.Refused, match="has flags 0x%04X" % flags):
+            image.stamp(bytes(img), HO)
+        with pytest.raises(errors.Refused, match="has flags 0x%04X" % flags):
+            image.parse_image(PB, bytes(img))
+
+
+def test_bare_header_ignorable_flags_are_taken():
+    img = bytearray(build_bare_image(stamped=False))
+    struct.pack_into("<H", img, HO + 6, 0x00FF)
+    stamped = image.stamp(bytes(img), HO)
+    assert struct.unpack_from("<H", stamped, HO + 6)[0] == 0x00FF
+    assert image.parse_image(PB, stamped).elf_sha == bare_id(stamped)

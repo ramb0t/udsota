@@ -21,6 +21,10 @@ BOOT_TIMEOUT_S = 60.0
 BOOT_POLL_S = 1.0
 CONFIRM_RETRY_S = 2.0    # between ConfirmImage tries; Uds's 3E 00 keepalive holds the extended session meanwhile
 CONFIRM_TIMEOUT_S = 120.0   # a product's soak plus its health check, with margin
+WAIT_RETRY_S = 0.05      # flash --wait-for-unit: the next 10 02 at most this long after the last went unanswered,
+                         # so that one lands in a bootloader's power-up window (about 200 ms)
+WAIT_SETTLE_S = 0.25     # then the answers to earlier 10 02s, which a unit sends a P2 (50 ms) apart, are passed
+WAIT_DRAIN_S = 2.0       # over until none comes for WAIT_SETTLE_S, or for WAIT_DRAIN_S at most
 # flash's diff_format (--diff-format): the delta DFIs it may try; and each delta DFI's name in the log.
 DIFF_DFIS = {"auto": (DL_DFI_DELTA, DL_DFI_DELTA_DEFLATE), "heatshrink": (DL_DFI_DELTA,),
              "deflate": (DL_DFI_DELTA_DEFLATE,)}
@@ -42,6 +46,7 @@ ACTIVATE_CONDITIONS = ("ActivateImage refused (0x22): the server's conditions ar
 # What a bootloader-flow refusal after the 10 02 adds: where it leaves the unit.
 LEFT_IN_BOOTLOADER = ("The unit is in its bootloader and returns to its app when its programming session times "
                       "out, unless it is held there")
+WAIT_NEEDS_BOOTLOADER = '--wait-for-unit is for [update] flow = "bootloader"'
 
 
 # What F1F3 holds for profile's images: an ESP-IDF image's app_elf_sha256, or a bare image's image ID.
@@ -399,10 +404,13 @@ def device_keys(uds, profile, secret):
 # bases, (name, bytes) pairs, offers a delta download from the one the server runs, in the modes diff_format
 # allows (plan_deltas); its patches are built before the programming session opens. Only an explicit "none"
 # (--no-compress) rules out the DEFLATE delta, 0x30: a server with delta downloads has compressed ones too, and one
-# without answers 0x31. Under the profile's [update] flow = "bootloader", flash_bootloader runs instead.
+# without answers 0x31. Under the profile's [update] flow = "bootloader", flash_bootloader runs instead, and
+# wait_for_unit (seconds, --wait-for-unit), which that flow alone takes, has it catch the unit's power-up window.
 def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep=time.sleep,
           clock=time.monotonic, log=print, quiet=contextlib.nullcontext, compress=None, bases=None,
-          diff_format="auto"):
+          diff_format="auto", wait_for_unit=None):
+    if wait_for_unit is not None and profile.flow != "bootloader":
+        raise Refused(WAIT_NEEDS_BOOTLOADER)
     if bases is not None and drop_76 is not None:
         raise Refused("--drop-76 is for full and compressed downloads, not with --diff-from")
     if bases is not None:
@@ -416,7 +424,7 @@ def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep
     if profile.flow == "bootloader":
         return flash_bootloader(uds, profile, image, img, secret, drop_76=drop_76, preroll=preroll, sleep=sleep,
                                 clock=clock, log=log, quiet=quiet, compress=compress, bases=bases,
-                                diff_format=diff_format, deflate_ok=deflate_ok)
+                                diff_format=diff_format, deflate_ok=deflate_ok, wait_for_unit=wait_for_unit)
     status = read_record(uds, DID_STATUS)
     if status is None:                        # 0x31: no udsota status DID, so no udsota server
         raise Refused(NOT_UDSOTA)
@@ -481,9 +489,10 @@ def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep
 # answers 7F 10 78 and resets into the bootloader, which sends the 50 02. Then, all in the programming session, the
 # precheck reads, the unlock, download, FF01, ActivateImage and wait_for_start, the proof of life; no ConfirmImage. An
 # image the unit already holds gets 11 01 and the same proof. quiet() is held from the 10 02, which stops the app.
+# With wait_for_unit, wait_for_power_up sends the 10 02.
 def flash_bootloader(uds, profile, image, img, secret, drop_76=None, preroll=lambda: None, sleep=time.sleep,
                      clock=time.monotonic, log=print, quiet=contextlib.nullcontext, compress="none", bases=None,
-                     diff_format="auto", deflate_ok=True):
+                     diff_format="auto", deflate_ok=True, wait_for_unit=None):
     try:
         prefix = uds.read_did(DID_IMAGE_PREFIX)
     except (Nrc, NoResponse, SendFailed):    # 0x31 from the bootloader, or an app that is not healthy
@@ -492,7 +501,10 @@ def flash_bootloader(uds, profile, image, img, secret, drop_76=None, preroll=lam
         log("the unit's app already runs this image (F1F4 %s) and reports healthy: nothing to do" % prefix.hex())
         return 0
     with quiet():
-        uds.session(SESSION_PROGRAMMING)
+        if wait_for_unit is None:
+            uds.session(SESSION_PROGRAMMING)
+        else:
+            wait_for_power_up(uds, wait_for_unit, log=log, clock=clock)
         status = read_record(uds, DID_STATUS)
         if status is None:
             raise Refused("%s %s" % (NOT_UDSOTA, LEFT_IN_BOOTLOADER))
@@ -554,6 +566,37 @@ def flash_bootloader(uds, profile, image, img, secret, drop_76=None, preroll=lam
                 recovered = need_download = True   # one re-download per run
         return wait_for_start(uds, profile, img.elf_sha, preroll, sleep=sleep, clock=clock, log=log,
                               activated=activated)
+
+
+# The bootloader flow's 10 02 under --wait-for-unit, for a unit whose app runs but cannot hand over. The first 10 02
+# goes as without the option, a live app's 7F 10 78 waited out for its 50 02 as for any request, and once it is
+# answered the flow goes on. Otherwise the operator is told to power-cycle the unit, whose bootloader also takes a
+# 10 02 in its power-up window, while 10 02 goes out again, the next at most WAIT_RETRY_S after the last went
+# unanswered, was refused or failed to send (Uds.try_session, which waits no longer than that after a 0x78 either),
+# until one is answered 50 02; UpdateFailed once seconds have passed since the prompt. A failed send, as while the unit
+# is off and nothing acknowledges the frame, is a try like any other. The unit answers every 10 02 it gets, the ones
+# the kernel still held unacknowledged among them, so 50 02s can follow the first; they are passed over until the
+# unit goes quiet (Uds.drain), the monitor counting that as ours, before the next request goes. Dropping them is not
+# enough, though udsoncan empties the receive queue before each send: one that comes after that send is taken for its
+# answer, and the request itself can reach the unit while it is still answering 10 02s.
+def wait_for_power_up(uds, seconds, log=print, clock=time.monotonic):
+    try:
+        uds.session(SESSION_PROGRAMMING)
+        return
+    except (Nrc, NoResponse, SendFailed):
+        pass
+    log("waiting up to %d s for the unit: power-cycle it now" % seconds)
+    start, tries = clock(), 1
+    while True:
+        tries += 1
+        if uds.try_session(SESSION_PROGRAMMING, WAIT_RETRY_S):
+            break
+        if clock() - start >= seconds:
+            raise UpdateFailed("no 10 02 was answered within %d s (%d tries)" % (seconds, tries))
+    took = clock() - start
+    late = uds.drain(WAIT_SETTLE_S, WAIT_DRAIN_S)
+    passed = "; passed over %d later answers" % late if late else ""
+    log("10 02 answered after %.1f s, at try %d%s" % (took, tries, passed))
 
 
 # The bootloader flow's proof of life after ActivateImage or 11 01: wait REBOOT_WAIT_S, then poll F1F4 until the
