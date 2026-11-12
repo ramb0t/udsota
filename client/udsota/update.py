@@ -1,5 +1,6 @@
 """The commands: info, the flash sequence (precheck to ConfirmImage, with its recovery paths), confirm and
-the keyed reset. Every product-specific step comes from the profile."""
+the keyed reset, and under [update] flow = "bootloader" a single-slot bootloader unit's flash, info and reset. Every
+product-specific step comes from the profile."""
 import contextlib
 import time
 
@@ -7,13 +8,13 @@ from .delta import validation_hash
 from .errors import NoResponse, Nrc, Refused, SendFailed, UpdateFailed
 from .image import parse_image
 from .keys import DeviceKeys, SigningKeys
-from .pack import build_patch, encode, rank_deltas
-from .wire import (DID_COUNTERS, DID_DEVICE_ID, DID_RESULT, DID_RUNNING_SHA, DID_SESSION, DID_STATUS, DID_VERSION,
-                   DL_DFI, DL_DFI_DEFLATE, DL_DFI_DELTA, DL_DFI_DELTA_DEFLATE, IMG_PENDING_VERIFY, IMG_STATES,
-                   NRC_CONDITIONS, NRC_NOT_ACCEPTED, NRC_OUT_OF_RANGE, NRC_PROGRAMMING_FAILURE, NRC_SEQUENCE,
-                   OTHER_VERIFIED, RID_ACTIVATE, RID_CHECK_DEPS, RID_CONFIRM, SESSION_EXTENDED, SESSION_PROGRAMMING,
-                   DECODE, cstr, decode_counters, decode_result, decode_status, describe_result, describe_status,
-                   reason_name)
+from .pack import build_patch, encode, rank_deltas, refuse_bare_delta
+from .wire import (DID_COUNTERS, DID_DEVICE_ID, DID_IMAGE_PREFIX, DID_RESULT, DID_RUNNING_SHA, DID_SESSION,
+                   DID_STATUS, DID_VERSION, DL_DFI, DL_DFI_DEFLATE, DL_DFI_DELTA, DL_DFI_DELTA_DEFLATE,
+                   IMG_PENDING_VERIFY, IMG_STATES, NRC_CONDITIONS, NRC_NOT_ACCEPTED, NRC_OUT_OF_RANGE,
+                   NRC_PROGRAMMING_FAILURE, NRC_SEQUENCE, OTHER_VERIFIED, RID_ACTIVATE, RID_CHECK_DEPS, RID_CONFIRM,
+                   SESSION_EXTENDED, SESSION_PROGRAMMING, STATUS_BOOT_HELD, DECODE, cstr, decode_counters,
+                   decode_result, decode_status, describe_result, describe_status, reason_name)
 
 REBOOT_WAIT_S = 3.0
 BOOT_TIMEOUT_S = 60.0
@@ -25,15 +26,27 @@ DIFF_DFIS = {"auto": (DL_DFI_DELTA, DL_DFI_DELTA_DEFLATE), "heatshrink": (DL_DFI
              "deflate": (DL_DFI_DELTA_DEFLATE,)}
 DELTA_NAMES = {DL_DFI_DELTA: "heatshrink patch", DL_DFI_DELTA_DEFLATE: "patch as raw DEFLATE"}
 
-# The server-owned DIDs `info` reads first, with their labels and renderers.
+# The server-owned DIDs `info` reads first, with their labels and renderers; F1F3's label names the image's ID as
+# the profile's image format does (id_name).
 CORE_DIDS = ((DID_SESSION, "active session", DECODE["hex"]),
              (DID_VERSION, "version", cstr),
              (DID_DEVICE_ID, "device ID", lambda d: ":".join("%02x" % b for b in d)),
-             (DID_RUNNING_SHA, "running app_elf_sha256", DECODE["hex"]),
+             (DID_RUNNING_SHA, "running %s", DECODE["hex"]),
              (DID_STATUS, "update status", lambda d: describe_status(decode_status(d))),
              (DID_RESULT, "last download", describe_result),
              (DID_COUNTERS, "ISO-TP/UDS counters",
               lambda d: " ".join("%s=%d" % kv for kv in decode_counters(d).items())))
+NOT_UDSOTA = "the device does not serve the udsota status DID F1F0; is it running a udsota server?"
+ACTIVATE_CONDITIONS = ("ActivateImage refused (0x22): the server's conditions are not met. The image stays verified "
+                       "until the server restarts; run flash again when they are")
+# What a bootloader-flow refusal after the 10 02 adds: where it leaves the unit.
+LEFT_IN_BOOTLOADER = ("The unit is in its bootloader and returns to its app when its programming session times "
+                      "out, unless it is held there")
+
+
+# What F1F3 holds for profile's images: an ESP-IDF image's app_elf_sha256, or a bare image's image ID.
+def id_name(profile):
+    return "image ID" if profile.image_format == "bare" else "app_elf_sha256"
 
 
 # One DID's record, or None when the server answers 0x31 (it does not serve that DID).
@@ -47,9 +60,15 @@ def read_record(uds, did):
 
 
 # `info`: the server-owned DIDs, then the profile's [dids] in file order; a range stops at its first absent DID.
+# Under flow "bootloader" it enters the programming session first, since the unit's app answers no reads, and sends
+# no reset after.
 def info(uds, profile, log=print):
+    bootloader = profile.flow == "bootloader"
+    if bootloader:
+        uds.session(SESSION_PROGRAMMING)
     for did, name, render in CORE_DIDS:
         d = read_record(uds, did)
+        name = name % id_name(profile) if did == DID_RUNNING_SHA else name
         log("%04X %s: %s" % (did, name, "not supported" if d is None else render(d)))
     for entry in profile.dids:
         for did in range(entry.first, entry.last + 1):
@@ -59,6 +78,8 @@ def info(uds, profile, log=print):
                     log("%04X %s: not supported" % (did, entry.name))
                 break
             log("%04X %s: %s" % (did, entry.name, DECODE[entry.decode](d)))
+    if bootloader:
+        log("the unit stays in its bootloader until its programming session times out")
     return 0
 
 
@@ -378,20 +399,27 @@ def device_keys(uds, profile, secret):
 # bases, (name, bytes) pairs, offers a delta download from the one the server runs, in the modes diff_format
 # allows (plan_deltas); its patches are built before the programming session opens. Only an explicit "none"
 # (--no-compress) rules out the DEFLATE delta, 0x30: a server with delta downloads has compressed ones too, and one
-# without answers 0x31.
+# without answers 0x31. Under the profile's [update] flow = "bootloader", flash_bootloader runs instead.
 def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep=time.sleep,
           clock=time.monotonic, log=print, quiet=contextlib.nullcontext, compress=None, bases=None,
           diff_format="auto"):
     if bases is not None and drop_76 is not None:
         raise Refused("--drop-76 is for full and compressed downloads, not with --diff-from")
+    if bases is not None:
+        refuse_bare_delta(profile)
     deflate_ok = compress != "none"             # before the profile's default: see the comment above
     compress = profile.compression if compress is None else compress
     img = parse_image(profile, image)
     board_of = profile.board_names.get(img.hw_id, "hw_id %d" % img.hw_id)
-    log("image %s for %s, %d bytes, app_elf_sha256 %s" % (img.version, board_of, img.size, img.elf_sha[:8].hex()))
+    log("image %s for %s, %d bytes, %s %s" % (img.version, board_of, img.size, id_name(profile),
+                                              img.elf_sha[:8].hex()))
+    if profile.flow == "bootloader":
+        return flash_bootloader(uds, profile, image, img, secret, drop_76=drop_76, preroll=preroll, sleep=sleep,
+                                clock=clock, log=log, quiet=quiet, compress=compress, bases=bases,
+                                diff_format=diff_format, deflate_ok=deflate_ok)
     status = read_record(uds, DID_STATUS)
     if status is None:                        # 0x31: no udsota status DID, so no udsota server
-        raise Refused("the device does not serve the udsota status DID F1F0; is it running a udsota server?")
+        raise Refused(NOT_UDSOTA)
     state = decode_status(status)
     running_sha = uds.read_did(DID_RUNNING_SHA)
     board = None if profile.board_did is None else cstr(uds.read_did(profile.board_did))
@@ -433,8 +461,7 @@ def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep
                 resent = True                     # the request itself was lost: send it once more
             except Nrc as e:
                 if e.code == NRC_CONDITIONS:
-                    raise UpdateFailed("ActivateImage refused (0x22): the server's conditions are not met. The image "
-                                       "stays verified until the server restarts; run flash again when they are") from e
+                    raise UpdateFailed(ACTIVATE_CONDITIONS) from e
                 if e.code == NRC_PROGRAMMING_FAILURE:
                     activation_failed(uds, profile, keys, e, log=log)
                     break
@@ -446,6 +473,129 @@ def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep
         wait_for_image(uds, img.elf_sha, preroll, sleep=sleep, clock=clock)
         log("the server runs %s; confirming" % img.version)
         return confirm(uds, sleep=sleep, clock=clock, log=log)
+
+
+# `flash` under [update] flow = "bootloader", for a single-slot unit whose resident bootloader is its only UDS server
+# (docs/wire.md#bootloader-flow); img is image parsed, the other arguments flash's. First one F1F4 read in the default
+# session: an app already running this image and healthy needs nothing, so it is left running. Then 10 02: the app
+# answers 7F 10 78 and resets into the bootloader, which sends the 50 02. Then, all in the programming session, the
+# precheck reads, the unlock, download, FF01, ActivateImage and wait_for_start, the proof of life; no ConfirmImage. An
+# image the unit already holds gets 11 01 and the same proof. quiet() is held from the 10 02, which stops the app.
+def flash_bootloader(uds, profile, image, img, secret, drop_76=None, preroll=lambda: None, sleep=time.sleep,
+                     clock=time.monotonic, log=print, quiet=contextlib.nullcontext, compress="none", bases=None,
+                     diff_format="auto", deflate_ok=True):
+    try:
+        prefix = uds.read_did(DID_IMAGE_PREFIX)
+    except (Nrc, NoResponse, SendFailed):    # 0x31 from the bootloader, or an app that is not healthy
+        prefix = None
+    if prefix == img.elf_sha[:4]:
+        log("the unit's app already runs this image (F1F4 %s) and reports healthy: nothing to do" % prefix.hex())
+        return 0
+    with quiet():
+        uds.session(SESSION_PROGRAMMING)
+        status = read_record(uds, DID_STATUS)
+        if status is None:
+            raise Refused("%s %s" % (NOT_UDSOTA, LEFT_IN_BOOTLOADER))
+        state = decode_status(status)
+        running_sha = uds.read_did(DID_RUNNING_SHA)
+        board = None if profile.board_did is None else cstr(uds.read_did(profile.board_did))
+        keys = device_keys(uds, profile, secret)
+        unlock_programming(uds, profile, keys)
+        held = state["flags"] & STATUS_BOOT_HELD
+        if held:
+            log("the unit is held in its bootloader: its app failed to start")
+        if running_sha == img.elf_sha:
+            log("the unit already holds this image (%s)%s: resetting into it" % (
+                img.elf_sha[:8].hex(), "; the reset releases it for another try" if held else ""))
+            uds.ecu_reset()
+            return wait_for_start(uds, profile, img.elf_sha, preroll, sleep=sleep, clock=clock, log=log)
+        board_of = profile.board_names.get(img.hw_id, "hw_id %d" % img.hw_id)
+        if board is not None and board != profile.board_names.get(img.hw_id):
+            raise Refused("image is for %s but the server is %s. %s" % (board_of, board, LEFT_IN_BOOTLOADER))
+        verified = state["other_state"] == OTHER_VERIFIED and state["other_sha_prefix"] == img.elf_sha[:8]
+        deltas = []
+        if bases is not None and not verified:
+            deltas = plan_deltas(bases, image, running_sha, compress, diff_format, log=log, deflate_ok=deflate_ok)
+            enter_programming(uds, profile, keys)   # building the patches, used or not, may have outlasted S3
+        if verified:
+            log("the other slot already holds this image, verified: skipping to ActivateImage")
+        need_download, recovered, resent, activated = not verified, False, False, True
+        while True:
+            if need_download:
+                download(uds, image, drop_76=drop_76, log=log, compress=compress, clock=clock, deltas=deltas,
+                         reenter=lambda: enter_programming(uds, profile, keys))
+                check_image(uds, log=log)
+                need_download, drop_76 = False, None   # the fault injection applies to the first download only
+            try:
+                uds.routine(RID_ACTIVATE)
+                log("activated; waiting for the app to start")
+                break
+            except NoResponse:
+                # F1F3 already reads the new ID after FF01, so it can't tell whether F001 landed: F1F4 decides.
+                if resent:
+                    log("no answer to ActivateImage again: waiting for the app to start, which decides")
+                    activated = False
+                    break
+                log("no answer to ActivateImage: sending it again")
+                resent = True
+            except Nrc as e:
+                if resent:                    # the app, if the first F001 started it, refuses a routine: F1F4 decides
+                    log("ActivateImage sent again answered 0x%02X: waiting for the app to start, which decides"
+                        % e.code)
+                    activated = False
+                    break
+                if e.code == NRC_CONDITIONS:
+                    raise UpdateFailed(ACTIVATE_CONDITIONS) from e
+                if e.code == NRC_PROGRAMMING_FAILURE:
+                    raise UpdateFailed("ActivateImage failed (0x72); read F1F0 with `info`") from e
+                if recovered or e.code != NRC_SEQUENCE:
+                    raise
+                log("ActivateImage answered 0x24 (the image is not verified): downloading again")
+                recovered = need_download = True   # one re-download per run
+        return wait_for_start(uds, profile, img.elf_sha, preroll, sleep=sleep, clock=clock, log=log,
+                              activated=activated)
+
+
+# The bootloader flow's proof of life after ActivateImage or 11 01: wait REBOOT_WAIT_S, then poll F1F4 until the
+# unit's app answers it, which it does once healthy, for up to the profile's start_timeout_s, and check it is the first
+# 4 bytes of sha. Returns 0, or raises UpdateFailed: another prefix (the app runs another image), 0x31 (the bootloader
+# answers: the app did not start, F1F0 saying whether the unit holds itself there; or, when activated is False because
+# no F001 was answered, perhaps never activated), or nothing within the timeout. Silence is never success.
+def wait_for_start(uds, profile, sha, preroll, sleep=time.sleep, clock=time.monotonic, log=print, activated=True):
+    uds.restarted()
+    sleep(REBOOT_WAIT_S)
+    deadline = clock() + profile.start_timeout_s
+    while True:
+        preroll()
+        try:
+            prefix = uds.read_did(DID_IMAGE_PREFIX)
+        except (NoResponse, SendFailed):   # the unit is restarting, or its app is not healthy yet
+            if clock() >= deadline:
+                raise UpdateFailed("nothing answered F1F4 in %d s of polling after the restart, so the app has not "
+                                   "reported healthy" % profile.start_timeout_s)
+            sleep(BOOT_POLL_S)
+            continue
+        except Nrc as e:
+            if e.code != NRC_OUT_OF_RANGE:
+                raise
+            if not activated:
+                raise UpdateFailed("ActivateImage got no answer and the unit is still in its bootloader (F1F4 "
+                                   "answered 0x31): run flash again; %s" % unit_status(uds)) from e
+            raise UpdateFailed("the unit is back in its bootloader (F1F4 answered 0x31): the app did not start; %s"
+                               % unit_status(uds)) from e
+        if prefix != sha[:4]:
+            raise UpdateFailed("the app runs another image: F1F4 reads %s, not the new image's %s"
+                               % (prefix.hex(), sha[:4].hex()))
+        log("the app runs the new image (F1F4 %s) and reports healthy" % prefix.hex())
+        return 0
+
+
+# F1F0 as an error quotes it, or that it could not be read, so a failed read never hides the error being reported.
+def unit_status(uds):
+    try:
+        return "F1F0: %s" % describe_status(decode_status(uds.read_did(DID_STATUS)))
+    except UpdateFailed:
+        return "F1F0 could not be read"
 
 
 # After no answer to ActivateImage: True when the server activated anyway, so its answer, not the request, was
@@ -492,6 +642,11 @@ def activation_failed(uds, profile, keys, nrc, log=print):
 # 10 02, then the programming unlock when the profile has [security]: download, FF01 and ActivateImage need it.
 def enter_programming(uds, profile, keys):
     uds.session(SESSION_PROGRAMMING)
+    unlock_programming(uds, profile, keys)
+
+
+# The programming unlock with keys; nothing when the profile has no [security] (keys None).
+def unlock_programming(uds, profile, keys):
     if keys is not None:
         uds.unlock(profile.security.level_programming, keys)
 
@@ -505,8 +660,16 @@ def keyed_reset(uds, profile, keys):
     uds.ecu_reset()
 
 
-# `reset`: ECUReset from the extended session, keyed when the profile has [security].
+# `reset`: ECUReset from the extended session, keyed when the profile has [security]. Under flow "bootloader", from
+# the programming session instead (10 02, the device ID, the programming unlock, 11 01): the unit leaves its
+# bootloader for its app.
 def reset(uds, profile, secret, log=print):
+    if profile.flow == "bootloader":
+        uds.session(SESSION_PROGRAMMING)
+        unlock_programming(uds, profile, device_keys(uds, profile, secret))
+        uds.ecu_reset()
+        log("reset accepted: the unit leaves its bootloader for its app")
+        return 0
     keyed_reset(uds, profile, device_keys(uds, profile, secret))
     log("reset accepted: the server restarts")
     return 0

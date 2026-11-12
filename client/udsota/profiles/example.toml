@@ -9,16 +9,26 @@ resp_id = 0x718                       # the server's response ID
 deny_tx = []                          # IDs the tool must never transmit on, e.g. other nodes' diagnostic IDs
 
 [image]
-product = "example"                   # esp_app_desc_t project name the image must carry
+product = "example"                   # project name the image must carry: esp_app_desc_t's, or the bare block's
 hw_ids = [1]                          # hw_id values in the udsota descriptor that this profile accepts
 layout_id = 1                         # partition layout ID the image must carry
 slot_size = 0x1E0000                  # largest image in bytes: examples/esp32's OTA slot (default 0x400000)
 # compression = "deflate"             # send the image as raw DEFLATE (DFI 0x10), as --compress does; "auto" as
 #                                     # --compress-auto, which falls back to uncompressed; default "none"
+# format = "bare"                     # an image that is not an ESP-IDF app, identified by its bare descriptor
+#                                     # block (docs/wire.md); default "esp-idf". Delta downloads need "esp-idf"
+# desc_offset = 0x200                 # format "bare" only, and required there: the block's offset in the file
 
 [board]
 did = 0xF191                          # a DID the server answers with its board name (ASCII)
 names = { 1 = "devkit" }              # board name for each hw_id; flash refuses an image for another board
+
+# [update] picks the update sequence. "app", the default, is udsota's: an A/B updater in the app, ending in
+# ConfirmImage. "bootloader" is for a single-slot unit whose resident bootloader is its only UDS server: flash's
+# 10 02 resets the app into it, and flash ends once the new app answers F1F4 (docs/wire.md); confirm is refused.
+# [update]
+# flow = "bootloader"                 # "app" or "bootloader"
+# start_timeout_s = 60                # bootloader only: how long flash polls F1F4 after the 3 s reboot wait (1 to 600)
 
 # [security] turns on SecurityAccess (0x27): without it the tool never unlocks. It has two modes, which must match
 # the server's. In mode "hmac" (the default) the key for each seed is derived from a 32-byte master key file, the

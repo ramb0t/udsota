@@ -70,6 +70,21 @@ def build_image(version="v0.2.0", product="example", hw_id=1, layout=1, ids=(0x7
     return reseal(img)
 
 
+# A bare image ([image] format = "bare"): size bytes of a byte pattern with the 128-byte descriptor block at
+# desc_offset, its udsota_image_desc_t then version, project and image_id, each field overridable.
+def build_bare_image(desc_offset=0x200, size=4096, version="1.4.0", product="stm32boot", image_id=bytes(range(32)),
+                     hw_id=1, layout=1, ids=(0x710, 0x718), magic=0x5544534F, desc_version=1, release=None):
+    img = bytearray((i * 7 + 13) & 0xFF for i in range(size))
+    block = bytearray(128)
+    flags = int(is_release(version) if release is None else release)
+    struct.pack_into("<IHBBHHB", block, 0, magic, desc_version, hw_id, layout, ids[0], ids[1], flags)
+    block[32:64] = version.encode().ljust(32, b"\0")
+    block[64:96] = product.encode().ljust(32, b"\0")
+    block[96:128] = image_id
+    img[desc_offset:desc_offset + 128] = block
+    return bytes(img)
+
+
 # The app_elf_sha256 an image carries (what F1F3 answers once it runs).
 def elf_sha(image):
     return image[176:208]

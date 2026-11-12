@@ -4,6 +4,11 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ## [Unreleased]
 
+### Added
+
+- Client: `[image] format = "bare"` takes images that are not ESP-IDF apps. Their identity comes from a 128-byte descriptor block at the profile's `desc_offset` ([docs/wire.md](docs/wire.md#image-descriptor)), checked as an ESP-IDF image's descriptor is and needing `desc_version` 1 or later; plain and compressed downloads and `pack` take them, and delta downloads refuse them. `udsota.h` gains `UDSOTA_BARE_DESC_LEN` and the block's field offsets. `format = "esp-idf"` stays the default.
+- Client: `[update] flow = "bootloader"` updates a single-slot unit whose resident bootloader is its only UDS server, such as an STM32 bootloader on iso14229 ([docs/wire.md](docs/wire.md#bootloader-flow)). `flash` enters the programming session first, which resets the app into the bootloader, and ends once the new app answers F1F4 with the image ID's first 4 bytes within `start_timeout_s`; a unit whose app already runs the image and reports healthy is left running. There is no ConfirmImage, so `confirm` is refused, and the app serves no UDS, so `config` and `dtc` are refused. `udsota.h` gains `UDSOTA_DID_IMAGE_PREFIX` (F1F4) and `UDSOTA_STATUS_BOOT_HELD` (F1F0 flag 0x04, held in the bootloader), which `udsota.c` neither serves nor sets. `flow = "app"` stays the default.
+
 ### Fixed
 
 - Client: after a delta download, `flash` no longer prints a full download's time estimated from the delta's: that time is mostly the server rebuilding and writing the image, so the estimate came out ten times too high (5,299 s for an image that takes 526 s). It prints the delta's size and time and the image's size. Compressed downloads still print the time saved.

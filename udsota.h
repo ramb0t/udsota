@@ -39,16 +39,19 @@
 #define UDSOTA_VERSION       "0.16.0"
 
 /* ---- Wire contract ----
- * The numbers a tester sees, under the names udsota v0.14.2 gave them. client/udsota/wire.py, keys.py and image.py
- * mirror them, and client/tests/test_udsota.py checks each against its client copy, or against v0.14.2's for the few
- * the client never uses: changing one needs a matching client change and a CHANGELOG entry. NRCs and sessions are
- * iso14229's (UDS_NRC_*, UDS_LEV_DS_*), and the download reasons are udsota_reason_t below. */
+ * The numbers a tester sees, under the names udsota v0.14.2 gave them; UDSOTA_BARE_*, UDSOTA_DID_IMAGE_PREFIX and
+ * UDSOTA_STATUS_BOOT_HELD are newer, and udsota.c neither serves nor sets them. client/udsota/wire.py, keys.py and
+ * image.py mirror them, and client/tests/test_udsota.py checks each against its client copy, or against v0.14.2's for
+ * the few the client never uses: changing one needs a matching client change and a CHANGELOG entry. NRCs and sessions
+ * are iso14229's (UDS_NRC_*, UDS_LEV_DS_*), and the download reasons are udsota_reason_t below. */
 #define UDSOTA_DID_ACTIVE_SESSION   0xF186u   /* 1 B: the active session */
 #define UDSOTA_DID_SW_VERSION       0xF189u   /* the running image's version string */
 #define UDSOTA_DID_SERIAL           0xF18Cu   /* the device ID the keys bind to */
 #define UDSOTA_DID_STATUS           0xF1F0u   /* 16 B: the A/B slots (udsota_status_t) */
 #define UDSOTA_DID_RESULT           0xF1F1u   /* 5 B: the last download's reason and bytes received */
 #define UDSOTA_DID_RUNNING_SHA      0xF1F3u   /* 32 B: the running image's app_elf_sha256 */
+#define UDSOTA_DID_IMAGE_PREFIX     0xF1F4u   /* 4 B: F1F3's first 4 bytes, from a single-slot bootloader unit's app
+                                                 once healthy (docs/wire.md); udsota.c does not serve it */
 #define UDSOTA_RID_CHECK_PROG_DEPS  0xFF01u   /* CheckProgrammingDependencies (verify): status udsota_reason_t */
 #define UDSOTA_RID_GET_RESUME_POINT 0xF000u   /* reserved: status UDSOTA_RESUME_NOT_AVAILABLE */
 #define UDSOTA_RID_ACTIVATE_IMAGE   0xF001u
@@ -71,7 +74,13 @@
 #define UDSOTA_KEYS_PUBKEY_LEN      65u       /* cfg.key_pubkey: 04 || X || Y, P-256 */
 #define UDSOTA_KEYS_ID_MAX          16u       /* the longest device ID (F18C) */
 #define UDSOTA_IMG_DESC_OFFSET      288u      /* udsota_image_desc_t in the image, right after esp_app_desc_t */
+#define UDSOTA_BARE_DESC_LEN        128u      /* a non-ESP image's descriptor block: udsota_image_desc_t first */
+#define UDSOTA_BARE_VERSION_OFFSET  32u       /* in the block: 32 B, the version string F189 returns, NUL-terminated */
+#define UDSOTA_BARE_PROJECT_OFFSET  64u       /* in the block: 32 B, the project name, NUL-terminated */
+#define UDSOTA_BARE_IMAGE_ID_OFFSET 96u       /* in the block: 32 B, the image ID F1F3 returns */
 #define UDSOTA_STATUS_SIG_CHECKED   0x01u     /* F1F0's flags: images are signature-checked */
+#define UDSOTA_STATUS_BOOT_HELD     0x04u     /* F1F0's flags: held in the bootloader, the app failed to start; a
+                                                 bootloader unit's, never udsota.c's */
 
 /* ---- The image descriptor ----
  * Every image says which board, partition layout and CAN IDs it is for, at offset 288 (right after ESP-IDF's

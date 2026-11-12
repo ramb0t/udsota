@@ -4,6 +4,7 @@ No kernel ISO-TP socket and no vcan: the UDS layer runs over a stub udsoncan con
 python-can virtual buses.
 Most tests run with FULL (P), a profile that turns every optional feature on."""
 import argparse
+import contextlib
 import dataclasses
 import errno
 import hashlib
@@ -38,7 +39,7 @@ from udsota import cli, config, delta, dtc, errors, image, keys, pack, profile, 
 from udsota.image import parse_image
 from udsota.uds import BUSY_BACKOFF_S, KEEPALIVE_S, SA_DELAY_S, SIG_P2_S, Uds
 
-from .demo_server import MASTER, build_image, delta_pair, elf_sha, reseal
+from .demo_server import MASTER, build_bare_image, build_image, delta_pair, elf_sha, reseal
 
 # Every optional table on, with the example IDs, label, product and board; a deny list and three boards so
 # the deny-list and board checks have something to refuse.
@@ -226,14 +227,18 @@ class FakeServer:
         self.level_extended = level_extended    # the requestSeed level 14's hook needs unlocked
         self.s3_on = s3_on                      # the SIDs that restart S3; None: every request
 
+    # The sub-function, DID, RID or block counter the log records for request req (None for the other SIDs).
+    @staticmethod
+    def request_arg(req):
+        return {0x10: lambda: req[1], 0x11: lambda: req[1], 0x27: lambda: req[1], 0x36: lambda: req[1],
+                0x3E: lambda: req[1], 0x22: lambda: int.from_bytes(req[1:3], "big"),
+                0x2E: lambda: int.from_bytes(req[1:3], "big"),
+                0x31: lambda: int.from_bytes(req[2:4], "big"), 0x19: lambda: req[1],
+                0x14: lambda: int.from_bytes(req[1:4], "big")}.get(req[0], lambda: None)()
+
     # Answer one request payload with a list of response payloads ([] = no answer).
     def handle(self, req):
-        sid = req[0]
-        arg = {0x10: lambda: req[1], 0x11: lambda: req[1], 0x27: lambda: req[1], 0x36: lambda: req[1],
-               0x3E: lambda: req[1], 0x22: lambda: int.from_bytes(req[1:3], "big"),
-               0x2E: lambda: int.from_bytes(req[1:3], "big"),
-               0x31: lambda: int.from_bytes(req[2:4], "big"), 0x19: lambda: req[1],
-               0x14: lambda: int.from_bytes(req[1:4], "big")}.get(sid, lambda: None)()
+        sid, arg = req[0], self.request_arg(req)
         if self.no_fc.get((sid, arg)):
             self.no_fc[(sid, arg)] -= 1         # FF seen, FC dropped: the request never arrives
             raise OSError(errno.ECOMM, os.strerror(errno.ECOMM))
@@ -1164,6 +1169,53 @@ def test_parse_image_refuses_bad_images(image):
         parse_image(P, image)
 
 
+# A profile for bare images (a non-ESP unit): the block at 0x200, a 64 KiB slot, build_bare_image's identity.
+BARE = """
+[can]
+interface = "vcan0"
+req_id = 0x710
+resp_id = 0x718
+
+[image]
+format = "bare"
+desc_offset = 0x200
+product = "stm32boot"
+hw_ids = [1, 2]
+layout_id = 1
+slot_size = 0x10000
+"""
+PB = profile.from_dict("bare", tomllib.loads(BARE))
+
+
+# Check a bare image parses from its descriptor block alone, wherever desc_offset puts it, its image_id standing in
+# for app_elf_sha256; and that an ESP-IDF image has no block where a bare profile looks.
+def test_parse_bare_image_reads_the_block():
+    assert parse_image(PB, build_bare_image(hw_id=2)) == \
+        image.ImageInfo("1.4.0", "stm32boot", bytes(range(32)), 2, 1, 4096)
+    for off in (0, 4096 - 128):
+        prof = dataclasses.replace(PB, desc_offset=off)
+        assert parse_image(prof, build_bare_image(desc_offset=off, image_id=NEW_SHA)).elf_sha == NEW_SHA
+    with pytest.raises(errors.Refused, match="no udsota image descriptor"):
+        parse_image(PB, make_image(project=b"stm32boot"))
+
+
+# Check each malformed or foreign bare image is refused, naming what is wrong and where.
+@pytest.mark.parametrize("data, why", [
+    (build_bare_image()[:0x200 + 127], "639 bytes, too short for the 128-byte descriptor block at desc_offset 512"),
+    (build_bare_image(magic=0), "no udsota image descriptor (magic UDSO) at desc_offset 512"),
+    (build_bare_image(magic=0x4F534455), "no udsota image descriptor (magic UDSO) at desc_offset 512"),
+    (build_bare_image(desc_version=0), "the image descriptor at desc_offset 512 has desc_version 0, not 1 or later"),
+    (build_bare_image(product="other"), "image project is 'other', not 'stm32boot'"),
+    (build_bare_image(ids=(0x720, 0x728)), "image answers on 0x720/0x728, not 0x710/0x718"),
+    (build_bare_image(hw_id=9), "image hw_id 9 is not one of the profile's [1, 2]"),
+    (build_bare_image(layout=2), "image layout 2 is not the profile's 1"),
+    (build_bare_image(size=0x10001), "image is 65537 bytes; the slot holds 65536"),
+])
+def test_parse_bare_image_refuses_bad_images(data, why):
+    with pytest.raises(errors.Refused, match=re.escape(why)):
+        parse_image(PB, data)
+
+
 # ---- DID decoding ----
 
 # Check F1F0 decodes the fixture (slot 1 PENDING_VERIFY, other VERIFIED v0.2.7, flags 0x05).
@@ -1173,7 +1225,9 @@ def test_decode_status_fixture():
     assert s["other_version"] == (0, 2, 7) and s["other_sha_prefix"] == bytes(range(0xA1, 0xA9))
     text = wire.describe_status(s)
     assert "PENDING_VERIFY" in text and "VERIFIED v0.2.7" in text and "signature-checked" in text
-    assert "flags signature-checked,0x04" in text        # 0x04 has no UDSOTA_STATUS_* name, so it shows as hex
+    assert "flags signature-checked,held-in-bootloader" in text
+    s["flags"] = 0x09                                    # 0x08 has no UDSOTA_STATUS_* name, so it shows as hex
+    assert wire.describe_status(s).endswith("flags signature-checked,0x08")
 
 
 # Check F1F1 and F1F2 decode big-endian.
@@ -1248,14 +1302,14 @@ def test_reason_names_match_udsota_wire():
 
 
 # Check the DIDs, RIDs, NRCs, download format, DTC numbers and status flags wire.py mirrors match v0.14.2's
-# udsota_wire.h #defines.
+# udsota_wire.h #defines; the held flag (0x04) came after v0.14.2.
 def test_wire_numbers_match_udsota_wire():
     defines = {m[1]: int(m[2], 0) for m in re.finditer(r"#define\s+(UDSOTA_\w+)\s+(0x[0-9A-Fa-f]+|\d+)u?\b",
                                                       wire_header())}
     assert {c: defines[c] for c in WIRE_DEFINES} == {c: getattr(wire, py) for c, py in WIRE_DEFINES.items()}
     assert defines["UDSOTA_DL_MAX_BLOCK_LEN"] - 2 == wire.DL_MAX_DATA
     flags = {v for k, v in defines.items() if k.startswith("UDSOTA_STATUS_") and k != "UDSOTA_STATUS_LEN"}
-    assert flags == set(wire.STATUS_FLAGS)
+    assert flags == set(wire.STATUS_FLAGS) - {wire.STATUS_BOOT_HELD}
 
 
 UDSOTA_H, ISO14229_H = REPO / "udsota.h", REPO / "iso14229" / "iso14229.h"
@@ -1274,13 +1328,17 @@ NRC_ISO14229 = {"UDSOTA_NRC_BUSY_REPEAT": "UDS_NRC_BusyRepeatRequest",
                 "UDSOTA_NRC_GENERAL_PROGRAMMING_FAILURE": "UDS_NRC_GeneralProgrammingFailure",
                 "UDSOTA_NRC_SUBFUNC_NOT_SUPPORTED": "UDS_NRC_SubFunctionNotSupported",
                 "UDSOTA_NRC_RESPONSE_TOO_LONG": "UDS_NRC_ResponseTooLong"}
-# The client's own copy of each udsota.h wire number outside WIRE_DEFINES: lengths, levels and offsets.
-CLIENT_NUMBERS = {"UDSOTA_DL_MAX_BLOCK_LEN": wire.DL_MAX_DATA + 2,
+# The client's own copy of each udsota.h wire number outside WIRE_DEFINES: lengths, levels, offsets, and F1F4, which
+# came after v0.14.2.
+CLIENT_NUMBERS = {"UDSOTA_DID_IMAGE_PREFIX": wire.DID_IMAGE_PREFIX, "UDSOTA_DL_MAX_BLOCK_LEN": wire.DL_MAX_DATA + 2,
                   "UDSOTA_SA_SEED_EXTENDED": PE.security.level_extended,         # the profile's default levels
                   "UDSOTA_SA_SEED_PROGRAMMING": PE.security.level_programming,
                   "UDSOTA_SEED_LEN": keys.SEED_LEN, "UDSOTA_KEY_LEN": keys.KEY_LEN, "UDSOTA_KEYS_SIG_LEN": keys.SIG_LEN,
                   "UDSOTA_KEYS_SIG_TAG": keys.SIG_TAG.decode(), "UDSOTA_KEYS_PUBKEY_LEN": keys.PUBKEY_LEN,
-                  "UDSOTA_KEYS_ID_MAX": keys.ID_MAX, "UDSOTA_IMG_DESC_OFFSET": image.DESC_OFFSET}
+                  "UDSOTA_KEYS_ID_MAX": keys.ID_MAX, "UDSOTA_IMG_DESC_OFFSET": image.DESC_OFFSET,
+                  "UDSOTA_BARE_DESC_LEN": image.BARE_DESC_LEN, "UDSOTA_BARE_VERSION_OFFSET": image.BARE_VERSION_OFFSET,
+                  "UDSOTA_BARE_PROJECT_OFFSET": image.BARE_PROJECT_OFFSET,
+                  "UDSOTA_BARE_IMAGE_ID_OFFSET": image.BARE_IMAGE_ID_OFFSET}
 # udsota.h's wire numbers the client never sends or reads, which must equal v0.14.2's instead.
 SERVER_ONLY = {"UDSOTA_RID_GET_RESUME_POINT", "UDSOTA_RESUME_NOT_AVAILABLE", "UDSOTA_DL_Z_BOUND",
                "UDSOTA_SA_SEED_VALID_MS"}
@@ -2648,6 +2706,33 @@ def test_bad_profiles_are_refused(tmp_path, text, why):
     p.write_bytes(text if isinstance(text, bytes) else text.encode())
     with pytest.raises(errors.Refused, match=why):
         profile.load(str(p))
+
+
+# Check [image] format defaults to esp-idf with no desc_offset, and "bare" takes a desc_offset from 0 to 0xFFFFFFFF.
+def test_image_format_profile_values():
+    assert (P.image_format, P.desc_offset) == ("esp-idf", None)
+    assert (profile.load("example").image_format, profile.load("example").desc_offset) == ("esp-idf", None)
+    esp = profile.from_dict("e", tomllib.loads(FULL.replace("[image]\n", '[image]\nformat = "esp-idf"\n')))
+    assert (esp.image_format, esp.desc_offset) == ("esp-idf", None)
+    assert (PB.image_format, PB.desc_offset) == ("bare", 0x200)
+    for off in (0, 0xFFFFFFFF):
+        assert profile.from_dict("b", tomllib.loads(BARE.replace("0x200", str(off)))).desc_offset == off
+
+
+# Check a bad [image] format or desc_offset is refused with its reason.
+@pytest.mark.parametrize("old, new, why", [
+    ('format = "bare"', 'format = "elf"', "[image] format must be one of esp-idf, bare"),
+    ('format = "bare"', "format = 1", "format must be a non-empty string"),
+    ("desc_offset = 0x200\n", "", '[image] format = "bare" needs desc_offset'),
+    ('format = "bare"', 'format = "esp-idf"', '[image] desc_offset is for format = "bare"'),
+    ('format = "bare"\n', "", '[image] desc_offset is for format = "bare"'),
+    ("0x200", "-1", "desc_offset must be an integer from 0x0 to 0xFFFFFFFF"),
+    ("0x200", "0x100000000", "desc_offset must be an integer from 0x0 to 0xFFFFFFFF"),
+    ("0x200", '"0x200"', "desc_offset must be an integer from 0x0 to 0xFFFFFFFF"),
+])
+def test_bad_image_format_is_refused(old, new, why):
+    with pytest.raises(errors.Refused, match="profile bare: " + re.escape(why)):
+        profile.from_dict("bare", tomllib.loads(BARE.replace(old, new)))
 
 
 # Check the odd requestSeed levels at both ends of the range load.
@@ -4339,3 +4424,439 @@ def test_pack_orders_deltas_as_flash_does(tmp_path):
     planned = update.plan_deltas([("base", DELTA_BASE)], DELTA_NEW, DELTA_BASE[176:208], "auto", "auto",
                                  log=lambda *a: None)
     assert [e["dfi"] for e in m["payloads"] if e.get("smaller_than_dfi_10")] == [d for d, _ in planned]
+
+
+# ---- bare images: flash and pack ----
+
+# Check flash sends a bare image as it sends an ESP-IDF one, plain and compressed, and compares F1F3 with its
+# image_id. The block sits at 80 so that its image_id lands where FakeServer reads a written image's F1F3, 176..208.
+def test_flash_bare_image():
+    prof = dataclasses.replace(PB, desc_offset=80)
+    img = build_bare_image(desc_offset=80, image_id=NEW_SHA)
+    for compress, dfi in (("none", 0x00), ("deflate", 0x10)):
+        d = FakeServer(security=False, compress=True)
+        assert run_flash(d, img, prof=prof, compress=compress)[0] == 0
+        assert (d.dfi, bytes(d.written), d.sha) == (dfi, img, NEW_SHA)
+    d = FakeServer(security=False, sha=NEW_SHA)
+    assert run_flash(d, img, prof=prof)[0] == 0 and not any(x[0] == 0x34 for x in d.log)
+
+
+# Check pack writes a bare image's DFI 0x10 and 0x00 payloads as an ESP-IDF image's, the manifest carrying its
+# image_id as image_elf_sha256.
+@pytest.mark.parametrize("args, dfis", [((), [0x10, 0x00]), (("--dfi", "0x00"), [0x00]), (("--dfi", "0x10"), [0x10])])
+def test_pack_bare_image(tmp_path, args, dfis):
+    img = build_bare_image()
+    (tmp_path / "bare.toml").write_text(BARE)
+    (tmp_path / "fw.bin").write_bytes(img)
+    assert cli.main(["--profile", str(tmp_path / "bare.toml"), "pack", str(tmp_path / "fw.bin"),
+                     "--out", str(tmp_path / "out"), *args]) == 0
+    m = json.loads((tmp_path / "out" / "fw.manifest.json").read_text())
+    assert [e["dfi"] for e in m["payloads"]] == dfis
+    for e in m["payloads"]:
+        data = (tmp_path / "out" / e["file"]).read_bytes()
+        assert (e["memory_size"], e["image_elf_sha256"], e["image_version"], e["hw_id"]) == \
+            (len(img), bytes(range(32)).hex(), "1.4.0", 1)
+        assert (zlib.decompress(data, -15) if e["dfi"] == 0x10 else data) == img
+
+
+# Check every delta download is refused for a bare image (exit 2) before anything is written or sent, and before
+# detools is looked for: flash and pack --diff-from, a delta DFI in pack --dfi, and update.flash and pack.pack given
+# a base.
+def test_bare_image_refuses_delta(tmp_path, capsys, monkeypatch):
+    monkeypatch.setitem(sys.modules, "detools", None)
+    prof, img, base = tmp_path / "bare.toml", tmp_path / "fw.bin", tmp_path / "base.bin"
+    prof.write_text(BARE)
+    img.write_bytes(build_bare_image())
+    base.write_bytes(build_bare_image(version="1.3.0"))
+    why = ('profile bare: delta downloads (--diff-from, DFI 0x20 and 0x30) need ESP-IDF images, and its [image] '
+           'format is "bare"')
+    out = ["--out", str(tmp_path / "out")]
+    for argv in (["pack", str(img), *out, "--diff-from", str(base)], ["pack", str(img), *out, "--dfi", "0x30"],
+                 ["pack", str(img), *out, "--diff-from", str(tmp_path)],
+                 ["flash", str(img), "--diff-from", str(base)], ["flash", str(img), "--diff-from", str(tmp_path)]):
+        assert cli.main(["--profile", str(prof), *argv], transport=no_transport) == 2
+        assert why in capsys.readouterr().err
+    assert not (tmp_path / "out").exists()
+    d = FakeServer(security=False)
+    with pytest.raises(errors.Refused, match=re.escape(why)):
+        run_flash(d, build_bare_image(), prof=PB, bases=[("base.bin", base.read_bytes())])
+    assert d.log == []
+    with pytest.raises(errors.Refused, match=re.escape(why)):
+        pack.pack(PB, build_bare_image(), "fw", tmp_path / "out", base=base.read_bytes())
+    assert not (tmp_path / "out").exists()
+
+
+# ---- [update] flow = "bootloader": a single-slot unit whose bootloader is its only UDS server ----
+
+# A single-slot unit whose resident bootloader is its only UDS server, on FakeServer's session, key, download and FF01
+# rules. Its app (in_app) answers only 10 02, with 7F 10 78 and then, from the bootloader it resets into, 50 02, and,
+# unless app_silent, 22 F1F4 with the running image ID's first 4 bytes (app_prefix in their place); it answers
+# nothing for start_silence requests after starting. The bootloader answers F1F0 for one slot (running state 3 while
+# the app is valid, flag 0x04 while held), F1F3 (zeros once a 34 erases the app, the new ID once FF01 passes), and
+# F1F4 with 0x31. F001 after a passing FF01, or a keyed 11 01, starts the app; with app_fails it does not start and
+# the unit is back in its bootloader, held. lose_activate_answer drops the first F001's answer after serving it, and
+# lose_activate loses that many F001s before they are served. With app_nrc the app answers every other request with
+# that NRC.
+class BootloaderUnit(FakeServer):
+    # FakeServer's knobs, plus the app's and the bootloader's above.
+    def __init__(self, in_app=True, held=False, app_fails=False, app_silent=False, app_prefix=None, start_silence=2,
+                 lose_activate_answer=False, lose_activate=0, app_nrc=None, **kw):
+        super().__init__(**kw)
+        self.in_app, self.held, self.app_valid = in_app, held, True
+        self.app_fails, self.app_silent, self.app_prefix = app_fails, app_silent, app_prefix
+        self.start_silence, self.lose_activate_answer = start_silence, lose_activate_answer
+        self.lose_activate, self.app_nrc = lose_activate, app_nrc
+
+    # The app's two answers while it runs; the bootloader's (FakeServer's rules) otherwise.
+    def handle(self, req):
+        if not self.in_app:
+            return super().handle(req)
+        self.log.append((req[0], self.request_arg(req)))
+        if self.silence:
+            self.silence -= 1
+            return []
+        if bytes(req) == b"\x10\x02":
+            self.in_app, self.session, self.unlocked, self.last_t = False, 2, 0, self.clock()
+            return [b"\x7f\x10\x78", bytes([0x50, 0x02, 0x00, 0x32, 0x01, 0xF4])]
+        if bytes(req) == b"\x22\xf1\xf4" and not self.app_silent:
+            return [b"\x62\xf1\xf4" + (self.app_prefix or self.sha[:4])]
+        return [] if self.app_nrc is None else self.nrc(req[0], self.app_nrc)
+
+    # Start the app after F001 or 11 01, or stay in the bootloader, held, when there is none or it fails.
+    def start_app(self):
+        self.session, self.unlocked, self.verified, self.dl_open, self.dl_complete = 1, 0, False, False, False
+        if self.app_valid and not self.app_fails:
+            self.in_app, self.held, self.silence = True, False, self.start_silence
+        else:
+            self.held, self.silence = True, self.boot_silence
+
+    # F1F0 for one slot; every other DID as FakeServer (F1F4 among those it answers 0x31).
+    def s22(self, req, did):
+        if did == 0xF1F0:
+            status = bytes([0, 3 if self.app_valid else 4, 0, 0]) + bytes(11) + bytes([0x04 if self.held else 0])
+            return [b"\x62\xf1\xf0" + status]
+        return super().s22(req, did)
+
+    # RequestDownload as FakeServer; a download that opens erases the app.
+    def s34(self, req, arg):
+        answer = super().s34(req, arg)
+        if answer[0][0] == 0x74:
+            self.app_valid, self.sha = False, bytes(32)
+        return answer
+
+    # FF01 as FakeServer, a pass making the image the app; F001 starts it, needing a passing FF01 (else 0x24).
+    def s31(self, req, rid):
+        if rid == 0xF001 and self.lose_activate:
+            self.lose_activate -= 1
+            return []
+        if rid != 0xF001:
+            answer = super().s31(req, rid)
+            if rid == 0xFF01 and self.verified:
+                self.app_valid, self.sha = True, bytes(self.written[176:208])
+            return answer
+        if self.activate_nrcs:
+            return self.nrc(0x31, self.activate_nrcs.pop(0))
+        if not self.verified:
+            return self.nrc(0x31, 0x24)
+        self.start_app()
+        if self.lose_activate_answer:
+            self.lose_activate_answer = False
+            return []
+        return [b"\x71\x01\xf0\x01"]
+
+    # ECUReset, keyed as FakeServer's: the bootloader starts the app.
+    def s11(self, req, sub):
+        if self.security and not self.unlocked:
+            return self.nrc(0x11, 0x33)
+        self.start_app()
+        return [bytes([0x51, sub])]
+
+
+UPDATE_BL = '\n[update]\nflow = "bootloader"\n'
+# BARE under the bootloader flow, its block at 80 so that the image_id lands where BootloaderUnit reads a written
+# image's ID, 176..208; and FULL under it, for [security] and [board].
+BARE_BL = BARE.replace("0x200", "80") + UPDATE_BL
+PBL = profile.from_dict("bare-boot", tomllib.loads(BARE_BL))
+PFB = profile.from_dict("full-boot", tomllib.loads(FULL + UPDATE_BL))
+BL_IMG = build_bare_image(desc_offset=80, size=4800, image_id=NEW_SHA)
+BL_PRECHECK = [(0x22, 0xF1F4), (0x10, 2), (0x22, 0xF1F0), (0x22, 0xF1F3)]   # F1F4 to the app, then the hop
+POLLS = [(0x22, 0xF1F4)] * 3        # the app answers the third, after start_silence
+
+
+# Run flash under the bootloader flow (PBL, BL_IMG, no master by default); returns (rc, fake time, log lines).
+def run_boot(unit, image=BL_IMG, prof=PBL, master=None, **kw):
+    lines = []
+    rc, ft, _ = run_flash(unit, image=image, prof=prof, master=master, log=lines.append, **kw)
+    return rc, ft, lines
+
+
+# Check the bootloader flow flashes a bare image: F1F4 read once, which the app answers with another image's prefix,
+# then 10 02, which the app answers 7F 10 78 and the bootloader 50 02 through the real udsoncan layer, the precheck
+# reads in the programming session, the download, FF01 and F001, then F1F4 polled until the app answers with the image
+# ID's prefix; no 10 03, no F002, and quiet() held from the 10 02 to the end.
+def test_bootloader_flow_flashes_a_bare_image():
+    d, events = BootloaderUnit(security=False), []
+
+    @contextlib.contextmanager
+    def quiet():
+        events.append(len(d.log))
+        yield
+        events.append(len(d.log))
+
+    rc, ft, lines = run_boot(d, quiet=quiet)
+    assert rc == 0
+    assert d.log == BL_PRECHECK + DOWNLOAD + POLLS
+    assert bytes(d.written) == BL_IMG and d.in_app and d.sha == NEW_SHA and events == [1, len(d.log)]
+    assert ft.sleeps == [update.REBOOT_WAIT_S] + [update.BOOT_POLL_S] * 2
+    assert lines[0] == "image 1.4.0 for hw_id 1, 4800 bytes, image ID a0a1a2a3a4a5a6a7"
+    assert lines[-1] == "the app runs the new image (F1F4 a0a1a2a3) and reports healthy"
+
+
+# Check an image a unit in its bootloader already holds gets 11 01 and the F1F4 proof, no download; a held unit is told
+# so, and that the reset releases it for another try.
+@pytest.mark.parametrize("held", [False, True])
+def test_bootloader_flow_already_installed_resets_into_it(held):
+    d = BootloaderUnit(security=False, in_app=False, held=held, sha=NEW_SHA)
+    rc, _, lines = run_boot(d)
+    assert rc == 0 and d.log == BL_PRECHECK + [(0x11, 1)] + POLLS and d.in_app and not d.held
+    text = "\n".join(lines)
+    assert ("the unit is held in its bootloader: its app failed to start" in text) == held
+    assert ("the reset releases it for another try" in text) == held
+
+
+# Check a unit held in its bootloader with another image is flashed as any other, and its new app starts.
+def test_bootloader_flow_flashes_a_held_unit():
+    d = BootloaderUnit(security=False, in_app=False, held=True)
+    rc, _, lines = run_boot(d)
+    assert rc == 0 and d.log == BL_PRECHECK + DOWNLOAD + POLLS and d.in_app and not d.held
+    assert "the unit is held in its bootloader: its app failed to start" in lines
+
+
+# Check a healthy app already running the image is left running: one F1F4 read in the default session, then nothing.
+def test_bootloader_flow_healthy_app_with_the_image_is_left_running():
+    d, entered = BootloaderUnit(security=False, sha=NEW_SHA), []
+    rc, _, lines = run_boot(d, quiet=lambda: entered.append(1) or contextlib.nullcontext())
+    assert rc == 0 and d.log == [(0x22, 0xF1F4)] and d.in_app and not entered
+    assert lines[-1] == "the unit's app already runs this image (F1F4 a0a1a2a3) and reports healthy: nothing to do"
+
+
+# Check the first F1F4 read leads to the 10 02 whenever it does not read the image's prefix: a silent app, a
+# bootloader answering 0x31, and an app running another image.
+@pytest.mark.parametrize("kw", [dict(app_silent=True, start_silence=0), dict(in_app=False),
+                                dict(app_prefix=b"\xde\xad\xbe\xef", sha=NEW_SHA)])
+def test_bootloader_flow_first_f1f4_without_the_image_goes_on(kw):
+    d = BootloaderUnit(security=False, **kw)
+    with contextlib.suppress(errors.UpdateFailed):   # the silent app and the other image fail later, at F1F4
+        run_boot(d)
+    assert d.log[:3] == [(0x22, 0xF1F4), (0x10, 2), (0x22, 0xF1F0)]
+
+
+# Check F001 is sent once more after no answer, and a second silence leaves F1F4 to decide: no F1F3 or F1F0 read
+# between, since F1F3 already reads the new ID after FF01.
+def test_bootloader_flow_lost_activate_twice_waits_for_f1f4():
+    d = BootloaderUnit(security=False, lose_activate_answer=True)
+    rc, _, lines = run_boot(d)
+    assert rc == 0
+    assert d.log == BL_PRECHECK + DOWNLOAD + [(0x31, 0xF001)] + [(0x22, 0xF1F4)] * 2
+    assert "no answer to ActivateImage again: waiting for the app to start, which decides" in lines
+
+
+# Check an NRC to the F001 sent again after no answer also leaves F1F4 to decide: no stop, no download again.
+@pytest.mark.parametrize("nrc", [0x7F, 0x11])
+def test_bootloader_flow_nrc_to_the_resent_activate_waits_for_f1f4(nrc):
+    d = BootloaderUnit(security=False, lose_activate_answer=True, start_silence=0, app_nrc=nrc)
+    rc, _, lines = run_boot(d)
+    assert rc == 0 and d.log == BL_PRECHECK + DOWNLOAD + [(0x31, 0xF001), (0x22, 0xF1F4)]
+    assert "ActivateImage sent again answered 0x%02X: waiting for the app to start, which decides" % nrc in lines
+
+
+# Check F1F4 answered 0x31 says the unit was perhaps never activated when no F001 was answered, F1F0 quoted, and that
+# the app did not start after 11 01 (an answered F001: test_bootloader_flow_app_that_does_not_start_fails).
+@pytest.mark.parametrize("kw, why", [
+    (dict(lose_activate=2), r"ActivateImage got no answer and the unit is still in its bootloader \(F1F4 answered "
+                            r"0x31\): run flash again; F1F0: "),
+    (dict(in_app=False, sha=NEW_SHA, app_fails=True), r"the unit is back in its bootloader \(F1F4 answered 0x31\): "
+                                                      r"the app did not start; F1F0: "),
+])
+def test_bootloader_flow_bootloader_answering_f1f4_names_the_cause(kw, why):
+    d = BootloaderUnit(security=False, **kw)
+    with pytest.raises(errors.UpdateFailed, match="^" + why):
+        run_boot(d)
+    assert d.log[-2:] == [(0x22, 0xF1F4), (0x22, 0xF1F0)]
+
+
+# Check the programming session is entered again after the delta patches are built, even when none is worth sending:
+# building them can outlast S3, and the full download's 34 must not meet the default session.
+def test_bootloader_flow_reenters_after_unused_deltas(monkeypatch):
+    d = BootloaderUnit(sha=elf_sha(DELTA_BASE))
+
+    def slow_build(base, new, dfi):        # outlasts S3, and is bigger than the image
+        d.session, d.unlocked = 1, 0
+        return bytes(2 * len(new))
+
+    monkeypatch.setattr(pack, "build_delta", slow_build)
+    rc, _, lines = run_boot(d, image=DELTA_NEW, prof=PFB, master=MASTER, compress="none",
+                            bases=[("a.bin", DELTA_BASE)])
+    assert rc == 0 and d.dfis == [0x00] and bytes(d.written) == DELTA_NEW
+    first_34 = d.log.index((0x34, None))
+    assert d.log[:first_34] == BL_PRECHECK[:2] + PRECHECK + UNLOCK_PROG[1:] + UNLOCK_PROG
+    assert any(ln.startswith("no delta over DFI 0x20") for ln in lines)
+
+
+# Check 0x72 and 0x22 to F001 stop at once, and 0x24 downloads once more.
+@pytest.mark.parametrize("nrc, why", [(0x72, "ActivateImage failed (0x72); read F1F0 with `info`"),
+                                      (0x22, "ActivateImage refused (0x22): the server's conditions are not met")])
+def test_bootloader_flow_activate_refusals_stop(nrc, why):
+    d = BootloaderUnit(security=False, activate_nrcs=[nrc])
+    with pytest.raises(errors.UpdateFailed, match=re.escape(why)):
+        run_boot(d)
+    assert d.log == BL_PRECHECK + DOWNLOAD
+
+
+# Check 0x24 to F001 downloads again, once, and the run ends on F1F4 as usual.
+def test_bootloader_flow_activate_sequence_error_downloads_again():
+    d = BootloaderUnit(security=False, activate_nrcs=[0x24])
+    assert run_boot(d)[0] == 0 and d.log == BL_PRECHECK + DOWNLOAD + DOWNLOAD + POLLS
+
+
+# Check an app that does not start fails the run: F1F4 answered 0x31 by the bootloader, with F1F0 quoted, held flag
+# and all.
+def test_bootloader_flow_app_that_does_not_start_fails():
+    d = BootloaderUnit(security=False, app_fails=True)
+    with pytest.raises(errors.UpdateFailed, match=r"^the unit is back in its bootloader \(F1F4 answered 0x31\): the "
+                                                  r"app did not start; F1F0: .*flags held-in-bootloader$"):
+        run_boot(d)
+    assert d.log == BL_PRECHECK + DOWNLOAD + POLLS + [(0x22, 0xF1F0)]
+
+
+# Check an app that never answers F1F4 fails once the profile's start_timeout_s has passed after the reboot wait that
+# follows F001, polling from the end of that wait until then.
+@pytest.mark.parametrize("timeout", [60, 5])
+def test_bootloader_flow_silent_app_times_out(timeout):
+    d = BootloaderUnit(security=False, app_silent=True)
+    with pytest.raises(errors.UpdateFailed, match="^nothing answered F1F4 in %d s of polling after the restart, so the "
+                                                  "app has not reported healthy$" % timeout):
+        run_boot(d, prof=dataclasses.replace(PBL, start_timeout_s=timeout))
+    start = update.REBOOT_WAIT_S + timeout
+    assert start <= d.clock() < start + update.BOOT_POLL_S
+    assert d.log[len(BL_PRECHECK + DOWNLOAD):] == [(0x22, 0xF1F4)] * (timeout + 1)
+
+
+# Check an app that answers F1F4 with another image's prefix fails the run.
+def test_bootloader_flow_other_prefix_fails():
+    d = BootloaderUnit(security=False, app_prefix=b"\xde\xad\xbe\xef")
+    with pytest.raises(errors.UpdateFailed, match="^the app runs another image: F1F4 reads deadbeef, not the new "
+                                                  "image's a0a1a2a3$"):
+        run_boot(d)
+
+
+# Check [security] under the bootloader flow: every precheck read, the device ID last, before the programming unlock,
+# all after 10 02; and the board check refuses after them, saying the unit is left in its bootloader.
+def test_bootloader_flow_unlocks_after_the_precheck_reads():
+    d = BootloaderUnit()
+    rc, _, lines = run_boot(d, image=make_image(), prof=PFB, master=MASTER)
+    assert rc == 0 and d.log == BL_PRECHECK[:2] + PRECHECK + UNLOCK_PROG[1:] + DOWNLOAD + POLLS
+    assert lines[0] == "image 0.3.0 for devkit, 4800 bytes, app_elf_sha256 a0a1a2a3a4a5a6a7"
+    d = BootloaderUnit()
+    with pytest.raises(errors.Refused, match="^image is for devkit-three but the server is devkit. The unit is in its "
+                                             "bootloader and returns to its app when its programming session times "
+                                             "out, unless it is held there$"):
+        run_boot(d, image=make_image(hw_id=3), prof=PFB, master=MASTER)
+    assert d.log == BL_PRECHECK[:2] + PRECHECK + UNLOCK_PROG[1:]
+
+
+# Check a bootloader that does not serve F1F0 is refused as no udsota server, after the 10 02 alone, saying the unit is
+# left in its bootloader.
+def test_bootloader_flow_without_f1f0_is_refused():
+    d = BootloaderUnit(security=False)
+    d.s22 = lambda req, did: FakeServer.nrc(0x22, 0x31)
+    with pytest.raises(errors.Refused, match=re.escape(update.NOT_UDSOTA) + " The unit is in its bootloader and "
+                                             "returns to its app when its programming session times out, unless it "
+                                             "is held there$"):
+        run_boot(d)
+    assert d.log == BL_PRECHECK[:3]
+
+
+# Check reset under the bootloader flow: 10 02, the device ID and the programming unlock when keyed, then 11 01.
+def test_bootloader_flow_reset():
+    ft, d = FakeTime(), BootloaderUnit()
+    assert update.reset(uds_for(d, ft), PFB, MASTER, log=lambda *a: None) == 0
+    assert d.log == [(0x10, 2), (0x22, 0xF18C), (0x27, 3), (0x27, 4), (0x11, 1)] and d.in_app
+    ft, d = FakeTime(), BootloaderUnit(security=False)
+    assert update.reset(uds_for(d, ft), PBL, None, log=lambda *a: None) == 0
+    assert d.log == [(0x10, 2), (0x11, 1)]
+
+
+# Check info under the bootloader flow enters the programming session first, labels F1F3 the image ID for a bare
+# profile, says the unit stays in its bootloader, and sends no reset.
+def test_bootloader_flow_info_enters_programming_first():
+    ft, lines, d = FakeTime(), [], BootloaderUnit(security=False)
+    assert update.info(uds_for(d, ft), PBL, log=lines.append) == 0
+    assert d.log == [(0x10, 2)] + [(0x22, did) for did in (0xF186, 0xF189, 0xF18C, 0xF1F3, 0xF1F0, 0xF1F1, 0xF1F2)]
+    assert "F186 active session: 02" in lines and "F1F3 running image ID: " + OLD_SHA.hex(" ") in lines
+    assert lines[-1] == "the unit stays in its bootloader until its programming session times out"
+
+
+# Check confirm under the bootloader flow is refused (exit 2) before any bus opens.
+def test_bootloader_flow_confirm_is_refused(tmp_path, capsys):
+    p = tmp_path / "boot.toml"
+    p.write_text(BARE_BL)
+    assert cli.main(["--profile", str(p), "confirm"], transport=no_transport) == 2
+    assert 'flow = "bootloader" has no ConfirmImage' in capsys.readouterr().err
+
+
+# Check config and dtc under the bootloader flow are refused (exit 2) before any bus opens: the app serves no UDS.
+@pytest.mark.parametrize("argv", [["config", "show"], ["dtc", "show"]])
+def test_bootloader_flow_config_and_dtc_are_refused(tmp_path, capsys, argv):
+    p = tmp_path / "boot.toml"
+    p.write_text(BARE_BL)
+    assert cli.main(["--profile", str(p), *argv], transport=no_transport) == 2
+    assert ('flow = "bootloader" has no %s: the unit\'s app serves no UDS' % argv[0]) in capsys.readouterr().err
+
+
+# Check main runs a bootloader-flow flash of a bare image end to end, its flow from the profile alone.
+def test_main_bootloader_flow_flash_end_to_end(tmp_path, monkeypatch):
+    monkeypatch.setattr(update, "REBOOT_WAIT_S", 0.0)
+    (tmp_path / "boot.toml").write_text(BARE_BL)
+    (tmp_path / "fw.bin").write_bytes(BL_IMG)
+    d = BootloaderUnit(security=False, start_silence=0)
+    assert cli.main(["--profile", str(tmp_path / "boot.toml"), "flash", str(tmp_path / "fw.bin")],
+                    transport=FakeTransport.on(d)) == 0
+    assert d.log == BL_PRECHECK + DOWNLOAD + [(0x22, 0xF1F4)] and d.sha == NEW_SHA
+
+
+# Check [update] defaults to flow "app" with start_timeout_s 60, and "bootloader" takes 1 to 600.
+def test_update_flow_profile_values():
+    assert (P.flow, P.start_timeout_s) == ("app", 60)
+    e = profile.load("example")
+    assert (e.flow, e.start_timeout_s) == ("app", 60)
+    app = profile.from_dict("a", tomllib.loads(FULL + '[update]\nflow = "app"\n'))
+    assert (app.flow, app.start_timeout_s) == ("app", 60)
+    assert (PBL.flow, PBL.start_timeout_s) == ("bootloader", 60)
+    for t in (1, 600):
+        assert profile.from_dict("b", tomllib.loads(BARE_BL + "start_timeout_s = %d\n" % t)).start_timeout_s == t
+
+
+# Check a bad [update] is refused with its reason.
+@pytest.mark.parametrize("text, why", [
+    ('[update]\nflow = "rom"\n', "[update] flow must be one of app, bootloader"),
+    ("[update]\nflow = 1\n", "flow must be a non-empty string"),
+    ("[update]\nstart_timeout_s = 30\n", '[update] start_timeout_s is for flow = "bootloader"'),
+    ('[update]\nflow = "app"\nstart_timeout_s = 30\n', '[update] start_timeout_s is for flow = "bootloader"'),
+    (UPDATE_BL + "start_timeout_s = 0\n", "start_timeout_s must be an integer from 0x1 to 0x258"),
+    (UPDATE_BL + "start_timeout_s = 601\n", "start_timeout_s must be an integer from 0x1 to 0x258"),
+    (UPDATE_BL + 'start_timeout_s = "60"\n', "start_timeout_s must be an integer from 0x1 to 0x258"),
+    (UPDATE_BL + "start_timeout_s = true\n", "start_timeout_s must be an integer from 0x1 to 0x258"),
+    (UPDATE_BL + "timeout = 5\n", "unknown key timeout in [update]"),
+])
+def test_bad_update_flow_is_refused(text, why):
+    with pytest.raises(errors.Refused, match="profile u: " + re.escape(why)):
+        profile.from_dict("u", tomllib.loads(CAN + text))
+
+
+# Check example.toml's commented [update] loads once uncommented.
+def test_example_update_comments_load():
+    text = (profile.PROFILE_DIR / "example.toml").read_text()
+    live = re.sub(r"(?m)^# (?=\[update\]$|flow |start_timeout_s )", "", text)
+    e = profile.from_dict("example", tomllib.loads(live))
+    assert (e.flow, e.start_timeout_s) == ("bootloader", 60)

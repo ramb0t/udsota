@@ -26,7 +26,7 @@ from .image import parse_image
 from .keys import keygen, load_master, load_private_key
 from .transport import Transport
 from .delta import DETOOLS_HINT
-from .pack import DFIS, pack
+from .pack import DFIS, pack, refuse_bare_delta
 from .update import DIFF_DFIS, confirm_cmd, flash, info, reset
 
 
@@ -143,6 +143,8 @@ def keygen_cmd(out):
 
 # `pack`: reads FILE and the --diff-from base, and writes the payloads and manifest (pack.pack).
 def pack_cmd(prof, args):
+    if args.diff_from is not None:
+        refuse_bare_delta(prof)
     if args.diff_from is not None and args.diff_from.is_dir():
         raise Refused("pack --diff-from takes one base file, the image the devices run: with no device to ask, it "
                       "cannot choose from a directory as flash does")
@@ -176,6 +178,12 @@ def main(argv=None, transport=Transport):
         if interface is None:
             raise Refused("profile %s names no CAN interface: pass --interface" % prof.name)
         image = secret = writes = bases = ext = None
+        if args.cmd == "confirm" and prof.flow == "bootloader":
+            raise Refused("profile %s: [update] flow = \"bootloader\" has no ConfirmImage; flash ends once the app "
+                          "reports healthy" % prof.name)
+        if args.cmd in ("config", "dtc") and prof.flow == "bootloader":
+            raise Refused("profile %s: [update] flow = \"bootloader\" has no %s: the unit's app serves no UDS"
+                          % (prof.name, args.cmd))
         if args.cmd == "flash":
             try:
                 image = args.file.read_bytes()
@@ -189,6 +197,7 @@ def main(argv=None, transport=Transport):
             if args.diff_from is not None:
                 if args.drop_76 is not None:            # flash refuses it too; here before any key or bus
                     raise Refused("--drop-76 is for full and compressed downloads, not with --diff-from")
+                refuse_bare_delta(prof)
                 bases = load_bases(args.diff_from)
         if args.cmd == "config" and args.config_cmd == "set":
             writes = parse_writes(prof, args.assignments, args.commit, args.reset)
