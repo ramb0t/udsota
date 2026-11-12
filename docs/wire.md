@@ -81,7 +81,7 @@ Those udsota sends; the app's own services send theirs.
 | 0x13 | a requestSeed with data, a sendKey of the wrong length (the seed stays), an option record on udsota's RIDs, a 36 with no data or over 4093, a 37 with data |
 | 0x22 | 10 02 or 34 while the slots are unsettled (an activated image waiting for its restart, or a running image still pending verify), a flash job runs or a download is open; 11 01, 27 or F001 while a flash job runs; 27 when no seed can be drawn or no key checked (keys unusable, or the app holds the PSA lock past 40 ms); a 34 with no inactive slot (F1F1 12) or no memory for the inflater or a delta's patch state (F1F1 14); F002 when the running image is not the boot image, or is neither valid nor pending verify; the gate's choice |
 | 0x24 | a sendKey with no live seed (none, another level's, or older than 30 s), a 37 before every byte of a DFI 00 download (which ends it), FF01 with no finished download, F001 before a passing FF01 |
-| 0x31 | a 34 with another DFI (DFI 20 always, DFI 30 where the unit serves no delta), size 0 or past the slot; a first block the [image rules](#reasons) refuse; a DEFLATE block that is corrupt or inflates past memorySize; a delta block whose patch is for another base (F1F1 15) or is corrupt (F1F1 13); one of udsota's RIDs in the wrong non-default session |
+| 0x31 | a 34 with another DFI (DFI 20 always, DFI 30 where the unit serves no delta), size 0 or past the slot, or for a bare image a size that is not a multiple of 4 or ends before its header; a first block the [image rules](#reasons) refuse; a DEFLATE block that is corrupt or inflates past memorySize; a delta block whose patch is for another base (F1F1 15) or is corrupt (F1F1 13); one of udsota's RIDs in the wrong non-default session |
 | 0x33 | 11 01 locked; 34, 36, 37, FF01, F000 or F001 without level 03 |
 | 0x35 | a wrong key |
 | 0x71 | a 36 past memorySize, or after DFI 10 or 30 past `UDSOTA_DL_Z_BOUND` of it (an eighth plus 1024 bytes over); the download ends |
@@ -106,7 +106,7 @@ F1F1 byte 0 and FF01's status byte. The first-block rules (1–7) run before any
 | 5 | `UDSOTA_DL_BAD_DIAG_IDS` | the image would answer on other CAN IDs |
 | 6 | `UDSOTA_DL_NOT_NEWER` | a release not newer than the running image (a running dev build with the same X.Y.Z takes it), or a dev build whose X.Y.Z is older; `cfg.allow_downgrade` lifts this rule alone; a bare unit has no version rule |
 | 7 | `UDSOTA_DL_TOO_BIG` | larger than the slot; a 34 that announces it answers 0x31 first and leaves F1F1 as it was |
-| 8 | `UDSOTA_DL_VERIFY_FAILED` | FF01's check of the image failed (an ESP-IDF image's hash or signature, a bare image's `crc32`), or it could not read the slot back. FF01's image-rule failures report 1–6, and a failed F001 answers 0x72 and leaves F1F1 as it was |
+| 8 | `UDSOTA_DL_VERIFY_FAILED` | FF01's check of the image failed (an ESP-IDF image's hash or signature, a bare image's `crc32`), or it could not read the slot back. FF01's image-rule failures report the rule's own reason, and a failed F001 answers 0x72 and leaves F1F1 as it was |
 | 9 | `UDSOTA_DL_SIG_FAILED` | reserved: ESP-IDF reports a bad signature as 8 |
 | 10 | `UDSOTA_DL_WORKER_TIMEOUT` | a flash job passed 90 s, or its session ended while it ran |
 | 11 | `UDSOTA_DL_ABORTED` | ended early: a session change, S3, the gate, an overrun, an early 37, a block-counter mismatch, or any other NRC that ended iso14229's transfer |

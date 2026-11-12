@@ -5540,3 +5540,19 @@ def test_bare_header_ignorable_flags_are_taken():
     stamped = image.stamp(bytes(img), HO)
     assert struct.unpack_from("<H", stamped, HO + 6)[0] == 0x00FF
     assert image.parse_image(PB, stamped).elf_sha == bare_id(stamped)
+
+
+# Check a wait the operator interrupts says what the 10 02s still queued in the adapter do, as one that gives up does,
+# and lets the interrupt through.
+def test_wait_for_unit_interrupted_says_what_queued_10_02s_do():
+    class Interrupted:
+        def session(self, n):
+            raise errors.NoResponse("no response to service 0x10")
+
+        def try_session(self, n, window_s):
+            raise KeyboardInterrupt
+
+    lines = []
+    with pytest.raises(KeyboardInterrupt):
+        update.wait_for_power_up(Interrupted(), 10, log=lines.append, clock=lambda: 0.0)
+    assert lines == ["waiting up to 10 s for the unit: power-cycle it now", update.WAIT_QUEUED]

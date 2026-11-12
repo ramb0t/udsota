@@ -579,8 +579,9 @@ def flash_bootloader(uds, profile, image, img, secret, drop_76=None, preroll=lam
 # 10 02 in its power-up window, while 10 02 goes out again, the next at most WAIT_RETRY_S after the last went
 # unanswered, was refused or failed to send (Uds.try_session, which waits no longer than that after a 0x78 or 0x21
 # either), until one is answered 50 02; UpdateFailed once seconds have passed since the prompt, saying what the 10 02s
-# still queued then do (WAIT_QUEUED). A failed send, as while the unit is off and nothing acknowledges the frame, is a
-# try like any other. The unit answers every 10 02 it gets, the ones the kernel still held unacknowledged among them,
+# still queued then do (WAIT_QUEUED), as a wait the operator interrupts also logs. A failed send, as while the unit
+# is off and nothing acknowledges the frame, is a try like any other. The unit answers every 10 02 it gets, the ones
+# the kernel still held unacknowledged among them,
 # so 50 02s can follow the first; they are passed over until the unit goes quiet (Uds.drain), the monitor counting
 # that as ours, before the next request goes. Dropping them is not enough, though udsoncan empties the receive queue
 # before each send: one that comes after that send is taken for its answer, and the request itself can reach the unit
@@ -593,12 +594,16 @@ def wait_for_power_up(uds, seconds, log=print, clock=time.monotonic):
         pass
     log("waiting up to %d s for the unit: power-cycle it now" % seconds)
     start, tries = clock(), 1
-    while True:
-        tries += 1
-        if uds.try_session(SESSION_PROGRAMMING, WAIT_RETRY_S):
-            break
-        if clock() - start >= seconds:
-            raise UpdateFailed("no 10 02 was answered within %d s (%d tries). %s" % (seconds, tries, WAIT_QUEUED))
+    try:
+        while True:
+            tries += 1
+            if uds.try_session(SESSION_PROGRAMMING, WAIT_RETRY_S):
+                break
+            if clock() - start >= seconds:
+                raise UpdateFailed("no 10 02 was answered within %d s (%d tries). %s" % (seconds, tries, WAIT_QUEUED))
+    except KeyboardInterrupt:
+        log(WAIT_QUEUED)
+        raise
     took = clock() - start
     late = uds.drain(WAIT_SETTLE_S, WAIT_DRAIN_S)
     passed = "; passed over %d later answers" % late if late else ""
