@@ -55,6 +55,7 @@ The checks run in this order: 0x7F in the default session, 0x12 for sub-function
 | F1F0 | update status, 16 bytes |
 | F1F1 | last download, 5 bytes |
 | F1F3 | the running image's `app_elf_sha256`, 32 bytes |
+| F1F4 | F1F3's first 4 bytes, from a [bootloader-flow](#bootloader-flow) unit's app once it is healthy; udsota doesn't serve it |
 
 **F1F0** is laid out as in 0.14, less its flag 0x02:
 
@@ -66,7 +67,7 @@ The checks run in this order: 0x7F in the default session, 0x12 for sub-function
 | 3 | `other_slot_state` | 0 empty, 1 holds an unverified image, 2 being written, 3 verified since boot (ActivateImage may use it), 4 rolled back |
 | 4–6 | `other_version` | major, minor, patch; 0.0.0 when empty or being written |
 | 7–14 | `other_elf_sha_prefix` | the first 8 bytes of the other slot's `app_elf_sha256` |
-| 15 | `flags` | 0x01 updates are signature-checked (`UDSOTA_STATUS_SIG_CHECKED`); other bits 0 |
+| 15 | `flags` | 0x01 updates are signature-checked (`UDSOTA_STATUS_SIG_CHECKED`); 0x04 held in the bootloader because the app failed to start (`UDSOTA_STATUS_BOOT_HELD`), which only a [bootloader-flow](#bootloader-flow) unit sets; other bits 0 |
 
 **F1F1** is the [reason](#reasons) in byte 0 and, in bytes 1–4, big-endian, the data bytes the 36s carried, coded bytes after DFI 10 or 30. While FF01 runs it reads reason 10 until the verdict.
 
@@ -137,6 +138,15 @@ ISO-TP is iso14229's isotp-c with its defaults unless the app defines others bui
 | 12 | `flags` | bit 0: a release build (a clean `[v]X.Y.Z` version); other bits 0 |
 | 13 | `reserved` | 19 zero bytes |
 
+An image that is not an ESP-IDF app, which the client takes with `[image] format = "bare"`, has no fixed offset: the descriptor opens a 128-byte block (`UDSOTA_BARE_DESC_LEN`) at the offset its profile's `desc_offset` names, with `desc_version` 1 or later, and the block's other fields stand in for `esp_app_desc_t`'s.
+
+| Offset | Field | Value |
+|---|---|---|
+| 0 | descriptor | the 32 bytes above |
+| 32 | `version` | NUL-terminated ASCII: what F189 returns (`UDSOTA_BARE_VERSION_OFFSET`) |
+| 64 | `project` | NUL-terminated ASCII: the product name (`UDSOTA_BARE_PROJECT_OFFSET`) |
+| 96 | `image_id` | 32 opaque bytes: what F1F3 returns, in place of `app_elf_sha256` (`UDSOTA_BARE_IMAGE_ID_OFFSET`) |
+
 ## Keys
 
 With keys set, 27 01/02 unlocks 11 01 in the extended session, and 27 03/04 unlocks 34, 36, 37, FF01, F000, F001 and 11 01 in the programming session. ConfirmImage needs no key, since it can only keep an image that passed FF01 and ActivateImage. Each 16-byte seed takes one sendKey of the right length, right or wrong. Below, `level` is the requestSeed sub-function (01 or 03) and `device_id` the bytes F18C returns.
@@ -151,8 +161,20 @@ A flasher that is not the client, such as an edge device that fetches updates fr
 
 **Precheck**, in the default session. If F1F3 already reads the manifest's `image_elf_sha256`, there is nothing to send, or only ConfirmImage when F1F0 says the running image is pending verify. Any other pending-verify image must be confirmed or rolled back first. The board DID (`board_did`) must read `board`. If F1F0's other slot is verified since the last boot and its SHA prefix is the first 8 bytes of `image_elf_sha256`, skip the payloads and FF01: after 10 02 and the unlock, go straight to ActivateImage.
 
-**Download.** 10 02 and the programming unlock, then the payloads in manifest order until one is taken. Each goes as a 34 with the entry's `dfi`, ALFID 44, address 0 and `memory_size`; then 36 blocks of 4093 bytes, the counter from 01 wrapping FF to 00; then a 37. Skip a delta entry whose `base_elf_sha256` is not what F1F3 reads: the unit runs another image than its base and would refuse it with reason 15. A 34 answered 0x31, as every DFI 20 entry is and every DFI 30 entry where the unit serves no delta, or 0x22 with F1F1 reason 14, means the device can't take that payload now: try the next entry. A delta's 36 answered 0x31 with F1F1 reason 15 means the unit runs another image than the patch's base: skip the other delta entries and send the first full one, in the same session. Any other refusal stops the update, and F1F1 names why.
+**Download.** 10 02 and the programming unlock, then the payloads in manifest order until one is taken. Each goes as a 34 with the entry's `dfi`, ALFID 44, address 0 and `memory_size`; then 36 blocks of the 74's maxNumberOfBlockLength minus 2 bytes (4093 from udsota's own `74 20 0F FF`; a server may announce less), the counter from 01 wrapping FF to 00; then a 37. Skip a delta entry whose `base_elf_sha256` is not what F1F3 reads: the unit runs another image than its base and would refuse it with reason 15. A 34 answered 0x31, as every DFI 20 entry is and every DFI 30 entry where the unit serves no delta, or 0x22 with F1F1 reason 14, means the device can't take that payload now: try the next entry. A delta's 36 answered 0x31 with F1F1 reason 15 means the unit runs another image than the patch's base: skip the other delta entries and send the first full one, in the same session. Any other refusal stops the update, and F1F1 names why.
 
-**Lost answers.** Nothing in the download may be resent. A resent 36 answers 0x24 and ends the transfer, and a resent 37 answers 0x70, even when the first copy succeeded. So when a 36 or 37 gets no answer, start the download again from its 34, in the same session and unlock if they still hold. When a delta's 36 gets no answer and F1F1 then reads reason 15, the lost answer was the base refusal: go on to the first full entry instead. Waiting out P2* for a lost answer can outlast S3 (5.1 s), so read F186 first and, if the session is no longer programming, enter it and unlock again. A resent FF01 answers 00 again after a pass, and 0x24 after a failure, which F1F1 names.
+**Lost answers.** Nothing in the download may be resent. A resent 36 answers 0x24 and ends the transfer, and a resent 37 answers 0x70, even when the first copy succeeded. So when a 36 or 37 gets no answer, send a 37 first: a 34 answers 0x22 while a transfer is open, and a 37 closes it whatever it answers. A positive answer means the lost one was the last 36's and the download is complete; after any other, start the download again from its 34, in the same session and unlock if they still hold. When a delta's 36 gets no answer and F1F1 then reads reason 15, the lost answer was the base refusal: go on to the first full entry instead. Waiting out P2* for a lost answer can outlast S3 (5.1 s), so read F186 first and, if the session is no longer programming, enter it and unlock again. A resent FF01 answers 00 again after a pass, and 0x24 after a failure, which F1F1 names.
 
 **Verify, activate, confirm.** FF01 must answer status 00. ActivateImage (F001) answers and restarts the device, so wait about 3 s, then poll F1F3 until the device answers (the client allows 60 s). Any value but `image_elf_sha256` means it rolled back or never switched: stop. Finally 10 03 and ConfirmImage (F002), sent again every 2 s while it answers 0x22 and the product's own checks run; the client allows 120 s.
+
+## Bootloader flow
+
+A single-slot unit whose resident bootloader is its only UDS server, such as an STM32 bootloader on iso14229, serves the download, FF01 and F001 above from its bootloader, and the client drives it with `[update] flow = "bootloader"`. Its app answers two requests only: `10 02`, with `7F 10 78` before it resets into the bootloader, which then sends the `50 02` within P2*; and, once the app is healthy, a single-frame `22 F1F4`. `udsota.c` serves none of this.
+
+**Precheck.** First one `22 F1F4` in the default session: four bytes equal to the image ID's first four mean the app already runs the image and is healthy, so there is nothing to do and the app keeps running; anything else, or no answer, goes on to the `10 02`. Then, in the programming session: F1F0, F1F3, the board DID and F18C, then the programming unlock. F1F0 describes one slot: running slot 0 and boot slot 0, running state 3 only while the app is valid and never 2, other slot state 0. Flag 0x04 means the bootloader holds the unit there because its app failed to start; a reset releases it for another try. F1F3 reads 32 zero bytes while there is no valid app. If F1F3 already reads the image's ID, send `11 01` and go on to the proof of life.
+
+**Download, verify, activate** as in [Flashing without the client](#flashing-without-the-client), where address 0 in the 34 is the unit's update target. F001 answers, then resets into the app; without a passing FF01 it answers 0x24. There is no F002. F1F3 reads the new ID as soon as FF01 passes, so it can't tell whether an unanswered F001 landed: send F001 once more, and unless that one is answered positively, let F1F4 decide.
+
+**Proof of life.** Wait about 3 s, then poll `22 F1F4` (the client polls for `start_timeout_s` after that wait, 60 s by default). Four bytes equal to the image ID's first four mean the new app runs and is healthy: the update is done. Any other value means the app runs another image. 0x31 means the bootloader answers, so the app did not start; F1F0 says whether flag 0x04 holds it there. No answer by the deadline is a failure: the app has not reported healthy.
+
+`11 01` in the programming session, unlocked when the unit has keys, leaves the bootloader for the app. Otherwise the unit stays in the bootloader until its session times out.

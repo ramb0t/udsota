@@ -14,6 +14,14 @@ From 0.15 udsota answers inside the app's iso14229 server, which the client hand
 
 `tests/test_udsota.py` checks the client's wire numbers against two contracts. Against `udsota.h`'s "Wire contract" block, with the NRCs and sessions it takes from `iso14229.h`, the numbers in `udsota/wire.py`, `keys.py` and `image.py` and the profile's default levels must match what this server answers. Against v0.14.2's wire headers, frozen in `test/fixtures/wire-v0.14/`, `wire.py`'s must match what units still on a v0.14.x server answer, so the client keeps updating those, and the block's few numbers the client never uses (F000 and its status, the seed lifetime, the DEFLATE overrun bound) must match them too. A number changed on either side fails the test, and so does a new `udsota.h` wire number the test doesn't map.
 
+## Bare images
+
+A profile whose `[image]` sets `format = "bare"` takes images that are not ESP-IDF apps, such as a non-ESP unit's that speaks udsota's wire. It must also set `desc_offset`, where the image file holds its 128-byte descriptor block ([wire reference](../docs/wire.md#image-descriptor)), and the client checks that block as it checks an ESP-IDF image's descriptor, and that its `desc_version` is 1 or later. Plain and compressed downloads and `pack` work as for ESP-IDF images, with the block's image ID as the manifest's `image_elf_sha256`. Delta downloads need ESP-IDF's appended SHA-256, so `--diff-from` and DFI 0x20 and 0x30 are refused. The default, `format = "esp-idf"`, refuses `desc_offset`.
+
+## Bootloader flow
+
+A profile whose `[update]` sets `flow = "bootloader"` updates a single-slot unit whose resident bootloader is its only UDS server ([wire reference](../docs/wire.md#bootloader-flow)). `flash` first reads F1F4 once, and stops there with nothing to do if the app already runs the image and reports healthy. Otherwise it sends `10 02`, which resets the app into the bootloader, makes the precheck and the download there, waits 3 s for the restart, then polls F1F4 until the new app reports healthy with the image ID's first 4 bytes, for up to `start_timeout_s` more (1 to 600, default 60). It fails if the app runs another image, if the bootloader answers instead because the app did not start, or if nothing answers in time. There is no ConfirmImage, so `confirm` is refused, and the app serves no UDS, so `config` and `dtc` are refused. `reset` sends `10 02`, the programming unlock and `11 01`, and `info` reads from the bootloader, which stays there until its session times out. The default, `flow = "app"`, refuses `start_timeout_s`.
+
 ## Tests
 
 `python -m pytest client/tests` runs the unit tests, on virtual buses with no CAN interface, and the end-to-end tests. Without the `diff` extra the delta tests skip.

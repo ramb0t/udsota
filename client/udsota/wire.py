@@ -10,6 +10,7 @@ from .errors import UpdateFailed
 SESSION_PROGRAMMING, SESSION_EXTENDED = 0x02, 0x03
 DID_SESSION, DID_VERSION, DID_DEVICE_ID = 0xF186, 0xF189, 0xF18C
 DID_STATUS, DID_RESULT, DID_COUNTERS, DID_RUNNING_SHA = 0xF1F0, 0xF1F1, 0xF1F2, 0xF1F3
+DID_IMAGE_PREFIX = 0xF1F4        # 4 B: F1F3's first 4 bytes, from a bootloader-flow unit's app once it is healthy
 RID_CHECK_DEPS, RID_ACTIVATE, RID_CONFIRM = 0xFF01, 0xF001, 0xF002
 NRC_NOT_SUPPORTED, NRC_BUSY, NRC_CONDITIONS, NRC_SEQUENCE = 0x11, 0x21, 0x22, 0x24   # 0x11: e.g. 0x2E, no config writes
 NRC_OUT_OF_RANGE, NRC_TIME_DELAY, NRC_PENDING = 0x31, 0x37, 0x78
@@ -31,7 +32,8 @@ DTC_GROUP_ALL = 0xFFFFFF         # 14's groupOfDTC for every DTC
 IMG_STATES = {0: "UNDEFINED", 1: "NEW", 2: "PENDING_VERIFY", 3: "VALID", 4: "INVALID", 5: "ABORTED"}
 OTHER_STATES = {0: "EMPTY", 1: "UNVERIFIED", 2: "WRITING", 3: "VERIFIED", 4: "INVALID"}
 IMG_PENDING_VERIFY, OTHER_VERIFIED = 2, 3
-STATUS_FLAGS = {0x01: "signature-checked", 0x02: "boot-ignored-config"}
+STATUS_BOOT_HELD = 0x04         # a bootloader-flow unit held in its bootloader: its app failed to start
+STATUS_FLAGS = {0x01: "signature-checked", 0x02: "boot-ignored-config", STATUS_BOOT_HELD: "held-in-bootloader"}
 DL_REASONS = ("DL_OK", "DL_BAD_HEADER", "DL_BAD_PROJECT", "DL_BAD_BOARD", "DL_BAD_LAYOUT",
               "DL_BAD_DIAG_IDS", "DL_NOT_NEWER", "DL_TOO_BIG", "DL_VERIFY_FAILED", "DL_SIG_FAILED",
               "DL_WORKER_TIMEOUT", "DL_ABORTED", "DL_FLASH_ERROR", "DL_BAD_STREAM",

@@ -1,6 +1,6 @@
 """Client profiles: everything product-specific (CAN IDs, deny list, key derivation, image identity,
-busy detector, pre-roll, extra DIDs, writable config DIDs and their commit, DTC descriptions), read from a TOML
-file."""
+busy detector, pre-roll, extra DIDs, writable config DIDs and their commit, DTC descriptions, the update flow),
+read from a TOML file."""
 import pathlib
 import re
 import tomllib
@@ -17,14 +17,15 @@ SLOT_SIZE_DEFAULT = 0x400000   # UDSOTA_SLOT_SIZE_DEFAULT
 KEYS = {"can": {"interface", "req_id", "resp_id", "deny_tx"},
         "security": {"mode", "label", "master_file", "private_key_file", "device_id_did", "level_extended",
                      "level_programming"},
-        "image": {"product", "hw_ids", "layout_id", "slot_size", "compression"},
+        "image": {"product", "hw_ids", "layout_id", "slot_size", "compression", "format", "desc_offset"},
         "board": {"did", "names"},
         "busy": {"id", "byte", "values"},
         "preroll": {"tester_present_frames"},
         "functional": {"id", "quiet_bus"},
         "dids": None,
         "config": {"commit_rid", "status_did", "hash", "groups"},
-        "dtcs": None}
+        "dtcs": None,
+        "update": {"flow", "start_timeout_s"}}
 DID_KEYS = {"name", "decode", "type", "writable", "min", "max", "len"}
 HASH_KEYS = {"did", "first", "last", "schema"}
 GROUP_KEYS = {"name", "first", "last"}
@@ -33,6 +34,9 @@ BLOB_MAX = 4092   # the most one 0x2E carries: SID and DID plus 4092 bytes fill 
 
 SECURITY_MODES = {"hmac": ("label", "master_file"), "ecdsa": ("private_key_file",)}   # mode: its required keys
 COMPRESSION = ("none", "deflate", "auto")   # [image] compression: --no-compress, --compress and --compress-auto
+FORMATS = ("esp-idf", "bare")              # [image] format: an ESP-IDF app image, or one with a bare descriptor block
+FLOWS = ("app", "bootloader")              # [update] flow: an app-resident A/B updater, or a single-slot bootloader
+START_TIMEOUT_DEFAULT = 60                 # [update] start_timeout_s
 
 
 # [security]: the 0x27 keys and the seed levels. Mode "hmac" (the default) derives the keys, K_dev = HMAC(master,
@@ -124,6 +128,10 @@ class Profile:
     config: ConfigSpec | None = None   # [config]: config set's commit routine, status DID and hash check
     compression: str = "none"       # [image] compression: "none", "deflate" or "auto", as flash's compress
     dtcs: dict = field(default_factory=dict)   # [dtcs]: {(dtc, any_ftb): description} (dtc.parse_code)
+    image_format: str = "esp-idf"   # [image] format: "esp-idf" or "bare" (image.parse_image)
+    desc_offset: int | None = None  # [image] desc_offset: the bare descriptor block's offset in the file
+    flow: str = "app"               # [update] flow: "app" or "bootloader" (update.flash)
+    start_timeout_s: int = START_TIMEOUT_DEFAULT   # [update] start_timeout_s: the wait for F1F4 after activating
 
 
 # Raise Refused naming the profile and the problem.
@@ -348,6 +356,21 @@ def from_dict(name, d):
     compression = _str(name, img_t, "compression") or "none"
     if compression not in COMPRESSION:
         _bad(name, "[image] compression must be one of %s" % ", ".join(COMPRESSION))
+    image_format = _str(name, img_t, "format") or "esp-idf"
+    if image_format not in FORMATS:
+        _bad(name, "[image] format must be one of %s" % ", ".join(FORMATS))
+    if image_format == "esp-idf" and "desc_offset" in img_t:
+        _bad(name, "[image] desc_offset is for format = \"bare\"")
+    if image_format == "bare" and "desc_offset" not in img_t:
+        _bad(name, "[image] format = \"bare\" needs desc_offset, the descriptor block's offset in the image")
+    desc_offset = _int(name, img_t, "desc_offset", 0, 0xFFFFFFFF)
+    upd_t = d.get("update", {})
+    flow = _str(name, upd_t, "flow") or "app"
+    if flow not in FLOWS:
+        _bad(name, "[update] flow must be one of %s" % ", ".join(FLOWS))
+    if flow == "app" and "start_timeout_s" in upd_t:
+        _bad(name, "[update] start_timeout_s is for flow = \"bootloader\"")
+    start_timeout_s = _int(name, upd_t, "start_timeout_s", 1, 600, default=START_TIMEOUT_DEFAULT)
     dids = tuple(_did_entry(name, key, entry) for key, entry in d.get("dids", {}).items())
     names = [e.name for e in dids if e.writable]
     for n in names:
@@ -363,7 +386,8 @@ def from_dict(name, d):
                    preroll_frames=_int(name, d.get("preroll", {}), "tester_present_frames", 0, 64, default=0),
                    dids=dids, func_id=func_id, compression=compression,
                    quiet_bus=func_t is not None and _bool(name, func_t, "quiet_bus", False),
-                   config=_config(name, d.get("config"), dids), dtcs=_dtcs(name, d.get("dtcs", {})))
+                   config=_config(name, d.get("config"), dids), dtcs=_dtcs(name, d.get("dtcs", {})),
+                   image_format=image_format, desc_offset=desc_offset, flow=flow, start_timeout_s=start_timeout_s)
 
 
 # Load a profile by name (a file in udsota/profiles) or by path (anything with a / or ending .toml).

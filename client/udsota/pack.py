@@ -38,6 +38,14 @@ def build_patch(image, dfi, base):
         raise UpdateFailed("building the DFI 0x%02X patch failed: %s" % (dfi, e)) from e
 
 
+# Refuses a delta download when profile's images are bare: a patch names its base by the SHA-256 ESP-IDF appends to
+# an image, and flash matches a base by app_elf_sha256 at its ESP-IDF offset, which a bare image has neither of.
+def refuse_bare_delta(profile):
+    if profile.image_format == "bare":
+        raise Refused("profile %s: delta downloads (--diff-from, DFI 0x20 and 0x30) need ESP-IDF images, and its "
+                      "[image] format is \"bare\"" % profile.name)
+
+
 # The rule flash (plan_deltas) and pack share: of sizes, {delta DFI: payload length}, the DFIs worth sending against
 # a full download of full bytes, smallest first, and the rest, no smaller than it: (worth, rest).
 def rank_deltas(sizes, full):
@@ -52,6 +60,8 @@ def rank_deltas(sizes, full):
 # after 0x10: it needs less device memory than 0x10, so a flasher may still try it before 0x00. Never overwrites: a
 # <stem> file already in out is refused, and a failed write leaves nothing behind. Returns the manifest.
 def pack(profile, image, stem, out, dfis=None, base=None, log=print):
+    if base is not None or any(d in DELTA_DFIS for d in dfis or ()):
+        refuse_bare_delta(profile)
     img = parse_image(profile, image)
     if dfis is None:
         dfis = DFIS if base is not None else (DL_DFI, DL_DFI_DEFLATE)
