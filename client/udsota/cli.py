@@ -27,7 +27,7 @@ from .keys import keygen, load_master, load_private_key
 from .transport import Transport
 from .delta import DETOOLS_HINT
 from .pack import DFIS, pack, refuse_bare_delta
-from .update import DIFF_DFIS, confirm_cmd, flash, info, reset
+from .update import DIFF_DFIS, WAIT_NEEDS_BOOTLOADER, confirm_cmd, flash, info, reset
 
 
 # A --dfi value: one of pack's DFIs, written 0x00, 0x10, 0x20 or 0x30.
@@ -39,6 +39,17 @@ def dfi_arg(text):
     if dfi not in DFIS:
         raise argparse.ArgumentTypeError("%s is not one of %s" % (text, ", ".join("0x%02X" % d for d in DFIS)))
     return dfi
+
+
+# A --wait-for-unit value: whole seconds from 1 to 600.
+def wait_arg(text):
+    try:
+        seconds = int(text)
+    except ValueError:
+        seconds = None
+    if seconds is None or not 1 <= seconds <= 600:
+        raise argparse.ArgumentTypeError("%s is not a whole number of seconds from 1 to 600" % text)
+    return seconds
 
 
 # Command-line arguments; every command but keygen needs --profile.
@@ -70,6 +81,11 @@ def parse_args(argv):
     f.add_argument("--diff-format", choices=tuple(DIFF_DFIS),
                    help="with --diff-from, the delta modes to try: heatshrink (DFI 0x20), deflate (DFI 0x30) or "
                         "both (default auto)")
+    f.add_argument("--wait-for-unit", type=wait_arg, metavar="SECONDS",
+                   help="[update] flow = \"bootloader\" only, for a unit whose app cannot hand over: if the first "
+                        "10 02 is not answered, power-cycle the unit when told, while 10 02 goes out again, each at "
+                        "most 50 ms after the last went unanswered, for up to SECONDS (1 to 600) to catch its "
+                        "bootloader's power-up window")
     sub.add_parser("confirm", help="ConfirmImage for a PENDING_VERIFY image")
     sub.add_parser("reset", help="ECUReset (rolls back an unconfirmed image)")
     c = sub.add_parser("config", help="show or set the profile's writable DIDs")
@@ -194,6 +210,8 @@ def main(argv=None, transport=Transport):
                 raise Refused("--drop-76 takes a block number from 1")
             if args.diff_format is not None and args.diff_from is None:
                 raise Refused("--diff-format needs --diff-from")
+            if args.wait_for_unit is not None and prof.flow != "bootloader":   # flash refuses it too
+                raise Refused("profile %s: %s" % (prof.name, WAIT_NEEDS_BOOTLOADER))
             if args.diff_from is not None:
                 if args.drop_76 is not None:            # flash refuses it too; here before any key or bus
                     raise Refused("--drop-76 is for full and compressed downloads, not with --diff-from")
@@ -217,7 +235,7 @@ def main(argv=None, transport=Transport):
             if args.cmd == "flash":
                 return flash(uds, prof, image, secret, drop_76=args.drop_76, preroll=t.preroll,
                              quiet=getattr(t, "quiet", contextlib.nullcontext), compress=args.compress,
-                             bases=bases, diff_format=args.diff_format or "auto")
+                             bases=bases, diff_format=args.diff_format or "auto", wait_for_unit=args.wait_for_unit)
             if args.cmd == "confirm":
                 return confirm_cmd(uds)
             if args.cmd == "config":

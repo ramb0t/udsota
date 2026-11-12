@@ -119,12 +119,12 @@ class Uds:
         self.in_session = False
 
     # Listen window_s seconds for an answer to service that no send of ours is waiting for: a late one, or one
-    # still being served. A 0x78 extends the wait by P2_STAR_S each time, as it would for a request. Returns the
-    # positive response after its SID, raises Nrc for a final NRC, and returns None when nothing arrives. Frames for
-    # other services are passed over, as is a positive answer stale picks out, and so is 0x21 (an earlier send's)
-    # unless busy_ends, when the send being awaited is this one and 0x21 is its answer. The second-tester monitor
-    # counts the wait as a request of ours.
-    def await_answer(self, service, window_s, busy_ends=False, stale=None):
+    # still being served. A 0x78 extends the wait by pending_s each time, P2_STAR_S as it would be for a request.
+    # Returns the positive response after its SID, raises Nrc for a final NRC, and returns None when nothing arrives.
+    # Frames for other services are passed over, as is a positive answer stale picks out, and so is 0x21 (an earlier
+    # send's) unless busy_ends, when the send being awaited is this one and 0x21 is its answer. The second-tester
+    # monitor counts the wait as a request of ours.
+    def await_answer(self, service, window_s, busy_ends=False, stale=None, pending_s=P2_STAR_S):
         sid, conn = service.request_id(), self.client.conn
         timeout = window_s
         while True:
@@ -136,13 +136,27 @@ class Uds:
                 return None
             if len(frame) >= 3 and frame[0] == 0x7F and frame[1] == sid:
                 if frame[2] == NRC_PENDING:
-                    timeout = P2_STAR_S
+                    timeout = pending_s
                     continue
                 if frame[2] != NRC_BUSY or busy_ends:
                     self.settled(sid)
                     raise Nrc(sid, frame[2])
             elif len(frame) >= 1 and frame[0] == sid | 0x40 and not (stale is not None and stale(bytes(frame[1:]))):
                 return bytes(frame[1:])
+
+    # Pass over every frame that comes until settle_s passes with none, or max_s in all: answers still on their way
+    # to earlier sends, which the next request must not take for its own, nor reach the server while it still sends
+    # them. The second-tester monitor counts the wait as a request of ours. Returns how many frames it passed over.
+    def drain(self, settle_s, max_s):
+        conn, end, n = self.client.conn, self.clock() + max_s, 0
+        while (left := end - self.clock()) > 0:
+            expect = getattr(conn, "expect", None)
+            if expect is not None:
+                expect()
+            if conn.wait_frame(timeout=min(settle_s, left)) is None:
+                break
+            n += 1
+        return n
 
     # send_request, resent once after an ISO-TP send error (OSError: no FC within N_Bs, e.g. one a rate cap
     # dropped). Safe: without the FC the server never got the request, and a seed stays valid 30 s.
@@ -160,6 +174,33 @@ class Uds:
     # DiagnosticSessionControl.
     def session(self, n):
         return self.request(services.DiagnosticSessionControl, n)
+
+    # One try at session n on a unit that may not be listening yet: 10 n with its answer awaited window_s in place of
+    # both P2 and P2*, so a 0x78 with no 50 n after it does not hold the try either. True once a 50 n answers it. False
+    # when nothing does within window_s, and after window_s spent listening for a 50 n to an earlier send when the
+    # send failed or the answer was an NRC or another service's (one to a request that went out late), so tries never
+    # come faster than one per window_s.
+    def try_session(self, n, window_s):
+        p2, p2_star = self.client.config["p2_timeout"], self.client.config["p2_star_timeout"]
+        self.client.set_config("p2_timeout", window_s)
+        self.client.set_config("p2_star_timeout", window_s)
+        try:
+            return self.session(n)[:1] == bytes([n])
+        except NoResponse:
+            return False
+        except UpdateFailed:
+            pass
+        finally:
+            self.client.set_config("p2_timeout", p2)
+            self.client.set_config("p2_star_timeout", p2_star)
+        try:
+            late = self.await_answer(services.DiagnosticSessionControl, window_s, pending_s=window_s)
+        except Nrc:
+            return False
+        if late is None or late[:1] != bytes([n]):
+            return False
+        self.answered(0x10, n)
+        return True
 
     # ReadDataByIdentifier for one DID; returns the record without the DID echo.
     def read_did(self, did):

@@ -4825,6 +4825,314 @@ def test_main_bootloader_flow_flash_end_to_end(tmp_path, monkeypatch):
     assert d.log == BL_PRECHECK + DOWNLOAD + [(0x22, 0xF1F4)] and d.sha == NEW_SHA
 
 
+# ---- flash --wait-for-unit: 10 02 into a bootloader's power-up window ----
+
+# A TimedConnection whose server may answer late: an answer given as (delay_s, payload) arrives delay_s after the
+# request, and a wait takes fake time up to the next arrival. empty_rxqueue, which udsoncan calls before each send,
+# drops only what has arrived, as the kernel socket's queue would. Each send takes send_s of fake time first. A send
+# the server fails with OSError takes its no_ack_s (the kernel's echo timeout) more, and still queues the answers the
+# error carries as held (a frame the kernel held until the server came on). With monitor, every frame is shown to it
+# as it is taken or dropped.
+class LateConnection(TimedConnection):
+    # Wrap server on ft's clock.
+    def __init__(self, server, ft, monitor=None, send_s=0.0):
+        super().__init__(server, ft)
+        self.monitor, self.send_s = monitor, send_s
+
+    # Queue the server's answers to payload at their arrival times.
+    def specific_send(self, payload, timeout=None):
+        self.ft.t += self.send_s
+        t = self.ft.t
+        try:
+            answers = self.server.handle(bytes(payload))
+        except OSError as e:
+            self.enqueue(t, getattr(e, "held", []))
+            self.ft.t += getattr(self.server, "no_ack_s", 0.0)
+            raise
+        self.enqueue(t, answers)
+
+    # Queue answers to a send at t, each arriving then or as (delay_s, payload) delay_s later.
+    def enqueue(self, t, answers):
+        for a in answers:
+            self.queue.append((t + a[0], a[1]) if isinstance(a, tuple) else (t, a))
+        self.queue = deque(sorted(self.queue, key=lambda e: e[0]))
+
+    # Drop what has arrived.
+    def empty_rxqueue(self):
+        while self.queue and self.queue[0][0] <= self.ft.t:
+            self.seen(self.queue.popleft()[1])
+
+    # The next answer to arrive within timeout, the clock moved to its arrival; else the timeout passes.
+    def specific_wait_frame(self, timeout=None):
+        timeout = timeout or 0.0
+        if not self.queue or self.queue[0][0] > self.ft.t + timeout:
+            self.ft.t += timeout
+            raise TimeoutException("stub: no answer within %.3f s" % timeout)
+        t, frame = self.queue.popleft()
+        self.ft.t = max(self.ft.t, t)
+        self.seen(frame)
+        return frame
+
+    # Show frame to the monitor as a 0x718 frame.
+    def seen(self, frame):
+        if self.monitor is not None:
+            self.monitor.on_frame(can.Message(arbitration_id=0x718, is_extended_id=False, data=frame[:8]))
+
+
+# A Uds over a LateConnection to server on ft's clock, through a GuardedConnection with monitor when given.
+def late_uds(server, ft, monitor=None, send_s=0.0):
+    server.clock = ft.clock
+    conn = LateConnection(server, ft, monitor, send_s)
+    if monitor is not None:
+        conn = transport.GuardedConnection(conn, monitor)
+    client = Client(conn, config=transport.client_config())
+    client.open()
+    return Uds(client, sleep=ft.sleep, clock=ft.clock)
+
+
+# Make uds's tries fail the test past far more than one per WAIT_RETRY_S over seconds, rather than hang it on a wait
+# whose fake clock no longer moves; returns uds.
+def cap_tries(uds, seconds):
+    real, calls = uds.try_session, []
+
+    # One try, counted.
+    def capped(n, window_s):
+        calls.append(n)
+        assert len(calls) <= 4 * seconds / update.WAIT_RETRY_S + 10, "the wait does not end"
+        return real(n, window_s)
+
+    uds.try_session = capped
+    return uds
+
+
+# Run flash --wait-for-unit seconds under the bootloader flow (PBL, BL_IMG) over a LateConnection, its tries capped;
+# returns (rc, log lines).
+def run_wait(unit, seconds=10, ft=None, monitor=None, send_s=0.0):
+    ft, lines = ft or FakeTime(), []
+    uds = cap_tries(late_uds(unit, ft, monitor, send_s), seconds)
+    rc = update.flash(uds, PBL, BL_IMG, None, sleep=ft.sleep, clock=ft.clock, log=lines.append, wait_for_unit=seconds)
+    return rc, lines
+
+
+# A BootloaderUnit that is off until its clock reaches on_at: each request before then is lost, or with no_ack fails
+# to send, as a frame no node acknowledges does (OSError ECOMM, from the kernel's missing echo), taking no_ack_s of fake
+# time. A 10 02 whose send fails within held_s of on_at is held by the kernel and answered at on_at. With app, a 10 02
+# before on_at gets those answers instead, as from an app that cannot hand over. Then its bootloader runs, in its
+# power-up window, and answers the first 10 02 with 50 02 and extra more, 50 ms (its P2) apart: its answers to earlier
+# 10 02s it also got. tries holds the time of every 10 02 sent, failed sends included.
+class PoweredUpUnit(BootloaderUnit):
+    # BootloaderUnit's knobs, plus the ones above.
+    def __init__(self, on_at=1.0, no_ack=False, no_ack_s=0.0, held_s=0.0, app=None, extra=0, **kw):
+        super().__init__(in_app=False, security=False, **kw)
+        self.on_at, self.no_ack, self.no_ack_s, self.held_s = on_at, no_ack, no_ack_s, held_s
+        self.app, self.extra, self.tries = app, extra, []
+
+    # Nothing (or the app's answers to 10 02) while off; the bootloader's answers after.
+    def handle(self, req):
+        if bytes(req) == b"\x10\x02":
+            self.tries.append(self.clock())
+        if self.clock() < self.on_at:
+            if self.no_ack:
+                e = OSError(errno.ECOMM, os.strerror(errno.ECOMM))
+                if bytes(req) == b"\x10\x02" and self.on_at - self.clock() <= self.held_s:
+                    e.held = [(self.on_at - self.clock(), a) for a in super().handle(req)]
+                raise e
+            self.log.append((req[0], self.request_arg(req)))
+            return list(self.app) if self.app is not None and bytes(req) == b"\x10\x02" else []
+        return super().handle(req)
+
+    # 10 as FakeServer's; the first 50 02 brings the extra ones.
+    def s10(self, req, sub):
+        answer = super().s10(req, sub)
+        if answer[0][0] == 0x50:
+            answer += [(0.05 * (k + 1), answer[0]) for k in range(self.extra)]
+            self.extra = 0
+        return answer
+
+
+# Check a unit that answers nothing for a while, then 50 02 from its power-up window, is flashed: F1F4 once, a 10 02
+# with its P2, then after the prompt 10 02 again each time the last goes unanswered, never more than WAIT_RETRY_S
+# apart, then the bootloader flow as usual.
+def test_wait_for_unit_catches_the_power_up_window():
+    d = PoweredUpUnit(on_at=1.0)
+    rc, lines = run_wait(d)
+    n = len(d.tries)
+    assert rc == 0 and n >= 10 and d.tries[-1] >= 1.0
+    assert d.tries[1] - d.tries[0] == pytest.approx(transport.P2_S)
+    assert all(b - a <= update.WAIT_RETRY_S + 1e-9 for a, b in zip(d.tries[1:], d.tries[2:]))
+    assert d.log == [(0x22, 0xF1F4)] + [(0x10, 2)] * n + BL_PRECHECK[2:] + DOWNLOAD + POLLS
+    assert lines[1] == "waiting up to 10 s for the unit: power-cycle it now"
+    assert lines[2] == "10 02 answered after %.1f s, at try %d" % (d.tries[-1] - d.tries[1], n)
+    assert bytes(d.written) == BL_IMG and d.in_app
+
+
+# Check an app that answers each 10 02 before the power-cycle with an NRC, or with 7F 10 78 and no 50 02 after it (one
+# that resets back into itself), holds no try after the first longer than WAIT_RETRY_S, so the 10 02 that meets the
+# power-up window comes within WAIT_RETRY_S of it. The second frame of a pair stands for an answer to an earlier send,
+# met in the listen after the first.
+@pytest.mark.parametrize("app", [[b"\x7f\x10\x22"], [b"\x7f\x10\x22", (0.02, b"\x7f\x10\x22")], [b"\x7f\x10\x78"],
+                                 [b"\x7f\x10\x22", b"\x7f\x10\x78"]], ids=["nrc", "nrc-then-nrc", "78", "nrc-then-78"])
+def test_wait_for_unit_tries_every_50_ms_through_app_answers(app):
+    d = PoweredUpUnit(on_at=6.0, app=app)
+    rc, _ = run_wait(d)
+    assert rc == 0 and d.in_app
+    assert all(b - a <= update.WAIT_RETRY_S + 1e-9 for a, b in zip(d.tries[1:], d.tries[2:]))
+    assert 0 <= d.tries[-1] - d.on_at <= update.WAIT_RETRY_S + 1e-9
+
+
+# Check a 10 02 whose send failed but that the kernel held until the unit came on, its 50 02 arriving in the listen
+# after the failure, enters the session as a 10 02 answered at once does, that P2 and P2* are as they were after the
+# tries, and that the 50 02 to the resend is passed over.
+def test_wait_for_unit_takes_a_held_sends_late_answer():
+    ft, d, lines = FakeTime(), PoweredUpUnit(on_at=1.02, no_ack=True, held_s=update.WAIT_RETRY_S), []
+    uds = cap_tries(late_uds(d, ft), 10)
+    update.wait_for_power_up(uds, 10, log=lines.append, clock=ft.clock)
+    assert uds.in_session and uds.kept == pytest.approx(1.02)
+    assert uds.client.config["p2_timeout"] == transport.P2_S
+    assert uds.client.config["p2_star_timeout"] == transport.P2_STAR_S
+    assert lines[1].endswith("; passed over 1 later answers")
+
+
+# Check a try answered 50 03 to its 10 02 does not count as entering session 2.
+def test_try_session_needs_its_own_session():
+    d = FakeServer(security=False)
+    d.s10 = lambda req, sub: [b"\x50\x03\x00\x32\x01\xf4"]
+    assert not late_uds(d, FakeTime()).try_session(2, update.WAIT_RETRY_S)
+
+
+# Check the 50 02s that follow the first, the unit's answers to earlier 10 02s, are passed over before the next request,
+# and the second-tester monitor counts them as ours; and (the known positive) that without that drain one of them is
+# taken for a later request's answer and fails the run.
+@pytest.mark.parametrize("drained", [True, False])
+def test_wait_for_unit_passes_over_the_later_50_02s(monkeypatch, drained):
+    if not drained:
+        monkeypatch.setattr(Uds, "drain", lambda self, settle_s, max_s: 0)
+    ft = FakeTime()
+    mon = transport.SecondTesterMonitor(0x718, clock=ft.clock)
+    d = PoweredUpUnit(on_at=1.0, extra=3)
+    if not drained:
+        with pytest.raises(errors.UpdateFailed, match="unexpected answer to service 0x"):
+            run_wait(d, ft=ft, monitor=mon, send_s=0.001)
+        return
+    rc, lines = run_wait(d, ft=ft, monitor=mon, send_s=0.001)
+    assert rc == 0 and mon.alarm is None and d.in_app
+    assert lines[2].endswith("; passed over 3 later answers")
+    assert d.log[len(d.tries) + 1:] == BL_PRECHECK[2:] + DOWNLOAD + POLLS
+
+
+# Check a unit that answers the first 10 02 is flashed with no prompt to power-cycle it and with the requests of a run
+# without --wait-for-unit: a live app that answers 7F 10 78, its 50 02 coming 1 s later, long past WAIT_RETRY_S, and a
+# unit already in its bootloader.
+@pytest.mark.parametrize("live_app", [True, False])
+def test_wait_for_unit_waits_out_a_live_apps_handover(live_app):
+    if live_app:
+        d = BootloaderUnit(security=False)
+        real = d.handle
+        d.handle = lambda req: [(1.0, a) if a[0] == 0x50 else a for a in real(req)]
+    else:
+        d = PoweredUpUnit(on_at=0.0)
+    rc, lines = run_wait(d)
+    assert rc == 0 and d.log == BL_PRECHECK + DOWNLOAD + POLLS
+    assert not any("power-cycle" in line for line in lines)
+
+
+# Check sends that fail while the unit is off (no ACK, so no echo) are tries like any other: each failed 10 02 (sent
+# twice, as any failed send) is followed WAIT_RETRY_S later by the next, and the unit is flashed once it is on.
+def test_wait_for_unit_tolerates_failed_sends():
+    d = PoweredUpUnit(on_at=1.0, no_ack=True)
+    rc, _ = run_wait(d)
+    times = sorted(set(d.tries))
+    assert rc == 0 and len(times) >= 10 and d.in_app
+    assert all(b - a <= update.WAIT_RETRY_S + 1e-9 for a, b in zip(times, times[1:]))
+    assert d.log == [(0x10, 2)] + BL_PRECHECK[2:] + DOWNLOAD + POLLS   # the F1F4 and the failed 10 02s never arrived
+
+
+# Check an answer for another service ahead of the 50 02, here the bootloader's 0x31 to the F1F4 the kernel held
+# unacknowledged until the unit came on, is passed over within the try: the 50 02 behind it answers it.
+def test_wait_for_unit_passes_over_another_services_late_answer():
+    d = PoweredUpUnit(on_at=1.0)
+    real = d.s10
+    d.s10 = lambda req, sub: [b"\x7f\x22\x31"] + real(req, sub)
+    rc, lines = run_wait(d)
+    assert rc == 0 and d.log[len(d.tries) + 1:] == BL_PRECHECK[2:] + DOWNLOAD + POLLS
+    assert lines[2] == "10 02 answered after %.1f s, at try %d" % (d.tries[-1] - d.tries[1], len(d.tries))
+
+
+# Check a unit that never answers fails the given seconds after the prompt with the message, the tries after the first
+# bounded by one per WAIT_RETRY_S, whether its sends are lost or fail.
+@pytest.mark.parametrize("no_ack", [False, True])
+def test_wait_for_unit_gives_up_at_the_deadline(no_ack):
+    ft, d = FakeTime(), PoweredUpUnit(on_at=float("inf"), no_ack=no_ack)
+    with pytest.raises(errors.UpdateFailed, match=r"^no 10 02 was answered within 2 s \((\d+) tries\)$") as e:
+        run_wait(d, seconds=2, ft=ft)
+    tries = int(re.search(r"\((\d+) tries", str(e.value)).group(1))
+    assert 2 / update.WAIT_RETRY_S + 1 <= tries <= 2 / update.WAIT_RETRY_S + 2
+    sends = 2 if no_ack else 1
+    assert len(d.tries) == tries * sends
+    assert ft.t - d.tries[sends] < 2 + 2 * update.WAIT_RETRY_S
+
+
+# Check that while nothing acknowledges the frame, each failed send takes the kernel's echo timeout (2 s), so a try,
+# sent twice, takes about 4 s and the run gives up up to one try past the given seconds.
+def test_wait_for_unit_overshoots_by_a_try_without_acks():
+    ft, d = FakeTime(), PoweredUpUnit(on_at=float("inf"), no_ack=True, no_ack_s=2.0)
+    with pytest.raises(errors.UpdateFailed, match=r"^no 10 02 was answered within 1 s \(2 tries\)$"):
+        run_wait(d, seconds=1, ft=ft)
+    assert d.tries == [4.0, 6.0, 8.0, 10.0]   # after the F1F4's two sends; the prompt at 8 s
+    assert ft.t - 8.0 <= 1 + 2 * d.no_ack_s + update.WAIT_RETRY_S
+
+
+# Check Uds.drain passes over frames until settle_s passes with none, the monitor counting the wait as ours (frames
+# 0.5 s apart, past its GRACE_S, would raise its alarm otherwise), and stops after max_s however many come.
+def test_drain_settles_counts_as_ours_and_is_bounded():
+    ft, d = FakeTime(), FakeServer(security=False)
+    mon = transport.SecondTesterMonitor(0x718, clock=ft.clock)
+    uds = late_uds(d, ft, mon)
+    uds.session(2)
+    conn, t0, late = uds.client.conn.inner, ft.t, b"\x50\x02\x00\x32\x01\xf4"
+    conn.queue.extend((t0 + 0.5 * k, late) for k in range(1, 5))
+    assert uds.drain(1.0, 5.0) == 4
+    assert mon.alarm is None and ft.t == pytest.approx(t0 + 3.0)
+    t0 = ft.t
+    conn.queue.extend((t0 + 0.15 * k, late) for k in range(1, 100))
+    assert uds.drain(update.WAIT_SETTLE_S, update.WAIT_DRAIN_S) == 13
+    assert ft.t - t0 == pytest.approx(update.WAIT_DRAIN_S) and mon.alarm is None
+
+
+# Check --wait-for-unit with the default flow is refused (exit 2) before any bus opens.
+def test_main_wait_for_unit_needs_the_bootloader_flow(tmp_path, full_path, capsys):
+    good = tmp_path / "good.bin"
+    good.write_bytes(make_image())
+    assert cli.main(["--profile", full_path, "flash", str(good), "--wait-for-unit", "5"], transport=no_transport) == 2
+    assert 'profile full: --wait-for-unit is for [update] flow = "bootloader"' in capsys.readouterr().err
+    with pytest.raises(errors.Refused, match=re.escape(update.WAIT_NEEDS_BOOTLOADER)):
+        run_flash(FakeServer(), wait_for_unit=5)
+
+
+# Check --wait-for-unit takes whole seconds from 1 to 600 and refuses anything else.
+def test_wait_for_unit_flag(capsys):
+    for text, seconds in (("1", 1), ("600", 600)):
+        assert cli.parse_args(["--profile", "x", "flash", "x.bin", "--wait-for-unit", text]).wait_for_unit == seconds
+    assert cli.parse_args(["--profile", "x", "flash", "x.bin"]).wait_for_unit is None
+    for text in ("0", "601", "2.5", "ten"):
+        with pytest.raises(SystemExit):
+            cli.parse_args(["--profile", "x", "flash", "x.bin", "--wait-for-unit", text])
+        assert "%s is not a whole number of seconds from 1 to 600" % text in capsys.readouterr().err
+
+
+# Check main passes --wait-for-unit to flash under the bootloader flow: a live app's handover answers the first 10 02,
+# so there is no prompt to power-cycle.
+def test_main_wait_for_unit_end_to_end(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(update, "REBOOT_WAIT_S", 0.0)
+    (tmp_path / "boot.toml").write_text(BARE_BL)
+    (tmp_path / "fw.bin").write_bytes(BL_IMG)
+    d = BootloaderUnit(security=False, start_silence=0)
+    assert cli.main(["--profile", str(tmp_path / "boot.toml"), "flash", str(tmp_path / "fw.bin"),
+                     "--wait-for-unit", "5"], transport=FakeTransport.on(d)) == 0
+    assert d.log == BL_PRECHECK + DOWNLOAD + [(0x22, 0xF1F4)]
+    assert "power-cycle" not in capsys.readouterr().out
+
+
 # Check [update] defaults to flow "app" with start_timeout_s 60, and "bootloader" takes 1 to 600.
 def test_update_flow_profile_values():
     assert (P.flow, P.start_timeout_s) == ("app", 60)
