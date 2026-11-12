@@ -13,6 +13,7 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 ### Fixed
 
 - Client: after a delta download, `flash` no longer prints a full download's time estimated from the delta's: that time is mostly the server rebuilding and writing the image, so the estimate came out ten times too high (5,299 s for an image that takes 526 s). It prints the delta's size and time and the image's size. Compressed downloads still print the time saved.
+- Client: a late answer to a request that went unanswered is passed over when it arrives ahead of the next request's answer, as a keepalive's late `7E` already was. Before, the next request failed with "unexpected answer": for example a `10 02` after a read that an idle CAN adapter had held until the unit powered up.
 
 ## [0.16.0] - 2026-10-26
 

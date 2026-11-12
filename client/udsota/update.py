@@ -47,6 +47,9 @@ ACTIVATE_CONDITIONS = ("ActivateImage refused (0x22): the server's conditions ar
 LEFT_IN_BOOTLOADER = ("The unit is in its bootloader and returns to its app when its programming session times "
                       "out, unless it is held there")
 WAIT_NEEDS_BOOTLOADER = '--wait-for-unit is for [update] flow = "bootloader"'
+# What a --wait-for-unit that gives up adds: 10 02s the CAN adapter could not send while the unit was off stay queued.
+WAIT_QUEUED = ("If the unit is off, 10 02s still queued in the CAN adapter will hold it in its bootloader for about "
+               "5 s at its next power-up, once; taking the interface down and up clears them")
 
 
 # What F1F3 holds for profile's images: an ESP-IDF image's app_elf_sha256, or a bare image's image ID.
@@ -486,9 +489,11 @@ def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep
 # `flash` under [update] flow = "bootloader", for a single-slot unit whose resident bootloader is its only UDS server
 # (docs/wire.md#bootloader-flow); img is image parsed, the other arguments flash's. First one F1F4 read in the default
 # session: an app already running this image and healthy needs nothing, so it is left running. Then 10 02: the app
-# answers 7F 10 78 and resets into the bootloader, which sends the 50 02. Then, all in the programming session, the
-# precheck reads, the unlock, download, FF01, ActivateImage and wait_for_start, the proof of life; no ConfirmImage. An
-# image the unit already holds gets 11 01 and the same proof. quiet() is held from the 10 02, which stops the app.
+# answers 7F 10 78 and resets into the bootloader, which sends the 50 02; a late answer to an F1F4 read that went
+# unanswered, such as a bootloader's 7F 22 31 to one the adapter held, is passed over ahead of it (Uds.exchange).
+# Then, all in the programming session, the precheck reads, the unlock, download, FF01, ActivateImage and
+# wait_for_start, the proof of life; no ConfirmImage. An image the unit already holds gets 11 01 and the same proof.
+# quiet() is held from the 10 02, which stops the app.
 # With wait_for_unit, wait_for_power_up sends the 10 02.
 def flash_bootloader(uds, profile, image, img, secret, drop_76=None, preroll=lambda: None, sleep=time.sleep,
                      clock=time.monotonic, log=print, quiet=contextlib.nullcontext, compress="none", bases=None,
@@ -572,13 +577,14 @@ def flash_bootloader(uds, profile, image, img, secret, drop_76=None, preroll=lam
 # goes as without the option, a live app's 7F 10 78 waited out for its 50 02 as for any request, and once it is
 # answered the flow goes on. Otherwise the operator is told to power-cycle the unit, whose bootloader also takes a
 # 10 02 in its power-up window, while 10 02 goes out again, the next at most WAIT_RETRY_S after the last went
-# unanswered, was refused or failed to send (Uds.try_session, which waits no longer than that after a 0x78 either),
-# until one is answered 50 02; UpdateFailed once seconds have passed since the prompt. A failed send, as while the unit
-# is off and nothing acknowledges the frame, is a try like any other. The unit answers every 10 02 it gets, the ones
-# the kernel still held unacknowledged among them, so 50 02s can follow the first; they are passed over until the
-# unit goes quiet (Uds.drain), the monitor counting that as ours, before the next request goes. Dropping them is not
-# enough, though udsoncan empties the receive queue before each send: one that comes after that send is taken for its
-# answer, and the request itself can reach the unit while it is still answering 10 02s.
+# unanswered, was refused or failed to send (Uds.try_session, which waits no longer than that after a 0x78 or 0x21
+# either), until one is answered 50 02; UpdateFailed once seconds have passed since the prompt, saying what the 10 02s
+# still queued then do (WAIT_QUEUED). A failed send, as while the unit is off and nothing acknowledges the frame, is a
+# try like any other. The unit answers every 10 02 it gets, the ones the kernel still held unacknowledged among them,
+# so 50 02s can follow the first; they are passed over until the unit goes quiet (Uds.drain), the monitor counting
+# that as ours, before the next request goes. Dropping them is not enough, though udsoncan empties the receive queue
+# before each send: one that comes after that send is taken for its answer, and the request itself can reach the unit
+# while it is still answering 10 02s.
 def wait_for_power_up(uds, seconds, log=print, clock=time.monotonic):
     try:
         uds.session(SESSION_PROGRAMMING)
@@ -592,7 +598,7 @@ def wait_for_power_up(uds, seconds, log=print, clock=time.monotonic):
         if uds.try_session(SESSION_PROGRAMMING, WAIT_RETRY_S):
             break
         if clock() - start >= seconds:
-            raise UpdateFailed("no 10 02 was answered within %d s (%d tries)" % (seconds, tries))
+            raise UpdateFailed("no 10 02 was answered within %d s (%d tries). %s" % (seconds, tries, WAIT_QUEUED))
     took = clock() - start
     late = uds.drain(WAIT_SETTLE_S, WAIT_DRAIN_S)
     passed = "; passed over %d later answers" % late if late else ""

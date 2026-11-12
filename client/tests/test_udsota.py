@@ -2011,7 +2011,7 @@ def test_keepalive_passes_over_a_late_answer():
     d.s3e = lambda req, sub: [b"\x76\x02"]
     ft.sleep(KEEPALIVE_S + 0.1)
     uds.transfer(3, b"\xaa")
-    assert d.log[3:] == [(0x3E, 0), (0x36, 3)] and not uds.lost_7e
+    assert d.log[3:] == [(0x3E, 0), (0x36, 3)] and uds.unanswered is None
 
 
 # Check the fake's s3_on (the known positive for the next test): reads 4 s and 6 s after 10 03 keep the session when
@@ -2245,7 +2245,7 @@ def test_late_keepalive_answer_is_passed_over_by_the_next_request():
     ft.sleep(AGED)
     lines = []
     update.transfer_exit(uds, 16, log=lines.append)
-    assert d.dl_complete and d.log.count((0x37, None)) == 1 and not uds.lost_7e, (d.log[-4:], lines)
+    assert d.dl_complete and d.log.count((0x37, None)) == 1 and uds.unanswered is None, (d.log[-4:], lines)
 
 
 # A StubConnection whose empty waits take fake time: a wait with nothing queued advances the clock by its timeout (P2,
@@ -2467,7 +2467,7 @@ def test_a_later_keepalives_answer_keeps_the_pass_over():
     real22 = d.s22
     d.s22 = lambda req, did: [b"\x7e\x00"] + real22(req, did)
     uds.read_did(0xF1F0)
-    assert d.log[-1] == (0x22, 0xF1F0) and not uds.lost_7e
+    assert d.log[-1] == (0x22, 0xF1F0) and uds.unanswered is None
 
 
 # Check, after an unanswered keepalive, a late negative answer to it (7F 3E xx) is passed over as its 7E is, while an
@@ -5142,11 +5142,11 @@ def cap_tries(uds, seconds):
     return uds
 
 
-# Run flash --wait-for-unit seconds under the bootloader flow (PBL, BL_IMG) over a LateConnection, its tries capped;
-# returns (rc, log lines).
+# Run flash --wait-for-unit seconds (None: without the option) under the bootloader flow (PBL, BL_IMG) over a
+# LateConnection, its tries capped; returns (rc, log lines).
 def run_wait(unit, seconds=10, ft=None, monitor=None, send_s=0.0):
     ft, lines = ft or FakeTime(), []
-    uds = cap_tries(late_uds(unit, ft, monitor, send_s), seconds)
+    uds = cap_tries(late_uds(unit, ft, monitor, send_s), seconds or 0)
     rc = update.flash(uds, PBL, BL_IMG, None, sleep=ft.sleep, clock=ft.clock, log=lines.append, wait_for_unit=seconds)
     return rc, lines
 
@@ -5156,15 +5156,19 @@ def run_wait(unit, seconds=10, ft=None, monitor=None, send_s=0.0):
 # time. A 10 02 whose send fails within held_s of on_at is held by the kernel and answered at on_at. With app, a 10 02
 # before on_at gets those answers instead, as from an app that cannot hand over. Then its bootloader runs, in its
 # power-up window, and answers the first 10 02 with 50 02 and extra more, 50 ms (its P2) apart: its answers to earlier
-# 10 02s it also got. tries holds the time of every 10 02 sent, failed sends included.
+# 10 02s it also got. With window_s, the window closes window_s after on_at unless a 50 02 has been given by then, and
+# the app runs again, answering as before on_at. tries holds the time of every 10 02 sent, failed sends included.
 class PoweredUpUnit(BootloaderUnit):
     # BootloaderUnit's knobs, plus the ones above.
-    def __init__(self, on_at=1.0, no_ack=False, no_ack_s=0.0, held_s=0.0, app=None, extra=0, **kw):
+    def __init__(self, on_at=1.0, no_ack=False, no_ack_s=0.0, held_s=0.0, app=None, extra=0, window_s=float("inf"),
+                 **kw):
         super().__init__(in_app=False, security=False, **kw)
         self.on_at, self.no_ack, self.no_ack_s, self.held_s = on_at, no_ack, no_ack_s, held_s
         self.app, self.extra, self.tries = app, extra, []
+        self.window_s, self.caught = window_s, False
 
-    # Nothing (or the app's answers to 10 02) while off; the bootloader's answers after.
+    # Nothing (or the app's answers to 10 02) while off; the bootloader's answers after, or the app's once the window
+    # has closed.
     def handle(self, req):
         if bytes(req) == b"\x10\x02":
             self.tries.append(self.clock())
@@ -5174,16 +5178,22 @@ class PoweredUpUnit(BootloaderUnit):
                 if bytes(req) == b"\x10\x02" and self.on_at - self.clock() <= self.held_s:
                     e.held = [(self.on_at - self.clock(), a) for a in super().handle(req)]
                 raise e
-            self.log.append((req[0], self.request_arg(req)))
-            return list(self.app) if self.app is not None and bytes(req) == b"\x10\x02" else []
+            return self.app_answers(req)
+        if not self.caught and self.clock() >= self.on_at + self.window_s:
+            return self.app_answers(req)
         return super().handle(req)
+
+    # The app's answers to req: app's to a 10 02 when given, else none.
+    def app_answers(self, req):
+        self.log.append((req[0], self.request_arg(req)))
+        return list(self.app) if self.app is not None and bytes(req) == b"\x10\x02" else []
 
     # 10 as FakeServer's; the first 50 02 brings the extra ones.
     def s10(self, req, sub):
         answer = super().s10(req, sub)
         if answer[0][0] == 0x50:
             answer += [(0.05 * (k + 1), answer[0]) for k in range(self.extra)]
-            self.extra = 0
+            self.extra, self.caught = 0, True
         return answer
 
 
@@ -5217,6 +5227,23 @@ def test_wait_for_unit_tries_every_50_ms_through_app_answers(app):
     assert 0 <= d.tries[-1] - d.on_at <= update.WAIT_RETRY_S + 1e-9
 
 
+# Check an app that answers 7F 10 21 (busy), or 7F 10 21 then 7F 10 78, is tried again within WAIT_RETRY_S of each
+# answer, not after request()'s backoff after 0x21 or a P2* after the 0x78, so a 10 02 lands in a power-up window of
+# 200 ms that closes, the app running again once it has. The first 10 02, before the prompt, is retried after each
+# 0x21 as any request is, each send at least its backoff after the last.
+@pytest.mark.parametrize("app", [[b"\x7f\x10\x21"], [b"\x7f\x10\x21", b"\x7f\x10\x78"]], ids=["21", "21-then-78"])
+@pytest.mark.parametrize("on_at", [50.0, 50.33, 50.77])
+def test_wait_for_unit_tries_through_busy_into_a_closing_window(app, on_at):
+    d = PoweredUpUnit(on_at=on_at, app=app, window_s=0.2)
+    rc, lines = run_wait(d, seconds=60)
+    prompt = lines.index("waiting up to 60 s for the unit: power-cycle it now")
+    assert rc == 0 and d.in_app and d.tries[-1] < on_at + 0.2
+    first, after = d.tries[:len(BUSY_BACKOFF_S) + 1], d.tries[len(BUSY_BACKOFF_S) + 1:]   # once and once per backoff
+    assert all(b - a >= wait - 1e-9 for a, b, wait in zip(first, first[1:], BUSY_BACKOFF_S))
+    assert prompt == 1 and len(after) >= 100
+    assert all(b - a <= update.WAIT_RETRY_S + 1e-9 for a, b in zip(after, after[1:]))
+
+
 # Check a 10 02 whose send failed but that the kernel held until the unit came on, its 50 02 arriving in the listen
 # after the failure, enters the session as a 10 02 answered at once does, that P2 and P2* are as they were after the
 # tries, and that the 50 02 to the resend is passed over.
@@ -5228,6 +5255,15 @@ def test_wait_for_unit_takes_a_held_sends_late_answer():
     assert uds.client.config["p2_timeout"] == transport.P2_S
     assert uds.client.config["p2_star_timeout"] == transport.P2_STAR_S
     assert lines[1].endswith("; passed over 1 later answers")
+
+
+# Check a try is one 10 02 whose every wait is its window: 7F 10 21 is a failed try, not retried after a backoff, and a
+# 0x78 behind it extends the listen by the window, not by P2*.
+@pytest.mark.parametrize("app", [[b"\x7f\x10\x21"], [b"\x7f\x10\x21", b"\x7f\x10\x78"]], ids=["21", "21-then-78"])
+def test_try_session_is_one_send_within_its_window(app):
+    ft, d = FakeTime(), PoweredUpUnit(on_at=float("inf"), app=app)
+    assert not late_uds(d, ft).try_session(2, update.WAIT_RETRY_S)
+    assert d.tries == [0.0] and ft.t <= 2 * update.WAIT_RETRY_S + 1e-9
 
 
 # Check a try answered 50 03 to its 10 02 does not count as entering session 2.
@@ -5295,12 +5331,82 @@ def test_wait_for_unit_passes_over_another_services_late_answer():
     assert lines[2] == "10 02 answered after %.1f s, at try %d" % (d.tries[-1] - d.tries[1], len(d.tries))
 
 
-# Check a unit that never answers fails the given seconds after the prompt with the message, the tries after the first
-# bounded by one per WAIT_RETRY_S, whether its sends are lost or fail.
+# Check a late answer to the F1F4 read that went unanswered, the bootloader's 7F 22 31 to a read the adapter held while
+# the unit came up, is passed over when it comes ahead of the 50 02, with or without --wait-for-unit: the first 10 02
+# enters the session, with no prompt to power-cycle, and the run is a plain bootloader-flow flash. The read goes
+# unanswered, or both its sends fail (no ACK) and the adapter holds them, so a stray answer comes for each. An answer
+# to another service than the one that went unanswered still fails the run.
+@pytest.mark.parametrize("seconds", [None, 10])
+@pytest.mark.parametrize("stray,passed", [(b"\x7f\x22\x31", True), (b"\x7f\x31\x31", False)])
+@pytest.mark.parametrize("failed_send", [False, True], ids=["timeout", "failed-send"])
+def test_late_answer_to_the_unanswered_read_is_passed_over(seconds, stray, passed, failed_send):
+    d, held, sends = PoweredUpUnit(on_at=0.0), [], 2 if failed_send else 1
+    real = d.handle
+
+    # Answer the F1F4 read with nothing, or fail its sends; its answers, stray, come ahead of the next request's.
+    def handle(req):
+        if bytes(req) == b"\x22\xf1\xf4" and len(held) < sends:
+            held.append(req)
+            if failed_send:
+                raise OSError(errno.ECOMM, os.strerror(errno.ECOMM))
+            real(req)
+            return []
+        out = real(req)
+        if len(held) == sends:
+            held.append(None)
+            return [stray] * sends + out
+        return out
+
+    d.handle = handle
+    if not passed:
+        with pytest.raises(errors.UpdateFailed, match="unexpected answer to service 0x10"):
+            run_wait(d, seconds=seconds)
+        return
+    rc, lines = run_wait(d, seconds=seconds)
+    assert rc == 0 and d.log == BL_PRECHECK[sends - 1:] + DOWNLOAD + POLLS and d.in_app
+    assert not any("power-cycle" in line for line in lines)
+
+
+# Check the request that goes unanswered after passing over a late answer to the one before it is the one whose late
+# answer is passed over next: a 10 02 answered only with the unanswered read's 7F 22 31 leaves 10 unanswered.
+def test_passed_over_answer_then_silence_leaves_this_request_unanswered():
+    d = FakeServer(security=False)
+    d.handle = lambda req: [b"\x7f\x22\x31"]
+    uds = uds_for(d, FakeTime())
+    uds.unanswered = 0x22
+    with pytest.raises(errors.NoResponse, match="after an answer to service 0x22"):
+        uds.session(2)
+    assert uds.unanswered == 0x10
+
+
+# Check a block answered only with the last block's 76 leaves 36 unanswered.
+def test_stale_block_answer_then_silence_leaves_the_block_unanswered():
+    d = FakeServer(security=False)
+    d.s36 = lambda req, bsc: [bytes([0x76, (bsc - 1) & 0xFF])]
+    uds = uds_for(d, FakeTime())
+    uds.session(2)
+    with pytest.raises(errors.NoResponse, match="after a late answer to an earlier one"):
+        uds.transfer(3, b"\xaa")
+    assert uds.unanswered == 0x36
+
+
+# Check an answered 3E ends the pass-over for another request that went unanswered: its answer, had it come, came first.
+def test_answered_keepalive_clears_another_unanswered_request():
+    uds = uds_for(FakeServer(security=False), FakeTime())
+    uds.unanswered = 0x22
+    uds.tester_present()
+    assert uds.unanswered is None
+
+
+# Check a unit that never answers fails the given seconds after the prompt with the message, which says what the 10 02s
+# still queued in the adapter do and how to clear them, the tries after the first bounded by one per WAIT_RETRY_S,
+# whether its sends are lost or fail.
 @pytest.mark.parametrize("no_ack", [False, True])
 def test_wait_for_unit_gives_up_at_the_deadline(no_ack):
     ft, d = FakeTime(), PoweredUpUnit(on_at=float("inf"), no_ack=no_ack)
-    with pytest.raises(errors.UpdateFailed, match=r"^no 10 02 was answered within 2 s \((\d+) tries\)$") as e:
+    gave_up = r"^no 10 02 was answered within 2 s \((\d+) tries\)\. " + re.escape(update.WAIT_QUEUED) + "$"
+    assert "queued in the CAN adapter" in update.WAIT_QUEUED and "interface down and up" in update.WAIT_QUEUED
+    with pytest.raises(errors.UpdateFailed, match=gave_up) as e:
         run_wait(d, seconds=2, ft=ft)
     tries = int(re.search(r"\((\d+) tries", str(e.value)).group(1))
     assert 2 / update.WAIT_RETRY_S + 1 <= tries <= 2 / update.WAIT_RETRY_S + 2
@@ -5313,7 +5419,7 @@ def test_wait_for_unit_gives_up_at_the_deadline(no_ack):
 # sent twice, takes about 4 s and the run gives up up to one try past the given seconds.
 def test_wait_for_unit_overshoots_by_a_try_without_acks():
     ft, d = FakeTime(), PoweredUpUnit(on_at=float("inf"), no_ack=True, no_ack_s=2.0)
-    with pytest.raises(errors.UpdateFailed, match=r"^no 10 02 was answered within 1 s \(2 tries\)$"):
+    with pytest.raises(errors.UpdateFailed, match=r"^no 10 02 was answered within 1 s \(2 tries\)\. "):
         run_wait(d, seconds=1, ft=ft)
     assert d.tries == [4.0, 6.0, 8.0, 10.0]   # after the F1F4's two sends; the prompt at 8 s
     assert ft.t - 8.0 <= 1 + 2 * d.no_ack_s + update.WAIT_RETRY_S

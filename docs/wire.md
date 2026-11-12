@@ -30,15 +30,15 @@ A unit built with `UDSOTA_DELTA=1` and `cfg.allow_delta` set also takes DFI 30, 
 
 The 34's memorySize is the rebuilt image's size, and the 36s may carry up to `UDSOTA_DL_Z_BOUND` of it, as for DFI 10. They carry one raw DEFLATE stream that inflates to a 64-byte header and then a detools 0.53.0 sequential patch, uncompressed, from the running image to the new one; `udsota pack --diff-from` and `flash --diff-from` write it (`client/udsota/delta.py`). The header is the magic 0xFCCDDE10, little-endian (`10 DE CD FC`), the base's SHA-256, and 28 reserved bytes, which the client writes as zeros. The base's SHA-256 is the 32 bytes ESP-IDF appends to the image, not F1F3's `app_elf_sha256`, so the base must be the very `.bin` that was flashed: a rebuild of the same source that is not byte-identical names another base. Signing an image again leaves that hash as it was, since the signature sector comes after it, so a re-signed copy passes the base check, and its patch rebuilds the new image with the wrong signature sector, which FF01 refuses with reason 8.
 
-The unit checks the header in the 36 that completes it, before any patch byte is used, so before the image rules and the erase. A wrong magic is reason 13. A base hash other than the running image's, or a running image with none, is reason 15. Either answers that 36 0x31 and ends the download with nothing erased; a full download still works in the same session. The patch reads only the running slot, anywhere up to the slot's end. The rebuilt image's first 320 bytes then pass the image rules as any image's, and FF01, activate and confirm are unchanged. The 37 passes once the stream and the patch have both ended, with exactly memorySize bytes rebuilt and nothing after either.
+The unit checks the header in the 36 that completes it, before any patch byte is used, so before the image rules and the erase. A wrong magic is reason 13. A base hash other than the running image's, or a running image with none, is reason 15. Either answers that 36 0x31 and ends the download with nothing erased; a full download still works in the same session. The patch reads only the running slot, anywhere up to the slot's end. The rebuilt image's first 320 bytes then pass the image rules as any image's.
 
-A delta's flash work comes with the 36 that carries its patch bytes, and a short patch can rebuild most of an image in one 36, whose job erases and writes it under 0x78s up to the 90 s cap. Like every download here, a delta can't resume.
+A delta's flash work comes with the 36 that carries its patch bytes, and a short patch can rebuild most of an image in one 36, whose job erases and writes it under 0x78s up to the 90 s cap.
 
 ## Routines
 
 | RID | Routine | Session, key | Does |
 |---|---|---|---|
-| FF01 | CheckProgrammingDependencies | programming, programming | after a 37, verifies the image in flash (its hash, its signature when the build checks signatures, and the image rules again) and answers `71 01 FF 01 <status>`, 00 or a reason. A pass marks the slot verified until the next 34 or restart, and a repeat after a pass answers 00 again. Without a finished download, 0x24 |
+| FF01 | CheckProgrammingDependencies | programming, programming | after a 37, verifies the image in flash (the image rules again; an ESP-IDF image's hash, and its signature when the build checks signatures; a bare image's `crc32`) and answers `71 01 FF 01 <status>`, 00 or a reason. A pass marks the slot verified until the next 34 or restart, and a repeat after a pass answers 00 again. Without a finished download, 0x24 |
 | F000 | GetResumePoint | programming, programming | answers status FF: downloads never resume |
 | F001 | ActivateImage | programming, programming | needs a passing FF01 (else 0x24); makes the slot the boot slot, answers, and restarts about 60 ms later, reading requests until then |
 | F002 | ConfirmImage | extended, none | needs the running image to be the boot image (else 0x22); confirms a pending-verify image, answers positive at once for one already valid or with rollback off, and 0x22 otherwise |
@@ -94,19 +94,19 @@ Any NRC to a 36 or 37 ends the transfer, and F1F1 reads ABORTED unless it names 
 
 ## Reasons
 
-F1F1 byte 0 and FF01's status byte. The first-block rules (1–7) run on the image's first 320 bytes before anything is erased, and FF01 runs them again on the bytes in flash.
+F1F1 byte 0 and FF01's status byte. The first-block rules (1–7) run before anything is erased, on an ESP-IDF image's first 320 bytes or a [bare image](#image-descriptor)'s first `header_offset` + 224, which a DFI 00 download's first 36 must carry; FF01 runs them again on the bytes in flash.
 
 | Code | Name | Meaning |
 |---|---|---|
 | 0 | `UDSOTA_DL_OK` | success |
-| 1 | `UDSOTA_DL_BAD_HEADER` | not an ESP-IDF image for this chip (image magic, segment count, SPI mode, chip ID, segment 0's length, app-descriptor magic), a chip revision or flash mode ESP-IDF refuses, a version that doesn't parse or a release flag that disagrees with it, or a DEFLATE stream or delta patch that ends before 320 bytes of image |
+| 1 | `UDSOTA_DL_BAD_HEADER` | an ESP-IDF image not for this chip (image magic, segment count, SPI mode, chip ID, segment 0's length, app-descriptor magic), or with a chip revision or flash mode ESP-IDF refuses, a version that doesn't parse or a release flag that disagrees with it; a bare header's magic, `header_version` 0, high-byte flag, or `image_length` other than memorySize; or a first 36, DEFLATE stream or delta patch ending before the rules' bytes |
 | 2 | `UDSOTA_DL_BAD_PROJECT` | a project name other than `cfg.product`, or than this image's own when it is NULL |
 | 3 | `UDSOTA_DL_BAD_BOARD` | no descriptor (magic), descriptor version 0, or another `hw_id` |
 | 4 | `UDSOTA_DL_BAD_LAYOUT` | another `partition_layout_id` |
 | 5 | `UDSOTA_DL_BAD_DIAG_IDS` | the image would answer on other CAN IDs |
-| 6 | `UDSOTA_DL_NOT_NEWER` | a release not newer than the running image (a running dev build with the same X.Y.Z takes it), or a dev build whose X.Y.Z is older; `cfg.allow_downgrade` lifts this rule alone |
+| 6 | `UDSOTA_DL_NOT_NEWER` | a release not newer than the running image (a running dev build with the same X.Y.Z takes it), or a dev build whose X.Y.Z is older; `cfg.allow_downgrade` lifts this rule alone; a bare unit has no version rule |
 | 7 | `UDSOTA_DL_TOO_BIG` | larger than the slot; a 34 that announces it answers 0x31 first and leaves F1F1 as it was |
-| 8 | `UDSOTA_DL_VERIFY_FAILED` | FF01's hash or signature check failed, or it could not read the slot back. FF01's image-rule failures report 1–6, and a failed F001 answers 0x72 and leaves F1F1 as it was |
+| 8 | `UDSOTA_DL_VERIFY_FAILED` | FF01's check of the image failed (an ESP-IDF image's hash or signature, a bare image's `crc32`), or it could not read the slot back. FF01's image-rule failures report 1–6, and a failed F001 answers 0x72 and leaves F1F1 as it was |
 | 9 | `UDSOTA_DL_SIG_FAILED` | reserved: ESP-IDF reports a bad signature as 8 |
 | 10 | `UDSOTA_DL_WORKER_TIMEOUT` | a flash job passed 90 s, or its session ended while it ran |
 | 11 | `UDSOTA_DL_ABORTED` | ended early: a session change, S3, the gate, an overrun, an early 37, a block-counter mismatch, or any other NRC that ended iso14229's transfer |
@@ -117,15 +117,15 @@ F1F1 byte 0 and FF01's status byte. The first-block rules (1–7) run on the ima
 
 ## Timing
 
-The 10 answer carries iso14229's client defaults with P2* raised to the server's: P2 150 ms, P2* 5000 ms. iso14229 holds every answer until at least `srv->p2_ms` after the previous one: 50 ms by default, 5 ms as the examples set it, which every app should do ([Known limits](../README.md#known-limits)). A flash job answers 0x78 at once and every 1.5 s (0.3 × P2*) until it ends, and its final answer comes `p2_ms` after that; at 90 s it answers 0x72 and the session ends. While any 0x78 job runs, iso14229 reads no other request, and only the last one sent meanwhile is answered, after the job. A 27 gets no 0x78: an ECDSA check takes about 0.45 s on an ESP32-S3, so the client waits up to 2 s for a 64-byte key's answer.
+iso14229 holds every answer until at least `srv->p2_ms` after the previous one: 50 ms by default, 5 ms as the examples set it, which every app should do ([Known limits](../README.md#known-limits)). A flash job answers 0x78 at once and every 1.5 s (0.3 × P2*) until it ends, and its final answer comes `p2_ms` after that; at 90 s it answers 0x72 and the session ends. While any 0x78 job runs, iso14229 reads no other request, and only the last one sent meanwhile is answered, after the job. A 27 gets no 0x78: an ECDSA check takes about 0.45 s on an ESP32-S3, so the client waits up to 2 s for a 64-byte key's answer.
 
 S3 is 5100 ms (iso14229's default), restarted only by 10 and 3E, and by udsota while its own flash job runs; its expiry returns to the default session, relocks and ends a download. A seed is single-use and lives 30 s.
 
-ISO-TP is iso14229's isotp-c with its defaults unless the app defines others build-wide: frames not padded, flow control with BS 8 and STmin 0, N_Bs and N_Cr 100 ms. CANDash, for one, sets `ISO_TP_FRAME_PADDING`, `ISO_TP_FRAME_PADDING_VALUE=0xAA`, `ISO_TP_DEFAULT_BLOCK_SIZE=64`, `ISO_TP_DEFAULT_ST_MIN_US=5000` and `ISO_TP_DEFAULT_RESPONSE_TIMEOUT_US=1000000`. A message is at most 4095 bytes either way, and the 34's maxNumberOfBlockLength of 4095 (`UDSOTA_DL_MAX_BLOCK_LEN`) leaves 4093 data bytes per 36.
+ISO-TP is iso14229's isotp-c with its defaults unless the app defines others build-wide: frames not padded, flow control with BS 8 and STmin 0, N_Bs and N_Cr 100 ms. A message is at most 4095 bytes either way.
 
 ## Image descriptor
 
-32 bytes, little-endian, at image offset 288 (`UDSOTA_IMG_DESC_OFFSET`): after the ESP image header (24 bytes), the first segment header (8) and `esp_app_desc_t` (256), so a DFI 00 download's first 36 carries at least 320 bytes.
+32 bytes, little-endian, at image offset 288 (`UDSOTA_IMG_DESC_OFFSET`): after the ESP image header (24 bytes), the first segment header (8) and `esp_app_desc_t` (256).
 
 | Offset | Field | Value |
 |---|---|---|
@@ -156,11 +156,11 @@ An image that is not an ESP-IDF app, which the client takes with `[image] format
 
 Stamping pads the file with 0xFF to a multiple of 4 bytes, then writes `image_length`, then `image_id`, then `crc32`. It never touches the signature, and stamping a stamped image returns the same bytes. `udsota stamp` stamps a file, and a post-build script can call the client's `udsota.image.stamp(data, header_offset)` instead. `udsota_wire.h` names each offset (`UDSOTA_BARE_HDR_*`, and `UDSOTA_BARE_*` within the block).
 
-A unit's bootloader cannot be updated with its app, so the header keeps to these rules. A field defined in version 1 never moves or changes meaning, and a layout that breaks that gets another magic. A unit takes `header_version` 1 or later and ignores the reserved bytes and the signature it does not use; the client takes only the versions it knows, and refuses a high-byte flag as a unit does.
+A unit's bootloader cannot be updated with its app, so the header keeps to these rules. A field defined in version 1 never moves or changes meaning, and a layout that breaks that gets another magic. A unit takes `header_version` 1 or later and ignores the reserved bytes and the signature it does not use; the client takes only the versions it knows.
 
 ## Keys
 
-With keys set, 27 01/02 unlocks 11 01 in the extended session, and 27 03/04 unlocks 34, 36, 37, FF01, F000, F001 and 11 01 in the programming session. ConfirmImage needs no key, since it can only keep an image that passed FF01 and ActivateImage. Each 16-byte seed takes one sendKey of the right length, right or wrong. Below, `level` is the requestSeed sub-function (01 or 03) and `device_id` the bytes F18C returns.
+With keys set, 27 01/02 unlocks 11 01 in the extended session, and 27 03/04 unlocks 34, 36, 37, FF01, F000, F001 and 11 01 in the programming session. ConfirmImage needs no key. Each 16-byte seed takes one sendKey of the right length, right or wrong. Below, `level` is the requestSeed sub-function (01 or 03) and `device_id` the bytes F18C returns.
 
 In the ECDSA mode (`cfg.key_pubkey`, a 65-byte 04 ‖ X ‖ Y P-256 point) the key is a 64-byte signature, r ‖ s with 32 big-endian bytes each, over SHA-256("udsota-27-ecdsa-v1" ‖ seed ‖ level ‖ id_len ‖ device_id), where `id_len` is one byte. In the HMAC mode (`cfg.key_label` and `cfg.key_master`) the key is the first 16 bytes of HMAC-SHA256(K_dev, seed ‖ level ‖ device_id), where K_dev = HMAC-SHA256(key_master, key_label ‖ device_id).
 
@@ -184,7 +184,7 @@ A single-slot unit whose resident bootloader is its only UDS server, such as an 
 
 **Precheck.** First one `22 F1F4` in the default session: four bytes equal to the image ID's first four mean the app already runs the image and is healthy, so there is nothing to do and the app keeps running; anything else, or no answer, goes on to the `10 02`. Then, in the programming session: F1F0, F1F3, the board DID and F18C, then the programming unlock. F1F0 describes one slot: running slot 0 and boot slot 0, running state 3 only while the app is valid and never 2, other slot state 0. Flag 0x04 means the bootloader holds the unit there because its app failed to start; a reset releases it for another try. F1F3 reads 32 zero bytes while there is no valid app. If F1F3 already reads the image's ID, send `11 01` and go on to the proof of life.
 
-**Power-up window.** For about 200 ms after power-on the bootloader takes a `10 02`, answering `50 02` and staying in the bootloader, which is the only way in when the app passes its checks but cannot hand over. To use it, keep sending `10 02` while the unit is power-cycled, each within 50 ms of the last going unanswered, being refused or failing to send, and waiting no longer than that after a 0x78. While the unit is off nothing acknowledges the frame, so a send waits out the CAN stack's echo timeout and the frame stays queued until the unit's CAN comes up. The unit answers each `10 02` it receives, so discard the extra `50 02`s and let them stop before the next request.
+**Power-up window.** For about 200 ms after power-on (the unit's setting) the bootloader takes a `10 02`, answering `50 02` and staying in the bootloader, which is the only way in when the app passes its checks but cannot hand over; a `3E 00` or `3E 80` in the window holds it there too. To use it, keep sending `10 02` while the unit is power-cycled, each within 50 ms of the last going unanswered, being refused (0x21 included) or failing to send, and waiting no longer than that after a 0x78. While the unit is off nothing acknowledges the frame, so a send waits out the CAN stack's echo timeout and the frame stays queued until the unit's CAN comes up: `10 02`s still queued when a wait ends hold the unit in its bootloader for about 5 s at its next power-up, once, unless the interface is taken down and up. The unit answers each `10 02` it receives, so discard the extra `50 02`s and let them stop before the next request.
 
 **Download, verify, activate** as in [Flashing without the client](#flashing-without-the-client), where address 0 in the 34 is the unit's update target. F001 answers, then resets into the app; without a passing FF01 it answers 0x24. There is no F002. F1F3 reads the new ID as soon as FF01 passes, so it can't tell whether an unanswered F001 landed: send F001 once more, and unless that one is answered positively, let F1F4 decide.
 
