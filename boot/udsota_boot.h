@@ -161,8 +161,8 @@ bool udsota_boot_port_flash_program(uint32_t off, const void *data, uint32_t len
 
 /* -- CAN -- */
 
-/* Starts bus (1..buses) at the port's own rate for it, accepting 11-bit frames on request_id, or every frame if the
- * hardware cannot filter. Received frames wait in the controller, or in a queue its interrupt fills, until the main
+/* Starts bus (1..buses) at the port's own rate for it, accepting 11-bit data frames on request_id, or every frame if
+ * the hardware cannot filter. Received frames wait in the controller, or in a queue its interrupt fills, until the main
  * loop passes them to udsota_boot_rx. Starting a running bus restarts it. The core calls it in udsota_boot_init, for
  * the handed-over bus or for every bus, and for every bus each time it returns to listening. Returns true once the bus
  * runs, or false when the bus is not fitted or has not started within its time in the timing table, leaving it
@@ -283,7 +283,8 @@ udsota_boot_decision_t udsota_boot_init(const udsota_boot_cfg_t *cfg);
  * return once it resets or starts the app. */
 void udsota_boot_poll(void);
 
-/* One received frame, which the port passes only when it is an 11-bit one. The product calls it for each frame the
+/* One received frame, which the port passes only when it is an 11-bit data frame: a remote frame carries no data, so
+ * the port drops it, in software where the controller cannot filter it out. The product calls it for each frame the
  * board received, whether the loop polled the controller for it or an interrupt queued it, in arrival order, from the
  * main loop only: never from an interrupt, and never from inside a port function. It feeds isotp-c, which may send a
  * flow control from inside this call. bus is 1..cfg.buses, id the identifier, len 0..8. The core reads the clock at
