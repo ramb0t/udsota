@@ -1,5 +1,5 @@
 # udsota. Under ESP-IDF this directory is the component: udsota.c and the vendored iso14229, and detools when the build
-# defines UDSOTA_DELTA=1. On a host it builds the host test and udsota_lite_server:
+# defines UDSOTA_DELTA=1. On a host it builds the host tests, udsota_lite_server and udsota_boot_server:
 # cmake -S . -B build && cmake --build build && ctest --test-dir build
 
 # Delta downloads: detools as they use it, uncompressed sequential patches only and no file I/O. udsota.c reads detools.h
@@ -149,6 +149,71 @@ if(UDSOTA_FUZZ_LIBFUZZER)
     set_tests_properties(fuzz_udsota_seeds PROPERTIES FIXTURES_SETUP fuzz_seeds)
     set_tests_properties(fuzz_udsota_libfuzzer PROPERTIES FIXTURES_REQUIRED fuzz_seeds)
 endif()
+
+# The bootloader core (boot/): its unit tests under ASan and UBSan, over the fake port (test/boot/fake_port.c), with
+# iso14229 compiled as a product compiles it: the definitions boot/udsota_boot.h lists, -fwrapv (above) and NDEBUG.
+# test_udsota_boot drives the core frame by frame, and test_udsota_boot_asserts is the same with iso14229's asserts
+# enabled. test_udsota_boot_pure covers the CRC, the image rules, the boot rules and the image
+# tools/make_boot_fixtures.py stamped with the client's stamp(); test_udsota_app the app's side, the header-only
+# udsota_app.h built as an app builds it, without iso14229 or the core.
+set(UDSOTA_BOOT_DEFS UDS_SYS=UDS_SYS_CUSTOM ISO_TP_FRAME_PADDING UDS_SERVER_RECV_BUF_SIZE=1026
+                     UDS_SERVER_SEND_BUF_SIZE=64 ISO_TP_DEFAULT_BLOCK_SIZE=8 ISO_TP_DEFAULT_ST_MIN_US=0
+                     ISO_TP_DEFAULT_RESPONSE_TIMEOUT_US=1000000)
+set(UDSOTA_BOOT_CORE boot/udsota_boot.c test/boot/fake_port.c iso14229/iso14229.c)
+function(udsota_boot_test name)
+    add_executable(${name} ${ARGN})
+    target_include_directories(${name} PRIVATE . boot iso14229 test)
+    target_compile_definitions(${name} PRIVATE ${UDSOTA_BOOT_DEFS})
+    target_compile_options(${name} PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=all
+                                           -fno-omit-frame-pointer)
+    target_link_options(${name} PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=all)
+    add_test(NAME ${name} COMMAND ${name})
+endfunction()
+set_source_files_properties(boot/udsota_boot.c test/boot/fake_port.c test/test_udsota_boot.c
+                            test/test_udsota_boot_pure.c test/test_udsota_app.c
+                            PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror")
+udsota_boot_test(test_udsota_boot test/test_udsota_boot.c ${UDSOTA_BOOT_CORE})
+target_compile_definitions(test_udsota_boot PRIVATE NDEBUG)
+udsota_boot_test(test_udsota_boot_asserts test/test_udsota_boot.c ${UDSOTA_BOOT_CORE})
+udsota_boot_test(test_udsota_boot_pure test/test_udsota_boot_pure.c ${UDSOTA_BOOT_CORE})
+target_compile_definitions(test_udsota_boot_pure PRIVATE NDEBUG)
+add_executable(test_udsota_app test/test_udsota_app.c)
+target_include_directories(test_udsota_app PRIVATE .)   # the one include path an app adds
+target_compile_options(test_udsota_app PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=all)
+target_link_options(test_udsota_app PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=all)
+add_test(NAME test_udsota_app COMMAND test_udsota_app)
+
+# udsota.h and udsota_app.h, the headers an app includes, compile as C11 and as C++17 with every warning an error: an
+# app may be written in either. The build is the test; running it only returns 0. The C++ half needs a C++ compiler,
+# which nothing else here does, so a host without one builds the rest and says so; CI checks it is there.
+add_executable(test_headers_c test/test_headers.c)
+set(udsota_header_tests test_headers_c)
+include(CheckLanguage)
+check_language(CXX)
+if(CMAKE_CXX_COMPILER)
+    enable_language(CXX)
+    add_executable(test_headers_cxx test/test_headers.cpp)
+    set_target_properties(test_headers_cxx PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    list(APPEND udsota_header_tests test_headers_cxx)
+else()
+    message(STATUS "udsota: no C++ compiler, so no test_headers_cxx")
+endif()
+foreach(t ${udsota_header_tests})
+    target_include_directories(${t} PRIVATE . iso14229)
+    target_compile_options(${t} PRIVATE -Wall -Wextra -Werror -pedantic)
+    add_test(NAME ${t} COMMAND ${t})
+endforeach()
+
+# The core as a Linux process for the client's end-to-end tests (client/tests/test_e2e_boot.py): a frame pipe on
+# stdin and stdout, the fake port on CLOCK_MONOTONIC, a stand-in app on udsota_app.h, iso14229 as a product builds it
+# (NDEBUG), ASan and UBSan.
+add_executable(udsota_boot_server test/e2e/boot_server.c ${UDSOTA_BOOT_CORE})
+target_include_directories(udsota_boot_server PRIVATE . boot iso14229 test)
+target_compile_definitions(udsota_boot_server PRIVATE ${UDSOTA_BOOT_DEFS} NDEBUG)
+target_compile_options(udsota_boot_server PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=all
+                                                  -fno-omit-frame-pointer)
+target_link_options(udsota_boot_server PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=all)
+set_source_files_properties(test/e2e/boot_server.c PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror")
 
 # isotp-c's timers across the 2^31 us point, at -O2, where the -fwrapv above matters.
 add_executable(test_isotp_wrap test/test_isotp_wrap.c iso14229/iso14229.c)

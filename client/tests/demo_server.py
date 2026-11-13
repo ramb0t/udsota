@@ -1,7 +1,8 @@
-"""Helpers for the end-to-end test against udsota_lite_server (test_e2e_lite.py) and the unit tests: building
-images as a udsota server expects them, running a server in pipe mode, a client transport over that pipe that stands
-in for transport.Transport (can-isotp's Python ISO-TP stack instead of the kernel's), and the profile, cli.main and
-state helpers. A subset of udsota main's client/tests/demo_server.py, with the same names."""
+"""Helpers for the end-to-end tests against udsota_lite_server and udsota_boot_server (test_e2e_lite.py,
+test_e2e_boot.py) and the unit tests: building images as a udsota server expects them, running a server in pipe mode,
+a client transport over that pipe that stands in for transport.Transport (can-isotp's Python ISO-TP stack instead of
+the kernel's), and the profile, cli.main and state helpers. A subset of udsota main's client/tests/demo_server.py,
+with the same names."""
 import errno
 import hashlib
 import pathlib
@@ -73,7 +74,7 @@ def build_image(version="v0.2.0", product="example", hw_id=1, layout=1, ids=(0x7
 # A bare image ([image] format = "bare"): size bytes of a byte pattern with udsota's bare header at header_offset,
 # its descriptor block's udsota_image_desc_t, version and project overridable, stamped (image.stamp) unless stamped
 # is False. hdr_magic and hdr_version replace the header's magic and header_version after stamping.
-def build_bare_image(header_offset=0x200, size=4096, version="1.4.0", product="stm32boot", hw_id=1, layout=1,
+def build_bare_image(header_offset=0x100, size=4096, version="1.4.0", product="stm32boot", hw_id=1, layout=1,
                      ids=(0x710, 0x718), magic=0x5544534F, desc_version=1, release=None, stamped=True,
                      hdr_magic=image.BARE_HDR_MAGIC, hdr_version=image.BARE_HDR_VERSION):
     img = bytearray((i * 7 + 13) & 0xFF for i in range(size))
@@ -93,7 +94,7 @@ def build_bare_image(header_offset=0x200, size=4096, version="1.4.0", product="s
 
 
 # A bare image's image ID, as F1F3 answers it once the image runs.
-def bare_id(img, header_offset=0x200):
+def bare_id(img, header_offset=0x100):
     at = header_offset + image.BARE_ID_OFFSET
     return bytes(img[at:at + 32])
 

@@ -8,6 +8,7 @@ import contextlib
 import dataclasses
 import errno
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -1169,7 +1170,7 @@ def test_parse_image_refuses_bad_images(image):
         parse_image(P, image)
 
 
-# A profile for bare images (a non-ESP unit): the header at 0x200, a 64 KiB slot, build_bare_image's identity.
+# A profile for bare images (a non-ESP unit): the header at 0x100, a 64 KiB slot, build_bare_image's identity.
 BARE = """
 [can]
 interface = "vcan0"
@@ -1178,7 +1179,7 @@ resp_id = 0x718
 
 [image]
 format = "bare"
-header_offset = 0x200
+header_offset = 0x100
 product = "stm32boot"
 hw_ids = [1, 2]
 layout_id = 1
@@ -1186,7 +1187,7 @@ slot_size = 0x10000
 """
 PB = profile.from_dict("bare", tomllib.loads(BARE))
 BARE_IMG = build_bare_image()
-HO = 0x200                              # PB's header_offset
+HO = 0x100                              # PB's header_offset
 
 
 # Check a stamped bare image parses from its header alone, wherever header_offset puts it, its image_id standing in
@@ -1197,7 +1198,7 @@ def test_parse_bare_image_reads_the_header():
     for off in (0, 4096 - 224):
         img = build_bare_image(header_offset=off)
         assert parse_image(dataclasses.replace(PB, header_offset=off), img).elf_sha == bare_id(img, off)
-    with pytest.raises(errors.Refused, match=re.escape("no bare image header (magic UDSB) at header_offset 512")):
+    with pytest.raises(errors.Refused, match=re.escape("no bare image header (magic UDSB) at header_offset 256")):
         parse_image(PB, make_image(project=b"stm32boot"))
 
 
@@ -1211,10 +1212,10 @@ def flipped(img, at):
 # Check each malformed, unstamped, changed or foreign bare image is refused, naming what is wrong and where: the
 # header's own checks first, each stamping check before the identity, and the slot size on the padded length.
 @pytest.mark.parametrize("data, why", [
-    (BARE_IMG[:HO + 223], "735 bytes, too short for the 224-byte bare header at header_offset 512"),
-    (build_bare_image(hdr_magic=0), "no bare image header (magic UDSB) at header_offset 512"),
-    (build_bare_image(hdr_magic=0x42534455), "no bare image header (magic UDSB) at header_offset 512"),
-    (build_bare_image(hdr_version=2), "the bare header at header_offset 512 has header_version 2, not 1"),
+    (BARE_IMG[:HO + 223], "479 bytes, too short for the 224-byte bare header at header_offset 256"),
+    (build_bare_image(hdr_magic=0), "no bare image header (magic UDSB) at header_offset 256"),
+    (build_bare_image(hdr_magic=0x42534455), "no bare image header (magic UDSB) at header_offset 256"),
+    (build_bare_image(hdr_version=2), "the bare header at header_offset 256 has header_version 2, not 1"),
     (build_bare_image(hdr_version=0, stamped=False), "has header_version 0, not 1"),
     (build_bare_image(stamped=False), "the bare header's image_length is 4294967295 and the file 4096 bytes: the "
                                       "image is not stamped or was changed after stamping (`udsota stamp` stamps it)"),
@@ -1227,9 +1228,9 @@ def flipped(img, at):
     (flipped(BARE_IMG, 4095), "the bare header's crc32 is"),
     (flipped(BARE_IMG, HO + 0x20 + 33), "the bare header's crc32 is"),          # the version string
     (flipped(BARE_IMG, HO + 0xA0), "the bare header's crc32 is"),               # the signature, under the CRC
-    (build_bare_image(magic=0), "no udsota image descriptor (magic UDSO) in the bare header at header_offset 512"),
+    (build_bare_image(magic=0), "no udsota image descriptor (magic UDSO) in the bare header at header_offset 256"),
     (build_bare_image(magic=0x4F534455), "no udsota image descriptor (magic UDSO) in the bare header at header_offset"),
-    (build_bare_image(desc_version=0), "the image descriptor in the bare header at header_offset 512 has desc_version "
+    (build_bare_image(desc_version=0), "the image descriptor in the bare header at header_offset 256 has desc_version "
                                        "0, not 1 or later"),
     (build_bare_image(product="other"), "image project is 'other', not 'stm32boot'"),
     (build_bare_image(ids=(0x720, 0x728)), "image answers on 0x720/0x728, not 0x710/0x718"),
@@ -1298,9 +1299,9 @@ def test_stamp_helpers():
 
 # Check stamp refuses a file too short for the header, a wrong magic and a header_version other than 1, as Refused.
 @pytest.mark.parametrize("data, why", [
-    (build_bare_image(stamped=False)[:HO + 223], "735 bytes, too short for the 224-byte bare header at header_offset"),
-    (b"", "0 bytes, too short for the 224-byte bare header at header_offset 512"),
-    (build_bare_image(stamped=False, hdr_magic=0x5544534F), "no bare image header (magic UDSB) at header_offset 512"),
+    (build_bare_image(stamped=False)[:HO + 223], "479 bytes, too short for the 224-byte bare header at header_offset"),
+    (b"", "0 bytes, too short for the 224-byte bare header at header_offset 256"),
+    (build_bare_image(stamped=False, hdr_magic=0x5544534F), "no bare image header (magic UDSB) at header_offset 256"),
     (build_bare_image(stamped=False, hdr_version=0), "has header_version 0, not 1"),
     (build_bare_image(stamped=False, hdr_version=2), "has header_version 2, not 1"),
 ])
@@ -1431,10 +1432,12 @@ CLIENT_NUMBERS = {"UDSOTA_DID_IMAGE_PREFIX": wire.DID_IMAGE_PREFIX, "UDSOTA_DL_M
                   "UDSOTA_SEED_LEN": keys.SEED_LEN, "UDSOTA_KEY_LEN": keys.KEY_LEN, "UDSOTA_KEYS_SIG_LEN": keys.SIG_LEN,
                   "UDSOTA_KEYS_SIG_TAG": keys.SIG_TAG.decode(), "UDSOTA_KEYS_PUBKEY_LEN": keys.PUBKEY_LEN,
                   "UDSOTA_KEYS_ID_MAX": keys.ID_MAX, "UDSOTA_IMG_DESC_OFFSET": image.DESC_OFFSET,
+                  "UDSOTA_IMG_DESC_MAGIC": image.DESC_MAGIC,
                   "UDSOTA_BARE_DESC_LEN": image.BARE_DESC_LEN, "UDSOTA_BARE_VERSION_OFFSET": image.BARE_VERSION_OFFSET,
                   "UDSOTA_BARE_PROJECT_OFFSET": image.BARE_PROJECT_OFFSET,
                   "UDSOTA_BARE_IMAGE_ID_OFFSET": image.BARE_IMAGE_ID_OFFSET,
                   "UDSOTA_BARE_HDR_MAGIC": image.BARE_HDR_MAGIC, "UDSOTA_BARE_HDR_VERSION": image.BARE_HDR_VERSION,
+                  "UDSOTA_BARE_HDR_FLAGS_MUST": image.BARE_HDR_FLAGS_MUST,
                   "UDSOTA_BARE_HDR_LEN": image.BARE_HDR_LEN,
                   "UDSOTA_BARE_HDR_LENGTH_OFFSET": image.BARE_HDR_LENGTH_OFFSET,
                   "UDSOTA_BARE_HDR_CRC_OFFSET": image.BARE_HDR_CRC_OFFSET,
@@ -1444,6 +1447,17 @@ CLIENT_NUMBERS = {"UDSOTA_DID_IMAGE_PREFIX": wire.DID_IMAGE_PREFIX, "UDSOTA_DL_M
 # udsota_wire.h's numbers the client never sends or reads, which must equal v0.14.2's instead.
 SERVER_ONLY = {"UDSOTA_RID_GET_RESUME_POINT", "UDSOTA_RESUME_NOT_AVAILABLE", "UDSOTA_DL_Z_BOUND",
                "UDSOTA_SA_SEED_VALID_MS"}
+# udsota_wire.h's numbers only a bootloader unit (boot/) and its app use, which v0.14.2 never had and the client never
+# sends or reads: F180, the bootloader's version, and the keep words that carry the handover and the start count
+# across a reset. A bootloader and an app built from different releases must agree on the keep words, so each value is
+# pinned here; the function-like macro is evaluated at the values given.
+DEVICE_ONLY = {"UDSOTA_DID_BOOT_VERSION": 0xF180,
+               "UDSOTA_KEEP_WORD_MARK": 0, "UDSOTA_KEEP_WORD_HANDOVER": 1, "UDSOTA_KEEP_WORD_COUNT": 2,
+               "UDSOTA_KEEP_WORDS": 3, "UDSOTA_HANDOVER_MARK": 0xB007,
+               "UDSOTA_START_COUNT_MARKER": 0xA5, "UDSOTA_START_COUNT_MARKER_SHIFT": 8,
+               "UDSOTA_START_COUNT_MASK": 0x00FF,
+               "UDSOTA_START_COUNT_WORD": {(0,): 0xA500, (3,): 0xA503, (255,): 0xA5FF, (256,): 0xA500},
+               "UDSOTA_START_COUNT_CLEAR": 0xA500}
 
 
 # A header's text, udsota.h's by default, or a skip when the checkout has no udsota.h (a wheel-only install); a
@@ -1476,9 +1490,30 @@ def udsota_defines(text):
     return out
 
 
-# The wire contract, every UDSOTA_ #define in udsota_wire.h, as udsota_defines gives it.
+# The wire contract, every UDSOTA_ #define in udsota_wire.h, as udsota_defines gives it, continued lines joined.
 def udsota_h_wire_block():
-    return udsota_defines(re.sub(r"/\*.*?\*/", "", udsota_h(UDSOTA_WIRE_H), flags=re.S))
+    return udsota_defines(re.sub(r"/\*.*?\*/", "", udsota_h(UDSOTA_WIRE_H), flags=re.S).replace("\\\n", " "))
+
+
+# The integer value of each UDSOTA_ define in block (as udsota_h_wire_block gives it) that is a constant expression of
+# integers, casts to uint16_t or unsigned, and the block's other names; a function-like one becomes a function of its
+# parameters, its result taken to uint16_t when its body casts to it.
+def wire_values(block):
+    env = {"__builtins__": {}}   # the globals every expression and function body evaluates in
+
+    def py(expr):
+        expr = re.sub(r"\((?:uint16_t|unsigned)\)", "", expr)
+        return re.sub(r"\b(0x[0-9A-Fa-f]+|\d+)[uU]\b", r"\1", expr)
+    env.update({name: value for name, value in block.items() if isinstance(value, int)})
+    for name, value in block.items():
+        m = re.fullmatch(r"\(([\w, ]*)\)\s*(.*)", value) if isinstance(value, str) else None
+        if m and name in DEVICE_ONLY:
+            mask = 0xFFFF if "(uint16_t)" in m[2] else -1
+            env[name] = eval("lambda %s: (%s) & %d" % (m[1], py(m[2]), mask), env)
+    for name, value in block.items():
+        if isinstance(value, str) and name not in env and name in DEVICE_ONLY:
+            env[name] = eval(py(value), env)
+    return env
 
 
 # Check udsota_wire.h stands alone, with no #include, and that udsota.h includes it and defines none of its names.
@@ -1494,7 +1529,7 @@ def test_udsota_wire_h_stands_alone():
 def test_wire_numbers_match_udsota_h():
     block = udsota_h_wire_block()
     flags = {k for k in block if k.startswith("UDSOTA_STATUS_")}
-    unmapped = set(block) - set(WIRE_DEFINES) - set(CLIENT_NUMBERS) - SERVER_ONLY - flags
+    unmapped = set(block) - set(WIRE_DEFINES) - set(CLIENT_NUMBERS) - SERVER_ONLY - set(DEVICE_ONLY) - flags
     assert not unmapped, "udsota_wire.h numbers the client test doesn't map: %s" % sorted(unmapped)
     assert {c: block[c] for c in block.keys() & WIRE_DEFINES} == \
         {c: getattr(wire, WIRE_DEFINES[c]) for c in block.keys() & WIRE_DEFINES}
@@ -1519,9 +1554,25 @@ def test_server_only_numbers_match_udsota_wire():
     assert {k: block[k] for k in SERVER_ONLY} == {k: v014.get(k) for k in SERVER_ONLY}
 
 
-# Check wire.py's reason names match udsota_reason_t in udsota.h, by name and value, counting from its last entry.
-def test_reason_names_match_udsota_h():
-    text = re.sub(r"/\*.*?\*/", "", udsota_h(), flags=re.S)
+# Check udsota_wire.h's bootloader-only numbers are all there, with their pinned values, and that v0.14.2 had none.
+def test_device_only_numbers_match_udsota_wire():
+    block = udsota_h_wire_block()
+    assert set(DEVICE_ONLY) <= set(block)
+    values = wire_values(block)
+    for name, want in DEVICE_ONLY.items():
+        if isinstance(want, dict):
+            assert {args: values[name](*args) for args in want} == want, name
+        else:
+            assert values[name] == want, name
+    assert not set(DEVICE_ONLY) & set(udsota_defines(wire_header()))
+    assert set(DEVICE_ONLY).isdisjoint(set(WIRE_DEFINES) | set(CLIENT_NUMBERS) | SERVER_ONLY)
+
+
+# Check wire.py's reason names match udsota_reason_t in udsota_wire.h, by name and value, counting from its last
+# entry, and that udsota.h takes it from there rather than defining its own.
+def test_reason_names_match_udsota_wire_h():
+    assert "udsota_reason_t;" not in re.sub(r"/\*.*?\*/", "", udsota_h(), flags=re.S)
+    text = re.sub(r"/\*.*?\*/", "", udsota_h(UDSOTA_WIRE_H), flags=re.S)
     body = re.search(r"typedef enum \{([^}]*)\} udsota_reason_t;", text)[1]
     names, value = [], -1
     for item in (x.strip() for x in body.split(",") if x.strip()):
@@ -1530,6 +1581,37 @@ def test_reason_names_match_udsota_h():
         names.append((m[1], value))
     assert [(wire.reason_name(v), v) for _, v in names] == names
     assert names[-1][1] == len(wire.DL_REASONS) - 1
+
+
+# Check each header a bootloader or an app takes on its own includes only what it says it does: udsota_image.h the
+# wire header (and <assert.h> for static_assert), udsota_app.h no iso14229 and no core, boot/udsota_boot.h no
+# iso14229; and that udsota.h takes the descriptor from udsota_image.h.
+def test_boot_headers_include_only_their_own():
+    def includes(path):
+        text = re.sub(r"/\*.*?\*/", "", udsota_h(path), flags=re.S)
+        return re.findall(r'^[ \t]*#[ \t]*include[ \t]*[<"]([^>"]+)[>"]', text, flags=re.M)
+    assert includes(REPO / "udsota_image.h") == ["assert.h", "stddef.h", "stdint.h", "udsota_wire.h"]
+    assert includes(REPO / "udsota_app.h") == ["stdbool.h", "udsota_wire.h", "udsota_image.h"]
+    assert includes(REPO / "boot" / "udsota_boot.h") == ["stdbool.h", "stddef.h", "stdint.h", "udsota_wire.h"]
+    assert includes(REPO / "boot" / "udsota_boot_internal.h") == ["udsota_boot.h"]
+    assert "udsota_image.h" in includes(UDSOTA_H)
+    assert not re.search(r"\}\s*udsota_image_desc_t\s*;", re.sub(r"/\*.*?\*/", "", udsota_h(), flags=re.S))
+
+
+BOOT_FIXTURE = REPO / "test" / "fixtures" / "boot_fixtures.h"
+BOOT_FIXTURE_TOOL = REPO / "tools" / "make_boot_fixtures.py"
+
+
+# Check test/fixtures/boot_fixtures.h, the stamped image the bootloader core's C test checks its CRC and image rules
+# against, is what tools/make_boot_fixtures.py writes with this client's stamp() today.
+def test_boot_fixture_is_current():
+    if not BOOT_FIXTURE_TOOL.is_file():
+        pytest.skip("no %s (not a repo checkout)" % BOOT_FIXTURE_TOOL)
+    spec = importlib.util.spec_from_file_location("make_boot_fixtures", BOOT_FIXTURE_TOOL)
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    assert BOOT_FIXTURE.read_text() == tool.render(), \
+        "test/fixtures/boot_fixtures.h differs from what the client stamps: run tools/make_boot_fixtures.py"
 
 
 # ---- the update sequence ----
@@ -2836,9 +2918,10 @@ def test_image_format_profile_values():
     assert (profile.load("example").image_format, profile.load("example").header_offset) == ("esp-idf", None)
     esp = profile.from_dict("e", tomllib.loads(FULL.replace("[image]\n", '[image]\nformat = "esp-idf"\n')))
     assert (esp.image_format, esp.header_offset) == ("esp-idf", None)
-    assert (PB.image_format, PB.header_offset) == ("bare", 0x200)
+    assert (PB.image_format, PB.header_offset) == ("bare", 0x100)
     for off in (0, 0xFFFFFFFF):
-        assert profile.from_dict("b", tomllib.loads(BARE.replace("0x200", str(off)))).header_offset == off
+        assert profile.from_dict("b", tomllib.loads(BARE.replace("header_offset = 0x100", "header_offset = %d" % off))
+                                 ).header_offset == off
 
 
 # Check a bad [image] format or header_offset is refused with its reason, and desc_offset, which header_offset
@@ -2846,13 +2929,14 @@ def test_image_format_profile_values():
 @pytest.mark.parametrize("old, new, why", [
     ('format = "bare"', 'format = "elf"', "[image] format must be one of esp-idf, bare"),
     ('format = "bare"', "format = 1", "format must be a non-empty string"),
-    ("header_offset = 0x200\n", "", '[image] format = "bare" needs header_offset'),
-    ("header_offset = 0x200\n", "desc_offset = 0x200\n", "unknown key desc_offset in [image]"),
+    ("header_offset = 0x100\n", "", '[image] format = "bare" needs header_offset'),
+    ("header_offset = 0x100\n", "desc_offset = 0x100\n", "unknown key desc_offset in [image]"),
     ('format = "bare"', 'format = "esp-idf"', '[image] header_offset is for format = "bare"'),
     ('format = "bare"\n', "", '[image] header_offset is for format = "bare"'),
-    ("0x200", "-1", "header_offset must be an integer from 0x0 to 0xFFFFFFFF"),
-    ("0x200", "0x100000000", "header_offset must be an integer from 0x0 to 0xFFFFFFFF"),
-    ("0x200", '"0x200"', "header_offset must be an integer from 0x0 to 0xFFFFFFFF"),
+    ("header_offset = 0x100", "header_offset = -1", "header_offset must be an integer from 0x0 to 0xFFFFFFFF"),
+    ("header_offset = 0x100", "header_offset = 0x100000000",
+     "header_offset must be an integer from 0x0 to 0xFFFFFFFF"),
+    ("header_offset = 0x100", 'header_offset = "0x100"', "header_offset must be an integer from 0x0 to 0xFFFFFFFF"),
 ])
 def test_bad_image_format_is_refused(old, new, why):
     with pytest.raises(errors.Refused, match="profile bare: " + re.escape(why)):
@@ -4653,15 +4737,15 @@ def test_stamp_command_out(tmp_path):
 # Check stamp refuses (exit 2) an esp-idf profile, an unreadable FILE, a header stamp refuses, and an image that
 # fails the profile's checks once stamped, writing nothing.
 @pytest.mark.parametrize("edit, why", [
-    (lambda prof, fw: prof.write_text(BARE.replace('format = "bare"\nheader_offset = 0x200\n', "")),
+    (lambda prof, fw: prof.write_text(BARE.replace('format = "bare"\nheader_offset = 0x100\n', "")),
      'profile bare: stamp is for [image] format = "bare", and its format is "esp-idf"'),
     (lambda prof, fw: fw.unlink(), "cannot read %s"),
     (lambda prof, fw: fw.write_bytes(build_bare_image(stamped=False, hdr_magic=0)),
-     "no bare image header (magic UDSB) at header_offset 512"),
+     "no bare image header (magic UDSB) at header_offset 256"),
     (lambda prof, fw: fw.write_bytes(build_bare_image(stamped=False, product="other")),
      "image project is 'other', not 'stm32boot'"),
     (lambda prof, fw: fw.write_bytes(build_bare_image(stamped=False)[:HO + 100]),
-     "image is 612 bytes, too short for the 224-byte bare header at header_offset 512"),
+     "image is 356 bytes, too short for the 224-byte bare header at header_offset 256"),
 ])
 def test_stamp_command_refuses(tmp_path, capsys, edit, why):
     prof, fw, _ = stamp_files(tmp_path)
@@ -4810,7 +4894,7 @@ class BootloaderUnit(FakeServer):
 UPDATE_BL = '\n[update]\nflow = "bootloader"\n'
 # BARE under the bootloader flow, its header at 48 so that the image_id lands where BootloaderUnit reads a written
 # image's ID, 176..208; and FULL under it, for [security] and [board].
-BARE_BL = BARE.replace("0x200", "48") + UPDATE_BL
+BARE_BL = BARE.replace("header_offset = 0x100", "header_offset = 48") + UPDATE_BL
 PBL = profile.from_dict("bare-boot", tomllib.loads(BARE_BL))
 PFB = profile.from_dict("full-boot", tomllib.loads(FULL + UPDATE_BL))
 BL_IMG = build_bare_image(header_offset=48, size=4800)
@@ -5518,7 +5602,7 @@ def test_example_bare_comments_load():
     text = (profile.PROFILE_DIR / "example.toml").read_text()
     live = re.sub(r"(?m)^# (?=format |header_offset )", "", text)
     e = profile.from_dict("example", tomllib.loads(live))
-    assert (e.image_format, e.header_offset) == ("bare", 0x200)
+    assert (e.image_format, e.header_offset) == ("bare", 0x100)
 
 
 # Check the bare header's flags: a bit in the high byte is one a reader must understand, so stamp and parse_image

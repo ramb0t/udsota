@@ -30,7 +30,8 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "iso14229.h"
-#include "udsota_wire.h"   /* the wire contract: every number a tester sees */
+#include "udsota_wire.h"   /* the wire contract: every number a tester sees, and udsota_reason_t */
+#include "udsota_image.h"  /* udsota_image_desc_t and UDSOTA_IMG_RELEASE */
 
 /* The udsota release this header belongs to, for an #if on the release a feature arrived in. tools/release.py sets
  * all four at each cut, and its check fails when they disagree with the tag (RELEASING.md). */
@@ -40,23 +41,10 @@
 #define UDSOTA_VERSION       "0.16.0"
 
 /* ---- The image descriptor ----
- * Every image says which board, partition layout and CAN IDs it is for, at offset 288 (right after ESP-IDF's
- * esp_app_desc_t), so a device refuses a wrong image before erasing anything. Place it once, at file scope in the
- * app, with UDSOTA_IMAGE_DESC; udsota reads the running image's own copy as this device's identity. */
-typedef struct {
-    uint32_t magic;               /* "UDSO": flash bytes 4F 53 44 55 */
-    uint16_t desc_version;        /* 1 */
-    uint8_t  hw_id;               /* the board (one number per board variant) */
-    uint8_t  partition_layout_id; /* the partition table */
-    uint16_t diag_request_id;     /* the CAN IDs the image answers UDS on */
-    uint16_t diag_response_id;
-    uint8_t  flags;               /* 0x01: a release build (PROJECT_VER is a clean [v]X.Y.Z) */
-    uint8_t  reserved[19];
-} udsota_image_desc_t;
-
-#ifndef UDSOTA_IMG_RELEASE
-#define UDSOTA_IMG_RELEASE 0      /* udsota's CMakeLists sets it from PROJECT_VER */
-#endif
+ * Every image says which board, partition layout and CAN IDs it is for, in a udsota_image_desc_t at offset 288 (right
+ * after ESP-IDF's esp_app_desc_t), so a device refuses a wrong image before erasing anything. Place it once, at file
+ * scope in the app, with UDSOTA_IMAGE_DESC; udsota reads the running image's own copy as this device's identity. Its
+ * release flag comes from UDSOTA_IMG_RELEASE, which udsota's CMakeLists sets from PROJECT_VER. */
 #if defined(ESP_PLATFORM)
 #define UDSOTA_DESC_SECTION __attribute__((section(".rodata_custom_desc")))
 #else
@@ -64,7 +52,7 @@ typedef struct {
 #endif
 #define UDSOTA_IMAGE_DESC(hw, layout, req_id, resp_id)                                                   \
     const UDSOTA_DESC_SECTION udsota_image_desc_t udsota_image_desc = {                                  \
-        .magic = 0x5544534Fu, .desc_version = 1u, .hw_id = (uint8_t)(hw),                                \
+        .magic = UDSOTA_IMG_DESC_MAGIC, .desc_version = 1u, .hw_id = (uint8_t)(hw),                      \
         .partition_layout_id = (uint8_t)(layout), .diag_request_id = (uint16_t)(req_id),                 \
         .diag_response_id = (uint16_t)(resp_id), .flags = UDSOTA_IMG_RELEASE ? 0x01u : 0x00u,            \
     }
@@ -91,26 +79,6 @@ typedef enum {
     UDSOTA_OP_RESET,                /* 11 01 */
     UDSOTA_OP_CONFIRM,              /* 31 01 F002 */
 } udsota_op_t;
-
-/* Why the last download ended: F1F1's reason and FF01's status byte. Wire values. */
-typedef enum {
-    UDSOTA_DL_OK = 0,
-    UDSOTA_DL_BAD_HEADER,           /* 1: not an ESP-IDF image for this chip, or an unparseable version */
-    UDSOTA_DL_BAD_PROJECT,          /* 2: another project name */
-    UDSOTA_DL_BAD_BOARD,            /* 3: no udsota descriptor, or another hw_id */
-    UDSOTA_DL_BAD_LAYOUT,           /* 4: another partition layout */
-    UDSOTA_DL_BAD_DIAG_IDS,         /* 5: the image would answer on other CAN IDs */
-    UDSOTA_DL_NOT_NEWER,            /* 6: a release not newer than the running image, or a dev build older */
-    UDSOTA_DL_TOO_BIG,              /* 7: larger than the slot */
-    UDSOTA_DL_VERIFY_FAILED,        /* 8: hash or signature check failed */
-    UDSOTA_DL_SIG_FAILED,           /* 9: reserved */
-    UDSOTA_DL_WORKER_TIMEOUT,       /* 10: a flash job passed 90 s, or its session ended while it ran */
-    UDSOTA_DL_ABORTED,              /* 11: ended early: a session change, S3, the gate, an overrun, or iso14229 */
-    UDSOTA_DL_FLASH_ERROR,          /* 12: erase or write failed, or no inactive slot */
-    UDSOTA_DL_BAD_STREAM,           /* 13: a coded download did not inflate (or patch) to exactly the image */
-    UDSOTA_DL_NO_MEMORY,            /* 14: no memory for the inflater, or a delta's patch state */
-    UDSOTA_DL_BAD_BASE,             /* 15: a delta patch for another base than the running image, or no hash to tell */
-} udsota_reason_t;
 
 /* A download's progress, for a display. done and total are image bytes (0 outside ERASING and WRITING). */
 typedef enum {

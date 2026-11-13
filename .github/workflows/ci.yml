@@ -1,10 +1,13 @@
-# udsota: the host test with and without delta downloads and the fuzzer's replay with its delta seeds, the client's
-# tests and the release tool's, the client against udsota_lite_server, built with delta downloads, over the pipe and
-# on vcan0 (gcc and clang builds of each, and the fuzzer's libFuzzer build on clang), the CANDash example built with a
-# throwaway signing key for the ws43, the ws43b, the ws43 at -O2 and the ws43 with delta downloads, and what a release
-# of this commit would carry (release-assets.yml): the client's wheel and sdist and examples/esp32's image for esp32s3
-# and esp32. Every image build fails on a compiler warning, and every image must pass udsota's image rules
-# (tools/image_check.c) while a copy with a broken descriptor must not.
+# udsota: the host test with and without delta downloads and the fuzzer's replay with its delta seeds, the bootloader
+# core's tests (test_udsota_boot, test_udsota_boot_asserts, test_udsota_boot_pure, test_udsota_app) and the headers'
+# as C and C++ (test_headers_c, test_headers_cxx), the client's tests and the release tool's, the client against
+# udsota_lite_server, built with delta downloads, over the pipe and on vcan0, and against udsota_boot_server over the
+# pipe (test_e2e_boot.py), with gcc and clang builds of each and the fuzzer's libFuzzer build on clang; the bootloader
+# core cross-compiled for Cortex-M3 under a size gate; the CANDash example built with a throwaway signing key for the
+# ws43, the ws43b, the ws43 at -O2 and the ws43 with delta downloads; and what a release of this commit would carry
+# (release-assets.yml): the client's wheel and sdist and examples/esp32's image for esp32s3 and esp32. Every image
+# build fails on a compiler warning, and every image must pass udsota's image rules (tools/image_check.c) while a copy
+# with a broken descriptor must not.
 name: ci
 on: [push, pull_request]
 jobs:
@@ -19,12 +22,15 @@ jobs:
         run: cd iso14229 && sha256sum -c SHA256SUMS
       - name: The vendored detools files match detools/SHA256SUMS
         run: cd detools && sha256sum -c SHA256SUMS
-      - name: The host tests, test_udsota_delta and the fuzzer's delta seeds among them
+      - name: The host tests, test_udsota_delta, the fuzzer's delta seeds and the bootloader core's tests among them
         run: |
           cmake -S . -B build -DUDSOTA_FUZZ_LIBFUZZER="$FUZZ_LIBFUZZER"
           cmake --build build -j && ctest --test-dir build --output-on-failure
+          # CMake leaves test_headers_cxx out when it finds no C++ compiler; here it must be there.
+          ctest --test-dir build -N -R '^test_headers_cxx$' | grep -q 'Total Tests: 1'
         env:
           CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cc == 'clang' && 'clang++' || 'g++' }}
           FUZZ_LIBFUZZER: ${{ matrix.cc == 'clang' && 'ON' || 'OFF' }}
   client:
     runs-on: ubuntu-latest
@@ -50,12 +56,16 @@ jobs:
           python-version: "3.12"
       - run: |
           cmake -S . -B build -DUDSOTA_DELTA=ON
-          cmake --build build -j --target udsota_lite_server && test -x build/udsota_lite_server
+          cmake --build build -j --target udsota_lite_server udsota_boot_server
+          test -x build/udsota_lite_server && test -x build/udsota_boot_server
         env:
           CC: ${{ matrix.cc }}
-      - run: python -m pip install "./client[diff]" pytest && python -m pytest -q -rsx client/tests/test_e2e_lite.py
+      - run: |
+          python -m pip install "./client[diff]" pytest
+          python -m pytest -q -rsx client/tests/test_e2e_lite.py client/tests/test_e2e_boot.py
         env:
           UDSOTA_LITE_SERVER: ${{ github.workspace }}/build/udsota_lite_server
+          UDSOTA_BOOT_SERVER: ${{ github.workspace }}/build/udsota_boot_server
       - name: Set up vcan0
         run: |
           if ! sudo modprobe vcan; then
@@ -73,6 +83,26 @@ jobs:
         env:
           UDSOTA_LITE_SERVER: ${{ github.workspace }}/build/udsota_lite_server
           UDSOTA_VCAN: vcan0
+  boot-arm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the distribution's arm-none-eabi-gcc and newlib
+        run: sudo apt-get update && sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi
+      - name: The bootloader core compiles for Cortex-M3 with every warning an error, and its text stays under the gate
+        run: |
+          arm-none-eabi-gcc --version | head -n 1
+          arm-none-eabi-gcc -mcpu=cortex-m3 -mthumb -mfloat-abi=soft -std=c11 -Os -ffunction-sections -fdata-sections \
+            -Wall -Wextra -Werror -I. -Iboot -Iiso14229 -DUDS_SYS=UDS_SYS_CUSTOM -DISO_TP_FRAME_PADDING \
+            -DUDS_SERVER_RECV_BUF_SIZE=1026 -DUDS_SERVER_SEND_BUF_SIZE=64 -DISO_TP_DEFAULT_BLOCK_SIZE=8 \
+            -DISO_TP_DEFAULT_ST_MIN_US=0 -DISO_TP_DEFAULT_RESPONSE_TIMEOUT_US=1000000 -DNDEBUG \
+            -c boot/udsota_boot.c -o udsota_boot.o
+          arm-none-eabi-size udsota_boot.o
+          # The gate is the 2,879 bytes of text measured with arm-none-eabi-gcc 14.3.1 (boot/README.md, "Size") plus
+          # about 20 percent. The distribution's compiler is another release, which lays the code out differently, so
+          # the gate catches the core growing, not a few bytes' change.
+          text=$(arm-none-eabi-size udsota_boot.o | awk 'NR == 2 { print $1 }')
+          [ "$text" -le 3456 ] || { echo "udsota_boot.o has $text bytes of text, over the gate of 3456"; exit 1; }
   esp32:
     runs-on: ubuntu-latest
     container: espressif/idf:v6.1
