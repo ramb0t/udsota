@@ -14,8 +14,8 @@ typedef struct {
 
 /* The valid app is the boot check's result at udsota_boot_init (udsota_boot.h). Afterwards it is the core's flag: a
  * download's first erase clears it and a passing FF01 sets it, and the boot check runs again only at the next
- * udsota_boot_init. F1F0's running state (3 or 0), F189 and F1F3 (0.0.0 and 32 zero bytes without it) and both
- * session exits use the flag. */
+ * udsota_boot_init. F1F0's running state (3 or 0), F189 and F1F3 (0.0.0 and 32 zero bytes without it; 0.0.0 too for
+ * an app stamped with no version) and both session exits use the flag. */
 
 /* The boot rules as a pure function. udsota_boot_init calls it with the inputs as read. Both session exits call it
  * with handover_ok false, cause OTHER, app_valid the core's flag and count_word read again from its keep word.

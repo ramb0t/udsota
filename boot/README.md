@@ -2,7 +2,7 @@
 
 A resident bootloader core for a microcontroller unit with one app slot, so that the udsota client updates it over CAN in the bootloader flow ([docs/wire.md](../docs/wire.md#bootloader-flow)). It is one C11 file, `udsota_boot.c`, on unmodified iso14229, with no malloc and no RTOS; the app's side is the header-only `udsota_app.h` at the repository root.
 
-It is experimental: outside udsota's 1.0 promise until a product has run on it in the field.
+It is experimental: outside udsota's 1.0 promise until a product has run on it in the field. So far it has run on one STM32F1 unit on a bench.
 
 ## What a product supplies
 
@@ -22,9 +22,9 @@ Compile `udsota_boot.c` and `iso14229/iso14229.c` as they are, with `-I` for the
 
 The core never answers 0x78, so every call into it but `udsota_boot_init`, port calls included, must end within about 100 ms, inside a tester's 150 ms P2. Two budgets decide which parts that allows.
 
-A `36` costs the erase units it starts times the erase time, plus its bytes over the write unit times the program time, plus a compare of the block. On an STM32F1 with 1 KB pages, a block of 1024 data bytes (`UDS_SERVER_RECV_BUF_SIZE` 1026) starts one page (20 to 40 ms to erase) and programs 512 half-words (40 to 70 µs each): under 80 ms. A smaller `UDS_SERVER_RECV_BUF_SIZE` shortens it.
+A `36` costs the erase units it starts times the erase time, plus its bytes over the write unit times the program time, plus a compare of the block. On an STM32F1 with 1 KB pages, a block of 1024 data bytes (`UDS_SERVER_RECV_BUF_SIZE` 1026) starts one page (20 to 40 ms to erase) and programs 512 half-words (40 to 70 µs each): under 80 ms. A smaller `UDS_SERVER_RECV_BUF_SIZE` shortens it. Measured on an STM32F1 with 2 KB pages, such a block took 32 to 54 ms from its last frame to its answer, 47 at the median, and a download ran at about 4.7 KB a second at any bit rate, since flash and STmin set the pace.
 
-The boot check and FF01 cost the CRC's cycles a byte times `slot_size`, the largest image, at the port's clock. The core's loop is estimated, not measured, at 17 to 19 cycles a byte on a Cortex-M3 at 72 MHz with two flash wait states, so a 128 KB slot takes about 35 ms; at an 8 MHz reset clock it would take about 300 ms. The bootloader must therefore run from its fast clock.
+The boot check and FF01 cost the CRC's cycles a byte times `slot_size`, the largest image, at the port's clock. Measured on a Cortex-M3 at 72 MHz with two flash wait states, the core's loop takes 0.35 µs a byte, about 25 cycles, so a 128 KB slot takes about 45 ms and 100 ms covers about 280 KB; at an 8 MHz reset clock a 128 KB slot would take several hundred milliseconds. The bootloader must therefore run from its fast clock.
 
 That admits parts that erase in pages of a few KB within tens of milliseconds and program a word in tens of microseconds: STM32F0, F1, F3, G0, G4 and L4, and their like from other vendors. It rules out parts that erase in sectors of 16 KB or more, which take hundreds of milliseconds to seconds, STM32F2, F4, F7 and H7 among them: a `36` that starts such a sector cannot answer in time, and the core has no start-and-poll erase.
 
@@ -48,7 +48,7 @@ With arm-none-eabi-gcc 14.3.1 for Cortex-M3, `-Os -ffunction-sections -fdata-sec
 
 The app's one include path is the repository root, and it compiles no udsota source. It places its header once with `UDSOTA_IMAGE_HEADER(hw_id, layout_id, request_id, response_id, "version", "project")` from `udsota_image.h`. Its linker script puts the section `.udsota_image_header` at `image_header_offset` into the image, past the vector table, with `KEEP`, and ends the image on a 4-byte boundary. After the build, `udsota stamp app.bin`, or `udsota.image.stamp(data, header_offset)` from a post-build script, writes the image's length, ID and CRC. The stamped `.bin` is what a debugger loads and the client sends: an unstamped image fails the boot check, and the client refuses it.
 
-The app then keeps the duties `udsota_app.h` lists, with its helpers for the two answers, the handover and the healthy mark. If its start-up code points VTOR at the start of flash, it points VTOR at its own vector table again; a part with no VTOR, such as a Cortex-M0, copies its vectors to RAM and remaps RAM to address 0 instead.
+The app then keeps the duties `udsota_app.h` lists, with its helpers for the two answers, the handover and the healthy mark. One of them is easy to break by accident: nothing before the healthy mark may wait without a limit, the print path included. A `printf` that mirrors to the debug trace port with CMSIS's `ITM_SendChar` waits for ever when a debugger has left the port enabled and nothing drains it; behind the watchdog that is a reset at every start, and the bootloader holds the unit. If its start-up code points VTOR at the start of flash, it points VTOR at its own vector table again; a part with no VTOR, such as a Cortex-M0, copies its vectors to RAM and remaps RAM to address 0 instead.
 
 ## Tests and the host process
 

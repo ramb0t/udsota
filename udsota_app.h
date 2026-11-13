@@ -3,13 +3,15 @@
  * compiles no udsota source. It includes udsota_wire.h, udsota_image.h and <stdbool.h>, never iso14229 or
  * udsota_boot.h, keeps no state and calls no library function, so an interrupt may use any of it.
  *
- * The app answers exactly two requests, and only on 11-bit frames on its request ID, on any bus:
+ * The app answers exactly two requests, and only on 11-bit data frames on its request ID, on any bus:
  *  - 10 02, the handover;
  *  - 22 F1F4, the running image's ID prefix. The app answers it only once it is healthy.
  * It is silent to everything else. Its obligations:
  *  - reload the watchdog the bootloader started, which runs from the jump. Its period is nominal, and a watchdog's own
  *    clock can run well fast of nominal (an STM32F1's nominal 2 s is 1.33 to 2.67 s, boot/README.md), so reload well
  *    inside the shortest period the part's data allows;
+ *  - wait for nothing without a limit before the healthy mark, the print path included: a hang there is a watchdog
+ *    reset at every start, and the bootloader holds the unit after cfg.hold_after_starts of them;
  *  - clear the start count before any deliberate reset or standby;
  *  - never reset the store that holds the keep words. */
 #pragma once
