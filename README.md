@@ -65,6 +65,8 @@ flowchart TB
 
 An update runs `10 02`, `27 03/04`, `34`, `36`…, `37`, `31 01 FF01` (verify) and `31 01 F001` (activate; the device restarts), then `10 03` and `31 01 F002` (confirm). `udsota flash` in [`client/`](client/README.md) does all of it. The first block is held until its product, board, partition layout, CAN IDs, version and chip match this device, and only then does the slot start to fill. Blocks carry the image as it is (DFI 00) or as raw DEFLATE (DFI 10), which the ESP32's ROM inflates. A build that defines `UDSOTA_DELTA=1` and sets `cfg.allow_delta` also takes a delta (DFI 30): a patch from the running image, from which the device rebuilds the new one, so a small change costs kilobytes on the bus; the rebuilt image gets the same checks as any other. Flash work runs on a worker task while iso14229 answers 0x78, and each block erases only the sectors it writes, so the erase is spread over the download. With `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`, an image that is never confirmed rolls back at the next reset. The [wire reference](docs/wire.md) has every byte, and the sequence for a flasher other than the client.
 
+A microcontroller with one app slot is updated differently: its resident bootloader is its UDS server, and the client drives it with `[update] flow = "bootloader"`. [`boot/`](boot/README.md) is such a bootloader's core, on unmodified iso14229, which a product completes with its configuration and a port of a few flash, CAN and reset functions. It is experimental, outside the 1.0 promise until a product has run on it.
+
 ## Adding it to a project
 
 [`examples/esp32`](examples/esp32/README.md) is the smallest complete app, and [`examples/candash_ws43`](examples/candash_ws43/README.md) a product's. Copy or link this directory into your project's `components/` as `udsota`, and add `udsota` to `main`'s requirements. The component builds iso14229 from `iso14229/` with `-fwrapv` (see Known limits), so an app with its own copy drops it. Then:
@@ -112,22 +114,25 @@ udsota never changes iso14229's code. Where iso14229 has no call for what an upd
 
 | Path | What it is |
 |---|---|
-| `udsota.c`, `udsota.h`, `udsota_wire.h` | The updater, iso14229's events and the ESP-IDF platform. `udsota.h` ends with the platform functions a port to another MCU would supply; `udsota_wire.h`, which it includes, is the wire contract with no `#include` of its own, for a bootloader or tester to take alone |
+| `udsota.c`, `udsota.h`, `udsota_wire.h`, `udsota_image.h` | The updater, iso14229's events and the ESP-IDF platform. `udsota.h` ends with the platform functions a port to another MCU would supply; `udsota_wire.h`, which it includes, is the wire contract with no `#include` of its own, for a bootloader or tester to take alone, and `udsota_image.h` the image descriptor and the bare header as C types |
+| `udsota_app.h` | The app's side of a [`boot/`](boot/README.md) bootloader, header-only: the handover, the F1F4 answer and the healthy mark |
 | `iso14229/` | iso14229, vendored unmodified, with its MIT licence and `SHA256SUMS`, which CI checks; its commit is in [THIRD_PARTY.md](THIRD_PARTY.md) |
 | `detools/` | detools' C library, vendored unmodified, with its BSD-2-Clause licence and `SHA256SUMS`, which CI checks, compiled only in a build that defines `UDSOTA_DELTA=1`; its tag is in [THIRD_PARTY.md](THIRD_PARTY.md) |
+| [`boot/`](boot/README.md) | The bootloader core for single-slot units (`udsota_boot.c`, `udsota_boot.h`) and its porting guide; experimental |
 | `CMakeLists.txt` | The ESP-IDF component, or on a host the tests |
 | [`examples/esp32`](examples/esp32/README.md) | The smallest app, for any ESP32 with TWAI, with the client's `example` profile's identity; its image is the one a release carries |
 | [`examples/candash_ws43`](examples/candash_ws43/README.md) | An app on the CANDash ws43 or ws43b (ESP32-S3) with CANDash's identity, so updates go both ways |
 | `test/test_udsota.c` | The host test: updates through iso14229's mock transport into a RAM slot, plain and raw DEFLATE, under ASan and UBSan; built again as `test_udsota_delta`, it also runs delta downloads from a running image on the fixtures `tools/make_delta_fixtures.py` writes |
 | `test/fuzz_udsota.c` | The fuzzer: CAN frames through iso14229's isotp-c into udsota built with delta downloads (`fuzz_udsota_nodelta` without), its seeds, their mutants, random programs and mutants of a delta's patch, the same in every ctest run, under ASan and UBSan; with `-DUDSOTA_FUZZ_LIBFUZZER=ON` (clang) also a libFuzzer target |
-| `test/e2e/` | `udsota_lite_server`: udsota and iso14229 as a Linux process with RAM A/B slots, for the client's end-to-end tests over a frame pipe or on a vcan; `-DUDSOTA_DELTA=ON` builds it with delta downloads |
-| `tools/` | `release.py` ([RELEASING.md](RELEASING.md)); `image_check.c`, udsota's image rules run on a built image, which CI runs on every example image; and `make_delta_fixtures.py`, which writes the delta tests' fixtures |
+| `test/test_udsota_boot.c`, `test/test_udsota_boot_pure.c`, `test/test_udsota_app.c`, `test/boot/` | The bootloader core's tests: frame by frame through a fake port, its pure functions, and the app's side, under ASan and UBSan |
+| `test/e2e/` | `udsota_lite_server`: udsota and iso14229 as a Linux process with RAM A/B slots, for the client's end-to-end tests over a frame pipe or on a vcan; `-DUDSOTA_DELTA=ON` builds it with delta downloads. `udsota_boot_server`: the bootloader core and a stand-in app as a Linux process, over a frame pipe |
+| `tools/` | `release.py` ([RELEASING.md](RELEASING.md)); `image_check.c`, udsota's image rules run on a built image, which CI runs on every example image; and `make_delta_fixtures.py` and `make_boot_fixtures.py`, which write the delta tests' and the bootloader core's fixtures |
 | [`client/`](client/README.md) | The `udsota` command-line tool, for Linux with SocketCAN; it also updates units still on a 0.14.x server |
 | [`docs/wire.md`](docs/wire.md) | The wire reference: services, DIDs, routines, NRCs, reasons, timing, the descriptor, the 0x27 keys and flashing without the client |
 | [`MIGRATING.md`](MIGRATING.md) | From udsota 0.14's API, or from lite-v0.1.0, to this one |
 
 ```sh
-cmake -S . -B build && cmake --build build -j && ctest --test-dir build   # the host test and the fuzzer; also builds udsota_lite_server
+cmake -S . -B build && cmake --build build -j && ctest --test-dir build   # the host tests and the fuzzer; also builds both servers
 pip install "./client[diff]" pytest && python -m pytest client/tests      # the client's tests, and the end-to-end tests
 ```
 

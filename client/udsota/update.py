@@ -22,7 +22,7 @@ BOOT_POLL_S = 1.0
 CONFIRM_RETRY_S = 2.0    # between ConfirmImage tries; Uds's 3E 00 keepalive holds the extended session meanwhile
 CONFIRM_TIMEOUT_S = 120.0   # a product's soak plus its health check, with margin
 WAIT_RETRY_S = 0.05      # flash --wait-for-unit: the next 10 02 at most this long after the last went unanswered,
-                         # so that one lands in a bootloader's power-up window (about 200 ms)
+                         # so that one lands in a bootloader's power-up window (100 ms in udsota's examples)
 WAIT_SETTLE_S = 0.25     # then the answers to earlier 10 02s, which a unit sends a P2 (50 ms) apart, are passed
 WAIT_DRAIN_S = 2.0       # over until none comes for WAIT_SETTLE_S, or for WAIT_DRAIN_S at most
 # flash's diff_format (--diff-format): the delta DFIs it may try; and each delta DFI's name in the log.

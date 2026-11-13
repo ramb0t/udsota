@@ -17,7 +17,7 @@ slot_size = 0x1E0000                  # largest image in bytes: examples/esp32's
 #                                     # --compress-auto, which falls back to uncompressed; default "none"
 # format = "bare"                     # an image that is not an ESP-IDF app, identified by udsota's bare header
 #                                     # (docs/wire.md); default "esp-idf". Delta downloads need "esp-idf"
-# header_offset = 0x200               # format "bare" only, and required there: the header's offset in the file;
+# header_offset = 0x100               # format "bare" only, and required there: the header's offset in the file;
 #                                     # `udsota stamp` fills the header in after the build
 
 [board]

@@ -37,7 +37,7 @@ STATUS_FLAGS = {0x01: "signature-checked", 0x02: "boot-ignored-config", STATUS_B
 DL_REASONS = ("DL_OK", "DL_BAD_HEADER", "DL_BAD_PROJECT", "DL_BAD_BOARD", "DL_BAD_LAYOUT",
               "DL_BAD_DIAG_IDS", "DL_NOT_NEWER", "DL_TOO_BIG", "DL_VERIFY_FAILED", "DL_SIG_FAILED",
               "DL_WORKER_TIMEOUT", "DL_ABORTED", "DL_FLASH_ERROR", "DL_BAD_STREAM",
-              "DL_NO_MEMORY", "DL_BAD_BASE")   # udsota_reason_t (udsota.h)
+              "DL_NO_MEMORY", "DL_BAD_BASE")   # udsota_reason_t (udsota_wire.h)
 # 9 (DL_SIG_FAILED) is reserved and not emitted by IDF v6.1: esp_ota_end returns one code for a hash or a
 # signature failure, so FF01 reports both as 8 (DL_VERIFY_FAILED).
 COUNTER_NAMES = ("seq_errors", "ncr_timeouts", "repeated_blocks", "aborts", "withheld_fcs",
