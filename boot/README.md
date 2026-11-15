@@ -12,6 +12,8 @@ The board also resets every CAN controller it owns before `udsota_boot_init`. A 
 
 A port may poll its CAN controllers from the main loop instead of taking interrupts: each controller's hardware filter accepts only the request ID, the loop reads the controllers and calls `udsota_boot_rx`, and the controllers' own receive buffers are the queue. Nothing arrives during a flash erase, since a tester sends its next frame only after an answer or a flow control. Where the hardware filters, polling is the simpler choice: there is no interrupt to set up, and none for `start_app` to undo. Keep the loop's round shorter than a burst of consecutive frames takes to fill a controller's buffer, or ask for an STmin (`ISO_TP_DEFAULT_ST_MIN_US`) that spaces them.
 
+A product that accepts updates on only some of its buses has `udsota_boot_port_can_start` return false for the others, so the bootloader never listens there, and has its app classify frames only from the buses it allows. The two must agree: an app that hands over on a bus the bootloader will not start gets no `50 02`, and the bootloader goes on to its next boot rule.
+
 F180 answers the product's `boot_version`, then `udsota/` and the udsota release the core was built from. That release changes only when udsota cuts one, so a core built from a commit between releases names the last release: only a release tag names a core, and a product that ships pins one.
 
 ## Building
