@@ -442,9 +442,8 @@ static UDSErr_t read_did(UDSServer_t *srv, const UDSRDBIArgs_t *a)
         break;
     case UDSOTA_DID_SW_VERSION:
         p = installed(UDSOTA_BARE_VERSION_OFFSET);
-        if (p != NULL) {
-            n = str_len((const char *)p, 32u);
-        } else {
+        n = p != NULL ? str_len((const char *)p, 32u) : 0u;
+        if (n == 0u) {                                   /* no valid app, or one stamped with no version */
             p = (const uint8_t *)"0.0.0";
             n = 5u;
         }

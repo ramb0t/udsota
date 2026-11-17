@@ -536,6 +536,12 @@ static void test_f180_and_a_full_version_field(void)
     CHECK(ASK(0x22, 0xF1, 0x89) && g_len == 35 && g_ans[3] == 'v' && g_ans[34] == 'v');
     CHECK(ASK(0x22, 0xF1, 0x80) && g_len == 3 + 9 + 8 + (int)strlen(UDSOTA_VERSION) &&
           memcmp(g_ans + 3, "2.3.4-rc1 udsota/", 17u) == 0);
+    install_app(0x25);                                           /* a valid app stamped with no version */
+    memset(fake.slot + HDR + UDSOTA_BARE_HDR_DESC_OFFSET + UDSOTA_BARE_VERSION_OFFSET, 0, 32u);
+    restamp(fake.slot, 2052u);
+    handover_to(1u);
+    CHECK(boot(OTHER) == HANDOVER && answer(20u));
+    CHECK(status_of() == 0x0300 && sw_version_is("0.0.0"));
 }
 
 static void test_request_download_refusals(void)
