@@ -4,6 +4,8 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-11-17
+
 ### Added
 
 - Client: `[image] format = "bare"` takes images that are not ESP-IDF apps. Each carries udsota's 224-byte bare header at the profile's `header_offset` ([docs/wire.md](docs/wire.md#image-descriptor)): a magic, a version, the image's length and CRC-32, the descriptor block with the image's version, project and image ID (a SHA-256 of the image), and a signature field reserved for later. `udsota stamp FILE` fills in the length, image ID and CRC after the build, in place or to `--out`, and checks the result against the profile; a post-build script can call `udsota.image.stamp(data, header_offset)` instead. `flash` and `pack` refuse an image that is not stamped or was changed after stamping, and check its descriptor as an ESP-IDF image's, needing `desc_version` 1 or later. Plain and compressed downloads and `pack` take bare images, and delta downloads refuse them. `udsota_wire.h` names the header's offsets (`UDSOTA_BARE_HDR_*`) and the block's (`UDSOTA_BARE_*`), and the flags a reader must know to take an image (`UDSOTA_BARE_HDR_FLAGS_MUST`), the mask the client refuses a high-byte flag with. `format = "esp-idf"` stays the default.
