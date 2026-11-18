@@ -696,7 +696,7 @@ static void server_init(void)
 }
 
 /* Listening: the open buses started, one that does not start being absent, every other bus stopped, and iso14229 from
- * scratch with no lock and no window. What is installed now says which buses are open. */
+ * scratch with no lock; init opens the power-up window after it. What is installed now says which buses are open. */
 static void listen(void)
 {
     for (uint8_t b = 1; b <= B.cfg->buses; b++) {
@@ -846,7 +846,7 @@ static bool tester_frame(const uint8_t *d, uint8_t len)
            ((d[1] == 0x10u && (d[2] & 0x7Fu) == UDS_LEV_DS_PRGS) || (d[1] == 0x3Eu && (d[2] & 0x7Fu) == 0u));
 }
 
-void udsota_boot_rx(uint8_t bus,uint32_t id, const uint8_t *data, uint8_t len)
+void udsota_boot_rx(uint8_t bus, uint32_t id, const uint8_t *data, uint8_t len)
 {
     if (B.state == STOPPED || B.state == STARTING || bus == 0u || bus > B.cfg->buses || len > 8u ||
         id != B.cfg->request_id) {
