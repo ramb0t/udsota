@@ -31,7 +31,7 @@ class NoResponse(UpdateFailed):
     pass
 
 
-# The ISO-TP send failed twice (no FC within N_Bs, or no echo): the server ended the transfer.
+# The ISO-TP send failed twice (no FC within N_Bs, which means the server ended the transfer, or another OS error).
 # Not a NoResponse, so the 0x36, 0x37 and FF01 resends don't add a third send.
 class SendFailed(UpdateFailed):
     pass

@@ -1,4 +1,5 @@
 """The UDS requests the client makes, over a udsoncan Client (NRC 0x78 is handled inside udsoncan)."""
+import errno
 import time
 
 from udsoncan import Request, services
@@ -177,7 +178,8 @@ class Uds:
         return n
 
     # send_request, resent once after an ISO-TP send error (OSError: no FC within N_Bs, e.g. one a rate cap
-    # dropped). Safe: without the FC the server never got the request, and a seed stays valid 30 s.
+    # dropped). Safe: without the FC the server never got the request, and a seed stays valid 30 s. A second error
+    # is SendFailed, naming the server only for ECOMM (no FC) and giving the OS's own text for any other errno.
     def send_resending(self, req):
         try:
             return self.client.send_request(req)
@@ -186,8 +188,10 @@ class Uds:
         try:
             return self.client.send_request(req)
         except OSError as e:
-            raise SendFailed("service 0x%02X: the server ended the transfer (no flow control)"
-                             % req.service.request_id()) from e
+            sid = req.service.request_id()
+            if e.errno != errno.ECOMM:     # not the kernel's "no flow control": the PC's side, as its own text says
+                raise SendFailed("service 0x%02X: the send failed: %s" % (sid, e.strerror or e)) from e
+            raise SendFailed("service 0x%02X: the server ended the transfer (no flow control)" % sid) from e
 
     # DiagnosticSessionControl.
     def session(self, n):

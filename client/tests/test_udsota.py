@@ -1739,6 +1739,25 @@ def test_second_send_error_stops_with_no_flow_control():
     assert d.no_fc[(0x27, 4)] == 0 and (0x34, None) not in d.log
 
 
+# Check a send error that is not ECOMM (the PC's interface is down, or its queue is full) is not reported as the server
+# ending the transfer: it is resent once as any, and the second one's message carries the OS's own text.
+@pytest.mark.parametrize("code", [errno.ENETDOWN, errno.ENOBUFS])
+def test_send_error_other_than_ecomm_gives_the_os_text(code):
+    class InterfaceDown(FakeServer):
+        # The kernel refuses the 27 04 key's send, whatever the server would answer.
+        def handle(self, req):
+            if req[:2] == b"\x27\x04":
+                self.sends = getattr(self, "sends", 0) + 1
+                raise OSError(code, os.strerror(code))
+            return super().handle(req)
+
+    d = InterfaceDown()
+    with pytest.raises(errors.SendFailed) as e:
+        run_flash(d)
+    assert str(e.value) == "service 0x27: the send failed: %s" % os.strerror(code)
+    assert d.sends == 2 and e.value.exit_code == 1 and not isinstance(e.value, errors.NoResponse)
+
+
 # Check a send error on a 0x36 block is resent inside the request, so send_block adds no third send, and the error
 # names the block and F1F1's reason.
 def test_send_errors_on_a_block_send_it_twice_only():
