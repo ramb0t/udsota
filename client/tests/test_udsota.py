@@ -597,7 +597,7 @@ def uds_for(server, ft, monitor=None):
 def run_flash(server, image=None, prof=P, master=MASTER, log=lambda *a: None, **kw):
     ft, prerolls = FakeTime(), []
     rc = update.flash(uds_for(server, ft), prof, make_image() if image is None else image, master,
-                      preroll=lambda: prerolls.append(1), sleep=ft.sleep, clock=ft.clock, log=log, **kw)
+                      preroll=lambda: prerolls.append(1), log=log, **kw)
     return rc, ft, len(prerolls)
 
 
@@ -1795,6 +1795,7 @@ def test_wait_for_image_polls_through_send_errors():
     class Rebooting:
         # read_did fails the way a rebooting server does, then answers the new sha.
         def __init__(self):
+            self.sleep, self.clock = ft.sleep, ft.clock
             self.errors = [errors.SendFailed("send failed"), errors.NoResponse("no answer"),
                            errors.SendFailed("send failed")]
 
@@ -1808,7 +1809,7 @@ def test_wait_for_image_polls_through_send_errors():
         def restarted(self):
             pass
 
-    update.wait_for_image(Rebooting(), NEW_SHA, lambda: None, sleep=ft.sleep, clock=ft.clock)
+    update.wait_for_image(Rebooting(), NEW_SHA, lambda: None)
     assert ft.sleeps == [update.REBOOT_WAIT_S] + [update.BOOT_POLL_S] * 3
 
 
@@ -1833,6 +1834,7 @@ def test_failed_preroll_is_a_failed_poll_in_both_waits():
     # A restarting server: it answers the new sha only after three polls.
     class Rebooting:
         def __init__(self):
+            self.sleep, self.clock = ft.sleep, ft.clock
             self.polls = 0
 
         # Silent for two polls, then the sha F1F3 and the prefix F1F4 give.
@@ -1849,11 +1851,10 @@ def test_failed_preroll_is_a_failed_poll_in_both_waits():
     down = [can.CanOperationError("Failed to transmit: [Errno 105] No buffer space available"),
             OSError(errno.ENOBUFS, os.strerror(errno.ENOBUFS))]
     preroll = failing_preroll(*down)
-    update.wait_for_image(Rebooting(), NEW_SHA, preroll, sleep=ft.sleep, clock=ft.clock)
+    update.wait_for_image(Rebooting(), NEW_SHA, preroll)
     assert len(preroll.sent) == 1
     preroll = failing_preroll(*down)
-    assert update.wait_for_start(Rebooting(), PBL, NEW_SHA, preroll, sleep=ft.sleep, clock=ft.clock,
-                                 log=lambda *a: None) == 0
+    assert update.wait_for_start(Rebooting(), PBL, NEW_SHA, preroll, log=lambda *a: None) == 0
     assert len(preroll.sent) == 1
 
     # Never sendable, never answered: the deadline's error, not the pre-roll's.
@@ -1865,9 +1866,9 @@ def test_failed_preroll_is_a_failed_poll_in_both_waits():
             raise errors.NoResponse("no answer")
 
     with pytest.raises(errors.UpdateFailed, match="^the server did not answer within 60 s of ActivateImage$"):
-        update.wait_for_image(Silent(), NEW_SHA, never, sleep=ft.sleep, clock=ft.clock)
+        update.wait_for_image(Silent(), NEW_SHA, never)
     with pytest.raises(errors.UpdateFailed, match="^nothing answered F1F4 in 60 s"):
-        update.wait_for_start(Silent(), PBL, NEW_SHA, never, sleep=ft.sleep, clock=ft.clock, log=lambda *a: None)
+        update.wait_for_start(Silent(), PBL, NEW_SHA, never, log=lambda *a: None)
 
 
 # Check NRC 0x21 is retried after the first backoff step.
@@ -2136,10 +2137,10 @@ def test_activate_failure_reset_refused_stops():
 # Check confirm retries 0x22 then confirms, and does nothing for a VALID image.
 def test_confirm_command():
     ft, d = FakeTime(), FakeServer(running_state=2)
-    assert update.confirm_cmd(uds_for(d, ft), sleep=ft.sleep, clock=ft.clock, log=lambda *a: None) == 0
+    assert update.confirm_cmd(uds_for(d, ft), log=lambda *a: None) == 0
     assert d.log == [(0x22, 0xF1F0)] + CONFIRM
     ft, d = FakeTime(), FakeServer(running_state=3)
-    assert update.confirm_cmd(uds_for(d, ft), sleep=ft.sleep, clock=ft.clock, log=lambda *a: None) == 0
+    assert update.confirm_cmd(uds_for(d, ft), log=lambda *a: None) == 0
     assert d.log == [(0x22, 0xF1F0)]
 
 
@@ -2147,7 +2148,7 @@ def test_confirm_command():
 def test_confirm_gives_up_after_timeout():
     ft, d = FakeTime(), FakeServer(running_state=2, confirm_refusals=10 ** 6)
     with pytest.raises(errors.Nrc):
-        update.confirm_cmd(uds_for(d, ft), sleep=ft.sleep, clock=ft.clock, log=lambda *a: None)
+        update.confirm_cmd(uds_for(d, ft), log=lambda *a: None)
     assert ft.t >= update.CONFIRM_TIMEOUT_S
 
 
@@ -2175,7 +2176,7 @@ class LosesConfirm(FakeServer):
 @pytest.mark.parametrize("lost", ["request", "answer"])
 def test_confirm_resends_a_lost_confirm_image(lost):
     ft, d = FakeTime(), LosesConfirm(lost)
-    assert update.confirm_cmd(uds_for(d, ft), sleep=ft.sleep, clock=ft.clock, log=lambda *a: None) == 0
+    assert update.confirm_cmd(uds_for(d, ft), log=lambda *a: None) == 0
     assert d.log.count((0x31, 0xF002)) == 2 and d.running_state == 3 and ft.sleeps == [update.CONFIRM_RETRY_S]
     rc, _, _ = run_flash(LosesConfirm(lost, sha=NEW_SHA))
     assert rc == 0
@@ -2186,7 +2187,7 @@ def test_confirm_resends_a_lost_confirm_image(lost):
 def test_confirm_with_no_answer_says_the_image_is_unconfirmed():
     ft, d = FakeTime(), LosesConfirm("request", n=10 ** 6)
     with pytest.raises(errors.NoResponse) as e:
-        update.confirm(uds_for(d, ft), sleep=ft.sleep, clock=ft.clock, log=lambda *a: None)
+        update.confirm(uds_for(d, ft), log=lambda *a: None)
     assert ft.t >= update.CONFIRM_TIMEOUT_S and d.running_state == 2
     assert "the new image is not confirmed" in str(e.value) and '"udsota confirm"' in str(e.value)
     assert "rolls back" in str(e.value)
@@ -2211,11 +2212,11 @@ class FailsConfirmSend(FakeServer):
 @pytest.mark.parametrize("err", [errno.ENOBUFS, errno.ECOMM])
 def test_confirm_resends_a_failed_send(err):
     ft, d = FakeTime(), FailsConfirmSend(err, 2)
-    assert update.confirm(uds_for(d, ft), sleep=ft.sleep, clock=ft.clock, log=lambda *a: None) == 0
+    assert update.confirm(uds_for(d, ft), log=lambda *a: None) == 0
     assert d.running_state == 3
     ft, d = FakeTime(), FailsConfirmSend(err, 10 ** 6)
     with pytest.raises(errors.UpdateFailed) as e:
-        update.confirm(uds_for(d, ft), sleep=ft.sleep, clock=ft.clock, log=lambda *a: None)
+        update.confirm(uds_for(d, ft), log=lambda *a: None)
     assert ft.t >= update.CONFIRM_TIMEOUT_S and d.running_state == 2
     assert "the new image is not confirmed" in str(e.value) and '"udsota confirm"' in str(e.value)
 
@@ -2230,7 +2231,7 @@ def test_confirm_refused_after_a_lost_one_says_the_image_is_unconfirmed():
             return super().s31(req, rid)
     ft, d = FakeTime(), LapsesS3("request")
     with pytest.raises(errors.Nrc) as e:
-        update.confirm(uds_for(d, ft), sleep=ft.sleep, clock=ft.clock, log=lambda *a: None)
+        update.confirm(uds_for(d, ft), log=lambda *a: None)
     assert e.value.code == 0x7F and d.running_state == 2
     assert "the new image is not confirmed" in str(e.value) and '"udsota confirm"' in str(e.value)
 
@@ -2346,7 +2347,7 @@ def test_fake_s3_on(s3_on, session):
 # goes first whenever the last is over KEEPALIVE_S old (every other try, 2 s apart in fake time). A flash completes.
 def test_confirm_keeps_the_session_where_only_10_and_3e_restart_s3():
     ft, d = FakeTime(), FakeServer(running_state=2, confirm_refusals=5, s3_on=(0x10, 0x3E))
-    assert update.confirm_cmd(uds_for(d, ft), sleep=ft.sleep, clock=ft.clock, log=lambda *a: None) == 0
+    assert update.confirm_cmd(uds_for(d, ft), log=lambda *a: None) == 0
     assert d.log == ([(0x22, 0xF1F0), (0x10, 3), (0x31, 0xF002)] + [(0x31, 0xF002), (0x3E, 0), (0x31, 0xF002)] * 2
                      + [(0x31, 0xF002), (0x22, 0xF1F0)])
     assert d.running_state == 3
@@ -2466,8 +2467,7 @@ class SlowVerifyLostActivate(SlowVerify, LostActivateRequest):
 def flash_on(d):
     ft, lines = FakeTime(), []
     d.ft = ft
-    rc = update.flash(uds_for(d, ft), P, make_image(), MASTER, preroll=lambda: None, sleep=ft.sleep,
-                      clock=ft.clock, log=lines.append)
+    rc = update.flash(uds_for(d, ft), P, make_image(), MASTER, preroll=lambda: None, log=lines.append)
     return rc, lines
 
 
@@ -2520,8 +2520,8 @@ def test_unanswered_keepalive_is_not_a_commit_that_may_have_landed():
     writes = config.parse_writes(G, ["mode=2", "tag=ccdd"], True, True)
     msg = ""
     try:
-        config.config_set(uds_for(d, ft), G, writes, MASTER, commit=True, reset=True, sleep=ft.sleep,
-                          clock=ft.clock, log=lambda *a: None)
+        config.config_set(uds_for(d, ft), G, writes, MASTER, commit=True, reset=True,
+                          log=lambda *a: None)
     except errors.UpdateFailed as e:
         msg = str(e)
     assert msg == "" and d.log.count((0x31, CFG_COMMIT_RID)) == 2, msg
@@ -2864,7 +2864,7 @@ def test_busy_block_after_a_late_76_is_retried(s3_on, frames):
     assert d.log.count((0x36, 2)) == 2 and d.writes == 2 and d.session == 2
     ft, d = FakeTime(), FakeServer(s3_on=s3_on)
     first_send_of_block_2(d, lambda req, bsc, real: list(frames))
-    rc = update.flash(timed_uds(d, ft), P, make_image(), MASTER, sleep=ft.sleep, clock=ft.clock, log=lambda *a: None)
+    rc = update.flash(timed_uds(d, ft), P, make_image(), MASTER, log=lambda *a: None)
     assert rc == 0 and d.sha == NEW_SHA
 
 
@@ -3520,7 +3520,7 @@ def run_config_set(server, args, prof=C, master=MASTER, commit=True, reset=True)
     ft, lines = FakeTime(), []
     writes = config.parse_writes(prof, args, commit, reset)
     rc = config.config_set(uds_for(server, ft), prof, writes, master, commit=commit, reset=reset,
-                           sleep=ft.sleep, clock=ft.clock, log=lines.append)
+                           log=lines.append)
     return rc, lines, ft
 
 
@@ -3983,6 +3983,9 @@ def test_boot_wait_timeouts_name_their_cause():
 
     # A server that never answers again.
     class Gone:
+        def __init__(self):
+            self.sleep, self.clock = ft.sleep, ft.clock
+
         # Every read times out.
         def read_did(self, did):
             raise errors.NoResponse("no answer")
@@ -3992,7 +3995,7 @@ def test_boot_wait_timeouts_name_their_cause():
             pass
 
     with pytest.raises(errors.UpdateFailed, match="did not answer within 60 s of ActivateImage$"):
-        update.wait_for_image(Gone(), NEW_SHA, lambda: None, sleep=ft.sleep, clock=ft.clock)
+        update.wait_for_image(Gone(), NEW_SHA, lambda: None)
     d = FakeServer(cfg_keys=CFG_VALUES, boot_silence=10 ** 6)
     with pytest.raises(errors.UpdateFailed, match="did not answer within 60 s of the reset$"):
         run_config_set(d, ["mode=2"])
@@ -4297,9 +4300,17 @@ def test_flash_compressed_sends_a_deflate_stream():
 # Check the ratio line and the time-saved line, exactly, over a download that took 2 s by the clock.
 def test_compressed_download_reports_ratio_and_time_saved():
     d, lines = FakeServer(compress=True, security=False), []
-    uds = uds_for(d, FakeTime())
+    ft = FakeTime()
+    uds = uds_for(d, ft)
     uds.session(2)
-    update.download(uds, make_image(), log=lines.append, compress="deflate", clock=iter([100.0, 102.0]).__next__)
+    real = uds.transfer_exit
+
+    def slow_exit():                    # the download took 2 s by the clock, the 37 included
+        real()
+        ft.t += 2.0
+
+    uds.transfer_exit = slow_exit
+    update.download(uds, make_image(), log=lines.append, compress="deflate")
     z = len(deflate9(make_image()))
     assert lines[0] == "compressed with raw DEFLATE: 4800 -> %d bytes (%.0f%%)" % (z, 100.0 * z / 4800)
     assert lines[-1] == ("sent %d compressed bytes in 2.0 s; the 4800-byte image would take about %.1f s, so about "
@@ -5597,7 +5608,7 @@ def cap_tries(uds, seconds):
 def run_wait(unit, seconds=10, ft=None, monitor=None, send_s=0.0):
     ft, lines = ft or FakeTime(), []
     uds = cap_tries(late_uds(unit, ft, monitor, send_s), seconds or 0)
-    rc = update.flash(uds, PBL, BL_IMG, None, sleep=ft.sleep, clock=ft.clock, log=lines.append, wait_for_unit=seconds)
+    rc = update.flash(uds, PBL, BL_IMG, None, log=lines.append, wait_for_unit=seconds)
     return rc, lines
 
 
@@ -5700,7 +5711,7 @@ def test_wait_for_unit_tries_through_busy_into_a_closing_window(app, on_at):
 def test_wait_for_unit_takes_a_held_sends_late_answer():
     ft, d, lines = FakeTime(), PoweredUpUnit(on_at=1.02, no_ack=True, held_s=update.WAIT_RETRY_S), []
     uds = cap_tries(late_uds(d, ft), 10)
-    update.wait_for_power_up(uds, 10, log=lines.append, clock=ft.clock)
+    update.wait_for_power_up(uds, 10, log=lines.append)
     assert uds.in_session and uds.kept == pytest.approx(1.02)
     assert uds.client.config["p2_timeout"] == transport.P2_S
     assert uds.client.config["p2_star_timeout"] == transport.P2_STAR_S
@@ -6035,6 +6046,8 @@ def test_bare_header_ignorable_flags_are_taken():
 # and lets the interrupt through.
 def test_wait_for_unit_interrupted_says_what_queued_10_02s_do():
     class Interrupted:
+        sleep, clock = staticmethod(lambda s: None), staticmethod(lambda: 0.0)
+
         def session(self, n):
             raise errors.NoResponse("no response to service 0x10")
 
@@ -6043,5 +6056,5 @@ def test_wait_for_unit_interrupted_says_what_queued_10_02s_do():
 
     lines = []
     with pytest.raises(KeyboardInterrupt):
-        update.wait_for_power_up(Interrupted(), 10, log=lines.append, clock=lambda: 0.0)
+        update.wait_for_power_up(Interrupted(), 10, log=lines.append)
     assert lines == ["waiting up to 10 s for the unit: power-cycle it now", update.WAIT_QUEUED]
