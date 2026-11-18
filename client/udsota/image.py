@@ -11,6 +11,7 @@ from .wire import cstr
 
 IMG_MAGIC = 0xE9
 APP_DESC_OFFSET, APP_DESC_MAGIC = 32, 0xABCD5432
+APP_ELF_SHA = slice(176, 208)   # esp_app_desc_t's app_elf_sha256, in an image file
 DESC_OFFSET, DESC_MAGIC = 288, 0x5544534F   # udsota_image_desc_t, "UDSO"
 IMAGE_MIN_LEN = 320
 # The bare header (UDSOTA_BARE_HDR_*), at the profile's header_offset: magic "UDSB", header_version, flags,
@@ -47,7 +48,7 @@ def parse_image(profile, data):
     if magic != DESC_MAGIC:
         raise Refused("no udsota image descriptor (magic UDSO) at offset %d" % DESC_OFFSET)
     _check_identity(profile, req, resp, hw_id, layout, len(data))
-    return ImageInfo(version, project, bytes(data[176:208]), hw_id, layout, len(data))
+    return ImageInfo(version, project, bytes(data[APP_ELF_SHA]), hw_id, layout, len(data))
 
 
 # The CRC-32 a bare header carries, as zlib computes it: over data's bytes before the crc32 field, then those after

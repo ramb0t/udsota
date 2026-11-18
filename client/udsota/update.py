@@ -8,7 +8,7 @@ import can
 
 from .delta import validation_hash
 from .errors import NoResponse, Nrc, Refused, SendFailed, UpdateFailed
-from .image import parse_image, update_buses
+from .image import APP_ELF_SHA, parse_image, update_buses
 from .keys import DeviceKeys, SigningKeys
 from .pack import build_patch, encode, rank_deltas, refuse_bare_delta
 from .wire import (DID_COUNTERS, DID_DEVICE_ID, DID_IMAGE_PREFIX, DID_PROJECT, DID_RESULT, DID_RUNNING_SHA, DID_SESSION,
@@ -53,6 +53,7 @@ LEFT_IN_BOOTLOADER = ("The unit is in its bootloader and returns to its app when
                       "out, unless it is held there")
 WAIT_NEEDS_BOOTLOADER = '--wait-for-unit is for [update] flow = "bootloader"'
 PRODUCT_NEEDS_BOOTLOADER = '--allow-product-change is for [update] flow = "bootloader"'
+DROP_76_WITH_BASES = "--drop-76 is for full and compressed downloads, not with --diff-from"
 # What a --wait-for-unit that gives up adds: 10 02s the CAN adapter could not send while the unit was off stay queued.
 WAIT_QUEUED = ("If the unit is off, 10 02s still queued in the CAN adapter will hold it in its bootloader for about "
                "5 s at its next power-up, once; taking the interface down and up clears them")
@@ -277,7 +278,7 @@ def send_payload(uds, image, payload, max_data, kind, drop_76=None, log=print, c
 def choose_base(bases, image, running_sha, log=print):
     found = {}
     for name, data in bases:
-        if bytes(data[176:208]) == running_sha:
+        if bytes(data[APP_ELF_SHA]) == running_sha:
             found.setdefault(bytes(data), name)
     if not found:
         log("no delta: none of the %d base files has the running app_elf_sha256 %s"
@@ -465,7 +466,7 @@ def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep
     if allow_product_change and profile.flow != "bootloader":
         raise Refused(PRODUCT_NEEDS_BOOTLOADER)
     if bases is not None and drop_76 is not None:
-        raise Refused("--drop-76 is for full and compressed downloads, not with --diff-from")
+        raise Refused(DROP_76_WITH_BASES)
     if bases is not None:
         refuse_bare_delta(profile)
     refuse_bootloader_compression(profile, compress)

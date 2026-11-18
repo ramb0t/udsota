@@ -29,8 +29,8 @@ from .keys import keygen, load_master, load_private_key
 from .transport import Transport
 from .delta import DETOOLS_HINT
 from .pack import DFIS, pack, refuse_bare_delta
-from .update import (DIFF_DFIS, PRODUCT_NEEDS_BOOTLOADER, WAIT_NEEDS_BOOTLOADER, confirm_cmd, flash, info,
-                     refuse_bootloader_compression, reset)
+from .update import (DIFF_DFIS, DROP_76_WITH_BASES, PRODUCT_NEEDS_BOOTLOADER, WAIT_NEEDS_BOOTLOADER, confirm_cmd, flash,
+                     info, refuse_bootloader_compression, reset)
 
 
 # A --dfi value: one of pack's DFIs, written 0x00, 0x10, 0x20 or 0x30.
@@ -196,7 +196,7 @@ def stamp_cmd(prof, args, log=print):
     except OSError as e:
         raise Refused("cannot read %s: %s" % (args.file, e.strerror))
     img = stamp(data, prof.header_offset)
-    info = parse_image(prof, img)
+    stamped = parse_image(prof, img)
     out = args.out or args.file
     dest = out.resolve()   # through a symlink to its target, which the replace then keeps; a hard link is split
     if not dest.name or dest.is_dir():
@@ -220,7 +220,7 @@ def stamp_cmd(prof, args, log=print):
         raise Refused("cannot write %s: %s" % (out, e.strerror)) from None
     at = prof.header_offset + BARE_HDR_CRC_OFFSET
     crc = int.from_bytes(img[at:at + 4], "little")
-    log("stamped %s: %d bytes, crc32 0x%08X, image ID %s..." % (out, len(img), crc, info.elf_sha[:4].hex()))
+    log("stamped %s: %d bytes, crc32 0x%08X, image ID %s..." % (out, len(img), crc, stamped.elf_sha[:4].hex()))
     return 0
 
 
@@ -269,7 +269,7 @@ def main(argv=None, transport=Transport):
                 raise Refused("profile %s: %s" % (prof.name, PRODUCT_NEEDS_BOOTLOADER))
             if args.diff_from is not None:
                 if args.drop_76 is not None:            # flash refuses it too; here before any key or bus
-                    raise Refused("--drop-76 is for full and compressed downloads, not with --diff-from")
+                    raise Refused(DROP_76_WITH_BASES)
                 refuse_bare_delta(prof)
                 bases = load_bases(args.diff_from)
         if args.cmd == "config" and args.config_cmd == "set":

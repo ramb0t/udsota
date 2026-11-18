@@ -10,7 +10,7 @@ import os
 from . import __version__
 from .delta import DETOOLS_HINT, build as build_delta, deflate, validation_hash
 from .errors import Refused, UpdateFailed
-from .image import parse_image
+from .image import APP_ELF_SHA, parse_image
 from .wire import DL_DFI, DL_DFI_DEFLATE, DL_DFI_DELTA, DL_DFI_DELTA_DEFLATE
 
 DELTA_DFIS = (DL_DFI_DELTA, DL_DFI_DELTA_DEFLATE)
@@ -110,7 +110,7 @@ def pack(profile, image, stem, out, dfis=None, base=None, log=print):
         entry = {"dfi": dfi, "file": "%s.dfi%02x.bin" % (stem, dfi), "payload_size": len(data),
                  "payload_sha256": hashlib.sha256(data).hexdigest(), **common}
         if dfi in DELTA_DFIS:
-            entry.update(base_elf_sha256=bytes(base[176:208]).hex(), base_validation_sha256=base_hash.hex(),
+            entry.update(base_elf_sha256=bytes(base[APP_ELF_SHA]).hex(), base_validation_sha256=base_hash.hex(),
                          smaller_than_dfi_10=dfi in worth)
         entries.append(entry)
     manifest = {"udsota_version": __version__, "profile": profile.name, "payloads": entries}

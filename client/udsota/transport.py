@@ -119,18 +119,18 @@ class QuietBus:
         try:
             self._burst(QUIET_START)
         except (OSError, can.CanError):
-            self._release(quiet=True)
+            self._release(swallow=True)
             raise
         self._thread = threading.Thread(target=self._keepalive, name="udsota-quiet", daemon=True)
         self._thread.start()
         return self
 
-    # The release burst; with quiet=True a send error is dropped (another error is already on its way).
-    def _release(self, quiet):
+    # The release burst; with swallow=True a send error is dropped (another error is already on its way).
+    def _release(self, swallow):
         try:
             self._burst(QUIET_END)
         except (OSError, can.CanError):
-            if not quiet:
+            if not swallow:
                 raise
 
     # Stop the keepalive and release the bus. A release that fails never hides the error that ended the update.
@@ -138,7 +138,7 @@ class QuietBus:
         self._stop.set()
         if self._thread is not None:
             self._thread.join()
-        self._release(quiet=exc_type is not None)
+        self._release(swallow=exc_type is not None)
 
 
 # Listen listen_s seconds; raise Busy on a busy value, SecondTester on any response-ID frame; pre-roll

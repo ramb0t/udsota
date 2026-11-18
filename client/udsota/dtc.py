@@ -120,7 +120,10 @@ def dtc_ext(uds, profile, dtc, code, log=print):
     if len(d) < 4 or int.from_bytes(d[:3], "big") != dtc:
         raise UpdateFailed("19 06 answered %s, not DTC %06X and its status" % (d.hex(" ") or "nothing", dtc))
     log(dtc_line(profile, dtc, d[3], fmt))
-    log("extended data: %s" % d[4:].hex(" ") if len(d) > 4 else "no extended data stored")
+    if len(d) > 4:
+        log("extended data: %s" % d[4:].hex(" "))
+    else:
+        log("no extended data stored")
     return 0
 
 
