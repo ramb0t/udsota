@@ -65,9 +65,9 @@ _Static_assert(sizeof(tinfl_decompressor) == 10992u && TINFL_LZ_DICT_SIZE == 327
 #define PATCH_MAGIC     0xFCCDDE10u   /* a delta patch's first 4 bytes, little-endian (esp_delta_ota's) */
 #define PATCH_HDR_LEN   64u        /* the magic, the base's appended SHA-256 and 28 reserved bytes */
 
-/* A named step of a longer function, or a rule read in two places. -Og keeps even a small static as a call, so this
- * forces the inline and the name costs no flash; a one-line predicate is a plain `static inline`, which -Og takes. */
-#define STEP static inline __attribute__((always_inline))
+/* For a named step of a longer function, or a rule read in two places. -Og keeps even a small static as a call, so
+ * this forces the inline and the name costs no flash. */
+#define ALWAYS_INLINE __attribute__((always_inline))
 
 enum { DL_PLAIN, DL_DEFLATE, DL_DELTA };   /* a download's mode: the 34's DFI 00, 10 or 30 */
 
@@ -207,7 +207,7 @@ enum {
 #define ESP_APP_DESC_MAGIC  0xABCD5432u
 
 /* An ESP-IDF image for this chip that the platform can boot, with room for the descriptor. */
-STEP bool is_esp_image(const uint8_t *b, size_t len, uint32_t size)
+static inline ALWAYS_INLINE bool is_esp_image(const uint8_t *b, size_t len, uint32_t size)
 {
     return b != NULL && len >= IMAGE_MIN && size >= IMAGE_MIN && b[HDR_MAGIC] == ESP_IMAGE_MAGIC &&
            b[HDR_SEGMENTS] != 0u && b[HDR_SEGMENTS] <= 16u && b[HDR_SPI_MODE] <= 5u &&
@@ -217,7 +217,7 @@ STEP bool is_esp_image(const uint8_t *b, size_t len, uint32_t size)
 
 /* SemVer: a release must be newer than the running image, or the same core when that is a dev build; a dev build
  * needs a core at least equal. allow_downgrade skips the newer rule and nothing else. */
-STEP bool newer_enough(const uint8_t ver[3], bool release)
+static inline ALWAYS_INLINE bool newer_enough(const uint8_t ver[3], bool release)
 {
     const int c = memcmp(ver, U.running_version, 3);
     return U.cfg.allow_downgrade || (release ? (c > 0 || (c == 0 && !U.running_release)) : c >= 0);
@@ -463,7 +463,7 @@ static udsota_reason_t zdl_open(bool delta)
 
 /* Worker: what tinfl made last (fresh bytes of its window) on its way: to the patch stage whole for a delta, else into
  * zbuf. Either way the size checks count image bytes. */
-STEP uint8_t zdl_drain(void)
+static inline ALWAYS_INLINE uint8_t zdl_drain(void)
 {
     const uint8_t *made = &U.z.window[U.z.fresh_at];
     const size_t n = U.z.fresh;
@@ -473,7 +473,7 @@ STEP uint8_t zdl_drain(void)
 
 /* Worker: one tinfl call over the rest of the 36 (*in, *n) into its window, whose new bytes wait in fresh. False when
  * it made no progress; a failure is recorded in U.z.failed and the caller's loop ends on it. */
-STEP bool zdl_inflate(const uint8_t **in, size_t *n)
+static inline ALWAYS_INLINE bool zdl_inflate(const uint8_t **in, size_t *n)
 {
     size_t in_n = *n, out_n = TINFL_LZ_DICT_SIZE - U.z.window_at;
     U.z.status = tinfl_decompress(U.z.inflater, *in, &in_n, U.z.window, U.z.window + U.z.window_at, &out_n,
@@ -584,7 +584,7 @@ static int ecdsa_check(const uint8_t seed[UDSOTA_SEED_LEN], uint8_t level, const
 }
 
 /* HMAC mode, at init: this device's key, HMAC-SHA256(key_master, key_label || device ID). */
-STEP void derive_device_key(const udsota_cfg_t *cfg)
+static inline ALWAYS_INLINE void derive_device_key(const udsota_cfg_t *cfg)
 {
     uint8_t msg[LABEL_MAX + UDSOTA_KEYS_ID_MAX];
     const size_t ln = strnlen(cfg->key_label, LABEL_MAX + 1u);
@@ -599,7 +599,7 @@ STEP void derive_device_key(const udsota_cfg_t *cfg)
 
 /* 0x27: ECDSA wins over HMAC. Any key field turns it on, and an incomplete set then unlocks nothing; with none, 0x27 is
  * the app's and downloads need no key. */
-STEP void keys_init(const udsota_cfg_t *cfg)
+static inline ALWAYS_INLINE void keys_init(const udsota_cfg_t *cfg)
 {
     U.sec_ecdsa = (cfg->key_pubkey != NULL || cfg->key_pubkey_len != 0u);
     U.sec_on = U.sec_ecdsa || cfg->key_label != NULL || cfg->key_master != NULL || cfg->key_master_len != 0u;
@@ -664,14 +664,14 @@ static bool worker_busy(void)
 }
 
 /* The precondition of 10 02 and 34: settled slots, an idle worker and no transfer open. */
-STEP bool ready_to_program(void)
+static inline ALWAYS_INLINE bool ready_to_program(void)
 {
     return slots_settled() && !worker_busy() && !transferring();
 }
 
 /* The download is over, and F1F1 says why. It does not close an open image: the caller sets close_pending first, or
  * calls abort_download, which does. */
-STEP void end_download(uint8_t reason)
+static inline ALWAYS_INLINE void end_download(uint8_t reason)
 {
     U.phase = PHASE_IDLE;
     U.last_reason = reason;
@@ -1170,7 +1170,7 @@ static UDSErr_t as_err(int rc)
 /* Each handler below answers one event: false when the event is the app's (a request udsota does not serve), else true
  * with *rc, which starts as UDS_PositiveResponse, set to the answer. */
 
-STEP bool on_scheduled_reset(void)
+static inline ALWAYS_INLINE bool on_scheduled_reset(void)
 {
     if (!U.reset_mine) {
         return false;
@@ -1183,7 +1183,7 @@ STEP bool on_scheduled_reset(void)
     return true;
 }
 
-STEP bool on_session_ctrl(UDSServer_t *srv, UDSDiagSessCtrlArgs_t *a, UDSErr_t *rc)
+static inline ALWAYS_INLINE bool on_session_ctrl(UDSServer_t *srv, UDSDiagSessCtrlArgs_t *a, UDSErr_t *rc)
 {
     if (a->type < UDS_LEV_DS_DS || a->type > UDS_LEV_DS_EXTDS) {
         return false;
@@ -1206,7 +1206,7 @@ STEP bool on_session_ctrl(UDSServer_t *srv, UDSDiagSessCtrlArgs_t *a, UDSErr_t *
     return true;
 }
 
-STEP bool on_ecu_reset(UDSServer_t *srv, UDSECUResetArgs_t *a, UDSErr_t *rc)
+static inline ALWAYS_INLINE bool on_ecu_reset(UDSServer_t *srv, UDSECUResetArgs_t *a, UDSErr_t *rc)
 {
     if (a->type != UDS_LEV_RT_HR) {
         return false;
@@ -1239,7 +1239,7 @@ static UDSErr_t security_refusal(const UDSServer_t *srv, uint8_t level)
 }
 
 /* 27 requestSeed: a fresh single-use seed. iso14229 delays retries. */
-STEP bool on_request_seed(UDSServer_t *srv, UDSSecAccessRequestSeedArgs_t *a, UDSErr_t *rc)
+static inline ALWAYS_INLINE bool on_request_seed(UDSServer_t *srv, UDSSecAccessRequestSeedArgs_t *a, UDSErr_t *rc)
 {
     if (!level_is_ours(a->level)) {
         return false;
@@ -1263,7 +1263,7 @@ STEP bool on_request_seed(UDSServer_t *srv, UDSSecAccessRequestSeedArgs_t *a, UD
 }
 
 /* 27 sendKey: the key for the seed, once. */
-STEP bool on_validate_key(UDSServer_t *srv, const UDSSecAccessValidateKeyArgs_t *a, UDSErr_t *rc)
+static inline ALWAYS_INLINE bool on_validate_key(UDSServer_t *srv, const UDSSecAccessValidateKeyArgs_t *a, UDSErr_t *rc)
 {
     if (!level_is_ours(a->level)) {
         return false;
@@ -1299,7 +1299,7 @@ STEP bool on_validate_key(UDSServer_t *srv, const UDSSecAccessValidateKeyArgs_t 
     return true;
 }
 
-STEP bool on_read_did(UDSServer_t *srv, UDSRDBIArgs_t *a, UDSErr_t *rc)
+static inline ALWAYS_INLINE bool on_read_did(UDSServer_t *srv, UDSRDBIArgs_t *a, UDSErr_t *rc)
 {
     uint8_t buf[64];
     const size_t n = read_did(srv, a->dataId, buf);
@@ -1310,7 +1310,7 @@ STEP bool on_read_did(UDSServer_t *srv, UDSRDBIArgs_t *a, UDSErr_t *rc)
     return true;
 }
 
-STEP bool on_routine(UDSServer_t *srv, UDSRoutineCtrlArgs_t *a, UDSErr_t *rc)
+static inline ALWAYS_INLINE bool on_routine(UDSServer_t *srv, UDSRoutineCtrlArgs_t *a, UDSErr_t *rc)
 {
     uint8_t status[8];
     size_t status_len = 0;
@@ -1331,7 +1331,7 @@ STEP bool on_routine(UDSServer_t *srv, UDSRoutineCtrlArgs_t *a, UDSErr_t *rc)
     return true;
 }
 
-STEP bool on_request_download(UDSServer_t *srv, UDSRequestDownloadArgs_t *a, UDSErr_t *rc)
+static inline ALWAYS_INLINE bool on_request_download(UDSServer_t *srv, UDSRequestDownloadArgs_t *a, UDSErr_t *rc)
 {
     if (a->addr != 0u) {
         return false;                                    /* udsota's images go to address 0; the rest are the app's */
@@ -1346,7 +1346,7 @@ STEP bool on_request_download(UDSServer_t *srv, UDSRequestDownloadArgs_t *a, UDS
 }
 
 /* 36 and 37, while udsota's own download or job is open. */
-STEP bool on_transfer(UDSServer_t *srv, UDSEvent_t ev, void *arg, UDSErr_t *rc)
+static inline ALWAYS_INLINE bool on_transfer(UDSServer_t *srv, UDSEvent_t ev, void *arg, UDSErr_t *rc)
 {
     const uint8_t sid = (ev == UDS_EVT_TransferData) ? 0x36 : 0x37;
     if (!transferring() && !U.job_running) {
@@ -1374,7 +1374,7 @@ STEP bool on_transfer(UDSServer_t *srv, UDSEvent_t ev, void *arg, UDSErr_t *rc)
 }
 
 /* iso14229 ended a transfer without an event (0x24, 0x70, 0x71): udsota's download ends with it. */
-STEP void follow_iso14229(const UDSServer_t *srv)
+static inline ALWAYS_INLINE void follow_iso14229(const UDSServer_t *srv)
 {
     if (!srv->xferIsActive && transferring()) {
         abort_download();
@@ -1436,7 +1436,7 @@ bool udsota_event(UDSServer_t *srv, UDSEvent_t ev, void *arg, UDSErr_t *rc)
 static void psa_lock_init(void);                         /* the platform's: section 8 */
 
 /* This image's identity: the product it accepts images for, its own version, and the device ID. */
-STEP void read_identity(const udsota_cfg_t *cfg)
+static inline ALWAYS_INLINE void read_identity(const udsota_cfg_t *cfg)
 {
     U.product = (cfg->product != NULL) ? cfg->product : udsota_plat_project();
     const char *v = udsota_plat_version();
