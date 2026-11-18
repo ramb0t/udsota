@@ -1057,24 +1057,69 @@ static UDSErr_t as_err(int rc)
     return (rc == UDSOTA_PENDING) ? UDS_NRC_RequestCorrectlyReceived_ResponsePending : (UDSErr_t)rc;
 }
 
-static UDSErr_t on_session(UDSServer_t *srv, uint8_t type)
+/* Each handler below answers one event: false when the event is the app's (a request udsota does not serve), else true
+ * with *rc, which starts as UDS_PositiveResponse, set to the answer. Each is called from udsota_event alone, and a -Og
+ * build would otherwise keep it as a call, which costs a few hundred bytes over all of them. */
+#define HANDLER static inline __attribute__((always_inline))
+
+HANDLER bool on_scheduled_reset(void)
 {
+    if (!U.reset_mine) {
+        return false;
+    }
+    if (U.cfg.reset != NULL) {
+        U.cfg.reset(U.cfg.ctx);
+    } else {
+        RESTART();
+    }
+    return true;
+}
+
+HANDLER bool on_session_ctrl(UDSServer_t *srv, UDSDiagSessCtrlArgs_t *a, UDSErr_t *rc)
+{
+    if (a->type < UDS_LEV_DS_DS || a->type > UDS_LEV_DS_EXTDS) {
+        return false;
+    }
+    if (a->p2_star_ms < srv->p2_star_ms) {               /* iso14229 sends its client default, 1500 ms, which the 0x78s
+                                                            (every 0.3 x P2*) would race; P2 keeps its 150 ms */
+        a->p2_star_ms = srv->p2_star_ms;
+    }
     uint8_t nrc = 0;
-    if (type == UDS_LEV_DS_PRGS) {
+    if (a->type == UDS_LEV_DS_PRGS) {
         nrc = ready_to_program() ? gate(UDSOTA_OP_ENTER_PROGRAMMING) : UDS_NRC_ConditionsNotCorrect;
-    } else if (type == UDS_LEV_DS_EXTDS) {
+    } else if (a->type == UDS_LEV_DS_EXTDS) {
         nrc = gate(UDSOTA_OP_ENTER_EXTENDED);
     }
     if (nrc != 0u) {
-        return (UDSErr_t)nrc;
+        *rc = (UDSErr_t)nrc;
+    } else {
+        session_changed(srv);
     }
-    session_changed(srv);
-    return UDS_PositiveResponse;
+    return true;
 }
 
-/* 27 at our two levels, in their sessions: a fresh single-use seed, then its key. iso14229 delays retries. */
-static UDSErr_t on_security(UDSServer_t *srv, uint8_t level, const uint8_t *key, size_t len, bool seed,
-                            UDSSecAccessRequestSeedArgs_t *sa)
+HANDLER bool on_ecu_reset(UDSServer_t *srv, UDSECUResetArgs_t *a, UDSErr_t *rc)
+{
+    if (a->type != UDS_LEV_RT_HR) {
+        return false;
+    }
+    *rc = (srv->sessionType == UDS_LEV_DS_DS)                       ? UDS_NRC_ServiceNotSupportedInActiveSession
+        : (U.sec_on && srv->securityLevel == 0u)                    ? UDS_NRC_SecurityAccessDenied
+        : worker_busy()                                             ? UDS_NRC_ConditionsNotCorrect
+                                                                    : (UDSErr_t)gate(UDSOTA_OP_RESET);
+    U.reset_mine = U.reset_mine || *rc == UDS_PositiveResponse;
+    return true;
+}
+
+/* 27 is udsota's at its two pairs of levels, when keys are configured. */
+static inline bool level_is_ours(uint8_t level)
+{
+    return U.sec_on && (level == UDSOTA_SA_SEED_EXTENDED || level == UDSOTA_SA_SEED_PROGRAMMING);
+}
+
+/* What 27 at `level` meets first, in either direction: the level's session (0x7F in the default session), then an idle
+ * worker, which may be using the crypto. UDS_PositiveResponse: neither refuses. */
+static UDSErr_t security_refusal(const UDSServer_t *srv, uint8_t level)
 {
     if (srv->sessionType == UDS_LEV_DS_DS) {
         return UDS_NRC_ServiceNotSupportedInActiveSession;
@@ -1082,46 +1127,151 @@ static UDSErr_t on_security(UDSServer_t *srv, uint8_t level, const uint8_t *key,
     if (srv->sessionType != (level == UDSOTA_SA_SEED_PROGRAMMING ? UDS_LEV_DS_PRGS : UDS_LEV_DS_EXTDS)) {
         return UDS_NRC_SubFunctionNotSupportedInActiveSession;
     }
-    if (worker_busy()) {
-        return UDS_NRC_ConditionsNotCorrect;             /* the worker may be using the crypto */
+    return worker_busy() ? UDS_NRC_ConditionsNotCorrect : UDS_PositiveResponse;
+}
+
+/* 27 requestSeed: a fresh single-use seed. iso14229 delays retries. */
+HANDLER bool on_request_seed(UDSServer_t *srv, UDSSecAccessRequestSeedArgs_t *a, UDSErr_t *rc)
+{
+    if (!level_is_ours(a->level)) {
+        return false;
     }
-    if (seed) {
-        if (len != 0u) {
-            return UDS_NRC_IncorrectMessageLengthOrInvalidFormat;
-        }
-        U.seed_valid = udsota_plat_rng16(U.seed);
-        if (!U.seed_valid) {
-            return UDS_NRC_ConditionsNotCorrect;
-        }
-        U.seed_level = level;
-        U.seed_ms = UDSMillis();
-        return (UDSErr_t)sa->copySeed(srv, U.seed, UDSOTA_SEED_LEN);
+    if ((*rc = security_refusal(srv, a->level)) != UDS_PositiveResponse) {
+        return true;
     }
-    if (len != (U.sec_ecdsa ? UDSOTA_KEYS_SIG_LEN : UDSOTA_KEY_LEN)) {
-        return UDS_NRC_IncorrectMessageLengthOrInvalidFormat;   /* the seed stays */
+    if (a->len != 0u) {
+        *rc = UDS_NRC_IncorrectMessageLengthOrInvalidFormat;
+        return true;
     }
-    const bool fresh = U.seed_valid && U.seed_level == level &&
+    U.seed_valid = udsota_plat_rng16(U.seed);
+    if (!U.seed_valid) {
+        *rc = UDS_NRC_ConditionsNotCorrect;
+        return true;
+    }
+    U.seed_level = a->level;
+    U.seed_ms = UDSMillis();
+    *rc = (UDSErr_t)a->copySeed(srv, U.seed, UDSOTA_SEED_LEN);
+    return true;
+}
+
+/* 27 sendKey: the key for the seed, once. */
+HANDLER bool on_validate_key(UDSServer_t *srv, const UDSSecAccessValidateKeyArgs_t *a, UDSErr_t *rc)
+{
+    if (!level_is_ours(a->level)) {
+        return false;
+    }
+    if ((*rc = security_refusal(srv, a->level)) != UDS_PositiveResponse) {
+        return true;
+    }
+    if (a->len != (U.sec_ecdsa ? UDSOTA_KEYS_SIG_LEN : UDSOTA_KEY_LEN)) {
+        *rc = UDS_NRC_IncorrectMessageLengthOrInvalidFormat;   /* the seed stays */
+        return true;
+    }
+    const bool fresh = U.seed_valid && U.seed_level == a->level &&
                        (uint32_t)(UDSMillis() - U.seed_ms) < UDSOTA_SA_SEED_VALID_MS;
     U.seed_valid = false;
-    UDSErr_t rc = UDS_NRC_RequestSequenceError;
+    *rc = UDS_NRC_RequestSequenceError;
     if (fresh && U.sec_ecdsa) {
-        const int v = ecdsa_check(U.seed, level, key);
-        rc = (v == 1) ? UDS_PositiveResponse : (v < 0) ? UDS_NRC_ConditionsNotCorrect : UDS_NRC_InvalidKey;
+        const int v = ecdsa_check(U.seed, a->level, a->key);
+        *rc = (v == 1) ? UDS_PositiveResponse : (v < 0) ? UDS_NRC_ConditionsNotCorrect : UDS_NRC_InvalidKey;
     } else if (fresh) {
         uint8_t expect[UDSOTA_KEY_LEN];
         volatile uint8_t diff = 0;
-        if (!hmac_key(U.seed, level, expect)) {
-            rc = UDS_NRC_ConditionsNotCorrect;
+        if (!hmac_key(U.seed, a->level, expect)) {
+            *rc = UDS_NRC_ConditionsNotCorrect;
         } else {
             for (size_t i = 0; i < UDSOTA_KEY_LEN; i++) {
-                diff |= (uint8_t)(expect[i] ^ key[i]);   /* constant time */
+                diff |= (uint8_t)(expect[i] ^ a->key[i]);   /* constant time */
             }
-            rc = (diff == 0u) ? UDS_PositiveResponse : UDS_NRC_InvalidKey;
+            *rc = (diff == 0u) ? UDS_PositiveResponse : UDS_NRC_InvalidKey;
         }
         wipe(expect, sizeof expect);
     }
     wipe(U.seed, sizeof U.seed);
-    return rc;
+    return true;
+}
+
+HANDLER bool on_read_did(UDSServer_t *srv, UDSRDBIArgs_t *a, UDSErr_t *rc)
+{
+    uint8_t buf[64];
+    const size_t n = read_did(srv, a->dataId, buf);
+    if (n == 0u) {
+        return false;
+    }
+    *rc = (UDSErr_t)a->copy(srv, buf, (uint16_t)n);
+    return true;
+}
+
+HANDLER bool on_routine(UDSServer_t *srv, UDSRoutineCtrlArgs_t *a, UDSErr_t *rc)
+{
+    uint8_t status[8];
+    size_t status_len = 0;
+    int r;
+    if (U.job_running) {
+        r = resume(srv, 0x31, status, &status_len);
+    } else {
+        r = routine(srv, a->ctrlType, a->id, a->len, status, &status_len);
+        if (r < 0) {
+            return false;
+        }
+    }
+    activation_check(srv);
+    *rc = as_err(r);
+    if (*rc == UDS_PositiveResponse && status_len != 0u) {
+        *rc = (UDSErr_t)a->copyStatusRecord(srv, status, (uint16_t)status_len);
+    }
+    return true;
+}
+
+HANDLER bool on_request_download(UDSServer_t *srv, UDSRequestDownloadArgs_t *a, UDSErr_t *rc)
+{
+    if (a->addr != 0u) {
+        return false;                                    /* udsota's images go to address 0; the rest are the app's */
+    }
+    *rc = (a->size > UINT32_MAX)
+              ? UDS_NRC_RequestOutOfRange
+              : as_err(request_download(srv, a->dataFormatIdentifier, (uint32_t)a->addr, (uint32_t)a->size));
+    if (*rc == UDS_PositiveResponse) {
+        a->maxNumberOfBlockLength = UDSOTA_DL_MAX_BLOCK_LEN;
+    }
+    return true;
+}
+
+/* 36 and 37, while udsota's own download or job is open. */
+HANDLER bool on_transfer(UDSServer_t *srv, UDSEvent_t ev, void *arg, UDSErr_t *rc)
+{
+    const uint8_t sid = (ev == UDS_EVT_TransferData) ? 0x36 : 0x37;
+    if (!U.dl_active && !U.job_running) {
+        return false;                                    /* a transfer the app opened (34, 35 or 38) */
+    }
+    size_t none = 0;
+    bool end = false;
+    int r;
+    if (U.job_running) {
+        r = resume(srv, sid, NULL, &none);
+    } else if (ev == UDS_EVT_TransferData) {
+        const UDSTransferDataArgs_t *a = arg;
+        r = transfer_data(srv, a->data, a->len, &end);
+    } else {
+        r = transfer_exit(srv, ((UDSRequestTransferExitArgs_t *)arg)->len);
+    }
+    *rc = as_err(r);
+    if (*rc != UDS_PositiveResponse && *rc != UDS_NRC_RequestCorrectlyReceived_ResponsePending) {
+        abort_download();                                /* iso14229 ends its transfer on any NRC */
+    }
+    if (end) {
+        end_session(srv);
+    }
+    return true;
+}
+
+/* iso14229 ended a transfer without an event (0x24, 0x70, 0x71): udsota's download ends with it. */
+HANDLER void follow_iso14229(const UDSServer_t *srv)
+{
+    if (!srv->xferIsActive && U.dl_active) {
+        abort_download();
+        progress_sync();
+    }
 }
 
 bool udsota_event(UDSServer_t *srv, UDSEvent_t ev, void *arg, UDSErr_t *rc)
@@ -1131,135 +1281,46 @@ bool udsota_event(UDSServer_t *srv, UDSEvent_t ev, void *arg, UDSErr_t *rc)
         return false;
     }
     settle();
-    if (!srv->xferIsActive && U.dl_active) {             /* iso14229 ended a transfer without an event (0x24, 0x70, 0x71) */
-        abort_download();
-        progress_sync();
-    }
-    uint8_t status[8], buf[64];
-    size_t status_len = 0;
-    bool end = false, mine = true;
+    follow_iso14229(srv);
+    bool ours;
     switch (ev) {
     case UDS_EVT_SessionTimeout:
         session_changed(srv);
         return false;                                    /* the app may want it too */
-    case UDS_EVT_DoScheduledReset:
-        if (!U.reset_mine) {
-            return false;
-        }
-        if (U.cfg.reset != NULL) {
-            U.cfg.reset(U.cfg.ctx);
-        } else {
-            RESTART();
-        }
-        return true;
-    case UDS_EVT_DiagSessCtrl: {
-        UDSDiagSessCtrlArgs_t *a = arg;
-        if (a->type < UDS_LEV_DS_DS || a->type > UDS_LEV_DS_EXTDS) {
-            return false;
-        }
-        if (a->p2_star_ms < srv->p2_star_ms) {           /* iso14229 sends its client default, 1500 ms, which the 0x78s
-                                                            (every 0.3 x P2*) would race; P2 keeps its 150 ms */
-            a->p2_star_ms = srv->p2_star_ms;
-        }
-        *rc = on_session(srv, a->type);
+    case UDS_EVT_DoScheduledReset:                       /* this and the 22 change no stage: nothing to sync */
+        return on_scheduled_reset();
+    case UDS_EVT_ReadDataByIdent:
+        return on_read_did(srv, arg, rc);
+    case UDS_EVT_DiagSessCtrl:
+        ours = on_session_ctrl(srv, arg, rc);
         break;
-    }
     case UDS_EVT_EcuReset:
-        if (((UDSECUResetArgs_t *)arg)->type != UDS_LEV_RT_HR) {
-            return false;
-        }
-        *rc = (srv->sessionType == UDS_LEV_DS_DS)                       ? UDS_NRC_ServiceNotSupportedInActiveSession
-            : (U.sec_on && srv->securityLevel == 0u)                    ? UDS_NRC_SecurityAccessDenied
-            : worker_busy()                                             ? UDS_NRC_ConditionsNotCorrect
-                                                                        : (UDSErr_t)gate(UDSOTA_OP_RESET);
-        U.reset_mine = U.reset_mine || *rc == UDS_PositiveResponse;
+        ours = on_ecu_reset(srv, arg, rc);
         break;
-    case UDS_EVT_SecAccessRequestSeed: {
-        UDSSecAccessRequestSeedArgs_t *a = arg;
-        if (!U.sec_on || (a->level != UDSOTA_SA_SEED_EXTENDED && a->level != UDSOTA_SA_SEED_PROGRAMMING)) {
-            return false;
-        }
-        *rc = on_security(srv, a->level, NULL, a->len, true, a);
+    case UDS_EVT_SecAccessRequestSeed:
+        ours = on_request_seed(srv, arg, rc);
         break;
-    }
-    case UDS_EVT_SecAccessValidateKey: {
-        const UDSSecAccessValidateKeyArgs_t *a = arg;
-        if (!U.sec_on || (a->level != UDSOTA_SA_SEED_EXTENDED && a->level != UDSOTA_SA_SEED_PROGRAMMING)) {
-            return false;
-        }
-        *rc = on_security(srv, a->level, a->key, a->len, false, NULL);
+    case UDS_EVT_SecAccessValidateKey:
+        ours = on_validate_key(srv, arg, rc);
         break;
-    }
-    case UDS_EVT_ReadDataByIdent: {
-        UDSRDBIArgs_t *a = arg;
-        const size_t n = read_did(srv, a->dataId, buf);
-        if (n == 0u) {
-            return false;
-        }
-        *rc = (UDSErr_t)a->copy(srv, buf, (uint16_t)n);
-        return true;
-    }
-    case UDS_EVT_RoutineCtrl: {
-        UDSRoutineCtrlArgs_t *a = arg;
-        int r;
-        if (U.job_running) {
-            r = resume(srv, 0x31, status, &status_len);
-        } else {
-            r = routine(srv, a->ctrlType, a->id, a->len, status, &status_len);
-            if (r < 0) {
-                return false;
-            }
-        }
-        activation_check(srv);
-        *rc = as_err(r);
-        if (*rc == UDS_PositiveResponse && status_len != 0u) {
-            *rc = (UDSErr_t)a->copyStatusRecord(srv, status, (uint16_t)status_len);
-        }
+    case UDS_EVT_RoutineCtrl:
+        ours = on_routine(srv, arg, rc);
         break;
-    }
-    case UDS_EVT_RequestDownload: {
-        UDSRequestDownloadArgs_t *a = arg;
-        if (a->addr != 0u) {
-            return false;                                /* udsota's images go to address 0; the rest are the app's */
-        }
-        *rc = (a->size > UINT32_MAX)
-                  ? UDS_NRC_RequestOutOfRange
-                  : as_err(request_download(srv, a->dataFormatIdentifier, (uint32_t)a->addr, (uint32_t)a->size));
-        if (*rc == UDS_PositiveResponse) {
-            a->maxNumberOfBlockLength = UDSOTA_DL_MAX_BLOCK_LEN;
-        }
+    case UDS_EVT_RequestDownload:
+        ours = on_request_download(srv, arg, rc);
         break;
-    }
     case UDS_EVT_TransferData:
-    case UDS_EVT_RequestTransferExit: {
-        const uint8_t sid = (ev == UDS_EVT_TransferData) ? 0x36 : 0x37;
-        if (!U.dl_active && !U.job_running) {
-            return false;                                /* a transfer the app opened (34, 35 or 38) */
-        }
-        int r;
-        if (U.job_running) {
-            r = resume(srv, sid, status, &status_len);
-        } else if (ev == UDS_EVT_TransferData) {
-            const UDSTransferDataArgs_t *a = arg;
-            r = transfer_data(srv, a->data, a->len, &end);
-        } else {
-            r = transfer_exit(srv, ((UDSRequestTransferExitArgs_t *)arg)->len);
-        }
-        *rc = as_err(r);
-        if (*rc != UDS_PositiveResponse && *rc != UDS_NRC_RequestCorrectlyReceived_ResponsePending) {
-            abort_download();                            /* iso14229 ends its transfer on any NRC */
-        }
-        if (end) {
-            end_session(srv);
-        }
+    case UDS_EVT_RequestTransferExit:
+        ours = on_transfer(srv, ev, arg, rc);
         break;
-    }
     default:
-        mine = false;
-        break;
+        progress_sync();                                 /* not udsota's, but tell of any change since */
+        return false;
     }
-    progress_sync();
-    return mine;
+    if (ours) {
+        progress_sync();
+    }
+    return ours;
 }
 
 /* ==== The API ==== */
