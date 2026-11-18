@@ -4,6 +4,8 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-11-18
+
 ### Changed
 
 - **Breaking** for a product that lists udsota's sources by hand under ESP-IDF: the ESP-IDF platform (the `udsota_plat_*` functions, the flash worker and the PSA lock) is now `udsota_esp.c`, and `udsota.c` is the portable core that every host test builds as the target does. Add `udsota_esp.c` beside `udsota.c`; the component's `SRCS` already do. The two call each other through the new private header `udsota_priv.h`. **Breaking** for a host build that lists the sources by hand: the host's PSA lock, and `udsota_test_psa_depth()` under `UDSOTA_TEST`, are now `udsota_host.c`, which it adds beside `udsota.c`; the root `CMakeLists.txt`'s targets already do. See MIGRATING.md, 0.18.x to 0.19.0. The text of both objects together is within a few bytes of `udsota.c`'s before in the ws43 default and delta builds, and 823 bytes less at -O2 (12,333 to 11,510), where the core now calls the platform functions it used to inline.
