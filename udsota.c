@@ -168,45 +168,74 @@ static bool parse_version(const char *s, size_t n, uint8_t out[3], bool *clean)
     return true;
 }
 
+/* Where the rules look in an ESP-IDF image's first bytes: its 24-byte header, the header of the first segment, and
+ * esp_app_desc_t at the start of that segment, with udsota's descriptor (udsota_image_desc_t) 256 bytes on. */
+enum {
+    HDR_MAGIC = 0, HDR_SEGMENTS = 1, HDR_SPI_MODE = 2, HDR_CHIP_ID = 12,
+    SEGMENT_LEN = 28,                   /* the first segment's length, in the header that follows the image's own */
+    SEGMENT_MIN = 256 + 32,             /* esp_app_desc_t and the descriptor behind it */
+    APP_DESC = 32,
+    APP_VERSION = APP_DESC + 16, APP_PROJECT = APP_DESC + 48,
+};
+#define ESP_IMAGE_MAGIC     0xE9u
+#define ESP_APP_DESC_MAGIC  0xABCD5432u
+
+/* An ESP-IDF image for this chip that the platform can boot, with room for the descriptor. */
+STEP bool is_esp_image(const uint8_t *b, size_t len, uint32_t size)
+{
+    return b != NULL && len >= IMAGE_MIN && size >= IMAGE_MIN && b[HDR_MAGIC] == ESP_IMAGE_MAGIC &&
+           b[HDR_SEGMENTS] != 0u && b[HDR_SEGMENTS] <= 16u && b[HDR_SPI_MODE] <= 5u &&
+           le16(&b[HDR_CHIP_ID]) == CHIP_ID && le32(&b[SEGMENT_LEN]) >= SEGMENT_MIN &&
+           le32(&b[APP_DESC]) == ESP_APP_DESC_MAGIC && udsota_plat_compatible(b, len);
+}
+
+/* SemVer: a release must be newer than the running image, or the same core when that is a dev build; a dev build needs a
+ * core at least equal. allow_downgrade skips the newer rule and nothing else. */
+STEP bool newer_enough(const uint8_t ver[3], bool release)
+{
+    const int c = memcmp(ver, U.running_version, 3);
+    return U.cfg.allow_downgrade || (release ? (c > 0 || (c == 0 && !U.running_release)) : c >= 0);
+}
+
+/* A field of udsota's descriptor in an image's first bytes b. */
+#define DESC(b, field) (&(b)[UDSOTA_IMG_DESC_OFFSET + offsetof(udsota_image_desc_t, field)])
+
 /* The first IMAGE_MIN bytes of an image of `size` bytes, before anything is erased: an ESP-IDF image for this chip
  * that the platform can boot, this product, board, layout and CAN IDs, a newer version, and a size that fits. */
 static udsota_reason_t check_first(const uint8_t *b, size_t len, uint32_t size)
 {
-    if (b == NULL || len < IMAGE_MIN || size < IMAGE_MIN || b[0] != 0xE9u || b[1] == 0u || b[1] > 16u ||
-        b[2] > 5u || le16(&b[12]) != CHIP_ID || le32(&b[28]) < 256u + 32u || le32(&b[32]) != 0xABCD5432u ||
-        !udsota_plat_compatible(b, len)) {
+    if (!is_esp_image(b, len, size)) {
         return UDSOTA_DL_BAD_HEADER;
     }
-    const char *project = (const char *)&b[32 + 48];
+    const char *project = (const char *)&b[APP_PROJECT];
     const size_t plen = strnlen(U.product, 33);
     if (plen > 32u || memcmp(project, U.product, plen) != 0 || (plen < 32u && project[plen] != '\0')) {
         return UDSOTA_DL_BAD_PROJECT;
     }
-    const uint8_t *d = &b[UDSOTA_IMG_DESC_OFFSET];
-    if (le32(d) != udsota_image_desc.magic || le16(d + 4) < 1u || d[6] != udsota_image_desc.hw_id) {
+    if (le32(DESC(b, magic)) != udsota_image_desc.magic || le16(DESC(b, desc_version)) < 1u ||
+        *DESC(b, hw_id) != udsota_image_desc.hw_id) {
         return UDSOTA_DL_BAD_BOARD;
     }
-    if (d[7] != udsota_image_desc.partition_layout_id) {
+    if (*DESC(b, partition_layout_id) != udsota_image_desc.partition_layout_id) {
         return UDSOTA_DL_BAD_LAYOUT;
     }
-    if (le16(d + 8) != udsota_image_desc.diag_request_id || le16(d + 10) != udsota_image_desc.diag_response_id) {
+    if (le16(DESC(b, diag_request_id)) != udsota_image_desc.diag_request_id ||
+        le16(DESC(b, diag_response_id)) != udsota_image_desc.diag_response_id) {
         return UDSOTA_DL_BAD_DIAG_IDS;
     }
-    /* SemVer: a release must be newer than the running image, or the same core when that is a dev build; a dev
-     * build needs a core at least equal. The release flag must agree with the version string. allow_downgrade skips
-     * the newer rule and nothing else. */
+    /* The release flag must agree with the version string. */
     uint8_t ver[3];
     bool clean;
-    const bool release = (d[12] & 0x01u) != 0u;
-    if (!parse_version((const char *)&b[32 + 16], 32u, ver, &clean) || clean != release) {
+    const bool release = (*DESC(b, flags) & 0x01u) != 0u;
+    if (!parse_version((const char *)&b[APP_VERSION], 32u, ver, &clean) || clean != release) {
         return UDSOTA_DL_BAD_HEADER;
     }
-    const int c = memcmp(ver, U.running_version, 3);
-    if (!U.cfg.allow_downgrade && !(release ? (c > 0 || (c == 0 && !U.running_release)) : c >= 0)) {
+    if (!newer_enough(ver, release)) {
         return UDSOTA_DL_NOT_NEWER;
     }
     return (size > udsota_plat_slot_size()) ? UDSOTA_DL_TOO_BIG : UDSOTA_DL_OK;
 }
+#undef DESC
 
 /* ==== 3. Coded downloads (DFI 0x10: raw DEFLATE; 0x30: a delta patch in it; memorySize the image's size) ==== */
 
@@ -1339,7 +1368,7 @@ static void psa_lock_init(void);                         /* the platform's: sect
 
 int udsota_init(const udsota_cfg_t *cfg)
 {
-    if (U.started || cfg == NULL || udsota_image_desc.magic != 0x5544534Fu) {
+    if (U.started || cfg == NULL || udsota_image_desc.magic != UDSOTA_IMG_DESC_MAGIC) {
         return -1;
     }
     psa_lock_init();
