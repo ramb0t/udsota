@@ -101,6 +101,7 @@ static void crc_cases(void)
 #define PROJECT   (UDSOTA_BARE_HDR_DESC_OFFSET + UDSOTA_BARE_PROJECT_OFFSET)   /* the project field in the header */
 #define VERSION   (UDSOTA_BARE_HDR_DESC_OFFSET + UDSOTA_BARE_VERSION_OFFSET)
 #define DESC      UDSOTA_BARE_HDR_DESC_OFFSET
+#define UBUSES    UDSOTA_BARE_HDR_UPDATE_BUSES_OFFSET
 #define FULL32    "abcdefghijklmnopqrstuvwxyz012345"   /* a project name that fills its 32-byte field */
 struct poke_s {
     uint16_t at;
@@ -114,6 +115,7 @@ typedef struct {
     uint32_t        length;
     const char     *project;        /* the header's project field, NUL-padded; NULL = the fixture's */
     const char     *product;        /* cfg.product; NULL = the fixture's */
+    bool            any;            /* cfg.product NULL: an image of any project */
     uint32_t        hdr_len;        /* bytes the rules get; 0 = UDSOTA_BARE_HDR_LEN */
     uint32_t        mem;            /* the 34's memorySize; 0 = the fixture's size, or length when set_length */
     udsota_reason_t want;
@@ -151,6 +153,20 @@ static const rule_case_t k_rules[] = {
     {"BAD_PROJECT: shorter", .project = "exampl", .want = UDSOTA_DL_BAD_PROJECT},
     {"BAD_PROJECT: another cfg.product", .product = "widget", .want = UDSOTA_DL_BAD_PROJECT},
     {"accepted: another cfg.product and project", .product = "widget", .project = "widget", .want = UDSOTA_DL_OK},
+    {"accepted: cfg.product NULL, another project", .any = true, .project = "widget", .want = UDSOTA_DL_OK},
+    {"accepted: cfg.product NULL, an empty project", .any = true, .project = "", .want = UDSOTA_DL_OK},
+    {"accepted: cfg.product NULL, a project that fills its field", .any = true, .project = FULL32,
+     .want = UDSOTA_DL_OK},
+    {"BAD_HEADER: cfg.product NULL, the header rules stand", .any = true, POKE({0, 0x43}),
+     .want = UDSOTA_DL_BAD_HEADER},
+    {"BAD_BOARD: cfg.product NULL, hw_id", .any = true, .project = "widget", POKE({DESC + 6, 2}),
+     .want = UDSOTA_DL_BAD_BOARD},
+    {"BAD_LAYOUT: cfg.product NULL", .any = true, .project = "widget", POKE({DESC + 7, 2}),
+     .want = UDSOTA_DL_BAD_LAYOUT},
+    {"BAD_DIAG_IDS: cfg.product NULL", .any = true, .project = "widget", POKE({DESC + 8, 0x21}),
+     .want = UDSOTA_DL_BAD_DIAG_IDS},
+    {"accepted: update_buses 0", POKE({UBUSES, 0}, {UBUSES + 1, 0}), .want = UDSOTA_DL_OK},
+    {"accepted: update_buses for bus 3 alone", POKE({UBUSES, 4}, {UBUSES + 1, 0}), .want = UDSOTA_DL_OK},
     {"accepted: a project that fills its field", .product = FULL32, .project = FULL32, .want = UDSOTA_DL_OK},
     {"BAD_PROJECT: a product longer than the field", .product = FULL32 "6", .project = FULL32,
      .want = UDSOTA_DL_BAD_PROJECT},
@@ -207,6 +223,9 @@ static void image_rules_cases(void)
         udsota_boot_cfg_t cfg = k_cfg;
         if (c->product != NULL) {
             cfg.product = c->product;
+        }
+        if (c->any) {
+            cfg.product = NULL;
         }
         const uint32_t n = (c->hdr_len != 0u) ? c->hdr_len : UDSOTA_BARE_HDR_LEN;
         uint8_t *exact = malloc(n);
@@ -416,6 +435,8 @@ static void fixture_cases(void)
         }
     }
     CHECK(differ == 0 && unstamped == 0 && fixed == UDSOTA_BARE_HDR_LEN - 8u - 32u);
+    CHECK(udsota_image_header.update_buses == 0xFFFFu && hdr[UDSOTA_BARE_HDR_UPDATE_BUSES_OFFSET] == 0xFFu &&
+          hdr[UDSOTA_BARE_HDR_UPDATE_BUSES_OFFSET + 1u] == 0xFFu);   /* every bus, as every image built so far */
     CHECK(udsota_image_header.desc.flags == 0x01u && udsota_image_header.header_version == UDSOTA_BARE_HDR_VERSION);
 }
 

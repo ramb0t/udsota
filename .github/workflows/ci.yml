@@ -98,11 +98,11 @@ jobs:
             -DISO_TP_DEFAULT_ST_MIN_US=0 -DISO_TP_DEFAULT_RESPONSE_TIMEOUT_US=1000000 -DNDEBUG \
             -c boot/udsota_boot.c -o udsota_boot.o
           arm-none-eabi-size udsota_boot.o
-          # The gate is the 2,879 bytes of text measured with arm-none-eabi-gcc 14.3.1 (boot/README.md, "Size") plus
+          # The gate is the 3,083 bytes of text measured with arm-none-eabi-gcc 14.3.1 (boot/README.md, "Size") plus
           # about 20 percent. The distribution's compiler is another release, which lays the code out differently, so
           # the gate catches the core growing, not a few bytes' change.
           text=$(arm-none-eabi-size udsota_boot.o | awk 'NR == 2 { print $1 }')
-          [ "$text" -le 3456 ] || { echo "udsota_boot.o has $text bytes of text, over the gate of 3456"; exit 1; }
+          [ "$text" -le 3700 ] || { echo "udsota_boot.o has $text bytes of text, over the gate of 3700"; exit 1; }
   esp32:
     runs-on: ubuntu-latest
     container: espressif/idf:v6.1

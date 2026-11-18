@@ -183,7 +183,7 @@ udsota_reason_t udsota_boot_image_rules(const udsota_boot_cfg_t *cfg, const uint
     if (why != UDSOTA_DL_OK) {
         return why;
     }
-    if (!project_is(hdr + BLOCK(UDSOTA_BARE_PROJECT_OFFSET), cfg->product)) {
+    if (cfg->product != NULL && !project_is(hdr + BLOCK(UDSOTA_BARE_PROJECT_OFFSET), cfg->product)) {
         return UDSOTA_DL_BAD_PROJECT;
     }
     const uint8_t *d = hdr + BLOCK(0u);
@@ -265,6 +265,16 @@ static void tick(void)
     (void)UDSMillis();
 }
 
+/* Whether bus takes updates: the valid installed image's effective update_buses (udsota_image_bus_open), every bus
+ * without a valid app. Worked out afresh at each use, from the mask and the flag alone, never from whether a bus
+ * started. */
+static bool bus_open(uint8_t bus)
+{
+    const uint8_t *const hdr = udsota_boot_port_slot() + B.cfg->image_header_offset;
+    return udsota_image_bus_open(B.app_valid ? le16(hdr + UDSOTA_BARE_HDR_UPDATE_BUSES_OFFSET) : 0xFFFFu,
+                                 B.cfg->buses, bus);
+}
+
 /* Every bus but keep (0 for none). */
 static void stop_buses(uint8_t keep)
 {
@@ -276,11 +286,15 @@ static void stop_buses(uint8_t keep)
     }
 }
 
-/* Every bus; one that does not start is absent. */
-static void listen_all(void)
+/* The open buses started, one that does not start being absent, and every other bus stopped. */
+static void listen(void)
 {
     for (uint8_t b = 1; b <= B.cfg->buses; b++) {
-        (void)udsota_boot_port_can_start(b, B.cfg->request_id);
+        if (bus_open(b)) {
+            (void)udsota_boot_port_can_start(b, B.cfg->request_id);
+        } else {
+            udsota_boot_port_can_stop(b);
+        }
         tick();
     }
 }
@@ -475,6 +489,13 @@ static UDSErr_t read_did(UDSServer_t *srv, const UDSRDBIArgs_t *a)
         }
         n = 32u;
         break;
+    case UDSOTA_DID_PROJECT:
+        p = installed(UDSOTA_BARE_PROJECT_OFFSET);
+        n = p != NULL ? str_len((const char *)p, 32u) : 0u;
+        if (n == 0u) {                                   /* no valid app, or one stamped with no project */
+            return UDS_NRC_RequestOutOfRange;
+        }
+        break;
     default:                                             /* F1F4 too: only the app answers it */
         return UDS_NRC_RequestOutOfRange;
     }
@@ -633,7 +654,7 @@ static bool cfg_ok(const udsota_boot_cfg_t *c)
     }
     const uint32_t unit = c->slot_write_unit;
     return c->request_id <= 0x7FFu && c->response_id <= 0x7FFu && c->request_id != c->response_id &&
-           c->buses >= 1u && c->buses <= 15u && c->product != NULL && str_len(c->product, 33u) <= 32u &&
+           c->buses >= 1u && c->buses <= 15u && (c->product == NULL || str_len(c->product, 33u) <= 32u) &&
            c->boot_version != NULL && c->hold_after_starts != 0u && unit != 0u && (unit & (unit - 1u)) == 0u &&
            (c->slot_size & (unit - 1u)) == 0u && (DATA_MAX & (unit - 1u)) == 0u &&
            c->image_header_offset <= DATA_MAX - UDSOTA_BARE_HDR_LEN &&
@@ -660,7 +681,7 @@ static void reset(void)
 }
 
 /* S3's expiry and the idle exit: a reset when the boot rules would start the app, else listening again on every
- * bus, with iso14229 from scratch, no lock and no window. */
+ * open bus, with iso14229 from scratch, no lock and no window; what is installed now says which buses are open. */
 static void session_exit(void)
 {
     const udsota_boot_inputs_t in = {.count_word = udsota_boot_port_keep_read(UDSOTA_KEEP_WORD_COUNT),
@@ -669,9 +690,8 @@ static void session_exit(void)
         reset();
         return;
     }
-    stop_buses(0u);
     B.state = LISTENING;
-    listen_all();
+    listen();
     server_init();
 }
 
@@ -697,7 +717,7 @@ udsota_boot_decision_t udsota_boot_init(const udsota_boot_cfg_t *cfg)
     udsota_boot_decision_t d = udsota_boot_decide(cfg, &in, &B.count);
     if (d == UDSOTA_BOOT_DECIDE_HANDOVER) {
         B.bus = (uint8_t)in.handover;
-        if (udsota_boot_port_can_start(B.bus, cfg->request_id)) {
+        if (bus_open(B.bus) && udsota_boot_port_can_start(B.bus, cfg->request_id)) {
             B.replay = true;
         } else {
             in.handover_ok = false;
@@ -711,7 +731,7 @@ udsota_boot_decision_t udsota_boot_init(const udsota_boot_cfg_t *cfg)
         return d;
     }
     if (d != UDSOTA_BOOT_DECIDE_HANDOVER) {
-        listen_all();
+        listen();
     }
     server_init();
     B.since = UDSMillis();                               /* the window's start, or the replayed 10 02's time */
@@ -768,14 +788,15 @@ void udsota_boot_poll(void)
 void udsota_boot_rx(uint8_t bus, uint32_t id, const uint8_t *data, uint8_t len)
 {
     if (B.state == STOPPED || B.state == STARTING || bus == 0u || bus > B.cfg->buses || len > 8u ||
-        id != B.cfg->request_id || ((B.state == TESTER || busy()) && bus != B.bus)) {
+        id != B.cfg->request_id || ((B.state == TESTER || busy()) && bus != B.bus) ||
+        (B.state != TESTER && !bus_open(bus))) {
         return;
     }
     const uint32_t now = UDSMillis();
     B.bus = bus;
     if (len >= 3u && data[0] == 0x02u &&
-        ((data[1] == 0x10u && data[2] == UDS_LEV_DS_PRGS) || (data[1] == 0x3Eu && (data[2] & 0x7Fu) == 0u))) {
-        if (B.state != TESTER) {                         /* a tester frame: 02 10 02, 02 3E 00 or 02 3E 80 */
+        ((data[1] == 0x10u && (data[2] & 0x7Fu) == UDS_LEV_DS_PRGS) || (data[1] == 0x3Eu && (data[2] & 0x7Fu) == 0u))) {
+        if (B.state != TESTER) {                         /* a tester frame: 02 10 02/82 or 02 3E 00/80 */
             stop_buses(bus);
         }
         B.state = TESTER;

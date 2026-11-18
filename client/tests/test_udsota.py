@@ -1426,7 +1426,9 @@ NRC_ISO14229 = {"UDSOTA_NRC_BUSY_REPEAT": "UDS_NRC_BusyRepeatRequest",
                 "UDSOTA_NRC_RESPONSE_TOO_LONG": "UDS_NRC_ResponseTooLong"}
 # The client's own copy of each udsota_wire.h number outside WIRE_DEFINES: lengths, levels, offsets, the bare header,
 # and F1F4, which came after v0.14.2.
-CLIENT_NUMBERS = {"UDSOTA_DID_IMAGE_PREFIX": wire.DID_IMAGE_PREFIX, "UDSOTA_DL_MAX_BLOCK_LEN": wire.DL_MAX_DATA + 2,
+CLIENT_NUMBERS = {"UDSOTA_DID_IMAGE_PREFIX": wire.DID_IMAGE_PREFIX, "UDSOTA_DID_PROJECT": wire.DID_PROJECT,
+                  "UDSOTA_BARE_HDR_UPDATE_BUSES_OFFSET": image.BARE_HDR_UPDATE_BUSES_OFFSET,
+                  "UDSOTA_DL_MAX_BLOCK_LEN": wire.DL_MAX_DATA + 2,
                   "UDSOTA_SA_SEED_EXTENDED": PE.security.level_extended,         # the profile's default levels
                   "UDSOTA_SA_SEED_PROGRAMMING": PE.security.level_programming,
                   "UDSOTA_SEED_LEN": keys.SEED_LEN, "UDSOTA_KEY_LEN": keys.KEY_LEN, "UDSOTA_KEYS_SIG_LEN": keys.SIG_LEN,
@@ -1590,7 +1592,7 @@ def test_boot_headers_include_only_their_own():
     def includes(path):
         text = re.sub(r"/\*.*?\*/", "", udsota_h(path), flags=re.S)
         return re.findall(r'^[ \t]*#[ \t]*include[ \t]*[<"]([^>"]+)[>"]', text, flags=re.M)
-    assert includes(REPO / "udsota_image.h") == ["assert.h", "stddef.h", "stdint.h", "udsota_wire.h"]
+    assert includes(REPO / "udsota_image.h") == ["assert.h", "stdbool.h", "stddef.h", "stdint.h", "udsota_wire.h"]
     assert includes(REPO / "udsota_app.h") == ["stdbool.h", "udsota_wire.h", "udsota_image.h"]
     assert includes(REPO / "boot" / "udsota_boot.h") == ["stdbool.h", "stddef.h", "stdint.h", "udsota_wire.h"]
     assert includes(REPO / "boot" / "udsota_boot_internal.h") == ["udsota_boot.h"]
@@ -4815,12 +4817,14 @@ def test_stamp_command_refuses_a_directory(tmp_path, capsys, monkeypatch, out):
 # F1F4 with 0x31. F001 after a passing FF01, or a keyed 11 01, starts the app; with app_fails it does not start and
 # the unit is back in its bootloader, held. lose_activate_answer drops the first F001's answer after serving it, and
 # lose_activate loses that many F001s before they are served. With app_nrc the app answers every other request with
-# that NRC.
+# that NRC. F1F5 answers project (bytes, as installed) while there is a valid app, else 0x31; project None serves no
+# F1F5, as an older bootloader.
 class BootloaderUnit(FakeServer):
     # FakeServer's knobs, plus the app's and the bootloader's above.
     def __init__(self, in_app=True, held=False, app_fails=False, app_silent=False, app_prefix=None, start_silence=2,
-                 lose_activate_answer=False, lose_activate=0, app_nrc=None, **kw):
+                 lose_activate_answer=False, lose_activate=0, app_nrc=None, project=None, f1f5_nrc=0x31, **kw):
         super().__init__(**kw)
+        self.project, self.f1f5_nrc = project, f1f5_nrc
         self.in_app, self.held, self.app_valid = in_app, held, True
         self.app_fails, self.app_silent, self.app_prefix = app_fails, app_silent, app_prefix
         self.start_silence, self.lose_activate_answer = start_silence, lose_activate_answer
@@ -4854,6 +4858,10 @@ class BootloaderUnit(FakeServer):
         if did == 0xF1F0:
             status = bytes([0, 3 if self.app_valid else 4, 0, 0]) + bytes(11) + bytes([0x04 if self.held else 0])
             return [b"\x62\xf1\xf0" + status]
+        if did == 0xF1F5 and self.project is not None and self.app_valid and self.project:
+            return [b"\x62\xf1\xf5" + self.project]
+        if did == 0xF1F5:
+            return self.nrc(0x22, self.f1f5_nrc)
         return super().s22(req, did)
 
     # RequestDownload as FakeServer; a download that opens erases the app.
@@ -4899,7 +4907,9 @@ PBL = profile.from_dict("bare-boot", tomllib.loads(BARE_BL))
 PFB = profile.from_dict("full-boot", tomllib.loads(FULL + UPDATE_BL))
 BL_IMG = build_bare_image(header_offset=48, size=4800)
 BL_ID = bare_id(BL_IMG, 48)         # BL_IMG's image ID
-BL_PRECHECK = [(0x22, 0xF1F4), (0x10, 2), (0x22, 0xF1F0), (0x22, 0xF1F3)]   # F1F4 to the app, then the hop
+BL_PRECHECK = [(0x22, 0xF1F4), (0x10, 2), (0x22, 0xF1F0), (0x22, 0xF1F3), (0x22, 0xF1F5)]   # F1F4 to the app, then the hop
+# With [security] and [board]: the F1F5 read follows F1F3, before the profile's board DID and the device ID.
+BL_SECURE_PRECHECK = BL_PRECHECK[:4] + [(0x22, 0xF1F5), (0x22, 0xF191), (0x22, 0xF18C)]
 POLLS = [(0x22, 0xF1F4)] * 3        # the app answers the third, after start_silence
 
 
@@ -5020,7 +5030,7 @@ def test_bootloader_flow_reenters_after_unused_deltas(monkeypatch):
                             bases=[("a.bin", DELTA_BASE)])
     assert rc == 0 and d.dfis == [0x00] and bytes(d.written) == DELTA_NEW
     first_34 = d.log.index((0x34, None))
-    assert d.log[:first_34] == BL_PRECHECK[:2] + PRECHECK + UNLOCK_PROG[1:] + UNLOCK_PROG
+    assert d.log[:first_34] == BL_SECURE_PRECHECK + UNLOCK_PROG[1:] + UNLOCK_PROG
     assert any(ln.startswith("no delta over DFI 0x20") for ln in lines)
 
 
@@ -5076,14 +5086,14 @@ def test_bootloader_flow_other_prefix_fails():
 def test_bootloader_flow_unlocks_after_the_precheck_reads():
     d = BootloaderUnit()
     rc, _, lines = run_boot(d, image=make_image(), prof=PFB, master=MASTER)
-    assert rc == 0 and d.log == BL_PRECHECK[:2] + PRECHECK + UNLOCK_PROG[1:] + DOWNLOAD + POLLS
+    assert rc == 0 and d.log == BL_SECURE_PRECHECK + UNLOCK_PROG[1:] + DOWNLOAD + POLLS
     assert lines[0] == "image 0.3.0 for devkit, 4800 bytes, app_elf_sha256 a0a1a2a3a4a5a6a7"
     d = BootloaderUnit()
     with pytest.raises(errors.Refused, match="^image is for devkit-three but the server is devkit. The unit is in its "
                                              "bootloader and returns to its app when its programming session times "
                                              "out, unless it is held there$"):
         run_boot(d, image=make_image(hw_id=3), prof=PFB, master=MASTER)
-    assert d.log == BL_PRECHECK[:2] + PRECHECK + UNLOCK_PROG[1:]
+    assert d.log == BL_SECURE_PRECHECK + UNLOCK_PROG[1:]
 
 
 # Check a bootloader that does not serve F1F0 is refused as no udsota server, after the 10 02 alone, saying the unit is
@@ -5113,9 +5123,105 @@ def test_bootloader_flow_reset():
 def test_bootloader_flow_info_enters_programming_first():
     ft, lines, d = FakeTime(), [], BootloaderUnit(security=False)
     assert update.info(uds_for(d, ft), PBL, log=lines.append) == 0
-    assert d.log == [(0x10, 2)] + [(0x22, did) for did in (0xF186, 0xF189, 0xF18C, 0xF1F3, 0xF1F0, 0xF1F1, 0xF1F2)]
+    assert d.log == [(0x10, 2)] + [(0x22, did) for did in (0xF186, 0xF189, 0xF18C, 0xF1F3, 0xF1F0, 0xF1F1, 0xF1F2,
+                                                             0xF1F5)]
     assert "F186 active session: 02" in lines and "F1F3 running image ID: " + OLD_SHA.hex(" ") in lines
     assert lines[-1] == "the unit stays in its bootloader until its programming session times out"
+
+
+# Check info under the bootloader flow prints the installed project, and that there is none when F1F5 answers 0x31
+# (no valid app, an empty project, or a bootloader that does not know the DID); the app flow reads no F1F5.
+@pytest.mark.parametrize("kw, valid, line", [
+    (dict(project=b"stm32boot"), True, "F1F5 installed project: stm32boot"),
+    (dict(project=b"stm32boot"), False,
+     "F1F5 installed project: none (no valid app, or the bootloader does not report it)"),
+    (dict(project=b""), True, "F1F5 installed project: none (no valid app, or the bootloader does not report it)"),
+    (dict(), True, "F1F5 installed project: none (no valid app, or the bootloader does not report it)")])
+def test_bootloader_flow_info_prints_the_installed_project(kw, valid, line):
+    ft, lines, d = FakeTime(), [], BootloaderUnit(security=False, **kw)
+    d.app_valid = valid
+    assert update.info(uds_for(d, ft), PBL, log=lines.append) == 0
+    assert lines.index(line) == lines.index(next(x for x in lines if x.startswith("F1F2"))) + 1
+    d = FakeServer(security=False)
+    assert update.info(uds_for(d, FakeTime()), P, log=lines.append) == 0 and (0x22, 0xF1F5) not in d.log
+
+
+# Check flash under the bootloader flow reads F1F5 in a 22 of its own after F1F3, and refuses an image of another
+# project than the one installed after the 10 02, the precheck reads and the unlock, before any download, naming
+# both projects and the flag and saying the unit is left in its bootloader.
+def test_bootloader_flow_refuses_a_product_change():
+    d = BootloaderUnit(security=False, project=b"widget")
+    with pytest.raises(errors.Refused, match=r"^the unit runs project 'widget' and the image is project 'stm32boot': "
+                                             r"pass --allow-product-change to replace one with the other\. The unit "
+                                             r"is in its bootloader and returns to its app when its programming "
+                                             r"session times out, unless it is held there$"):
+        run_boot(d)
+    assert d.log == BL_PRECHECK
+    d = BootloaderUnit(project=b"widget")
+    with pytest.raises(errors.Refused, match="--allow-product-change"):
+        run_boot(d, image=make_image(project=b"example"), prof=PFB, master=MASTER)
+    assert d.log == BL_SECURE_PRECHECK + UNLOCK_PROG[1:] and not d.written
+
+
+# Check --allow-product-change logs both names and goes on to flash, and says nothing when the project is the same.
+def test_bootloader_flow_allow_product_change_flashes():
+    d = BootloaderUnit(security=False, project=b"widget")
+    rc, _, lines = run_boot(d, allow_product_change=True)
+    assert rc == 0 and d.log == BL_PRECHECK + DOWNLOAD + POLLS and bytes(d.written) == BL_IMG
+    assert "changing the unit's project from 'widget' to 'stm32boot' (--allow-product-change)" in lines
+    d = BootloaderUnit(security=False, project=b"stm32boot")
+    rc, _, lines = run_boot(d, allow_product_change=True)
+    assert rc == 0 and not any("project" in ln for ln in lines)
+
+
+# Check a negative answer to F1F5 (no valid app, an empty project, a bootloader that does not know it) goes on to flash
+# without the flag, and the same project needs none.
+@pytest.mark.parametrize("kw, valid", [(dict(), True), (dict(project=b""), True), (dict(project=b"stm32boot"), True),
+                                       (dict(project=b"widget", in_app=False), False)])
+def test_bootloader_flow_f1f5_without_a_conflict_goes_on(kw, valid):
+    d = BootloaderUnit(security=False, **kw)
+    d.app_valid = valid                     # not valid: nothing installed, and the bootloader answers 0x31
+    assert run_boot(d)[0] == 0 and d.log[:len(BL_PRECHECK)] == BL_PRECHECK and bytes(d.written) == BL_IMG
+
+
+# Check any other negative answer to F1F5 goes on too (a bootloader may deny reads before the unlock), in flash and info.
+@pytest.mark.parametrize("nrc", [0x11, 0x22, 0x33])
+def test_bootloader_flow_any_f1f5_nrc_goes_on(nrc):
+    d = BootloaderUnit(security=False, project=b"widget", f1f5_nrc=nrc)
+    d.app_valid = False
+    assert run_boot(d)[0] == 0 and bytes(d.written) == BL_IMG
+    d, lines = BootloaderUnit(security=False, project=b"widget", f1f5_nrc=nrc), []
+    d.app_valid = False
+    assert update.info(uds_for(d, FakeTime()), PBL, log=lines.append) == 0
+    assert "F1F5 installed project: none (no valid app, or the bootloader does not report it)" in lines
+
+
+# Check --allow-product-change is refused outside the bootloader flow, in flash and in main before any bus opens, and
+# that main passes it to a bootloader-flow flash.
+def test_allow_product_change_needs_the_bootloader_flow(tmp_path, full_path, capsys):
+    good = tmp_path / "good.bin"
+    good.write_bytes(make_image())
+    assert cli.main(["--profile", full_path, "flash", str(good), "--allow-product-change"],
+                    transport=no_transport) == 2
+    assert 'profile full: --allow-product-change is for [update] flow = "bootloader"' in capsys.readouterr().err
+    with pytest.raises(errors.Refused, match=re.escape(update.PRODUCT_NEEDS_BOOTLOADER)):
+        run_flash(FakeServer(), allow_product_change=True)
+    assert cli.parse_args(["--profile", "x", "flash", "x.bin"]).allow_product_change is False
+    assert cli.parse_args(["--profile", "x", "flash", "x.bin", "--allow-product-change"]).allow_product_change is True
+
+
+# Check main refuses a product change under the bootloader flow (exit 2, the message on stderr), and flashes with the
+# flag.
+def test_main_product_change(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(update, "REBOOT_WAIT_S", 0.0)
+    (tmp_path / "boot.toml").write_text(BARE_BL)
+    (tmp_path / "fw.bin").write_bytes(BL_IMG)
+    argv = ["--profile", str(tmp_path / "boot.toml"), "flash", str(tmp_path / "fw.bin")]
+    d = BootloaderUnit(security=False, start_silence=0, project=b"widget")
+    assert cli.main(argv, transport=FakeTransport.on(d)) == 2
+    assert "--allow-product-change" in capsys.readouterr().err and d.log == BL_PRECHECK
+    d = BootloaderUnit(security=False, start_silence=0, project=b"widget")
+    assert cli.main(argv + ["--allow-product-change"], transport=FakeTransport.on(d)) == 0 and d.sha == BL_ID
 
 
 # Check confirm under the bootloader flow is refused (exit 2) before any bus opens.

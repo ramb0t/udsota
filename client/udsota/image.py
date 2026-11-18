@@ -14,9 +14,10 @@ APP_DESC_OFFSET, APP_DESC_MAGIC = 32, 0xABCD5432
 DESC_OFFSET, DESC_MAGIC = 288, 0x5544534F   # udsota_image_desc_t, "UDSO"
 IMAGE_MIN_LEN = 320
 # The bare header (UDSOTA_BARE_HDR_*), at the profile's header_offset: magic "UDSB", header_version, flags,
-# image_length, crc32, 16 reserved bytes, the descriptor block, then the signature.
+# image_length, crc32, update_buses and 14 reserved bytes, the descriptor block, then the signature.
 BARE_HDR_MAGIC, BARE_HDR_VERSION, BARE_HDR_LEN = 0x55445342, 1, 224
 BARE_HDR_LENGTH_OFFSET, BARE_HDR_CRC_OFFSET, BARE_HDR_DESC_OFFSET = 8, 12, 32
+BARE_HDR_UPDATE_BUSES_OFFSET = 16   # 2 bytes of the 16 reserved: the buses that take updates; only a bootloader reads it
 BARE_HDR_SIG_OFFSET, BARE_HDR_SIG_LEN = 160, 64
 BARE_HDR_FLAGS_MUST = 0xFF00   # flags a reader must understand to take the image; the low byte is ignorable
 # The descriptor block (UDSOTA_BARE_*), in the header: udsota_image_desc_t, then the version, project and image ID

@@ -21,6 +21,9 @@
 #define UDSOTA_DID_RUNNING_SHA      0xF1F3u   /* 32 B: the running image's app_elf_sha256 */
 #define UDSOTA_DID_IMAGE_PREFIX     0xF1F4u   /* 4 B: F1F3's first 4 bytes, from a single-slot bootloader unit's app
                                                  once healthy (docs/wire.md); udsota.c does not serve it */
+#define UDSOTA_DID_PROJECT          0xF1F5u   /* a bootloader unit's: the installed app's project string, without its
+                                                 NUL; 0x31 with no valid app or an empty project field; udsota.c does
+                                                 not serve it */
 #define UDSOTA_RID_CHECK_PROG_DEPS  0xFF01u   /* CheckProgrammingDependencies (verify): status udsota_reason_t */
 #define UDSOTA_RID_GET_RESUME_POINT 0xF000u   /* reserved: status UDSOTA_RESUME_NOT_AVAILABLE */
 #define UDSOTA_RID_ACTIVATE_IMAGE   0xF001u
@@ -54,6 +57,8 @@
                                                      the header included; a multiple of 4 */
 #define UDSOTA_BARE_HDR_CRC_OFFSET    12u         /* in the header: 4 B, zlib's CRC-32 of the image's bytes before
                                                      this field and after it */
+#define UDSOTA_BARE_HDR_UPDATE_BUSES_OFFSET 16u   /* in the header: 2 B little-endian, the buses that take updates:
+                                                     bit b-1 set means bus b (udsota_image.h); 0xFFFF every bus */
 #define UDSOTA_BARE_HDR_DESC_OFFSET   32u         /* in the header: the descriptor block, UDSOTA_BARE_DESC_LEN */
 #define UDSOTA_BARE_HDR_SIG_OFFSET    160u        /* in the header: the signature, 0xFF; reserved */
 #define UDSOTA_BARE_HDR_SIG_LEN       64u

@@ -3,10 +3,11 @@
  * compiles no udsota source. It includes udsota_wire.h, udsota_image.h and <stdbool.h>, never iso14229 or
  * udsota_boot.h, keeps no state and calls no library function, so an interrupt may use any of it.
  *
- * The app answers exactly two requests, and only on 11-bit data frames on its request ID, on any bus:
+ * The app answers exactly two requests, and only on 11-bit data frames on its request ID, on a bus that takes updates
+ * (udsota_app_bus_open, from its own header's update_buses; every bus unless its header says otherwise):
  *  - 10 02, the handover;
  *  - 22 F1F4, the running image's ID prefix. The app answers it only once it is healthy.
- * It is silent to everything else. Its obligations:
+ * It is silent to everything else, and to those two on a bus that does not take updates. Its obligations:
  *  - reload the watchdog the bootloader started, which runs from the jump. Its period is nominal, and a watchdog's own
  *    clock can run well fast of nominal (an STM32F1's nominal 2 s is 1.33 to 2.67 s, boot/README.md), so reload well
  *    inside the shortest period the part's data allows;
@@ -48,6 +49,15 @@ static inline udsota_app_rx_t udsota_app_classify(uint32_t req_id, uint32_t id, 
         return UDSOTA_APP_RX_READ_PREFIX;
     }
     return UDSOTA_APP_RX_OTHER;
+}
+
+/* Whether bus (1 to buses, the board's bus count) takes updates under the app's own header (udsota_image_header,
+ * placed by UDSOTA_IMAGE_HEADER or UDSOTA_IMAGE_HEADER_BUSES): the rule of the bootloader, udsota_image_bus_open. The
+ * app calls it with the bus a frame came in on before it classifies the frame as a handover or a read of F1F4, and
+ * stays silent when it is false. */
+static inline bool udsota_app_bus_open(uint8_t bus, uint8_t buses)
+{
+    return udsota_image_bus_open(udsota_image_header.update_buses, buses, bus);
 }
 
 /* The answer to the handover, sent on the response ID within the tester's 150 ms P2, on the bus the request came

@@ -28,7 +28,7 @@ from .keys import keygen, load_master, load_private_key
 from .transport import Transport
 from .delta import DETOOLS_HINT
 from .pack import DFIS, pack, refuse_bare_delta
-from .update import DIFF_DFIS, WAIT_NEEDS_BOOTLOADER, confirm_cmd, flash, info, reset
+from .update import DIFF_DFIS, PRODUCT_NEEDS_BOOTLOADER, WAIT_NEEDS_BOOTLOADER, confirm_cmd, flash, info, reset
 
 
 # A --dfi value: one of pack's DFIs, written 0x00, 0x10, 0x20 or 0x30.
@@ -87,6 +87,9 @@ def parse_args(argv):
                         "10 02 is not answered, power-cycle the unit when told, while 10 02 goes out again, each at "
                         "most 50 ms after the last went unanswered, for up to SECONDS (1 to 600) to catch its "
                         "bootloader's power-up window")
+    f.add_argument("--allow-product-change", action="store_true",
+                   help="[update] flow = \"bootloader\" only: flash an image of another project than the one the unit "
+                        "reports as installed (F1F5), which is refused without this")
     sub.add_parser("confirm", help="ConfirmImage for a PENDING_VERIFY image")
     sub.add_parser("reset", help="ECUReset (rolls back an unconfirmed image)")
     c = sub.add_parser("config", help="show or set the profile's writable DIDs")
@@ -259,6 +262,8 @@ def main(argv=None, transport=Transport):
                 raise Refused("--diff-format needs --diff-from")
             if args.wait_for_unit is not None and prof.flow != "bootloader":   # flash refuses it too
                 raise Refused("profile %s: %s" % (prof.name, WAIT_NEEDS_BOOTLOADER))
+            if args.allow_product_change and prof.flow != "bootloader":
+                raise Refused("profile %s: %s" % (prof.name, PRODUCT_NEEDS_BOOTLOADER))
             if args.diff_from is not None:
                 if args.drop_76 is not None:            # flash refuses it too; here before any key or bus
                     raise Refused("--drop-76 is for full and compressed downloads, not with --diff-from")
@@ -282,7 +287,8 @@ def main(argv=None, transport=Transport):
             if args.cmd == "flash":
                 return flash(uds, prof, image, secret, drop_76=args.drop_76, preroll=t.preroll,
                              quiet=getattr(t, "quiet", contextlib.nullcontext), compress=args.compress,
-                             bases=bases, diff_format=args.diff_format or "auto", wait_for_unit=args.wait_for_unit)
+                             bases=bases, diff_format=args.diff_format or "auto", wait_for_unit=args.wait_for_unit,
+                             allow_product_change=args.allow_product_change)
             if args.cmd == "confirm":
                 return confirm_cmd(uds)
             if args.cmd == "config":

@@ -57,6 +57,7 @@ The checks run in this order: 0x7F in the default session, 0x12 for sub-function
 | F1F1 | last download, 5 bytes |
 | F1F3 | the running image's `app_elf_sha256`, 32 bytes |
 | F1F4 | F1F3's first 4 bytes, from a [bootloader-flow](#bootloader-flow) unit's app once it is healthy; udsota doesn't serve it |
+| F1F5 | a [bootloader-flow](#bootloader-flow) unit's installed app's project string, without its NUL, from the bootloader; 0x31 with no valid app or an empty project field; udsota doesn't serve it |
 
 **F1F0** is laid out as in 0.14, less its flag 0x02:
 
@@ -139,7 +140,7 @@ ISO-TP is iso14229's isotp-c with its defaults unless the app defines others bui
 | 12 | `flags` | bit 0: a release build (a clean `[v]X.Y.Z` version); other bits 0 |
 | 13 | `reserved` | 19 zero bytes |
 
-An image that is not an ESP-IDF app, which the client takes with `[image] format = "bare"`, carries udsota's bare header in its place: 224 bytes (`UDSOTA_BARE_HDR_LEN`), little-endian, at the offset its profile's `header_offset` names. The firmware build fills `magic`, `header_version`, `flags` (0), the descriptor, `version` and `project`, and leaves the reserved and `signature` fields 0xFF; stamping writes `image_length`, `image_id` and `crc32`. The client refuses an image that is not stamped, and needs the descriptor's `desc_version` to be 1 or later.
+An image that is not an ESP-IDF app, which the client takes with `[image] format = "bare"`, carries udsota's bare header in its place: 224 bytes (`UDSOTA_BARE_HDR_LEN`), little-endian, at the offset its profile's `header_offset` names. The firmware build fills `magic`, `header_version`, `flags` (0), the descriptor, `update_buses` (0xFFFF unless the product sets it), `version` and `project`, and leaves the reserved and `signature` fields 0xFF; stamping writes `image_length`, `image_id` and `crc32`. The client refuses an image that is not stamped, and needs the descriptor's `desc_version` to be 1 or later.
 
 | Offset | Field | Value |
 |---|---|---|
@@ -148,7 +149,8 @@ An image that is not an ESP-IDF app, which the client takes with `[image] format
 | 6 | `flags` | 0 (16-bit). No bit is defined yet: a reader ignores a low-byte bit it does not know and refuses the image for a high-byte one |
 | 8 | `image_length` | the image's length in bytes from its first byte, the header included; a multiple of 4 |
 | 12 | `crc32` | CRC-32 as zlib computes it, over the image's bytes before this field followed by those after it, up to `image_length` |
-| 16 | reserved | 16 bytes of 0xFF |
+| 16 | `update_buses` | 0xFFFF (16-bit): the buses that take updates, bit b−1 for bus b ([Bootloader flow](#bootloader-flow)); only a [bootloader-flow](#bootloader-flow) unit reads it |
+| 18 | reserved | 14 bytes of 0xFF |
 | 32 | descriptor | the 32 bytes above, opening the 128-byte block of the fields below (`UDSOTA_BARE_DESC_LEN`) |
 | 64 | `version` | 32 bytes, NUL-terminated ASCII: what F189 returns |
 | 96 | `project` | 32 bytes, NUL-terminated ASCII: the product name |
@@ -157,7 +159,7 @@ An image that is not an ESP-IDF app, which the client takes with `[image] format
 
 Stamping pads the file with 0xFF to a multiple of 4 bytes, then writes `image_length`, then `image_id`, then `crc32`. It never touches the signature, and stamping a stamped image returns the same bytes. `udsota stamp` stamps a file, and a post-build script can call the client's `udsota.image.stamp(data, header_offset)` instead. `udsota_wire.h` names each offset (`UDSOTA_BARE_HDR_*`, and `UDSOTA_BARE_*` within the block).
 
-A unit's bootloader cannot be updated with its app, so the header keeps to these rules. A field defined in version 1 never moves or changes meaning, and a layout that breaks that gets another magic. A unit takes `header_version` 1 or later and ignores the reserved bytes and the signature it does not use; the client takes only the versions it knows.
+A unit's bootloader cannot be updated with its app, so the header keeps to these rules. A field defined in version 1 never moves or changes meaning, and a layout that breaks that gets another magic. A unit takes `header_version` 1 or later and ignores the reserved bytes and the signature it does not use; the client takes only the versions it knows. `update_buses` was the first two of the 16 reserved bytes: every image built before it has 0xFF there, which means every bus, and a core that predates it ignores it, so `header_version` stays 1.
 
 ## Keys
 
@@ -183,12 +185,14 @@ A flasher that is not the client, such as an edge device that fetches updates fr
 
 A single-slot unit whose resident bootloader is its only UDS server, such as an STM32 bootloader on iso14229, serves the download, FF01 and F001 above from its bootloader, and the client drives it with `[update] flow = "bootloader"`. Its app answers two requests only: `10 02`, with `7F 10 78` before it resets into the bootloader, which then sends the `50 02` within P2*; and, once the app is healthy, a single-frame `22 F1F4`. `udsota.c` serves none of this; [`boot/`](../boot/README.md) is a bootloader core that serves the bootloader's side, and `udsota_app.h` builds the app's two answers.
 
-**Precheck.** First one `22 F1F4` in the default session: four bytes equal to the image ID's first four mean the app already runs the image and is healthy, so there is nothing to do and the app keeps running; anything else, or no answer, goes on to the `10 02`. Then, in the programming session: F1F0, F1F3, the board DID where the profile names one (a `boot/` unit serves none, so its profile has no `[board]`) and F18C, then the programming unlock. F1F0 describes one slot: running slot 0 and boot slot 0, running state 3 only while the app is valid and never 2, other slot state 0. Flag 0x04 means the bootloader holds the unit there because its app failed to start; a reset releases it for another try. F1F3 reads 32 zero bytes while there is no valid app, and F189 reads `0.0.0` then and for an app stamped with no version. If F1F3 already reads the image's ID, send `11 01` and go on to the proof of life.
+**Precheck.** First one `22 F1F4` in the default session: four bytes equal to the image ID's first four mean the app already runs the image and is healthy, so there is nothing to do and the app keeps running; anything else, or no answer, goes on to the `10 02`. Then, in the programming session: F1F0, F1F3, F1F5 in a request of its own (a request for several DIDs fails whole), the board DID where the profile names one (a `boot/` unit serves none, so its profile has no `[board]`) and F18C, then the programming unlock. F1F5 is the project of the installed app: a tester that finds it differs from the new image's project stops, as a product change needs the operator's say (the client's `--allow-product-change`); any negative answer means there is nothing installed to protect, or a bootloader that does not know the DID, and the flash goes on. F1F0 describes one slot: running slot 0 and boot slot 0, running state 3 only while the app is valid and never 2, other slot state 0. Flag 0x04 means the bootloader holds the unit there because its app failed to start; a reset releases it for another try. F1F3 reads 32 zero bytes while there is no valid app, and F189 reads `0.0.0` then and for an app stamped with no version. If F1F3 already reads the image's ID, send `11 01` and go on to the proof of life.
 
 **Power-up window.** For a short window after power-on, its configured length (100 ms in udsota's examples), the bootloader takes a `10 02`, answering `50 02` and staying in the bootloader, which is the only way in when the app passes its checks but cannot hand over; a `3E 00` or `3E 80` in the window holds it there too. To use it, keep sending `10 02` while the unit is power-cycled, each within 50 ms of the last going unanswered, being refused (0x21 included) or failing to send, and waiting no longer than that after a 0x78. While the unit is off nothing acknowledges the frame, so a send waits out the CAN stack's echo timeout and the frame stays queued until the unit's CAN comes up: `10 02`s still queued when a wait ends hold the unit in its bootloader for about 5 s at its next power-up, once, unless the interface is taken down and up. The unit answers each `10 02` it receives, so discard the extra `50 02`s and let them stop before the next request.
 
 **Download, verify, activate** as in [Flashing without the client](#flashing-without-the-client), where address 0 in the 34 is the unit's update target. Such a unit answers a `36` longer than the block length its `74` announced with an ISO-TP overflow flow control, not an NRC, and the transfer stays open. F001 answers, then resets into the app; without a passing FF01 it answers 0x24. There is no F002. F1F3 reads the new ID as soon as FF01 passes, so it can't tell whether an unanswered F001 landed: send F001 once more, and unless that one is answered positively, let F1F4 decide.
 
 **Proof of life.** Wait about 3 s, then poll `22 F1F4` (the client polls for `start_timeout_s` after that wait, 60 s by default). Four bytes equal to the image ID's first four mean the new app runs and is healthy: the update is done. Any other value means the app runs another image. 0x31 means the bootloader answers, so the app did not start; F1F0 says whether flag 0x04 holds it there. No answer by the deadline is a failure: the app has not reported healthy.
+
+**Buses and products.** The bootloader listens on the buses the installed image's `update_buses` names, cut to the board's buses; a mask that names none of them means every bus, and a unit with no valid app listens on all. The app answers `10 02` and F1F4 only on those buses, and a handover to another bus is not taken. A session keeps the bus it locked, and when it ends the bootloader listens by what is then installed. A bootloader built for no product (`cfg.product` NULL) takes an image of any project, and F1F5 tells a tester which project is installed.
 
 `11 01` in the programming session, unlocked when the unit has keys, leaves the bootloader for the app. Otherwise the unit stays in the bootloader until its session times out.

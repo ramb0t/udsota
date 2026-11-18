@@ -50,7 +50,10 @@ typedef struct {
     /* Identity: the image rules (udsota_boot_internal.h) hold every image to it before anything is erased. */
     uint16_t    request_id;          /* 11-bit: physical requests and tester frames; example 0x710 */
     uint16_t    response_id;         /* 11-bit: every answer; example 0x718 */
-    const char *product;             /* the project an image must carry, at most 32 characters; example "example" */
+    const char *product;             /* the project an image must carry, at most 32 characters; example "example". NULL
+                                        takes an image of any project: no project rule in the image rules, so the boot
+                                        check's first 36 and FF01 follow, one bootloader for every product on the
+                                        board. The hardware ID, the layout and both diagnostic IDs are still checked */
     uint8_t     hw_id;               /* the image descriptor's hw_id; example 1 */
     uint8_t     layout_id;           /* its partition_layout_id; example 1 */
     const char *boot_version;        /* this bootloader's version, NUL-terminated; example "1.0.0". F180
@@ -164,22 +167,24 @@ bool udsota_boot_port_flash_program(uint32_t off, const void *data, uint32_t len
 /* Starts bus (1..buses) at the port's own rate for it, accepting 11-bit data frames on request_id, or every frame if
  * the hardware cannot filter. Received frames wait in the controller, or in a queue its interrupt fills, until the main
  * loop passes them to udsota_boot_rx. Starting a running bus restarts it. The core calls it in udsota_boot_init, for
- * the handed-over bus or for every bus, and for every bus each time it returns to listening. Returns true once the bus
- * runs, or false when the bus is not fitted or has not started within its time in the timing table, leaving it
- * stopped with its interrupt off. The core treats a bus that did not start as absent, and a handover to it as not
- * decoding. */
+ * the handed-over bus or for every open bus, and for every open bus each time it returns to listening (open buses are
+ * those the installed image's update_buses names, every bus without a valid app). Returns true once the controller is
+ * configured and told to join the bus, without waiting for it to synchronise, or false when the bus is not fitted or
+ * the controller will not configure, leaving it stopped with its interrupt off. The core treats a bus that did not
+ * start as absent, and a handover to it as not decoding. */
 bool udsota_boot_port_can_start(uint8_t bus, uint16_t request_id);
 
 /* Stops bus: no more frames are received from it or sent on it. It is idempotent, and harmless on a bus that never
- * started. The core calls it on every other bus when a tester frame locks one, and on every bus before it returns to
- * listening and before start_app, so the port undoes only what the board's own init did. */
+ * started. The core calls it on every other bus when a tester frame locks one, on each bus that is not open when it
+ * starts listening, and on every bus before start_app, so the port undoes only what the board's own init did. */
 void udsota_boot_port_can_stop(uint8_t bus);
 
 /* Sends one classic 11-bit frame (id <= 0x7FF, len <= 8) on bus: an answer's, from inside udsota_boot_poll, or a flow
  * control, from inside udsota_boot_rx. When no transmit slot is free it waits for one, with a bound of its own, rather
  * than refusing: iso14229 drops an answer whose single or first frame fails to send. It does not wait for the frame to
  * leave. Returns true once the controller holds the frame, or false if the wait runs out or the bus is not running;
- * that answer is then lost, and the next request is still served. */
+ * that answer is then lost, and the next request is still served. On a bus that is not up (not synchronised, or
+ * bus-off) it fails by that same bounded wait. */
 bool udsota_boot_port_can_send(uint8_t bus, uint32_t id, const uint8_t *data, uint8_t len);
 
 /* -- Watchdog, reset, jump, identity -- */
@@ -239,11 +244,12 @@ size_t udsota_boot_port_device_id(uint8_t out[16]);
 
 /* What udsota_boot_init decided, in the order the boot rules apply. */
 typedef enum {
-    UDSOTA_BOOT_DECIDE_HANDOVER = 0, /* serves on the handed-over bus only and answers the 10 02 the app took */
+    UDSOTA_BOOT_DECIDE_HANDOVER = 0, /* serves on the handed-over bus only and answers the 10 02 the app took; a
+                                        handover to a bus that is not open does not decode */
     UDSOTA_BOOT_DECIDE_NO_APP,       /* no valid app: listens on every bus and stays */
-    UDSOTA_BOOT_DECIDE_HELD,         /* start count >= hold_after_starts: listens on every bus, stays until 11 01,
+    UDSOTA_BOOT_DECIDE_HELD,         /* start count >= hold_after_starts: listens on the open buses, stays until 11 01,
                                         F001, a power-on or a pin reset */
-    UDSOTA_BOOT_DECIDE_WINDOW,       /* power-on with window_ms > 0: listens on every bus for window_ms, then starts
+    UDSOTA_BOOT_DECIDE_WINDOW,       /* power-on with window_ms > 0: listens on the open buses for window_ms, then starts
                                         the app unless a tester frame held it, a download has begun or the session is
                                         no longer the default; in those two it listens on */
     UDSOTA_BOOT_DECIDE_START_APP,    /* the first udsota_boot_poll() starts the app; no bus has been started */
@@ -255,7 +261,7 @@ typedef enum {
  * any time, and each call is a boot: it resets every piece of core state, relies on no zeroed .bss, and may be given
  * another configuration. It is the one call that may take longer than about 100 ms. It:
  *  - checks cfg, and decides BAD_CFG unless every one of these holds: cfg is not NULL; request_id and response_id are
- *    at most 0x7FF and differ; buses is 1 to 15; product is not NULL and at most 32 characters; boot_version is not
+ *    at most 0x7FF and differ; buses is 1 to 15; product is NULL or at most 32 characters; boot_version is not
  *    NULL; hold_after_starts is not 0; slot_write_unit is a power of two; slot_size is a multiple of it and at least
  *    image_header_offset + UDSOTA_BARE_HDR_LEN; UDS_SERVER_RECV_BUF_SIZE - 2 is a multiple of it and at least
  *    image_header_offset + UDSOTA_BARE_HDR_LEN, so a full first 36 carries the whole header. On BAD_CFG it calls no
@@ -264,9 +270,14 @@ typedef enum {
  *  - takes the handover words;
  *  - checks the app (the boot check): magic UDSOTA_BARE_HDR_MAGIC, header_version at least 1, no bit of
  *    UDSOTA_BARE_HDR_FLAGS_MUST set, an image_length that is a multiple of 4 from the header's end up to slot_size,
- *    and the CRC over it, reloading the watchdog. It applies no project, board, layout or ID rule;
+ *    and the CRC over it, reloading the watchdog. It applies no project, board, layout or ID rule, and reads no
+ *    update_buses;
  *  - reads and updates the start count;
  *  - decides.
+ * The open buses are worked out afresh wherever the core needs them, with no copy kept: the valid installed image's
+ * update_buses (udsota_image.h, udsota_image_bus_open: cut to buses 1..cfg.buses, a mask naming none of them meaning
+ * every bus), or every bus when there is no valid app. A session keeps the bus it locked; a download's first erase
+ * clears the valid app, and when the session ends the core listens by whatever is then installed.
  * For every decision but START_APP and BAD_CFG it then starts the buses it will listen on and sets up iso14229, so a
  * bus is running before the server is first polled, and reads the clock: window_ms runs from that read, so the boot
  * check's time is not part of it. On a handover the core's own transport hands iso14229 the 10 02 the app took, as the
@@ -279,7 +290,7 @@ udsota_boot_decision_t udsota_boot_init(const udsota_boot_cfg_t *cfg);
  * unit that stays in its bootloader for weeks still answers at once, keeps the F1F1 bookkeeping, and applies the
  * session rules of the timing table: the window, the idle exit, S3 and the pending reset. Both session exits, the idle
  * exit and S3's expiry, apply the boot rules again with no handover and cause OTHER (udsota_boot_internal.h) and reset
- * exactly when they answer START_APP; otherwise the core returns to listening on every bus. On a target it does not
+ * exactly when they answer START_APP; otherwise the core returns to listening on the open buses. On a target it does not
  * return once it resets or starts the app. */
 void udsota_boot_poll(void);
 
@@ -290,11 +301,12 @@ void udsota_boot_poll(void);
  * flow control from inside this call. bus is 1..cfg.buses, id the identifier, len 0..8. The core reads the clock at
  * the call, and that is the frame's time for the window and the idle exit. The core ignores:
  *  - a bus outside 1..cfg.buses, a len over 8, and IDs other than request_id;
+ *  - before a lock, frames from a bus that is not open, so a port that polls every bus is covered;
  *  - frames from any bus but the one a tester frame locked;
  *  - before a lock, frames from any other bus from the first frame of a request until its whole answer has been
  *    handed to can_send, so each request is answered on the bus it came from;
  *  - every frame while the core is stopped, before the first poll of a START_APP, and after BAD_CFG.
- * A tester frame is a frame whose first bytes are exactly 02 10 02, 02 3E 00 or 02 3E 80. It holds the window,
+ * A tester frame is a frame whose first bytes are exactly 02 10 02, 02 10 82, 02 3E 00 or 02 3E 80. It holds the window,
  * restarts the idle exit's time, and locks its bus, stopping the others until the core next returns to listening.
  * Only a tester frame locks a bus. */
 void udsota_boot_rx(uint8_t bus, uint32_t id, const uint8_t *data, uint8_t len);

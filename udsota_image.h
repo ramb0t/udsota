@@ -6,6 +6,7 @@
  * unaligned. */
 #pragma once
 #include <assert.h>         /* static_assert, a keyword in C++ and C23 */
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include "udsota_wire.h"
@@ -49,7 +50,10 @@ typedef struct {
                                      of 4 */
     uint32_t crc32;               /* stamped: zlib's CRC-32 of the image's bytes before this field followed by those
                                      after it, up to image_length */
-    uint8_t  reserved[16];        /* 0xFF */
+    uint16_t update_buses;        /* the buses that take updates, bit b-1 for bus b; 0xFFFF every bus (what an image
+                                     built before this field has, and what UDSOTA_IMAGE_HEADER writes). A version 1
+                                     core before this field ignores it. Read it through udsota_image_bus_open */
+    uint8_t  reserved[14];        /* 0xFF */
     udsota_image_desc_t desc;     /* opens the 128-byte block (UDSOTA_BARE_DESC_LEN) */
     char     version[32];         /* NUL-terminated ASCII: what F189 returns */
     char     project[32];         /* NUL-terminated ASCII: the product name (rule BAD_PROJECT) */
@@ -64,7 +68,9 @@ static_assert(offsetof(udsota_image_header_t, header_version) == 4u, "header_ver
 static_assert(offsetof(udsota_image_header_t, flags) == 6u, "flags at 6");
 static_assert(offsetof(udsota_image_header_t, image_length) == UDSOTA_BARE_HDR_LENGTH_OFFSET, "image_length");
 static_assert(offsetof(udsota_image_header_t, crc32) == UDSOTA_BARE_HDR_CRC_OFFSET, "crc32");
-static_assert(offsetof(udsota_image_header_t, reserved) == 16u, "reserved at 16");
+static_assert(offsetof(udsota_image_header_t, update_buses) == UDSOTA_BARE_HDR_UPDATE_BUSES_OFFSET,
+               "update_buses at 16");
+static_assert(offsetof(udsota_image_header_t, reserved) == 18u, "reserved at 18");
 static_assert(offsetof(udsota_image_header_t, desc) == UDSOTA_BARE_HDR_DESC_OFFSET, "the block");
 static_assert(offsetof(udsota_image_header_t, version) == UDSOTA_BARE_HDR_DESC_OFFSET + UDSOTA_BARE_VERSION_OFFSET,
                "version");
@@ -74,6 +80,20 @@ static_assert(offsetof(udsota_image_header_t, image_id) == UDSOTA_BARE_HDR_DESC_
                "image_id");
 static_assert(offsetof(udsota_image_header_t, signature) == UDSOTA_BARE_HDR_SIG_OFFSET, "signature");
 static_assert(UDSOTA_BARE_HDR_SIG_OFFSET - UDSOTA_BARE_HDR_DESC_OFFSET == UDSOTA_BARE_DESC_LEN, "the block's length");
+
+/* The bit of bus b (1 to 15) in update_buses. */
+#define UDSOTA_BUS(b) ((uint16_t)(1u << ((b) - 1u)))
+
+/* Whether bus (1 to buses) takes updates under a header's update_buses mask, on a board with buses buses (1 to 15).
+ * The one rule, shared by the bootloader core and the app: the mask is cut to buses 1..buses, and a mask that names
+ * none of them means every bus, so no image can leave a unit reachable only by a debugger. A bus outside 1..buses is
+ * never open. */
+static inline bool udsota_image_bus_open(uint16_t mask, uint8_t buses, uint8_t bus)
+{
+    const uint16_t all = (uint16_t)((1u << buses) - 1u);
+    const uint16_t eff = ((mask & all) != 0u) ? (uint16_t)(mask & all) : all;
+    return bus >= 1u && bus <= buses && ((eff >> (bus - 1u)) & 1u) != 0u;
+}
 
 /* 1 for a release build (a clean [v]X.Y.Z version), which sets the descriptor's flag 0x01. Under ESP-IDF udsota's
  * CMakeLists sets it from PROJECT_VER; elsewhere the product's build does. */
@@ -92,22 +112,30 @@ static_assert(UDSOTA_BARE_HDR_SIG_OFFSET - UDSOTA_BARE_HDR_DESC_OFFSET == UDSOTA
 #endif
 
 #define UDSOTA_IMAGE_FF8  0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu
+#define UDSOTA_IMAGE_FF14 UDSOTA_IMAGE_FF8, 0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu
 #define UDSOTA_IMAGE_FF16 UDSOTA_IMAGE_FF8, UDSOTA_IMAGE_FF8
 #define UDSOTA_IMAGE_FF32 UDSOTA_IMAGE_FF16, UDSOTA_IMAGE_FF16
 #define UDSOTA_IMAGE_FF64 UDSOTA_IMAGE_FF32, UDSOTA_IMAGE_FF32
 
 /* Places the header, once, at file scope in the app: UDSOTA_IMAGE_HEADER(hw_id, layout_id, request_id, response_id,
  * "version", "project");. version and project are string literals of at most 31 characters. It fills magic,
- * header_version, flags, the descriptor, version and project, and leaves the stamped fields, the reserved bytes and
- * the signature 0xFF. The object is volatile because stamping writes image_length, image_id and crc32 after the
- * build: the app's reads of them, such as the F1F4 prefix, must come from flash, not from the initializer.
- * Example: UDSOTA_IMAGE_HEADER(1, 1, 0x710, 0x718, "1.0.0", "example"); */
-#define UDSOTA_IMAGE_HEADER(hw, layout, req_id, resp_id, ver, proj)                                              \
+ * header_version, flags, update_buses, the descriptor, version and project, and leaves the stamped fields, the
+ * reserved bytes and the signature 0xFF. This one means every bus takes updates. The object is volatile because
+ * stamping writes image_length, image_id and crc32 after the build: the app's reads of them, such as the F1F4
+ * prefix, must come from flash, not from the initializer.
+ * Example: UDSOTA_IMAGE_HEADER(1, 1, 0x710, 0x718, "1.0.0", "example");
+ * UDSOTA_IMAGE_HEADER_BUSES(buses, hw_id, layout_id, request_id, response_id, "version", "project"); is the same
+ * with update_buses set to buses, an OR of UDSOTA_BUS(b): UDSOTA_BUS(1) | UDSOTA_BUS(2) takes updates on buses 1 and
+ * 2 only (udsota_image_bus_open says how a mask is read). */
+#define UDSOTA_IMAGE_HEADER(hw, layout, req_id, resp_id, ver, proj) \
+    UDSOTA_IMAGE_HEADER_BUSES(0xFFFFu, hw, layout, req_id, resp_id, ver, proj)
+#define UDSOTA_IMAGE_HEADER_BUSES(buses, hw, layout, req_id, resp_id, ver, proj)                                 \
     static_assert(sizeof(ver) <= 32u, "version: at most 31 characters");                                       \
     static_assert(sizeof(proj) <= 32u, "project: at most 31 characters");                                      \
     UDSOTA_IMAGE_HEADER_SECTION const volatile udsota_image_header_t udsota_image_header = {                    \
         .magic = UDSOTA_BARE_HDR_MAGIC, .header_version = UDSOTA_BARE_HDR_VERSION, .flags = 0u,                 \
-        .image_length = 0xFFFFFFFFu, .crc32 = 0xFFFFFFFFu, .reserved = { UDSOTA_IMAGE_FF16 },                   \
+        .image_length = 0xFFFFFFFFu, .crc32 = 0xFFFFFFFFu, .update_buses = (uint16_t)(buses),                   \
+        .reserved = { UDSOTA_IMAGE_FF14 },                                                                      \
         .desc = { .magic = UDSOTA_IMG_DESC_MAGIC, .desc_version = 1u, .hw_id = (uint8_t)(hw),                   \
                   .partition_layout_id = (uint8_t)(layout), .diag_request_id = (uint16_t)(req_id),              \
                   .diag_response_id = (uint16_t)(resp_id), .flags = UDSOTA_IMG_RELEASE ? 0x01u : 0x00u },        \
