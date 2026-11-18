@@ -331,9 +331,8 @@ static UDSErr_t tp_poll(UDSTp_t *hdl)
 
 /* Whether the header's crc32 is the CRC over [0, image_length) without that field, run in pieces with the watchdog
  * reloaded between. Run after the header rules, which keep the field inside the image and the image inside the slot. */
-static bool crc_ok(void)
+static bool crc_ok(const uint8_t *slot)
 {
-    const uint8_t *const slot = udsota_boot_port_slot();
     const uint8_t *const hdr = slot + B.cfg->image_header_offset;
     const uint32_t len = le32(hdr + UDSOTA_BARE_HDR_LENGTH_OFFSET);
     const uint32_t crc_at = B.cfg->image_header_offset + UDSOTA_BARE_HDR_CRC_OFFSET;
@@ -356,20 +355,22 @@ static bool crc_ok(void)
  * CRC. */
 static bool boot_check(void)
 {
-    const uint8_t *const hdr = udsota_boot_port_slot() + B.cfg->image_header_offset;
-    return header_rules(B.cfg, hdr, le32(hdr + UDSOTA_BARE_HDR_LENGTH_OFFSET)) == UDSOTA_DL_OK && crc_ok();
+    const uint8_t *const slot = udsota_boot_port_slot();
+    const uint8_t *const hdr = slot + B.cfg->image_header_offset;
+    return header_rules(B.cfg, hdr, le32(hdr + UDSOTA_BARE_HDR_LENGTH_OFFSET)) == UDSOTA_DL_OK && crc_ok(slot);
 }
 
 /* FF01's check of the downloaded image: UDSOTA_DL_OK, or the first image rule against the download's memorySize that
  * fails, else VERIFY_FAILED for the CRC. */
 static udsota_reason_t ff01_check(void)
 {
-    const uint8_t *const hdr = udsota_boot_port_slot() + B.cfg->image_header_offset;
+    const uint8_t *const slot = udsota_boot_port_slot();
+    const uint8_t *const hdr = slot + B.cfg->image_header_offset;
     const udsota_reason_t why = udsota_boot_image_rules(B.cfg, hdr, UDSOTA_BARE_HDR_LEN, B.dl.announced);
     if (why != UDSOTA_DL_OK) {
         return why;
     }
-    return crc_ok() ? UDSOTA_DL_OK : UDSOTA_DL_VERIFY_FAILED;
+    return crc_ok(slot) ? UDSOTA_DL_OK : UDSOTA_DL_VERIFY_FAILED;
 }
 
 /* One 36's flash work at off: the erase units that start in its range, then n bytes programmed and compared. */
