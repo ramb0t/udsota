@@ -472,7 +472,7 @@ STEP uint8_t zdl_drain(void)
 }
 
 /* Worker: one tinfl call over the rest of the 36 (*in, *n) into its window, whose new bytes wait in fresh. False when
- * it made no progress. */
+ * it made no progress; a failure is recorded in U.z.failed and the caller's loop ends on it. */
 STEP bool zdl_inflate(const uint8_t **in, size_t *n)
 {
     size_t in_n = *n, out_n = TINFL_LZ_DICT_SIZE - U.z.window_at;
