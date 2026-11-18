@@ -605,7 +605,7 @@ static UDSErr_t on_event(UDSServer_t *srv, UDSEvent_t ev, void *arg)
         return UDS_PositiveResponse;
     case UDS_EVT_SessionTimeout:
         abort_download(srv);
-        B.state = LISTENING;
+        B.state = LISTENING;                             /* as S3_EXPIRED was: no window end, no lock until the exit */
         B.s3_expired = true;
         return UDS_PositiveResponse;
     case UDS_EVT_DiagSessCtrl: {
