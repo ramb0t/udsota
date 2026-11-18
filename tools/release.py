@@ -147,10 +147,41 @@ def bump(part, latest_tag, changelog, client_init, header, date):
             set_header_version(header, version), version)
 
 
+# The commands, each taking the parsed arguments and the CHANGELOG's text and returning the exit code; a ValueError is
+# main's to report.
+def run_check(args, changelog):
+    found = problems(args.tag, changelog, args.init.read_text(encoding="utf-8"),
+                     args.header.read_text(encoding="utf-8"))
+    for f in found:
+        print("release: %s" % f, file=sys.stderr)
+    if not found:
+        print("release: %s matches CHANGELOG.md, the client's __version__ and udsota.h" % args.tag)
+    return 1 if found else 0
+
+
+def run_notes(args, changelog):
+    sys.stdout.write(notes(args.tag, changelog))
+    return 0
+
+
+def run_bump(args, changelog):
+    changelog, client_init, header, version = bump(args.tag, args.latest, changelog,
+                                                   args.init.read_text(encoding="utf-8"),
+                                                   args.header.read_text(encoding="utf-8"), args.date)
+    args.changelog.write_text(changelog, encoding="utf-8")
+    args.init.write_text(client_init, encoding="utf-8")
+    args.header.write_text(header, encoding="utf-8")
+    print(version)
+    return 0
+
+
+COMMANDS = {"check": run_check, "notes": run_notes, "bump": run_bump}
+
+
 # Parse the arguments and run check, notes or bump; returns the exit code.
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("cmd", choices=("check", "notes", "bump"))
+    p.add_argument("cmd", choices=tuple(COMMANDS))
     p.add_argument("tag", help="the release tag, vX.Y.Z; for bump, minor or patch")
     p.add_argument("--latest", help="bump: the latest release tag, vX.Y.Z")
     p.add_argument("--date", default=datetime.date.today().isoformat(), help="bump: the release date")
@@ -159,30 +190,13 @@ def main(argv=None):
     p.add_argument("--header", type=pathlib.Path, default=ROOT / HEADER)
     args = p.parse_args(argv)
     changelog = args.changelog.read_text(encoding="utf-8")
+    if args.cmd == "bump" and args.latest is None:
+        p.error("bump needs --latest")
     try:
-        if args.cmd == "bump":
-            if args.latest is None:
-                p.error("bump needs --latest")
-            changelog, client_init, header, version = bump(args.tag, args.latest, changelog,
-                                                           args.init.read_text(encoding="utf-8"),
-                                                           args.header.read_text(encoding="utf-8"), args.date)
-            args.changelog.write_text(changelog, encoding="utf-8")
-            args.init.write_text(client_init, encoding="utf-8")
-            args.header.write_text(header, encoding="utf-8")
-            print(version)
-            return 0
-        if args.cmd == "notes":
-            sys.stdout.write(notes(args.tag, changelog))
-            return 0
-        found = problems(args.tag, changelog, args.init.read_text(encoding="utf-8"),
-                         args.header.read_text(encoding="utf-8"))
+        return COMMANDS[args.cmd](args, changelog)
     except ValueError as e:
-        found = [str(e)]
-    for f in found:
-        print("release: %s" % f, file=sys.stderr)
-    if not found:
-        print("release: %s matches CHANGELOG.md, the client's __version__ and udsota.h" % args.tag)
-    return 1 if found else 0
+        print("release: %s" % e, file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

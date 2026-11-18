@@ -22,19 +22,19 @@ if(ESP_PLATFORM)
     idf_build_get_property(udsota_build_defs COMPILE_DEFINITIONS)
     set(udsota_srcs "udsota.c" "iso14229/iso14229.c")
     set(udsota_priv_inc "")
+    set(udsota_delta_defs "")
     if("UDSOTA_DELTA=1" IN_LIST udsota_build_defs)
         list(APPEND udsota_srcs "detools/detools.c")
         set(udsota_priv_inc "detools")
+        set(udsota_delta_defs ${UDSOTA_DELTA_DEFS})
     endif()
     idf_component_register(SRCS ${udsota_srcs}
                            INCLUDE_DIRS "." "iso14229"
                            PRIV_INCLUDE_DIRS ${udsota_priv_inc}
                            PRIV_REQUIRES app_update bootloader_support esp_app_format esp_partition esp_timer
                                          esp_hw_support esp_system mbedtls)
-    target_compile_definitions(${COMPONENT_LIB} PUBLIC UDSOTA_IMG_RELEASE=${udsota_release})
-    if("UDSOTA_DELTA=1" IN_LIST udsota_build_defs)
-        target_compile_definitions(${COMPONENT_LIB} PRIVATE ${UDSOTA_DELTA_DEFS})
-    endif()
+    target_compile_definitions(${COMPONENT_LIB} PUBLIC UDSOTA_IMG_RELEASE=${udsota_release}
+                                                PRIVATE ${udsota_delta_defs})
     # Keep the app's UDSOTA_IMAGE_DESC in every image: ESP-IDF places .rodata_custom_desc without KEEP, so under
     # --gc-sections it would go from a build that never reaches udsota_init (diagnostics compiled out, say), and units
     # would then refuse that image as BAD_BOARD.
@@ -52,32 +52,54 @@ project(udsota C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 enable_testing()
-set_source_files_properties(iso14229/iso14229.c PROPERTIES COMPILE_OPTIONS "-fwrapv")   # as the component does
 
-# iso14229 on its mock transport with a clock the test sets, udsota over the test's platform, and miniz's tinfl
-# (tdefl too, to make a raw-DEFLATE image), under ASan and UBSan, the first report ending the test. malloc, calloc and
-# free go through the test, which can fail any one of the 34's allocations and counts the blocks udsota holds.
-# test_udsota_no_rollback is the same test on a platform that reports what ESP-IDF does without
-# CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE, and test_udsota_delta (below) the same with delta downloads.
-function(udsota_test name)
-    add_executable(${name} test/test_udsota.c udsota.c iso14229/iso14229.c test/miniz/miniz.c)
-    target_include_directories(${name} PRIVATE . iso14229 test/miniz)
-    target_compile_definitions(${name} PRIVATE UDS_SYS=UDS_SYS_UNIX UDS_AUTOSELECT_TP=0 UDS_TP_ISOTP_MOCK
-                                               UDS_CUSTOM_MILLIS _DEFAULT_SOURCE UDSOTA_TEST MINIZ_NO_STDIO
-                                               MINIZ_NO_TIME MINIZ_NO_ARCHIVE_APIS MINIZ_NO_ZLIB_APIS ${ARGN})
-    target_compile_options(${name} PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=all
+# ---- Host build: the tests, the two servers and the tools. What the targets share is said here once.
+
+set(UDSOTA_HOST_DEFS UDS_SYS=UDS_SYS_UNIX UDS_AUTOSELECT_TP=0 UDS_CUSTOM_MILLIS _DEFAULT_SOURCE)
+set(UDSOTA_MINIZ_DEFS MINIZ_NO_STDIO MINIZ_NO_TIME MINIZ_NO_ARCHIVE_APIS MINIZ_NO_ZLIB_APIS)
+
+# iso14229 is compiled with -fwrapv, as the component does.
+set_source_files_properties(iso14229/iso14229.c PROPERTIES COMPILE_OPTIONS "-fwrapv")
+# udsota's own sources build with every warning an error; the vendored ones do not.
+set_source_files_properties(udsota.c boot/udsota_boot.c tools/image_check.c test/test_udsota.c test/fuzz_udsota.c
+                            test/test_udsota_boot.c test/test_udsota_boot_pure.c test/test_udsota_app.c
+                            test/boot/fake_port.c test/e2e/lite_server.c test/e2e/lite_platform.c
+                            test/e2e/boot_server.c PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror")
+
+# The sanitizers every target but test_headers_*, test_isotp_wrap and image_check runs under, the first report ending
+# the run. sanitizers is a comma-separated list.
+function(udsota_sanitize name sanitizers)
+    target_compile_options(${name} PRIVATE -fsanitize=${sanitizers} -fno-sanitize-recover=all
                                            -fno-omit-frame-pointer)
-    target_link_options(${name} PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=all -Wl,--wrap=malloc
-                                        -Wl,--wrap=calloc -Wl,--wrap=free)
+    target_link_options(${name} PRIVATE -fsanitize=${sanitizers} -fno-sanitize-recover=all)
+endfunction()
+
+# An executable of udsota.c over the host's platform and miniz's tinfl (tdefl too, to make a raw-DEFLATE image), plus
+# the sources given.
+function(udsota_host_executable name)
+    add_executable(${name} ${ARGN} udsota.c test/miniz/miniz.c)
+    target_include_directories(${name} PRIVATE . iso14229 test/miniz)
+    target_compile_definitions(${name} PRIVATE ${UDSOTA_HOST_DEFS} ${UDSOTA_MINIZ_DEFS} UDSOTA_TEST)
+endfunction()
+
+# iso14229 on its mock transport with a clock the test sets, udsota over the test's platform and miniz, under ASan
+# and UBSan. malloc, calloc and free go through the test, which can fail any one of the 34's allocations and counts
+# the blocks udsota holds. test_udsota_no_rollback is the same test on a platform that reports what ESP-IDF does
+# without CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE, and test_udsota_delta (below) the same with delta downloads.
+function(udsota_test name)
+    udsota_host_executable(${name} test/test_udsota.c iso14229/iso14229.c)
+    target_compile_definitions(${name} PRIVATE UDS_TP_ISOTP_MOCK ${ARGN})
+    udsota_sanitize(${name} address,undefined)
+    target_link_options(${name} PRIVATE -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=free)
     add_test(NAME ${name} COMMAND ${name})
 endfunction()
-set_source_files_properties(udsota.c test/test_udsota.c PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror")
 udsota_test(test_udsota)
 udsota_test(test_udsota_no_rollback TEST_ROLLBACK=0)
 
 # Delta downloads in a host target: UDSOTA_DELTA=1, detools and its defines. The target's platform supplies the two
-# udsota_plat_base_* functions. -DUDSOTA_DELTA=ON builds udsota_lite_server so.
-option(UDSOTA_DELTA "Build udsota_lite_server with delta downloads (UDSOTA_DELTA=1 and detools)" OFF)
+# udsota_plat_base_* functions. udsota_lite_server is built with them unless -DUDSOTA_DELTA=OFF, as an app without delta
+# downloads is.
+option(UDSOTA_DELTA "Build udsota_lite_server with delta downloads (UDSOTA_DELTA=1 and detools)" ON)
 function(udsota_with_delta name)
     target_sources(${name} PRIVATE detools/detools.c)
     target_include_directories(${name} PRIVATE detools)
@@ -91,23 +113,17 @@ udsota_with_delta(test_udsota_delta)
 # slots, every timer on CLOCK_MONOTONIC, ASan and UBSan.
 include(CheckIncludeFile)
 check_include_file(linux/can/raw.h UDSOTA_HAVE_SOCKETCAN)
-add_executable(udsota_lite_server test/e2e/lite_server.c test/e2e/lite_platform.c test/e2e/sha256_host.c
-               test/e2e/hmac_sha256_host.c udsota.c iso14229/iso14229.c test/miniz/miniz.c)
-target_include_directories(udsota_lite_server PRIVATE . iso14229 test/miniz test/e2e)
-target_compile_definitions(udsota_lite_server PRIVATE UDS_SYS=UDS_SYS_UNIX UDS_AUTOSELECT_TP=0 UDS_TP_ISOTP_C
-                                                      UDS_CUSTOM_MILLIS _DEFAULT_SOURCE UDSOTA_TEST MINIZ_NO_STDIO
-                                                      MINIZ_NO_TIME MINIZ_NO_ARCHIVE_APIS MINIZ_NO_ZLIB_APIS)
+udsota_host_executable(udsota_lite_server test/e2e/lite_server.c test/e2e/lite_platform.c test/e2e/sha256_host.c
+                       test/e2e/hmac_sha256_host.c iso14229/iso14229.c)
+target_include_directories(udsota_lite_server PRIVATE test/e2e)
+target_compile_definitions(udsota_lite_server PRIVATE UDS_TP_ISOTP_C)
 if(UDSOTA_HAVE_SOCKETCAN)
     target_compile_definitions(udsota_lite_server PRIVATE LITE_SOCKETCAN)
 endif()
 if(UDSOTA_DELTA)
     udsota_with_delta(udsota_lite_server)
 endif()
-target_compile_options(udsota_lite_server PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=all
-                                                  -fno-omit-frame-pointer)
-target_link_options(udsota_lite_server PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=all)
-set_source_files_properties(test/e2e/lite_server.c test/e2e/lite_platform.c PROPERTIES COMPILE_OPTIONS
-                            "-Wall;-Wextra;-Werror")
+udsota_sanitize(udsota_lite_server address,undefined)
 
 # The fuzzer (test/fuzz_udsota.c): CAN frames through iso14229's isotp-c into UDSServerPoll and udsota, with delta
 # downloads, under ASan and UBSan. Each run replays its seeds, their mutants, random programs and mutants of a delta's
@@ -119,15 +135,10 @@ set_source_files_properties(test/e2e/lite_server.c test/e2e/lite_platform.c PROP
 set(UDSOTA_FUZZ_CORPUS "" CACHE PATH "A corpus directory for fuzz_udsota_corpus to replay (none when empty)")
 option(UDSOTA_FUZZ_LIBFUZZER "Build fuzz_udsota_libfuzzer, the fuzzer as a libFuzzer target (clang only)" OFF)
 function(udsota_fuzz name sanitizers)
-    add_executable(${name} test/fuzz_udsota.c udsota.c iso14229/iso14229.c test/miniz/miniz.c)
-    target_include_directories(${name} PRIVATE . iso14229 test/miniz)
-    target_compile_definitions(${name} PRIVATE UDS_SYS=UDS_SYS_UNIX UDS_AUTOSELECT_TP=0 UDS_TP_ISOTP_C
-                                               UDS_CUSTOM_MILLIS _DEFAULT_SOURCE UDSOTA_TEST MINIZ_NO_STDIO
-                                               MINIZ_NO_TIME MINIZ_NO_ARCHIVE_APIS MINIZ_NO_ZLIB_APIS ${ARGN})
-    target_compile_options(${name} PRIVATE -fsanitize=${sanitizers} -fno-sanitize-recover=all -fno-omit-frame-pointer)
-    target_link_options(${name} PRIVATE -fsanitize=${sanitizers} -fno-sanitize-recover=all)
+    udsota_host_executable(${name} test/fuzz_udsota.c iso14229/iso14229.c)
+    target_compile_definitions(${name} PRIVATE UDS_TP_ISOTP_C ${ARGN})
+    udsota_sanitize(${name} ${sanitizers})
 endfunction()
-set_source_files_properties(test/fuzz_udsota.c PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror")
 udsota_fuzz(fuzz_udsota address,undefined)
 udsota_with_delta(fuzz_udsota)
 add_test(NAME fuzz_udsota COMMAND fuzz_udsota)
@@ -164,14 +175,9 @@ function(udsota_boot_test name)
     add_executable(${name} ${ARGN})
     target_include_directories(${name} PRIVATE . boot iso14229 test)
     target_compile_definitions(${name} PRIVATE ${UDSOTA_BOOT_DEFS})
-    target_compile_options(${name} PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=all
-                                           -fno-omit-frame-pointer)
-    target_link_options(${name} PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=all)
+    udsota_sanitize(${name} address,undefined)
     add_test(NAME ${name} COMMAND ${name})
 endfunction()
-set_source_files_properties(boot/udsota_boot.c test/boot/fake_port.c test/test_udsota_boot.c
-                            test/test_udsota_boot_pure.c test/test_udsota_app.c
-                            PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror")
 udsota_boot_test(test_udsota_boot test/test_udsota_boot.c ${UDSOTA_BOOT_CORE})
 target_compile_definitions(test_udsota_boot PRIVATE NDEBUG)
 udsota_boot_test(test_udsota_boot_asserts test/test_udsota_boot.c ${UDSOTA_BOOT_CORE})
@@ -179,9 +185,29 @@ udsota_boot_test(test_udsota_boot_pure test/test_udsota_boot_pure.c ${UDSOTA_BOO
 target_compile_definitions(test_udsota_boot_pure PRIVATE NDEBUG)
 add_executable(test_udsota_app test/test_udsota_app.c)
 target_include_directories(test_udsota_app PRIVATE .)   # the one include path an app adds
-target_compile_options(test_udsota_app PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=all)
-target_link_options(test_udsota_app PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=all)
+udsota_sanitize(test_udsota_app address,undefined)
 add_test(NAME test_udsota_app COMMAND test_udsota_app)
+
+# The boot core for Cortex-M3 with every warning an error, under a gate on its text (CI's boot-arm job builds this
+# target; it needs arm-none-eabi-gcc and its size). The gate is the 3,119 bytes measured with arm-none-eabi-gcc 14.3.1
+# (boot/README.md, "Size") plus about a fifth, since another compiler release lays the code out differently: it
+# catches the core growing, not a few bytes' change.
+find_program(UDSOTA_ARM_GCC arm-none-eabi-gcc)
+find_program(UDSOTA_ARM_SIZE arm-none-eabi-size)
+if(UDSOTA_ARM_GCC AND UDSOTA_ARM_SIZE)
+    set(udsota_arm_defs ${UDSOTA_BOOT_DEFS} NDEBUG)
+    list(TRANSFORM udsota_arm_defs PREPEND -D)
+    add_custom_target(udsota_boot_arm_size
+        COMMAND ${UDSOTA_ARM_GCC} -mcpu=cortex-m3 -mthumb -mfloat-abi=soft -std=c11 -Os -ffunction-sections
+                -fdata-sections -Wall -Wextra -Werror -I${CMAKE_SOURCE_DIR} -I${CMAKE_SOURCE_DIR}/boot
+                -I${CMAKE_SOURCE_DIR}/iso14229 ${udsota_arm_defs} -c ${CMAKE_SOURCE_DIR}/boot/udsota_boot.c
+                -o udsota_boot_arm.o
+        COMMAND ${CMAKE_COMMAND} -DSIZE=${UDSOTA_ARM_SIZE} -DOBJECT=udsota_boot_arm.o -DGATE=3700
+                -P ${CMAKE_SOURCE_DIR}/tools/boot_size_gate.cmake
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+        COMMENT "udsota_boot.c for Cortex-M3, under the size gate"
+        VERBATIM)
+endif()
 
 # udsota.h and udsota_app.h, the headers an app includes, compile as C11 or as C++20 with every warning an error: an
 # app may be written in either. Both also place an image header with each macro and check its fields, which C++17
@@ -211,32 +237,23 @@ endforeach()
 add_executable(udsota_boot_server test/e2e/boot_server.c ${UDSOTA_BOOT_CORE})
 target_include_directories(udsota_boot_server PRIVATE . boot iso14229 test)
 target_compile_definitions(udsota_boot_server PRIVATE ${UDSOTA_BOOT_DEFS} NDEBUG)
-target_compile_options(udsota_boot_server PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=all
-                                                  -fno-omit-frame-pointer)
-target_link_options(udsota_boot_server PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=all)
-set_source_files_properties(test/e2e/boot_server.c PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror")
+udsota_sanitize(udsota_boot_server address,undefined)
 
 # isotp-c's timers across the 2^31 us point, at -O2, where the -fwrapv above matters.
 add_executable(test_isotp_wrap test/test_isotp_wrap.c iso14229/iso14229.c)
 target_include_directories(test_isotp_wrap PRIVATE iso14229)
-target_compile_definitions(test_isotp_wrap PRIVATE UDS_SYS=UDS_SYS_UNIX UDS_AUTOSELECT_TP=0 UDS_TP_ISOTP_C
-                                                   UDS_CUSTOM_MILLIS _DEFAULT_SOURCE)
+target_compile_definitions(test_isotp_wrap PRIVATE ${UDSOTA_HOST_DEFS} UDS_TP_ISOTP_C)
 target_compile_options(test_isotp_wrap PRIVATE -O2)
 add_test(NAME test_isotp_wrap COMMAND test_isotp_wrap)
 
 # tools/image_check, once per chip and board: udsota's image rules run on a built image, as a unit with that chip,
 # descriptor and slot size would (CI runs each on its board's image). Not a test: it needs the image.
 function(udsota_image_check name chip hw layout req resp slot)
-    add_executable(${name} tools/image_check.c udsota.c test/miniz/miniz.c)
-    target_include_directories(${name} PRIVATE . iso14229 test/miniz)
-    target_compile_definitions(${name} PRIVATE UDS_SYS=UDS_SYS_UNIX UDS_AUTOSELECT_TP=0 UDS_CUSTOM_MILLIS
-                                               _DEFAULT_SOURCE UDSOTA_TEST MINIZ_NO_STDIO MINIZ_NO_TIME
-                                               MINIZ_NO_ARCHIVE_APIS MINIZ_NO_ZLIB_APIS CHIP_ID=${chip}u
-                                               IMAGE_CHECK_HW=${hw} IMAGE_CHECK_LAYOUT=${layout}
+    udsota_host_executable(${name} tools/image_check.c)
+    target_compile_definitions(${name} PRIVATE CHIP_ID=${chip}u IMAGE_CHECK_HW=${hw} IMAGE_CHECK_LAYOUT=${layout}
                                                IMAGE_CHECK_REQ=${req} IMAGE_CHECK_RESP=${resp}
                                                IMAGE_CHECK_SLOT=${slot}u)
 endfunction()
-set_source_files_properties(tools/image_check.c PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror")
 udsota_image_check(image_check_example_esp32   0 1 1 0x710 0x718 0x1E0000)   # examples/esp32 and its partitions.csv
 udsota_image_check(image_check_example_esp32s3 9 1 1 0x710 0x718 0x1E0000)
 udsota_image_check(image_check_ws43            9 1 1 0x7E6 0x7EE 0x400000)   # examples/candash_ws43

@@ -71,7 +71,7 @@ def detools_or_skip():
 def served_delta(binary, tmp_path_factory):
     detools_or_skip()
     if not serves_delta(binary, tmp_path_factory.mktemp("delta")):
-        missing("udsota_lite_server serves no delta downloads: build it with cmake -DUDSOTA_DELTA=ON")
+        missing("udsota_lite_server serves no delta downloads: build it without -DUDSOTA_DELTA=OFF")
 
 
 # Starts servers for a test, each with slot 0 running OLD (or image), and stops them after it; each must exit 0, so a

@@ -48,7 +48,7 @@ A part whose flash has ECC (STM32G0, G4 and L4 among them) faults when it reads 
 
 ## Size
 
-With arm-none-eabi-gcc 14.3.1 for Cortex-M3, `-Os -ffunction-sections -fdata-sections` and the tests' definitions, `udsota_boot.o` is 3,119 bytes of text, 64 of data (the CRC table, kept in RAM so its reads wait on no flash wait state) and 2,444 of bss (the server, the transport and their buffers). Linked with iso14229 under `--gc-sections` into a minimal image, the two add about 10.9 KB of flash and 2.5 KB of RAM to an empty one, the port aside. CI holds the core's text to that size plus about a fifth.
+With arm-none-eabi-gcc 14.3.1 for Cortex-M3, `-Os -ffunction-sections -fdata-sections` and the tests' definitions, `udsota_boot.o` is 3,119 bytes of text, 64 of data (the CRC table, kept in RAM so its reads wait on no flash wait state) and 2,444 of bss (the server, the transport and their buffers). Linked with iso14229 under `--gc-sections` into a minimal image, the two add about 10.9 KB of flash and 2.5 KB of RAM to an empty one, the port aside. CI holds the core's text to that size plus about a fifth. `cmake -S . -B build && cmake --build build --target udsota_boot_arm_size`, with arm-none-eabi-gcc and its newlib on PATH, compiles it as CI does and prints the figures.
 
 ## The app
 

@@ -13,9 +13,9 @@
  * FILE is the app slot 0 runs, confirmed. --can serves on IFNAME through a CAN_RAW socket instead of the pipe; it is
  * built only where linux/can/raw.h is, and refuses any interface but a vcan. --soak-ms makes the app's gate refuse F002
  * (0x22) for that long after each boot. --drop-fc-after loses the FC sent after a request's Nth CF, once (N a multiple
- * of isotp-c's block size, 8). Built with -DUDSOTA_DELTA=ON, it serves delta downloads (DFI 0x30) from the running
- * slot, and --no-delta clears cfg.allow_delta so that a delta 34 answers 0x31; the start-up line says which. -v logs
- * every frame on stderr. stdin's EOF (in pipe mode), SIGTERM or SIGINT stops the server. */
+ * of isotp-c's block size, 8). Unless built with -DUDSOTA_DELTA=OFF, it serves delta downloads (DFI 0x30) from the
+ * running slot, and --no-delta clears cfg.allow_delta so that a delta 34 answers 0x31; the start-up line says which. -v
+ * logs every frame on stderr. stdin's EOF (in pipe mode), SIGTERM or SIGINT stops the server. */
 #include <errno.h>
 #include <getopt.h>
 #include <poll.h>

@@ -2,11 +2,11 @@
 (--can), and the client flashes it two ways: over can-isotp's Python ISO-TP stack on a python-can SocketCAN bus, which
 needs only the vcan module (CI's e2e job runs this on GitHub's hosted runners), and as the real `udsota` command over
 the kernel's ISO-TP socket, which also needs can-isotp; a delta download goes the first way too, against a server built
-with -DUDSOTA_DELTA=ON. Each skips when what it needs is missing, except that a missing vcan, server or delta build
-fails instead when $UDSOTA_VCAN is set, as CI sets it, so a broken setup cannot pass as skips. $UDSOTA_VCAN must name a
-vcan interface (vcan0, vcan1, ...), and the server refuses any other, as a test checks on lo: the tests never drive a
-real bus. The server is $UDSOTA_LITE_SERVER or build/udsota_lite_server, as for test_e2e_lite.py, built where
-linux/can/raw.h is."""
+with delta downloads (the default; -DUDSOTA_DELTA=OFF leaves them out). Each skips when what it needs is missing,
+except that a missing vcan, server, delta build or kernel ISO-TP fails instead when $UDSOTA_VCAN is set, as CI sets it,
+so a broken setup cannot pass as skips. $UDSOTA_VCAN must name a vcan interface (vcan0, vcan1, ...), and the server
+refuses any other, as a test checks on lo: the tests never drive a real bus. The server is $UDSOTA_LITE_SERVER or
+build/udsota_lite_server, as for test_e2e_lite.py, built where linux/can/raw.h is."""
 import importlib.util
 import os
 import pathlib
@@ -64,12 +64,12 @@ def vcan_or_skip():
     return binary
 
 
-# A skip unless the kernel serves CAN_ISOTP sockets, which the `udsota` command needs.
+# A skip (a failure when IFACE_REQUIRED) unless the kernel serves CAN_ISOTP sockets, which the `udsota` command needs.
 def kernel_isotp_or_skip():
     try:
         socket.socket(socket.AF_CAN, socket.SOCK_DGRAM, socket.CAN_ISOTP).close()
     except (OSError, AttributeError) as e:
-        pytest.skip("no kernel ISO-TP (modprobe can-isotp): %s" % e)
+        missing("no kernel ISO-TP (modprobe can-isotp): %s" % e)
 
 
 # The vcan interface as a DemoServer-like frame source for PipeTransport: a python-can SocketCAN bus that hears
@@ -175,13 +175,13 @@ def test_flash_over_vcan_with_python_isotp(vcan_lite, link, tmp_path, monkeypatc
 
 # Check a delta download over vcan with the Python ISO-TP stack: the server runs delta_pair's base, and flash
 # --diff-from sends DFI 0x30, a patch of a few hundred bytes, from which the server rebuilds the new image, which then
-# runs confirmed. Needs detools and a server built with -DUDSOTA_DELTA=ON (else a skip, or a failure when
+# runs confirmed. Needs detools and a server built with delta downloads (else a skip, or a failure when
 # UDSOTA_VCAN is set).
 def test_flash_delta_over_vcan(vcan_lite, link, tmp_path, monkeypatch, capsys):
     if importlib.util.find_spec("detools") is None:
         missing('flash --diff-from needs detools: pip install "./client[diff]"')
     if not serves_delta(server_or_skip(), tmp_path):
-        missing("udsota_lite_server serves no delta downloads: build it with cmake -DUDSOTA_DELTA=ON")
+        missing("udsota_lite_server serves no delta downloads: build it without -DUDSOTA_DELTA=OFF")
     monkeypatch.setattr(update, "REBOOT_WAIT_S", 0.5)
     base, new = delta_pair(payload=48 * 1024)
     s = vcan_lite(image=base)

@@ -1,5 +1,6 @@
 build/
-examples/*/build/
+examples/*/build*/
+examples/*/secrets
 examples/*/sdkconfig
 examples/*/sdkconfig.old
 examples/*/managed_components/
