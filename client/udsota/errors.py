@@ -31,7 +31,7 @@ class NoResponse(UpdateFailed):
     pass
 
 
-# The ISO-TP send failed twice (no FC within N_Bs, or no echo): the server ended the transfer.
+# The ISO-TP send failed twice (no FC within N_Bs, which means the server ended the transfer, or another OS error).
 # Not a NoResponse, so the 0x36, 0x37 and FF01 resends don't add a third send.
 class SendFailed(UpdateFailed):
     pass
@@ -39,7 +39,7 @@ class SendFailed(UpdateFailed):
 
 # A negative response: sid is the request SID, code the NRC.
 class Nrc(UpdateFailed):
-    # Keep the SID and NRC for callers that retry or explain specific codes.
-    def __init__(self, sid, code):
-        super().__init__("service 0x%02X answered NRC 0x%02X" % (sid, code))
+    # Keep the SID and NRC for callers that retry or explain specific codes; note, when given, follows the NRC.
+    def __init__(self, sid, code, note=""):
+        super().__init__("service 0x%02X answered NRC 0x%02X%s" % (sid, code, ": " + note if note else ""))
         self.sid, self.code = sid, code

@@ -4,6 +4,7 @@ quieting over the functional ID and the kernel ISO-TP binding."""
 import contextlib
 import selectors
 import socket
+import sys
 import threading
 import time
 
@@ -172,6 +173,7 @@ class SecondTesterMonitor:
         self._busy = False
         self._quiet_after = clock()   # response frames up to this time can still be ours
         self.alarm = None
+        self._warned = False
 
     # A request of ours is being sent; response frames are expected until end().
     def begin(self):
@@ -193,6 +195,24 @@ class SecondTesterMonitor:
             if not self._busy and self._clock() > self._quiet_after and self.alarm is None:
                 self.alarm = "unsolicited 0x%03X frame %s: a second tester is talking to the server" % (
                     self.resp_id, bytes(msg.data).hex(" "))
+
+    # Notifier error callback: a receive error on the raw socket (the interface bouncing gives ENETDOWN, which python-can
+    # raises as CanOperationError) would end the notifier's thread, and the monitor with it, if no listener handled it.
+    # Say so once, pause so a persistent error is not a busy loop, and listen again.
+    def on_error(self, exc):
+        if not self._warned:
+            self._warned = True
+            print("udsota: warning: receive error on the raw CAN socket (%s); the second-tester monitor keeps "
+                  "listening, but may have missed frames" % exc, file=sys.stderr)
+        time.sleep(RX_ERROR_PAUSE_S)
+
+    # The monitor is its own Notifier listener, so that the Notifier finds on_error.
+    def __call__(self, msg):
+        self.on_frame(msg)
+
+    # A python-can Notifier on bus that reports to on_frame and on_error.
+    def watch(self, bus):
+        return can.Notifier(bus, [self])
 
     # Raise SecondTester if an alarm was raised.
     def check(self):
@@ -340,7 +360,7 @@ class Transport:
     # Start the response monitor and open the UDS client over the kernel ISO-TP socket.
     def uds(self):
         self.raw.bus.set_filters([{"can_id": self.profile.resp_id, "can_mask": 0x7FF, "extended": False}])
-        self.notifier = can.Notifier(self.raw.bus, [self.monitor.on_frame])
+        self.notifier = self.monitor.watch(self.raw.bus)
         self.client = Client(GuardedConnection(isotp_connection(self.profile, self.interface), self.monitor),
                              config=client_config())
         self.client.open()

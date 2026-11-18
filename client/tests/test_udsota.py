@@ -429,6 +429,8 @@ class FakeServer:
     # 0x37 RequestTransferExit: an inflated or patched stream that is not the announced image answers 0x72
     # (DL_BAD_STREAM); an open transfer holding every announced byte closes (77), else 0x24.
     def s37(self, req, _):
+        if not self.dl_open and self.ended_nrc == 0x70 and not self.dl_complete:
+            return self.nrc(0x37, 0x70)                 # iso14229: no transfer open
         if self.dl_open and self.dfi:
             out = self.apply_patch() if self.dfi in (0x20, 0x30) else self.inflate()
             if out is None or len(out) != self.announced:
@@ -1178,6 +1180,42 @@ def test_quick_answer_keeps_the_p2_star_window_of_a_timed_out_request():
     assert mon.alarm is None
 
 
+# Check one receive error on the raw socket (ENETDOWN when the interface bounces, which python-can raises as
+# CanOperationError) neither ends the notifier thread nor goes unsaid: a second tester's frame heard afterwards still
+# raises the alarm, and the warning comes once however many errors follow.
+def test_monitor_survives_a_receive_error_and_says_so_once(capsys):
+    frames = deque([can.CanOperationError("Failed to receive: [Errno 100] Network is down")] * 3 + [resp_frame()])
+
+    # A virtual bus whose receive raises, then hears one response-ID frame.
+    class Bouncing(can.BusABC):
+        def __init__(self):
+            super().__init__(channel="bouncing")
+
+        # The next scripted error or frame, then silence.
+        def _recv_internal(self, timeout):
+            if frames and isinstance(frames[0], Exception):
+                raise frames.popleft()
+            return (frames.popleft(), False) if frames else (None, False)
+
+        # Nothing is sent.
+        def send(self, msg, timeout=None):
+            pass
+
+    ft = FakeTime()
+    mon = transport.SecondTesterMonitor(0x718, clock=ft.clock)
+    ft.sleep(10.0)                              # no request of ours is outstanding, nor within its grace time
+    notifier = mon.watch(Bouncing())
+    try:
+        deadline = time.monotonic() + 3.0
+        while mon.alarm is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+    finally:
+        notifier.stop()
+    assert mon.alarm and "second tester" in mon.alarm
+    err = capsys.readouterr().err
+    assert err.count("receive error") == 1 and "Network is down" in err
+
+
 # ---- image parsing ----
 
 # Check a well-formed image parses to its version, board and app_elf_sha256.
@@ -1701,6 +1739,25 @@ def test_second_send_error_stops_with_no_flow_control():
     assert d.no_fc[(0x27, 4)] == 0 and (0x34, None) not in d.log
 
 
+# Check a send error that is not ECOMM (the PC's interface is down, or its queue is full) is not reported as the server
+# ending the transfer: it is resent once as any, and the second one's message carries the OS's own text.
+@pytest.mark.parametrize("code", [errno.ENETDOWN, errno.ENOBUFS])
+def test_send_error_other_than_ecomm_gives_the_os_text(code):
+    class InterfaceDown(FakeServer):
+        # The kernel refuses the 27 04 key's send, whatever the server would answer.
+        def handle(self, req):
+            if req[:2] == b"\x27\x04":
+                self.sends = getattr(self, "sends", 0) + 1
+                raise OSError(code, os.strerror(code))
+            return super().handle(req)
+
+    d = InterfaceDown()
+    with pytest.raises(errors.SendFailed) as e:
+        run_flash(d)
+    assert str(e.value) == "service 0x27: the send failed: %s" % os.strerror(code)
+    assert d.sends == 2 and e.value.exit_code == 1 and not isinstance(e.value, errors.NoResponse)
+
+
 # Check a send error on a 0x36 block is resent inside the request, so send_block adds no third send, and the error
 # names the block and F1F1's reason.
 def test_send_errors_on_a_block_send_it_twice_only():
@@ -1749,6 +1806,64 @@ def test_wait_for_image_polls_through_send_errors():
 
     update.wait_for_image(Rebooting(), NEW_SHA, lambda: None, sleep=ft.sleep, clock=ft.clock)
     assert ft.sleeps == [update.REBOOT_WAIT_S] + [update.BOOT_POLL_S] * 3
+
+
+# A pre-roll that fails as python-can's does when nothing on the bus acknowledges, then sends: errors, the failures.
+def failing_preroll(*failures):
+    left, sent = list(failures), []
+
+    # Raise the next failure, or record a send.
+    def preroll():
+        if left:
+            raise left.pop(0)
+        sent.append(1)
+    preroll.sent = sent
+    return preroll
+
+
+# Check a pre-roll that cannot be sent while the unit restarts is a failed poll, in the app flow's wait and in the
+# bootloader flow's: both go on polling, and the wait runs to its deadline when the pre-roll never works.
+def test_failed_preroll_is_a_failed_poll_in_both_waits():
+    ft = FakeTime()
+
+    # A restarting server: it answers the new sha only after three polls.
+    class Rebooting:
+        def __init__(self):
+            self.polls = 0
+
+        # Silent for two polls, then the sha F1F3 and the prefix F1F4 give.
+        def read_did(self, did):
+            self.polls += 1
+            if self.polls <= 2:
+                raise errors.NoResponse("no answer")
+            return NEW_SHA if did == wire.DID_RUNNING_SHA else NEW_SHA[:4]
+
+        # The boot wait's note that the server restarted: nothing to track.
+        def restarted(self):
+            pass
+
+    down = [can.CanOperationError("Failed to transmit: [Errno 105] No buffer space available"),
+            OSError(errno.ENOBUFS, os.strerror(errno.ENOBUFS))]
+    preroll = failing_preroll(*down)
+    update.wait_for_image(Rebooting(), NEW_SHA, preroll, sleep=ft.sleep, clock=ft.clock)
+    assert len(preroll.sent) == 1
+    preroll = failing_preroll(*down)
+    assert update.wait_for_start(Rebooting(), PBL, NEW_SHA, preroll, sleep=ft.sleep, clock=ft.clock,
+                                 log=lambda *a: None) == 0
+    assert len(preroll.sent) == 1
+
+    # Never sendable, never answered: the deadline's error, not the pre-roll's.
+    def never():
+        raise can.CanOperationError("Failed to transmit")
+
+    class Silent(Rebooting):
+        def read_did(self, did):
+            raise errors.NoResponse("no answer")
+
+    with pytest.raises(errors.UpdateFailed, match="^the server did not answer within 60 s of ActivateImage$"):
+        update.wait_for_image(Silent(), NEW_SHA, never, sleep=ft.sleep, clock=ft.clock)
+    with pytest.raises(errors.UpdateFailed, match="^nothing answered F1F4 in 60 s"):
+        update.wait_for_start(Silent(), PBL, NEW_SHA, never, sleep=ft.sleep, clock=ft.clock, log=lambda *a: None)
 
 
 # Check NRC 0x21 is retried after the first backoff step.
@@ -2030,6 +2145,90 @@ def test_confirm_gives_up_after_timeout():
     with pytest.raises(errors.Nrc):
         update.confirm_cmd(uds_for(d, ft), sleep=ft.sleep, clock=ft.clock, log=lambda *a: None)
     assert ft.t >= update.CONFIRM_TIMEOUT_S
+
+
+# A server whose first n ConfirmImage requests, or their answers, are lost: "request" never reaches it, "answer" is
+# served and its 71 is lost. Later ones answer as FakeServer does (a repeat for an image already valid answers
+# positive, as the core's does).
+class LosesConfirm(FakeServer):
+    # lost: "request" or "answer"; n: how many F002s it loses.
+    def __init__(self, lost, n=1, **kw):
+        FakeServer.__init__(self, running_state=2, confirm_refusals=0, **kw)
+        self.lost, self.lose_n = lost, n
+
+    # F002 as FakeServer, losing the first lose_n.
+    def s31(self, req, rid):
+        if rid != 0xF002 or not self.lose_n:
+            return super().s31(req, rid)
+        self.lose_n -= 1
+        if self.lost == "answer":
+            super().s31(req, rid)
+        return []
+
+
+# Check a ConfirmImage whose request or answer is lost is sent again, as NRC 0x22 is, and confirms, in the command and
+# at the end of flash; the repeat is safe because F002 answers positive at once for an image already valid.
+@pytest.mark.parametrize("lost", ["request", "answer"])
+def test_confirm_resends_a_lost_confirm_image(lost):
+    ft, d = FakeTime(), LosesConfirm(lost)
+    assert update.confirm_cmd(uds_for(d, ft), sleep=ft.sleep, clock=ft.clock, log=lambda *a: None) == 0
+    assert d.log.count((0x31, 0xF002)) == 2 and d.running_state == 3 and ft.sleeps == [update.CONFIRM_RETRY_S]
+    rc, _, _ = run_flash(LosesConfirm(lost, sha=NEW_SHA))
+    assert rc == 0
+
+
+# Check a ConfirmImage that never gets an answer stops at confirm's deadline, saying the image is not confirmed and that
+# `udsota confirm` before the unit resets finishes the job.
+def test_confirm_with_no_answer_says_the_image_is_unconfirmed():
+    ft, d = FakeTime(), LosesConfirm("request", n=10 ** 6)
+    with pytest.raises(errors.NoResponse) as e:
+        update.confirm(uds_for(d, ft), sleep=ft.sleep, clock=ft.clock, log=lambda *a: None)
+    assert ft.t >= update.CONFIRM_TIMEOUT_S and d.running_state == 2
+    assert "the new image is not confirmed" in str(e.value) and '"udsota confirm"' in str(e.value)
+    assert "rolls back" in str(e.value)
+
+
+# A server whose ConfirmImage sends fail on the PC's side (the request never reaches it): OSError(err) from the first n
+# F002 sends, which send_resending turns into SendFailed after its one resend.
+class FailsConfirmSend(FakeServer):
+    def __init__(self, err, n, **kw):
+        FakeServer.__init__(self, running_state=2, confirm_refusals=0, **kw)
+        self.err, self.fail_n = err, n
+
+    def handle(self, req):
+        if req[0] == 0x31 and req[2:4] == b"\xf0\x02" and self.fail_n:
+            self.fail_n -= 1
+            raise OSError(self.err, os.strerror(self.err))
+        return super().handle(req)
+
+
+# Check a ConfirmImage whose send fails twice (ENOBUFS, or ECOMM from a frame nobody acknowledged) is sent again, as a
+# lost one is, and confirms; and that one that never goes stops at the deadline saying the image is not confirmed.
+@pytest.mark.parametrize("err", [errno.ENOBUFS, errno.ECOMM])
+def test_confirm_resends_a_failed_send(err):
+    ft, d = FakeTime(), FailsConfirmSend(err, 2)
+    assert update.confirm(uds_for(d, ft), sleep=ft.sleep, clock=ft.clock, log=lambda *a: None) == 0
+    assert d.running_state == 3
+    ft, d = FakeTime(), FailsConfirmSend(err, 10 ** 6)
+    with pytest.raises(errors.UpdateFailed) as e:
+        update.confirm(uds_for(d, ft), sleep=ft.sleep, clock=ft.clock, log=lambda *a: None)
+    assert ft.t >= update.CONFIRM_TIMEOUT_S and d.running_state == 2
+    assert "the new image is not confirmed" in str(e.value) and '"udsota confirm"' in str(e.value)
+
+
+# Check a resent ConfirmImage that meets the default session (S3 lapsed during the outage: 0x7F) says the image is not
+# confirmed, and that `udsota confirm` finishes it, as the deadline's error does.
+def test_confirm_refused_after_a_lost_one_says_the_image_is_unconfirmed():
+    class LapsesS3(LosesConfirm):
+        def s31(self, req, rid):
+            if rid == 0xF002 and self.lose_n:
+                self.session = 1                # the outage outlasted S3
+            return super().s31(req, rid)
+    ft, d = FakeTime(), LapsesS3("request")
+    with pytest.raises(errors.Nrc) as e:
+        update.confirm(uds_for(d, ft), sleep=ft.sleep, clock=ft.clock, log=lambda *a: None)
+    assert e.value.code == 0x7F and d.running_state == 2
+    assert "the new image is not confirmed" in str(e.value) and '"udsota confirm"' in str(e.value)
 
 
 # Check reset unlocks level 01/02 in the extended session with the vector key, then sends 11 01.
@@ -2663,6 +2862,45 @@ def test_busy_block_after_a_late_76_is_retried(s3_on, frames):
     first_send_of_block_2(d, lambda req, bsc, real: list(frames))
     rc = update.flash(timed_uds(d, ft), P, make_image(), MASTER, sleep=ft.sleep, clock=ft.clock, log=lambda *a: None)
     assert rc == 0 and d.sha == NEW_SHA
+
+
+# A server on iso14229 whose app answers a 36 or 37 busy (0x21) once: any NRC ends the transfer there, so the resend
+# finds none open and gets 0x70.
+class BusyEndsTransfer(FakeServer):
+    # sid: the service (0x36 or 0x37) that is answered 0x21 once.
+    def __init__(self, sid, **kw):
+        FakeServer.__init__(self, security=False, ended_nrc=0x70, **kw)
+        self.busy_sid = sid
+
+    # 0x21 to the first 36 or 37 asked for, which ends the transfer; then FakeServer's.
+    def handle(self, req):
+        if req[0] == self.busy_sid and self.dl_open:
+            self.busy_sid = None
+            self.log.append((req[0], self.request_arg(req)))
+            self.dl_open = False
+            return self.nrc(req[0], 0x21)
+        return super().handle(req)
+
+
+# Check the 0x70 that follows a retried 0x21 to a 36 or a 37 says the server answered busy, which ended the transfer on
+# this server, and that flash is to be run again; the retry is kept, since a v0.14.x server keeps the transfer across a
+# 0x21 and the client cannot tell the two apart. A 0x70 with no 0x21 before it is reported as it was.
+@pytest.mark.parametrize("sid", [0x36, 0x37])
+def test_busy_that_ended_the_transfer_is_named_after_its_0x70(sid):
+    d = BusyEndsTransfer(sid)
+    uds = uds_for(d, FakeTime())
+    uds.session(2)
+    with pytest.raises(errors.Nrc) as e:
+        update.download(uds, make_image(), log=lambda *a: None)
+    assert (e.value.sid, e.value.code) == (sid, 0x70)
+    assert "the server answered busy (0x21), which ends the transfer on this server; run flash again" in str(e.value)
+    assert [x for x in d.log if x[0] == sid][:2] == [(sid, 1 if sid == 0x36 else None)] * 2
+    d = FakeServer(security=False, ended_nrc=0x70, nrc_once={(0x36, 1): 0x70})
+    uds = uds_for(d, FakeTime())
+    uds.session(2)
+    with pytest.raises(errors.Nrc) as e:
+        update.download(uds, make_image(), log=lambda *a: None)
+    assert str(e.value) == "service 0x36 answered NRC 0x70"
 
 
 # Check the 76 to a download's last block that lands on 0x37 (the block was resent after its first 76 came late, and

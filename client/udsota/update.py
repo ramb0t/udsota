@@ -4,6 +4,8 @@ product-specific step comes from the profile."""
 import contextlib
 import time
 
+import can
+
 from .delta import validation_hash
 from .errors import NoResponse, Nrc, Refused, SendFailed, UpdateFailed
 from .image import parse_image, update_buses
@@ -21,6 +23,9 @@ BOOT_TIMEOUT_S = 60.0
 BOOT_POLL_S = 1.0
 CONFIRM_RETRY_S = 2.0    # between ConfirmImage tries; Uds's 3E 00 keepalive holds the extended session meanwhile
 CONFIRM_TIMEOUT_S = 120.0   # a product's soak plus its health check, with margin
+NRC_SERVICE_IN_SESSION = 0x7F   # serviceNotSupportedInActiveSession: ConfirmImage met the default session (S3 lapsed)
+UNCONFIRMED = ("the new image is not confirmed and rolls back at the unit's next reset; run \"udsota confirm\" "
+               "before then to finish it")
 WAIT_RETRY_S = 0.05      # flash --wait-for-unit: the next 10 02 at most this long after the last went unanswered,
                          # so that one lands in a bootloader's power-up window (100 ms in udsota's examples)
 WAIT_SETTLE_S = 0.25     # then the answers to earlier 10 02s, which a unit sends a P2 (50 ms) apart, are passed
@@ -355,6 +360,15 @@ def check_image(uds, log=print):
                            % (reason_name(status[0]) if status else "no status"))
 
 
+# One pre-roll while a unit restarts. A send the adapter cannot make (python-can raises CanOperationError, or OSError,
+# when nothing on the bus acknowledges and its queue fills) is not the wait's failure: the poll that follows decides.
+def try_preroll(preroll):
+    try:
+        preroll()
+    except (OSError, can.CanError):
+        pass
+
+
 # Wait for a restarting server: pre-roll and poll the running SHA until it answers, and return it. after names what
 # restarted it, for the timeout message. The server comes back in the default session, so no 3E 00 precedes a poll.
 def wait_for_boot(uds, preroll, after, sleep=time.sleep, clock=time.monotonic):
@@ -362,7 +376,7 @@ def wait_for_boot(uds, preroll, after, sleep=time.sleep, clock=time.monotonic):
     sleep(REBOOT_WAIT_S)
     deadline = clock() + BOOT_TIMEOUT_S
     while True:
-        preroll()
+        try_preroll(preroll)
         try:
             return uds.read_did(DID_RUNNING_SHA)
         except (NoResponse, SendFailed):   # a rebooting server answers nothing, or leaves a send unacknowledged
@@ -379,17 +393,27 @@ def wait_for_image(uds, sha, preroll, sleep=time.sleep, clock=time.monotonic):
                            "read F1F0 with `info`" % (running[:8].hex(), sha[:8].hex()))
 
 
-# ConfirmImage in the extended session, retrying NRC 0x22 until the product's soak and health check pass.
+# ConfirmImage in the extended session, retrying NRC 0x22 until the product's soak and health check pass, and a
+# request or answer that is lost: the server answers positive at once for an image already valid, so a repeat is safe.
 def confirm(uds, sleep=time.sleep, clock=time.monotonic, log=print):
     uds.session(SESSION_EXTENDED)
     deadline = clock() + CONFIRM_TIMEOUT_S
+    lost = False                                # a send or an answer was lost: S3 may have lapsed since
     while True:
         try:
             uds.routine(RID_CONFIRM)
             break
         except Nrc as e:
-            if e.code != NRC_CONDITIONS or clock() >= deadline:
-                raise
+            if e.code == NRC_CONDITIONS and clock() < deadline:
+                sleep(CONFIRM_RETRY_S)
+                continue
+            if e.code != NRC_CONDITIONS and (lost or e.code == NRC_SERVICE_IN_SESSION):
+                raise Nrc(e.sid, e.code, UNCONFIRMED) from e
+            raise
+        except (NoResponse, SendFailed) as e:   # a failed send never reached the server
+            lost = True
+            if clock() >= deadline:
+                raise type(e)("ConfirmImage got no answer in %d s: %s" % (CONFIRM_TIMEOUT_S, UNCONFIRMED)) from e
             sleep(CONFIRM_RETRY_S)
     log("confirmed: %s" % describe_status(decode_status(uds.read_did(DID_STATUS))))
     return 0
@@ -665,7 +689,7 @@ def wait_for_start(uds, profile, sha, preroll, sleep=time.sleep, clock=time.mono
     sleep(REBOOT_WAIT_S)
     deadline = clock() + profile.start_timeout_s
     while True:
-        preroll()
+        try_preroll(preroll)
         try:
             prefix = uds.read_did(DID_IMAGE_PREFIX)
         except (NoResponse, SendFailed):   # the unit is restarting, or its app is not healthy yet
