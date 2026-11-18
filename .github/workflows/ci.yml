@@ -25,7 +25,10 @@ jobs:
       - name: The host tests, test_udsota_delta, the fuzzer's delta seeds and the bootloader core's tests among them
         run: |
           cmake -S . -B build -DUDSOTA_FUZZ_LIBFUZZER="$FUZZ_LIBFUZZER"
-          cmake --build build -j && ctest --test-dir build --output-on-failure
+          # One command a line: bash -e does not stop at a failure on the left of an && that is not the last command,
+          # so a failed build would fall through to the check below and pass.
+          cmake --build build -j
+          ctest --test-dir build --output-on-failure
           # CMake leaves test_headers_cxx out when it finds no C++ compiler; here it must be there.
           ctest --test-dir build -N -R '^test_headers_cxx$' | grep -q 'Total Tests: 1'
         env:
