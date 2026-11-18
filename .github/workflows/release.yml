@@ -87,7 +87,9 @@ jobs:
           if [ "$(git log -1 --format=%s "$SHA")" = "Release $VERSION" ]; then
             files=$(git diff --name-only "$SHA^" "$SHA")
             other=$(printf '%s\n' "$files" | grep -vxE 'CHANGELOG\.md|client/udsota/__init__\.py|udsota\.h' || true)
-            if [ -z "$other" ]; then SHA=$(git rev-parse "$SHA^"); fi
+            # In udsota.h only the version macros may change.
+            code=$(git diff -U0 "$SHA^" "$SHA" -- udsota.h | grep -E '^[-+][^-+]' | grep -vE '^[-+]#define UDSOTA_VERSION' || true)
+            if [ -z "$other" ] && [ -z "$code" ]; then SHA=$(git rev-parse "$SHA^"); fi
           fi
           ci=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$SHA&event=push" \
                --jq '[.workflow_runs[] | select(.status == "completed")][0].conclusion // ""')
