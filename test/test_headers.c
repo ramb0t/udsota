@@ -1,11 +1,12 @@
 /* udsota.h and udsota_app.h, the headers an app includes, compile cleanly as C11 here and as C++20 through
  * test_headers.cpp, which includes this file: an ESP-IDF app may be written in either. Both place a header with
- * UDSOTA_IMAGE_HEADER_BUSES, the C++ one also with UDSOTA_IMAGE_HEADER, and main checks the fields they set. */
+ * UDSOTA_IMAGE_HEADER_BUSES, the C++ one also with UDSOTA_IMAGE_HEADER; both place UDSOTA_IMAGE_DESC, and main checks the fields they set. */
 #include <string.h>
 #include "udsota.h"
 #include "udsota_app.h"
 
 UDSOTA_IMAGE_HEADER_BUSES(UDSOTA_BUS(2), 1, 2, 0x710, 0x718, "1.0.0", "example");
+UDSOTA_IMAGE_DESC(3, 4, 0x720, 0x728);   /* the ESP-IDF app's descriptor, from udsota.h */
 
 static bool header_is(const volatile udsota_image_header_t *h, uint16_t buses)
 {
@@ -22,4 +23,17 @@ static bool header_is(const volatile udsota_image_header_t *h, uint16_t buses)
 #define UDSOTA_TEST_EVERY_BUS_HEADER_IS() true
 #endif
 
-int main(void) { return header_is(&udsota_image_header, UDSOTA_BUS(2)) && UDSOTA_TEST_EVERY_BUS_HEADER_IS() ? 0 : 1; }
+static bool desc_is(const udsota_image_desc_t *d)
+{
+    return d->magic == UDSOTA_IMG_DESC_MAGIC && d->desc_version == 1u && d->hw_id == 3u &&
+           d->partition_layout_id == 4u && d->diag_request_id == 0x720u && d->diag_response_id == 0x728u &&
+           d->reserved[0] == 0u && d->reserved[18] == 0u;
+}
+
+int main(void)
+{
+    return header_is(&udsota_image_header, UDSOTA_BUS(2)) && UDSOTA_TEST_EVERY_BUS_HEADER_IS() &&
+                   desc_is(&udsota_image_desc)
+               ? 0
+               : 1;
+}
