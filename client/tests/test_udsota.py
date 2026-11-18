@@ -5103,6 +5103,20 @@ def test_bootloader_flow_silent_app_times_out(timeout):
     assert d.log[len(BL_PRECHECK + DOWNLOAD):] == [(0x22, 0xF1F4)] * (timeout + 1)
 
 
+# Check the timeout names the image's update_buses when the image does not take updates on every bus, since from a bus
+# it closes a healthy app is silent too.
+def test_bootloader_flow_silent_app_on_an_image_that_closes_buses():
+    data = bytearray(BL_IMG)
+    struct.pack_into("<H", data, 48 + image.BARE_HDR_UPDATE_BUSES_OFFSET, 0x0004)
+    closing = image.stamp(bytes(data), 48)
+    assert image.update_buses(PBL, closing) == 0x0004 and image.update_buses(PBL, BL_IMG) == 0xFFFF
+    d = BootloaderUnit(security=False, app_silent=True)
+    with pytest.raises(errors.UpdateFailed, match="reported healthy. Or it has, and this is a bus the image closes: "
+                                                  "its update_buses is 0x0004, and on a bus that does not name, the "
+                                                  "app runs but answers nothing$"):
+        run_boot(d, image=closing)
+
+
 # Check an app that answers F1F4 with another image's prefix fails the run.
 def test_bootloader_flow_other_prefix_fails():
     d = BootloaderUnit(security=False, app_prefix=b"\xde\xad\xbe\xef")

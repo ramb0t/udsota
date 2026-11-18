@@ -6,7 +6,7 @@ import time
 
 from .delta import validation_hash
 from .errors import NoResponse, Nrc, Refused, SendFailed, UpdateFailed
-from .image import parse_image
+from .image import parse_image, update_buses
 from .keys import DeviceKeys, SigningKeys
 from .pack import build_patch, encode, rank_deltas, refuse_bare_delta
 from .wire import (DID_COUNTERS, DID_DEVICE_ID, DID_IMAGE_PREFIX, DID_PROJECT, DID_RESULT, DID_RUNNING_SHA, DID_SESSION,
@@ -563,7 +563,8 @@ def flash_bootloader(uds, profile, image, img, secret, drop_76=None, preroll=lam
             log("the unit already holds this image (%s)%s: resetting into it" % (
                 img.elf_sha[:8].hex(), "; the reset releases it for another try" if held else ""))
             uds.ecu_reset()
-            return wait_for_start(uds, profile, img.elf_sha, preroll, sleep=sleep, clock=clock, log=log)
+            return wait_for_start(uds, profile, img.elf_sha, preroll, sleep=sleep, clock=clock, log=log,
+                                  buses=update_buses(profile, image))
         board_of = profile.board_names.get(img.hw_id, "hw_id %d" % img.hw_id)
         if board is not None and board != profile.board_names.get(img.hw_id):
             raise Refused("image is for %s but the server is %s. %s" % (board_of, board, LEFT_IN_BOOTLOADER))
@@ -608,7 +609,7 @@ def flash_bootloader(uds, profile, image, img, secret, drop_76=None, preroll=lam
                 log("ActivateImage answered 0x24 (the image is not verified): downloading again")
                 recovered = need_download = True   # one re-download per run
         return wait_for_start(uds, profile, img.elf_sha, preroll, sleep=sleep, clock=clock, log=log,
-                              activated=activated)
+                              activated=activated, buses=update_buses(profile, image))
 
 
 # The bootloader flow's 10 02 under --wait-for-unit, for a unit whose app runs but cannot hand over. The first 10 02
@@ -648,12 +649,18 @@ def wait_for_power_up(uds, seconds, log=print, clock=time.monotonic):
     log("10 02 answered after %.1f s, at try %d%s" % (took, tries, passed))
 
 
+# What a silent F1F4 may also mean when the image does not take updates on every bus (its header's update_buses).
+CLOSED_BUS = (". Or it has, and this is a bus the image closes: its update_buses is 0x%04X, and on a bus that does not "
+              "name, the app runs but answers nothing")
+
+
 # The bootloader flow's proof of life after ActivateImage or 11 01: wait REBOOT_WAIT_S, then poll F1F4 until the
 # unit's app answers it, which it does once healthy, for up to the profile's start_timeout_s, and check it is the first
 # 4 bytes of sha. Returns 0, or raises UpdateFailed: another prefix (the app runs another image), 0x31 (the bootloader
 # answers: the app did not start, F1F0 saying whether the unit holds itself there; or, when activated is False because
 # no F001 was answered, perhaps never activated), or nothing within the timeout. Silence is never success.
-def wait_for_start(uds, profile, sha, preroll, sleep=time.sleep, clock=time.monotonic, log=print, activated=True):
+def wait_for_start(uds, profile, sha, preroll, sleep=time.sleep, clock=time.monotonic, log=print, activated=True,
+                   buses=0xFFFF):
     uds.restarted()
     sleep(REBOOT_WAIT_S)
     deadline = clock() + profile.start_timeout_s
@@ -664,7 +671,8 @@ def wait_for_start(uds, profile, sha, preroll, sleep=time.sleep, clock=time.mono
         except (NoResponse, SendFailed):   # the unit is restarting, or its app is not healthy yet
             if clock() >= deadline:
                 raise UpdateFailed("nothing answered F1F4 in %d s of polling after the restart, so the app has not "
-                                   "reported healthy" % profile.start_timeout_s)
+                                   "reported healthy%s" % (profile.start_timeout_s, CLOSED_BUS % buses
+                                                           if buses != 0xFFFF else ""))
             sleep(BOOT_POLL_S)
             continue
         except Nrc as e:
