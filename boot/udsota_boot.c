@@ -57,8 +57,9 @@ enum {
     TESTER,        /* serving with B.bus locked, the others stopped: the idle exit comes at since + IDLE_MS */
     S3_EXPIRED,    /* serving, and S3 expired in this poll, which ends in a session exit */
 };
-/* A download: OPEN from its 34 to its end, ENDED once its 37 passed, VERIFIED once FF01 passed, until the next 34. */
-enum { DL_NONE = 0, DL_OPEN, DL_ENDED, DL_VERIFIED };
+/* A download's phase: OPEN from its 34 until it fails or its 37 passes, RECEIVED once its 37 passed, VERIFIED once FF01
+ * passed, until the next 34. */
+enum { DL_NONE = 0, DL_OPEN, DL_RECEIVED, DL_VERIFIED };
 
 /* Every piece of the core's state. udsota_boot_init clears it all, so nothing relies on a zeroed .bss. */
 static struct {
@@ -75,9 +76,11 @@ static struct {
     uint8_t  bus;                  /* TESTER's, else the bus of the request in flight (busy()) or of the last frame */
     bool     replay;               /* the handover's 10 02, for iso14229's first receive */
 
-    uint8_t  dl;                   /* DL_* */
-    uint8_t  last_reason;          /* F1F1 byte 0 */
-    uint32_t announced, received;  /* the 34's memorySize; the data bytes the 36s carried (F1F1 bytes 1-4) */
+    struct {
+        uint8_t  phase;            /* DL_* */
+        uint8_t  reason;           /* F1F1 byte 0 */
+        uint32_t announced, received;   /* the 34's memorySize; the data bytes the 36s carried (F1F1 bytes 1-4) */
+    } dl;
 
     UDSServer_t srv;
     struct {
@@ -359,7 +362,7 @@ static bool boot_check(void)
 static udsota_reason_t ff01_check(void)
 {
     const uint8_t *const hdr = udsota_boot_port_slot() + B.cfg->image_header_offset;
-    const udsota_reason_t why = udsota_boot_image_rules(B.cfg, hdr, UDSOTA_BARE_HDR_LEN, B.announced);
+    const udsota_reason_t why = udsota_boot_image_rules(B.cfg, hdr, UDSOTA_BARE_HDR_LEN, B.dl.announced);
     if (why != UDSOTA_DL_OK) {
         return why;
     }
@@ -378,22 +381,29 @@ static bool write_block(uint32_t off, const uint8_t *data, uint32_t n)
 
 /* ==== 7. The services ==== */
 
-/* The open download ends, and F1F1 names why. One that has already ended keeps its reason, so a later ABORTED never
+/* The open download fails, and F1F1 names why. One that has already ended keeps its reason, so a later ABORTED never
  * overwrites an image rule's or a flash failure's. */
-static void dl_end(uint8_t why)
+static void dl_fail(uint8_t why)
 {
-    if (B.dl == DL_OPEN) {
-        B.last_reason = why;
-        B.dl = DL_NONE;
+    if (B.dl.phase == DL_OPEN) {
+        B.dl.reason = why;
+        B.dl.phase = DL_NONE;
     }
 }
 
 /* iso14229 ends a transfer without an event (0x24, 0x71, a 36 shorter than 2 bytes): noticed after every poll. */
-static void xfer_check(void)
+static void notice_dropped_transfer(void)
 {
-    if (B.dl == DL_OPEN && !B.srv.xferIsActive) {
-        dl_end(UDSOTA_DL_ABORTED);
+    if (B.dl.phase == DL_OPEN && !B.srv.xferIsActive) {
+        dl_fail(UDSOTA_DL_ABORTED);
     }
+}
+
+/* A session change ends the download, and iso14229 would keep its transfer open across it. */
+static void abort_download(UDSServer_t *srv)
+{
+    dl_fail(UDSOTA_DL_ABORTED);
+    srv->xferIsActive = false;
 }
 
 /* The unit holds: the start count the last decision used is at the threshold. */
@@ -459,11 +469,11 @@ static UDSErr_t read_did(UDSServer_t *srv, const UDSRDBIArgs_t *a)
         n = 16u;
         break;
     case UDSOTA_DID_RESULT:
-        b[0] = B.last_reason;
-        b[1] = (uint8_t)(B.received >> 24);
-        b[2] = (uint8_t)(B.received >> 16);
-        b[3] = (uint8_t)(B.received >> 8);
-        b[4] = (uint8_t)B.received;
+        b[0] = B.dl.reason;
+        b[1] = (uint8_t)(B.dl.received >> 24);
+        b[2] = (uint8_t)(B.dl.received >> 16);
+        b[3] = (uint8_t)(B.dl.received >> 8);
+        b[4] = (uint8_t)B.dl.received;
         n = 5u;
         break;
     case UDSOTA_DID_RUNNING_SHA:
@@ -501,10 +511,10 @@ static UDSErr_t request_download(const UDSServer_t *srv, UDSRequestDownloadArgs_
         a->size > cfg->slot_size || (a->size & 3u) != 0u) {
         return UDS_NRC_RequestOutOfRange;
     }
-    B.dl = DL_OPEN;
-    B.last_reason = UDSOTA_DL_OK;
-    B.announced = (uint32_t)a->size;
-    B.received = 0u;
+    B.dl.phase = DL_OPEN;
+    B.dl.reason = UDSOTA_DL_OK;
+    B.dl.announced = (uint32_t)a->size;
+    B.dl.received = 0u;
     a->maxNumberOfBlockLength = UDS_SERVER_RECV_BUF_SIZE;
     return UDS_PositiveResponse;
 }
@@ -516,18 +526,18 @@ static UDSErr_t request_download(const UDSServer_t *srv, UDSRequestDownloadArgs_
 static UDSErr_t transfer_data(UDSServer_t *srv, const UDSTransferDataArgs_t *a)
 {
     const udsota_boot_cfg_t *cfg = B.cfg;
-    const uint32_t len = a->len, at = B.received, unit = cfg->slot_write_unit;
-    if (len == 0u || (at + len != B.announced && (len & (unit - 1u)) != 0u)) {
-        dl_end(UDSOTA_DL_ABORTED);
+    const uint32_t len = a->len, at = B.dl.received, unit = cfg->slot_write_unit;
+    if (len == 0u || (at + len != B.dl.announced && (len & (unit - 1u)) != 0u)) {
+        dl_fail(UDSOTA_DL_ABORTED);
         return UDS_NRC_IncorrectMessageLengthOrInvalidFormat;
     }
     uint8_t *data = &srv->r.recv_buf[2];                 /* a->data, past the SID and the counter, writable */
     if (at == 0u) {
         const uint32_t off = cfg->image_header_offset;
         const uint32_t hdr_len = (len > off) ? len - off : 0u;
-        const udsota_reason_t why = udsota_boot_image_rules(cfg, data + off, hdr_len, B.announced);
+        const udsota_reason_t why = udsota_boot_image_rules(cfg, data + off, hdr_len, B.dl.announced);
         if (why != UDSOTA_DL_OK) {
-            dl_end(why);
+            dl_fail(why);
             return UDS_NRC_RequestOutOfRange;
         }
         B.app_valid = false;                             /* the first erase */
@@ -535,21 +545,21 @@ static UDSErr_t transfer_data(UDSServer_t *srv, const UDSTransferDataArgs_t *a)
     const uint32_t n = (len + unit - 1u) & ~(uint32_t)(unit - 1u);
     memset(data + len, 0xFF, n - len);
     if (!write_block(at, data, n)) {
-        dl_end(UDSOTA_DL_FLASH_ERROR);
+        dl_fail(UDSOTA_DL_FLASH_ERROR);
         return UDS_NRC_GeneralProgrammingFailure;
     }
-    B.received = at + len;
+    B.dl.received = at + len;
     return UDS_PositiveResponse;
 }
 
 /* 37: no data, and once every announced byte has arrived. */
 static UDSErr_t transfer_exit(const UDSRequestTransferExitArgs_t *a)
 {
-    if (a->len != 0u || B.received != B.announced) {
-        dl_end(UDSOTA_DL_ABORTED);
+    if (a->len != 0u || B.dl.received != B.dl.announced) {
+        dl_fail(UDSOTA_DL_ABORTED);
         return (a->len != 0u) ? UDS_NRC_IncorrectMessageLengthOrInvalidFormat : UDS_NRC_RequestSequenceError;
     }
-    B.dl = DL_ENDED;
+    B.dl.phase = DL_RECEIVED;
     return UDS_PositiveResponse;
 }
 
@@ -570,16 +580,16 @@ static UDSErr_t routine(UDSServer_t *srv, UDSRoutineCtrlArgs_t *a)
         return UDS_NRC_IncorrectMessageLengthOrInvalidFormat;
     }
     if (a->id == UDSOTA_RID_ACTIVATE_IMAGE) {
-        return (B.dl == DL_VERIFIED) ? leave() : UDS_NRC_RequestSequenceError;
+        return (B.dl.phase == DL_VERIFIED) ? leave() : UDS_NRC_RequestSequenceError;
     }
-    if (B.dl == DL_ENDED) {
-        B.last_reason = (uint8_t)ff01_check();
-        B.app_valid = (B.last_reason == UDSOTA_DL_OK);
-        B.dl = B.app_valid ? DL_VERIFIED : DL_NONE;
-    } else if (B.dl != DL_VERIFIED) {
+    if (B.dl.phase == DL_RECEIVED) {
+        B.dl.reason = (uint8_t)ff01_check();
+        B.app_valid = (B.dl.reason == UDSOTA_DL_OK);
+        B.dl.phase = B.app_valid ? DL_VERIFIED : DL_NONE;
+    } else if (B.dl.phase != DL_VERIFIED) {
         return UDS_NRC_RequestSequenceError;
     }
-    return (UDSErr_t)a->copyStatusRecord(srv, &B.last_reason, 1u);
+    return (UDSErr_t)a->copyStatusRecord(srv, &B.dl.reason, 1u);
 }
 
 /* iso14229's events. Its own refusals of a malformed or untimely request come first; every event the core does not
@@ -592,8 +602,7 @@ static UDSErr_t on_event(UDSServer_t *srv, UDSEvent_t ev, void *arg)
     case UDS_EVT_DoScheduledReset:                       /* 11 01 resets on the core's own delay */
         return UDS_PositiveResponse;
     case UDS_EVT_SessionTimeout:
-        dl_end(UDSOTA_DL_ABORTED);
-        srv->xferIsActive = false;
+        abort_download(srv);
         B.state = S3_EXPIRED;
         return UDS_PositiveResponse;
     case UDS_EVT_DiagSessCtrl: {
@@ -602,8 +611,7 @@ static UDSErr_t on_event(UDSServer_t *srv, UDSEvent_t ev, void *arg)
             return UDS_NRC_SubFunctionNotSupported;
         }
         a->p2_star_ms = P2_STAR_MS;
-        dl_end(UDSOTA_DL_ABORTED);
-        srv->xferIsActive = false;
+        abort_download(srv);
         return UDS_PositiveResponse;
     }
     case UDS_EVT_EcuReset:
@@ -801,7 +809,7 @@ void udsota_boot_poll(void)
     UDSServerPoll(&B.srv);
     const uint32_t now = UDSMillis();
     age_timers(now);
-    xfer_check();
+    notice_dropped_transfer();
     if (B.reset) {
         if (now - B.reset_at >= RESET_DELAY_MS) {
             reset();
