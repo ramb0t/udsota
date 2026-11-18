@@ -4,6 +4,8 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-11-18
+
 ### Added
 
 - Bootloader core: `boot/ports/stm32f1/`, a port for STM32F1 parts with bxCAN on CMSIS registers and no HAL, moved in from the first product's bootloader as it was. It covers every `udsota_boot_port_*` function but `can_start`, `can_stop` and `can_send` (the DWT clock, the keep words in the backup registers, the independent watchdog, the device ID and reset, page erase and half-word programming bounded to the slot, and a `start_app` that returns the clocks and peripherals to reset), and has `f1_bxcan`, a polled bxCAN driver the board writes those three on; its README says what a product adds. Its host tests (`test_port_f1`, `test_port_f1_flash`, `test_f1_bxcan`) run against a stand-in `stm32f1xx.h` over the CMSIS headers vendored for them in `test/boot/stm32f1/cmsis/` ([THIRD_PARTY.md](THIRD_PARTY.md)), and CI compiles, without linking, its three sources for Cortex-M3 with every warning an error (`udsota_boot_port_stm32f1_arm`).

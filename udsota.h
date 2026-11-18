@@ -36,9 +36,9 @@
 /* The udsota release this header belongs to, for an #if on the release a feature arrived in. tools/release.py sets
  * all four at each cut, and its check fails when they disagree with the tag (RELEASING.md). */
 #define UDSOTA_VERSION_MAJOR 0
-#define UDSOTA_VERSION_MINOR 19
+#define UDSOTA_VERSION_MINOR 20
 #define UDSOTA_VERSION_PATCH 0
-#define UDSOTA_VERSION       "0.19.0"
+#define UDSOTA_VERSION       "0.20.0"
 
 /* ---- The image descriptor ----
  * Every image says which board, partition layout and CAN IDs it is for, in a udsota_image_desc_t at offset 288 (right
