@@ -123,7 +123,7 @@ def send_payload(uds, image, payload, max_data, kind, drop_76=None, log=print, c
 
 # Send one 0x36 block; resend it once after a plain timeout (the block-counter rule makes that safe). Only a 0.14.x
 # server answers a repeated block, so the resend recovers a lost answer there; on 0.15+ it recovers a block the server
-# never got, and a lost answer fails the run (0x70).
+# never got, and a lost answer fails the run (0x24).
 def send_block(uds, bsc, chunk):
     try:
         uds.transfer(bsc, chunk)
