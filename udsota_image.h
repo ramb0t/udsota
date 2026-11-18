@@ -1,6 +1,6 @@
 /* udsota_image.h: the types of an image's identity, for an app that places its header and for the bootloader core and
  * the tests that read one. udsota.h takes udsota_image_desc_t from here, and udsota_app.h includes it whole. It
- * compiles as C11 and as C++.
+ * compiles as C11 or C++20 (C++17 has no designated initialisers, which the header macros use).
  * Every field is little-endian; on a little-endian target each struct is its layout byte for byte, and the asserts
  * hold it to udsota_wire.h. The core reads a header as bytes, not through these types, since a 36's data may be
  * unaligned. */
@@ -138,7 +138,8 @@ static inline bool udsota_image_bus_open(uint16_t mask, uint8_t buses, uint8_t b
         .reserved = { UDSOTA_IMAGE_FF14 },                                                                      \
         .desc = { .magic = UDSOTA_IMG_DESC_MAGIC, .desc_version = 1u, .hw_id = (uint8_t)(hw),                   \
                   .partition_layout_id = (uint8_t)(layout), .diag_request_id = (uint16_t)(req_id),              \
-                  .diag_response_id = (uint16_t)(resp_id), .flags = UDSOTA_IMG_RELEASE ? 0x01u : 0x00u },        \
+                  .diag_response_id = (uint16_t)(resp_id), .flags = UDSOTA_IMG_RELEASE ? 0x01u : 0x00u,           \
+                  .reserved = { 0u } },                                                                         \
         .version = ver, .project = proj,                                                                        \
         .image_id = { UDSOTA_IMAGE_FF32 }, .signature = { UDSOTA_IMAGE_FF64 },                                  \
     }

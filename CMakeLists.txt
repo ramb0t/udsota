@@ -183,8 +183,9 @@ target_compile_options(test_udsota_app PRIVATE -fsanitize=address,undefined -fno
 target_link_options(test_udsota_app PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=all)
 add_test(NAME test_udsota_app COMMAND test_udsota_app)
 
-# udsota.h and udsota_app.h, the headers an app includes, compile as C11 and as C++17 with every warning an error: an
-# app may be written in either. The build is the test; running it only returns 0. The C++ half needs a C++ compiler,
+# udsota.h and udsota_app.h, the headers an app includes, compile as C11 or as C++20 with every warning an error: an
+# app may be written in either. Both also place an image header with each macro and check its fields, which C++17
+# cannot compile (designated initialisers). The build is the test, with that check. The C++ half needs a C++ compiler,
 # which nothing else here does, so a host without one builds the rest and says so; CI checks it is there.
 add_executable(test_headers_c test/test_headers.c)
 set(udsota_header_tests test_headers_c)
@@ -193,7 +194,7 @@ check_language(CXX)
 if(CMAKE_CXX_COMPILER)
     enable_language(CXX)
     add_executable(test_headers_cxx test/test_headers.cpp)
-    set_target_properties(test_headers_cxx PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    set_target_properties(test_headers_cxx PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
     list(APPEND udsota_header_tests test_headers_cxx)
 else()
     message(STATUS "udsota: no C++ compiler, so no test_headers_cxx")

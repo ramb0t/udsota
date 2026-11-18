@@ -11,7 +11,8 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ### Fixed
 
-- Bootloader core: a unit with a valid app no longer stays in its bootloader for ever after a session that no tester frame opened (`10 03`, or `10 02` with a third byte) ends with `10 01`. In the default session with no lock and no deadline the core now resets once the answer has gone, as the idle exit does, when the boot rules would start the app; a held unit and one with no valid app keep listening. About 50 more bytes of Cortex-M3 text.
+- Bootloader core: a unit with a valid app no longer stays in its bootloader for ever after a session that no tester frame opened (`10 02` with a third byte) ends with `10 01`. In the default session with no lock and no deadline the core now resets once the answer has gone, as the idle exit does, when the boot rules would start the app; a held unit and one with no valid app keep listening. About 50 more bytes of Cortex-M3 text.
+- `udsota_image.h`: `UDSOTA_IMAGE_HEADER` and `UDSOTA_IMAGE_HEADER_BUSES` compile as C++20, as the header says, with `-Wall -Wextra -Werror -pedantic`; C++17 has no designated initialisers. The bytes they place are unchanged. The headers now say "C11 or C++20", and `test_headers_cxx` is built as C++20 and places a header with each macro.
 
 ## [0.17.0] - 2026-11-17
 
