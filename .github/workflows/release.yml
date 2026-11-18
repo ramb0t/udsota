@@ -19,7 +19,7 @@ on:
         description: "Existing tag to release, vX.Y.Z"
         required: true
       backfill:
-        description: "An older version: skip the version check"
+        description: "An older version: skip the version check and the warning and image gates"
         type: boolean
         default: false
   workflow_call:
