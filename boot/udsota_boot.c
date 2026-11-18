@@ -503,9 +503,6 @@ static UDSErr_t request_download(const UDSServer_t *srv, UDSRequestDownloadArgs_
     const udsota_boot_cfg_t *cfg = B.cfg;
     const uint8_t alfid = srv->r.recv_buf[2];            /* not in the event's arguments; iso14229 allows 1 to 8 */
     const uint8_t size_len = alfid >> 4, addr_len = alfid & 0x0Fu;
-    if (srv->sessionType != UDS_LEV_DS_PRGS) {
-        return UDS_NRC_ServiceNotSupportedInActiveSession;
-    }
     if (size_len < 1u || size_len > 4u || addr_len < 1u || addr_len > 4u || a->addr != 0u ||
         a->dataFormatIdentifier != UDSOTA_DL_DFI || a->size < cfg->image_header_offset + UDSOTA_BARE_HDR_LEN ||
         a->size > cfg->slot_size || (a->size & 3u) != 0u) {
@@ -567,9 +564,6 @@ static UDSErr_t transfer_exit(const UDSRequestTransferExitArgs_t *a)
  * the slot's bytes, then the CRC; its status is also F1F1 byte 0, and a pass answers 00 again until the next 34. */
 static UDSErr_t routine(UDSServer_t *srv, UDSRoutineCtrlArgs_t *a)
 {
-    if (srv->sessionType != UDS_LEV_DS_PRGS) {
-        return UDS_NRC_ServiceNotSupportedInActiveSession;
-    }
     if (a->id != UDSOTA_RID_CHECK_PROG_DEPS && a->id != UDSOTA_RID_ACTIVATE_IMAGE) {
         return UDS_NRC_RequestOutOfRange;
     }
@@ -596,7 +590,11 @@ static UDSErr_t routine(UDSServer_t *srv, UDSRoutineCtrlArgs_t *a)
  * serve answers 0x11, never iso14229's default positive answer. */
 static UDSErr_t on_event(UDSServer_t *srv, UDSEvent_t ev, void *arg)
 {
-    const bool prog = (srv->sessionType == UDS_LEV_DS_PRGS);
+    if (srv->sessionType != UDS_LEV_DS_PRGS &&           /* these services exist only in the programming session */
+        (ev == UDS_EVT_EcuReset || ev == UDS_EVT_SecAccessRequestSeed || ev == UDS_EVT_SecAccessValidateKey ||
+         ev == UDS_EVT_RoutineCtrl || ev == UDS_EVT_RequestDownload)) {
+        return UDS_NRC_ServiceNotSupportedInActiveSession;
+    }
     switch (ev) {
     case UDS_EVT_Err:                                    /* a lost answer: the next request is still served */
     case UDS_EVT_DoScheduledReset:                       /* 11 01 resets on the core's own delay */
@@ -615,14 +613,9 @@ static UDSErr_t on_event(UDSServer_t *srv, UDSEvent_t ev, void *arg)
         return UDS_PositiveResponse;
     }
     case UDS_EVT_EcuReset:
-        return !prog                                                    ? UDS_NRC_ServiceNotSupportedInActiveSession
-             : (((UDSECUResetArgs_t *)arg)->type != UDS_LEV_RT_HR)      ? UDS_NRC_SubFunctionNotSupported
-                                                                        : leave();
+        return (((UDSECUResetArgs_t *)arg)->type == UDS_LEV_RT_HR) ? leave() : UDS_NRC_SubFunctionNotSupported;
     case UDS_EVT_ReadDataByIdent:
         return read_did(srv, arg);
-    case UDS_EVT_SecAccessRequestSeed:                   /* 27 is not served */
-    case UDS_EVT_SecAccessValidateKey:
-        return prog ? UDS_NRC_ServiceNotSupported : UDS_NRC_ServiceNotSupportedInActiveSession;
     case UDS_EVT_RoutineCtrl:
         return routine(srv, arg);
     case UDS_EVT_RequestDownload:
@@ -631,7 +624,7 @@ static UDSErr_t on_event(UDSServer_t *srv, UDSEvent_t ev, void *arg)
         return transfer_data(srv, arg);
     case UDS_EVT_RequestTransferExit:
         return transfer_exit(arg);
-    default:
+    default:                                             /* 27 included: it is not served */
         return UDS_NRC_ServiceNotSupported;
     }
 }
