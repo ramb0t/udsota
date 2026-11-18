@@ -1251,6 +1251,9 @@ product = "stm32boot"
 hw_ids = [1, 2]
 layout_id = 1
 slot_size = 0x10000
+
+[update]
+flow = "bootloader"
 """
 PB = profile.from_dict("bare", tomllib.loads(BARE))
 BARE_IMG = build_bare_image()
@@ -3194,7 +3197,7 @@ def test_image_format_profile_values():
 
 
 # Check a bad [image] format or header_offset is refused with its reason, and desc_offset, which header_offset
-# replaced, as an unknown key.
+# replaced, as an unknown key; and so is a bare image with flow "app" or flow "bootloader" with an ESP-IDF one.
 @pytest.mark.parametrize("old, new, why", [
     ('format = "bare"', 'format = "elf"', "[image] format must be one of esp-idf, bare"),
     ('format = "bare"', "format = 1", "format must be a non-empty string"),
@@ -3206,6 +3209,10 @@ def test_image_format_profile_values():
     ("header_offset = 0x100", "header_offset = 0x100000000",
      "header_offset must be an integer from 0x0 to 0xFFFFFFFF"),
     ("header_offset = 0x100", 'header_offset = "0x100"', "header_offset must be an integer from 0x0 to 0xFFFFFFFF"),
+    ('flow = "bootloader"', 'flow = "app"',
+     '[image] format = "bare" is for flow = "bootloader": an A/B server takes only an ESP-IDF image'),
+    ('format = "bare"\nheader_offset = 0x100\n', "",
+     '[update] flow = "bootloader" needs [image] format = "bare": the boot core takes only a bare image'),
 ])
 def test_bad_image_format_is_refused(old, new, why):
     with pytest.raises(errors.Refused, match="profile bare: " + re.escape(why)):
@@ -4909,20 +4916,6 @@ def test_pack_orders_deltas_as_flash_does(tmp_path):
 
 # ---- bare images: flash and pack ----
 
-# Check flash sends a bare image as it sends an ESP-IDF one, plain and compressed, and compares F1F3 with its
-# image_id. The header sits at 48 so that its image_id lands where FakeServer reads a written image's F1F3, 176..208.
-def test_flash_bare_image():
-    prof = dataclasses.replace(PB, header_offset=48)
-    img = build_bare_image(header_offset=48)
-    ident = bare_id(img, 48)
-    for compress, dfi in (("none", 0x00), ("deflate", 0x10)):
-        d = FakeServer(security=False, compress=True)
-        assert run_flash(d, img, prof=prof, compress=compress)[0] == 0
-        assert (d.dfi, bytes(d.written), d.sha) == (dfi, img, ident)
-    d = FakeServer(security=False, sha=ident)
-    assert run_flash(d, img, prof=prof)[0] == 0 and not any(x[0] == 0x34 for x in d.log)
-
-
 # Check pack writes a bare image's DFI 0x10 and 0x00 payloads as an ESP-IDF image's, the manifest carrying its
 # image_id as image_elf_sha256.
 @pytest.mark.parametrize("args, dfis", [((), [0x10, 0x00]), (("--dfi", "0x00"), [0x00]), (("--dfi", "0x10"), [0x10])])
@@ -5010,7 +5003,8 @@ def test_stamp_command_out(tmp_path):
 # Check stamp refuses (exit 2) an esp-idf profile, an unreadable FILE, a header stamp refuses, and an image that
 # fails the profile's checks once stamped, writing nothing.
 @pytest.mark.parametrize("edit, why", [
-    (lambda prof, fw: prof.write_text(BARE.replace('format = "bare"\nheader_offset = 0x100\n', "")),
+    (lambda prof, fw: prof.write_text(BARE.replace('format = "bare"\nheader_offset = 0x100\n', "")
+                                  .replace('\n[update]\nflow = "bootloader"\n', "")),
      'profile bare: stamp is for [image] format = "bare", and its format is "esp-idf"'),
     (lambda prof, fw: fw.unlink(), "cannot read %s"),
     (lambda prof, fw: fw.write_bytes(build_bare_image(stamped=False, hdr_magic=0)),
@@ -5172,13 +5166,12 @@ class BootloaderUnit(FakeServer):
 
 UPDATE_BL = '\n[update]\nflow = "bootloader"\n'
 # BARE under the bootloader flow, its header at 48 so that the image_id lands where BootloaderUnit reads a written
-# image's ID, 176..208; and FULL under it, for [security] and [board].
-BARE_BL = BARE.replace("header_offset = 0x100", "header_offset = 48") + UPDATE_BL
+# image's ID, 176..208; and with [board] and a third hw_id, for the board check.
+BARE_BL = BARE.replace("header_offset = 0x100", "header_offset = 48")
 PBL = profile.from_dict("bare-boot", tomllib.loads(BARE_BL))
-# PFB is FULL without [security], which the loader refuses under the bootloader flow (the boot core serves no 0x27):
-# an ESP-IDF image with the [board] check and deltas.
-PFB = profile.from_dict("full-boot", tomllib.loads(FULL.replace(FULL[FULL.index("[security]"):FULL.index("[image]")], "")
-                                                   + UPDATE_BL))
+PBB = profile.from_dict("bare-boot-board", tomllib.loads(
+    BARE_BL.replace("hw_ids = [1, 2]", "hw_ids = [1, 2, 3]")
+    + '\n[board]\ndid = 0xF191\nnames = { 1 = "devkit", 2 = "devkit-two", 3 = "devkit-three" }\n'))
 BL_IMG = build_bare_image(header_offset=48, size=4800)
 BL_ID = bare_id(BL_IMG, 48)         # BL_IMG's image ID
 BL_PRECHECK = [(0x22, 0xF1F4), (0x10, 2), (0x22, 0xF1F0), (0x22, 0xF1F3), (0x22, 0xF1F5)]   # F1F4 to the app, then the hop
@@ -5290,23 +5283,6 @@ def test_bootloader_flow_bootloader_answering_f1f4_names_the_cause(kw, why):
     assert d.log[-2:] == [(0x22, 0xF1F4), (0x22, 0xF1F0)]
 
 
-# Check the programming session is entered again after the delta patches are built, even when none is worth sending:
-# building them can outlast S3, and the full download's 34 must not meet the default session.
-def test_bootloader_flow_reenters_after_unused_deltas(monkeypatch):
-    d = BootloaderUnit(security=False, sha=elf_sha(DELTA_BASE))
-
-    def slow_build(base, new, dfi):        # outlasts S3, and is bigger than the image
-        d.session = 1
-        return bytes(2 * len(new))
-
-    monkeypatch.setattr(pack, "build_delta", slow_build)
-    rc, _, lines = run_boot(d, image=DELTA_NEW, prof=PFB, compress="none", bases=[("a.bin", DELTA_BASE)])
-    assert rc == 0 and d.dfis == [0x00] and bytes(d.written) == DELTA_NEW
-    first_34 = d.log.index((0x34, None))
-    assert d.log[:first_34] == BL_BOARD_PRECHECK + [(0x10, 2)]
-    assert any(ln.startswith("no delta over DFI 0x20") for ln in lines)
-
-
 # Check 0x72 and 0x22 to F001 stop at once, and 0x24 downloads once more.
 @pytest.mark.parametrize("nrc, why", [(0x72, "ActivateImage failed (0x72); read F1F0 with `info`"),
                                       (0x22, "ActivateImage refused (0x22): the server's conditions are not met")])
@@ -5372,14 +5348,14 @@ def test_bootloader_flow_other_prefix_fails():
 # refuses after them, saying the unit is left in its bootloader.
 def test_bootloader_flow_checks_the_board_after_the_precheck_reads():
     d = BootloaderUnit(security=False)
-    rc, _, lines = run_boot(d, image=make_image(), prof=PFB)
+    rc, _, lines = run_boot(d, image=BL_IMG, prof=PBB)
     assert rc == 0 and d.log == BL_BOARD_PRECHECK + DOWNLOAD + POLLS
-    assert lines[0] == "image 0.3.0 for devkit, 4800 bytes, app_elf_sha256 a0a1a2a3a4a5a6a7"
+    assert lines[0] == "image 1.4.0 for devkit, 4800 bytes, image ID %s" % BL_ID[:8].hex()
     d = BootloaderUnit(security=False)
     with pytest.raises(errors.Refused, match="^image is for devkit-three but the server is devkit. The unit is in its "
                                              "bootloader and returns to its app when its programming session times "
                                              "out, unless it is held there$"):
-        run_boot(d, image=make_image(hw_id=3), prof=PFB)
+        run_boot(d, image=build_bare_image(header_offset=48, size=4800, hw_id=3), prof=PBB)
     assert d.log == BL_BOARD_PRECHECK
 
 
@@ -5443,7 +5419,7 @@ def test_bootloader_flow_refuses_a_product_change():
     assert d.log == BL_PRECHECK
     d = BootloaderUnit(security=False, project=b"widget")
     with pytest.raises(errors.Refused, match="--allow-product-change"):
-        run_boot(d, image=make_image(project=b"example"), prof=PFB)
+        run_boot(d, prof=PBB)
     assert d.log == BL_BOARD_PRECHECK and not d.written
 
 
@@ -6025,20 +6001,13 @@ def test_bootloader_flow_refuses_compression(tmp_path, capsys):
     assert run_boot(d, prof=dataclasses.replace(PBL, compression="deflate"), compress="none")[0] == 0
 
 
-# Check example.toml's commented [update] loads once uncommented.
-def test_example_update_comments_load():
+# Check example.toml's commented [image] format and header_offset and [update] load once uncommented: a bare image
+# and the bootloader flow go together.
+def test_example_bare_bootloader_comments_load():
     text = (profile.PROFILE_DIR / "example.toml").read_text()
-    live = re.sub(r"(?m)^# (?=\[update\]$|flow |start_timeout_s )", "", text)
+    live = re.sub(r"(?m)^# (?=\[update\]$|flow |start_timeout_s |format |header_offset )", "", text)
     e = profile.from_dict("example", tomllib.loads(live))
-    assert (e.flow, e.start_timeout_s) == ("bootloader", 60)
-
-
-# Check example.toml's commented format and header_offset load once uncommented.
-def test_example_bare_comments_load():
-    text = (profile.PROFILE_DIR / "example.toml").read_text()
-    live = re.sub(r"(?m)^# (?=format |header_offset )", "", text)
-    e = profile.from_dict("example", tomllib.loads(live))
-    assert (e.image_format, e.header_offset) == ("bare", 0x100)
+    assert (e.image_format, e.header_offset, e.flow, e.start_timeout_s) == ("bare", 0x100, "bootloader", 60)
 
 
 # Check the bare header's flags: a bit in the high byte is one a reader must understand, so stamp and parse_image

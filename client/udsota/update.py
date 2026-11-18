@@ -129,8 +129,7 @@ def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep
                                               img.elf_sha[:8].hex()))
     if profile.flow == "bootloader":
         return flash_bootloader(uds, profile, image, img, drop_76=drop_76, preroll=preroll, sleep=sleep,
-                                clock=clock, log=log, quiet=quiet, compress=compress, bases=bases,
-                                diff_format=diff_format, deflate_ok=deflate_ok, wait_for_unit=wait_for_unit,
+                                clock=clock, log=log, quiet=quiet, compress=compress, wait_for_unit=wait_for_unit,
                                 allow_product_change=allow_product_change)
     return flash_app(uds, profile, image, img, secret, drop_76=drop_76, preroll=preroll, sleep=sleep, clock=clock,
                      log=log, quiet=quiet, compress=compress, bases=bases, diff_format=diff_format,
@@ -334,8 +333,8 @@ def installed_project(uds):
 # both names and goes on; any negative answer to F1F5 goes on too: nothing is installed, or the bootloader does not
 # know the DID.
 def flash_bootloader(uds, profile, image, img, drop_76=None, preroll=lambda: None, sleep=time.sleep,
-                     clock=time.monotonic, log=print, quiet=contextlib.nullcontext, compress="none", bases=None,
-                     diff_format="auto", deflate_ok=True, wait_for_unit=None, allow_product_change=False):
+                     clock=time.monotonic, log=print, quiet=contextlib.nullcontext, compress="none",
+                     wait_for_unit=None, allow_product_change=False):
     try:
         prefix = uds.read_did(DID_IMAGE_PREFIX)
     except (Nrc, NoResponse, SendFailed):    # 0x31 from the bootloader, or an app that is not healthy
@@ -368,16 +367,12 @@ def flash_bootloader(uds, profile, image, img, drop_76=None, preroll=lambda: Non
         if (why := wrong_board(profile, img, board)) is not None:
             raise Refused("%s. %s" % (why, LEFT_IN_BOOTLOADER))
         verified = state["other_state"] == OTHER_VERIFIED and state["other_sha_prefix"] == img.elf_sha[:8]
-        deltas = []
-        if bases is not None and not verified:
-            deltas = plan_deltas(bases, image, running_sha, compress, diff_format, log=log, deflate_ok=deflate_ok)
-            uds.session(SESSION_PROGRAMMING)   # building the patches, used or not, may have outlasted S3
         if verified:
             log("the other slot already holds this image, verified: skipping to ActivateImage")
         need_download, recovered, resent, activated = not verified, False, False, True
         while True:
             if need_download:
-                download(uds, image, drop_76=drop_76, log=log, compress=compress, clock=clock, deltas=deltas,
+                download(uds, image, drop_76=drop_76, log=log, compress=compress, clock=clock,
                          reenter=lambda: uds.session(SESSION_PROGRAMMING))
                 check_image(uds, log=log)
                 need_download, drop_76 = False, None   # the fault injection applies to the first download only

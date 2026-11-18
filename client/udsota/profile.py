@@ -385,6 +385,10 @@ def _profile(name, d):
     if flow == "bootloader" and security is not None:
         _bad("[security] is for flow = \"app\": the boot core serves no SecurityAccess (0x27) to unlock")
     start_timeout_s = _int(upd_t, "start_timeout_s", 1, 600, default=START_TIMEOUT_DEFAULT)
+    if flow == "app" and image_format == "bare":
+        _bad("[image] format = \"bare\" is for flow = \"bootloader\": an A/B server takes only an ESP-IDF image")
+    if flow == "bootloader" and image_format == "esp-idf":
+        _bad("[update] flow = \"bootloader\" needs [image] format = \"bare\": the boot core takes only a bare image")
     dids = tuple(_did_entry(key, entry) for key, entry in d.get("dids", {}).items())
     names = [e.name for e in dids if e.writable]
     for n in names:
