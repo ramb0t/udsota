@@ -134,262 +134,273 @@ class Profile:
     start_timeout_s: int = START_TIMEOUT_DEFAULT   # [update] start_timeout_s: the wait for F1F4 after activating
 
 
-# Raise Refused naming the profile and the problem.
-def _bad(name, why):
-    raise Refused("profile %s: %s" % (name, why))
+# A problem in the profile being read; from_dict turns it into the Refused that names the profile.
+class _Bad(Exception):
+    pass
+
+
+def _bad(why):
+    raise _Bad(why)
 
 
 # t[key] as an int in lo..hi, or default when absent (a missing required key passes default=None, required=True).
-def _int(name, t, key, lo, hi, default=None, required=False):
+def _int(t, key, lo, hi, default=None, required=False):
     if key not in t:
         if required:
-            _bad(name, "missing %s" % key)
+            _bad("missing %s" % key)
         return default
     v = t[key]
     if not isinstance(v, int) or isinstance(v, bool) or not lo <= v <= hi:
-        _bad(name, "%s must be an integer from 0x%X to 0x%X" % (key, lo, hi))
+        _bad("%s must be an integer from 0x%X to 0x%X" % (key, lo, hi))
     return v
 
 
 # t[key] as a requestSeed level: odd, 0x01 to 0x7D (sendKey is level + 1, still under the suppress bit).
-def _level(name, t, key, default):
-    v = _int(name, t, key, 0x01, 0x7D, default=default)
+def _level(t, key, default):
+    v = _int(t, key, 0x01, 0x7D, default=default)
     if v % 2 == 0:
-        _bad(name, "%s must be odd (a requestSeed level)" % key)
+        _bad("%s must be odd (a requestSeed level)" % key)
     return v
 
 
 # t[key] as a tuple of ints in lo..hi (empty when absent).
-def _ints(name, t, key, lo, hi):
+def _ints(t, key, lo, hi):
     v = t.get(key, [])
     if not isinstance(v, list) or any(not isinstance(x, int) or isinstance(x, bool) or not lo <= x <= hi for x in v):
-        _bad(name, "%s must be a list of integers from 0x%X to 0x%X" % (key, lo, hi))
+        _bad("%s must be a list of integers from 0x%X to 0x%X" % (key, lo, hi))
     return tuple(v)
 
 
 # t[key] as a non-empty str, or None when absent and not required.
-def _str(name, t, key, required=False):
+def _str(t, key, required=False):
     if key not in t:
         if required:
-            _bad(name, "missing %s" % key)
+            _bad("missing %s" % key)
         return None
     if not isinstance(t[key], str) or not t[key]:
-        _bad(name, "%s must be a non-empty string" % key)
+        _bad("%s must be a non-empty string" % key)
     return t[key]
 
 
 # t[key] as a bool, or default when absent.
-def _bool(name, t, key, default):
+def _bool(t, key, default):
     v = t.get(key, default)
     if not isinstance(v, bool):
-        _bad(name, "%s must be true or false" % key)
+        _bad("%s must be true or false" % key)
     return v
 
 
 # "0xF191" or "0x0200-0x02FF" to (first, last).
-def _did_range(name, key):
+def _did_range(key):
     m = re.fullmatch(r"0x([0-9A-Fa-f]{1,4})(?:-0x([0-9A-Fa-f]{1,4}))?", key)
     if m is None:
-        _bad(name, "[dids] key %r is not 0xNNNN or 0xNNNN-0xNNNN" % key)
+        _bad("[dids] key %r is not 0xNNNN or 0xNNNN-0xNNNN" % key)
     first, last = int(m[1], 16), int(m[2] or m[1], 16)
     if first > last:
-        _bad(name, "[dids] key %r runs backwards" % key)
+        _bad("[dids] key %r runs backwards" % key)
     return first, last
 
 
 # One [dids] entry from its key and table: name and decode, and for a typed entry its type, writable flag and
 # write range (u8 and u16 only; an absent min or max is the type's bound, blob's stay None). A writable entry is
 # one DID with a type and a plain name. Entries may overlap (a range plus keys inside it).
-def _did_entry(name, key, entry):
-    first, last = _did_range(name, key)
+def _did_entry(key, entry):
+    first, last = _did_range(key)
     if not isinstance(entry, dict) or set(entry) - DID_KEYS:
-        _bad(name, "[dids] %s must be { name = \"...\", decode = \"hex\" }" % key)
-    decode = _str(name, entry, "decode", required=True)
+        _bad("[dids] %s must be { name = \"...\", decode = \"hex\" }" % key)
+    decode = _str(entry, "decode", required=True)
     if decode not in DECODE:
-        _bad(name, "[dids] %s decode must be one of %s" % (key, ", ".join(DECODE)))
-    label = _str(name, entry, "name", required=True)
-    vtype = _str(name, entry, "type")
+        _bad("[dids] %s decode must be one of %s" % (key, ", ".join(DECODE)))
+    label = _str(entry, "name", required=True)
+    vtype = _str(entry, "type")
     if vtype is not None and vtype not in TYPES:
-        _bad(name, "[dids] %s type must be one of %s" % (key, ", ".join(TYPES)))
+        _bad("[dids] %s type must be one of %s" % (key, ", ".join(TYPES)))
     writable = entry.get("writable", False)
     if not isinstance(writable, bool):
-        _bad(name, "[dids] %s writable must be true or false" % key)
+        _bad("[dids] %s writable must be true or false" % key)
     if writable and first != last:
-        _bad(name, "[dids] %s is a range: a writable entry is one DID" % key)
+        _bad("[dids] %s is a range: a writable entry is one DID" % key)
     if writable and vtype is None:
-        _bad(name, "[dids] %s is writable and needs a type (u8, u16 or blob)" % key)
+        _bad("[dids] %s is writable and needs a type (u8, u16 or blob)" % key)
     if writable and KEY_NAME.fullmatch(label) is None:
-        _bad(name, "[dids] %s name %r: a writable key's name is letters, digits and _" % (key, label))
+        _bad("[dids] %s name %r: a writable key's name is letters, digits and _" % (key, label))
     top, lo, hi = TYPES.get(vtype), None, None
     if top is None and ("min" in entry or "max" in entry):
-        _bad(name, "[dids] %s min and max need type u8 or u16" % key)
+        _bad("[dids] %s min and max need type u8 or u16" % key)
     if top is not None:
-        lo, hi = _int(name, entry, "min", 0, top, default=0), _int(name, entry, "max", 0, top, default=top)
+        lo, hi = _int(entry, "min", 0, top, default=0), _int(entry, "max", 0, top, default=top)
         if lo > hi:
-            _bad(name, "[dids] %s min %d is above max %d" % (key, lo, hi))
+            _bad("[dids] %s min %d is above max %d" % (key, lo, hi))
     if "len" in entry and vtype != "blob":
-        _bad(name, "[dids] %s len needs type blob" % key)
-    return DidEntry(first, last, label, decode, vtype, writable, lo, hi, _int(name, entry, "len", 1, BLOB_MAX))
+        _bad("[dids] %s len needs type blob" % key)
+    return DidEntry(first, last, label, decode, vtype, writable, lo, hi, _int(entry, "len", 1, BLOB_MAX))
 
 
 # [config] groups as a tuple of ConfigGroup: each { name, first, last } with all three required, the names distinct
 # and the ranges disjoint, and every writable key in dids inside one of them.
-def _groups(name, groups, dids):
+def _groups(groups, dids):
     if not isinstance(groups, list):
-        _bad(name, "[config] groups must be a list of { name = \"...\", first = 0x..., last = 0x... }")
+        _bad("[config] groups must be a list of { name = \"...\", first = 0x..., last = 0x... }")
     out = []
     for g in groups:
         if not isinstance(g, dict) or set(g) - GROUP_KEYS:
-            _bad(name, "[config] groups entries must be { name = \"...\", first = 0x..., last = 0x... }")
-        label = _str(name, g, "name", required=True)
+            _bad("[config] groups entries must be { name = \"...\", first = 0x..., last = 0x... }")
+        label = _str(g, "name", required=True)
         if KEY_NAME.fullmatch(label) is None:
-            _bad(name, "[config] group name %r: a group's name is letters, digits and _" % label)
+            _bad("[config] group name %r: a group's name is letters, digits and _" % label)
         if any(o.name == label for o in out):
-            _bad(name, "[config] two groups are named %s" % label)
-        grp = ConfigGroup(label, _int(name, g, "first", 0, 0xFFFF, required=True),
-                          _int(name, g, "last", 0, 0xFFFF, required=True))
+            _bad("[config] two groups are named %s" % label)
+        grp = ConfigGroup(label, _int(g, "first", 0, 0xFFFF, required=True),
+                          _int(g, "last", 0, 0xFFFF, required=True))
         if grp.first > grp.last:
-            _bad(name, "[config] group %s first 0x%04X is above last 0x%04X" % (label, grp.first, grp.last))
+            _bad("[config] group %s first 0x%04X is above last 0x%04X" % (label, grp.first, grp.last))
         for o in out:
             if grp.first <= o.last and o.first <= grp.last:
-                _bad(name, "[config] groups %s and %s overlap" % (o.name, label))
+                _bad("[config] groups %s and %s overlap" % (o.name, label))
         out.append(grp)
     for e in dids:
         if e.writable and not any(g.first <= e.first <= g.last for g in out):
-            _bad(name, "[config] groups: writable key %s (0x%04X) lies in no group" % (e.name, e.first))
+            _bad("[config] groups: writable key %s (0x%04X) lies in no group" % (e.name, e.first))
     return tuple(out)
 
 
 # [config] as a ConfigSpec (None when absent): commit_rid, the optional status_did, hash = { did, first, last,
 # schema }, all four required in the hash, and groups (_groups, over dids). The hash DID and the status DID lie
 # outside first..last: inside, their own records would feed the hash and the check could never pass.
-def _config(name, t, dids):
+def _config(t, dids):
     if t is None:
         return None
     spec, h = None, t.get("hash")
     if h is not None:
         if not isinstance(h, dict) or set(h) - HASH_KEYS:
-            _bad(name, "[config] hash must be { did = 0x..., first = 0x..., last = 0x..., schema = 1 }")
-        spec = HashSpec(_int(name, h, "did", 0, 0xFFFF, required=True),
-                        _int(name, h, "first", 0, 0xFFFF, required=True),
-                        _int(name, h, "last", 0, 0xFFFF, required=True),
-                        _int(name, h, "schema", 0, 0xFF, required=True))
+            _bad("[config] hash must be { did = 0x..., first = 0x..., last = 0x..., schema = 1 }")
+        spec = HashSpec(_int(h, "did", 0, 0xFFFF, required=True),
+                        _int(h, "first", 0, 0xFFFF, required=True),
+                        _int(h, "last", 0, 0xFFFF, required=True),
+                        _int(h, "schema", 0, 0xFF, required=True))
         if spec.first > spec.last:
-            _bad(name, "[config] hash first 0x%04X is above last 0x%04X" % (spec.first, spec.last))
+            _bad("[config] hash first 0x%04X is above last 0x%04X" % (spec.first, spec.last))
         if spec.first <= spec.did <= spec.last:
-            _bad(name, "[config] hash did 0x%04X is inside first..last, so it would hash itself" % spec.did)
-    status_did = _int(name, t, "status_did", 0, 0xFFFF)
+            _bad("[config] hash did 0x%04X is inside first..last, so it would hash itself" % spec.did)
+    status_did = _int(t, "status_did", 0, 0xFFFF)
     if spec is not None and status_did is not None and spec.first <= status_did <= spec.last:
-        _bad(name, "[config] status_did 0x%04X is inside the hash range 0x%04X..0x%04X"
+        _bad("[config] status_did 0x%04X is inside the hash range 0x%04X..0x%04X"
              % (status_did, spec.first, spec.last))
-    groups = _groups(name, t["groups"], dids) if "groups" in t else ()
-    return ConfigSpec(_int(name, t, "commit_rid", 0, 0xFFFF, required=True), status_did, spec, groups)
+    groups = _groups(t["groups"], dids) if "groups" in t else ()
+    return ConfigSpec(_int(t, "commit_rid", 0, 0xFFFF, required=True), status_did, spec, groups)
 
 
 # [dtcs] as {(dtc, any_ftb): description}: each key a code dtc.parse_code reads, each value a non-empty string, and no
 # two keys naming the same DTC (U0073 and u0073, or U0073-00 and 0xC07300). A key without a failure-type byte names
 # every FTB of its code, and `dtc show` prefers the key with the DTC's own.
-def _dtcs(name, t):
+def _dtcs(t):
     out = {}
     for key, text in t.items():
         dtc = parse_code(key)
         if dtc is None:
-            _bad(name, "[dtcs] key %r is not a DTC code (%s)" % (key, CODE_FORMS))
+            _bad("[dtcs] key %r is not a DTC code (%s)" % (key, CODE_FORMS))
         if not isinstance(text, str) or not text:
-            _bad(name, "[dtcs] %s must be a non-empty string" % key)
+            _bad("[dtcs] %s must be a non-empty string" % key)
         if dtc in out:
-            _bad(name, "[dtcs] %s names the same DTC as an earlier key" % key)
+            _bad("[dtcs] %s names the same DTC as an earlier key" % key)
         out[dtc] = text
     return out
 
 
 # Build a Profile from parsed TOML; every problem raises Refused (exit 2, nothing sent).
 def from_dict(name, d):
+    try:
+        return _profile(name, d)
+    except _Bad as e:
+        raise Refused("profile %s: %s" % (name, e)) from None
+
+
+def _profile(name, d):
     for table, value in d.items():
         if table not in KEYS or not isinstance(value, dict):
-            _bad(name, "unknown table [%s]" % table)
+            _bad("unknown table [%s]" % table)
         if KEYS[table] is not None and set(value) - KEYS[table]:
-            _bad(name, "unknown key %s in [%s]" % (sorted(set(value) - KEYS[table])[0], table))
+            _bad("unknown key %s in [%s]" % (sorted(set(value) - KEYS[table])[0], table))
     can_t = d.get("can", {})
-    req_id = _int(name, can_t, "req_id", 0, 0x7FF, required=True)
-    resp_id = _int(name, can_t, "resp_id", 0, 0x7FF, required=True)
-    deny_tx = frozenset(_ints(name, can_t, "deny_tx", 0, 0x7FF))
+    req_id = _int(can_t, "req_id", 0, 0x7FF, required=True)
+    resp_id = _int(can_t, "resp_id", 0, 0x7FF, required=True)
+    deny_tx = frozenset(_ints(can_t, "deny_tx", 0, 0x7FF))
     if req_id in deny_tx:
-        _bad(name, "req_id 0x%03X is in deny_tx" % req_id)
+        _bad("req_id 0x%03X is in deny_tx" % req_id)
     if req_id == resp_id:
-        _bad(name, "req_id and resp_id are both 0x%03X" % req_id)
+        _bad("req_id and resp_id are both 0x%03X" % req_id)
     func_t, func_id = d.get("functional"), None
     if func_t is not None:
-        func_id = _int(name, func_t, "id", 0, 0x7FF, required=True)
+        func_id = _int(func_t, "id", 0, 0x7FF, required=True)
         if func_id in deny_tx or func_id in (req_id, resp_id):
-            _bad(name, "[functional] id 0x%03X is the request or response ID, or in deny_tx" % func_id)
+            _bad("[functional] id 0x%03X is the request or response ID, or in deny_tx" % func_id)
     sec_t, security = d.get("security"), None
     if sec_t is not None:
-        mode = _str(name, sec_t, "mode") or "hmac"
+        mode = _str(sec_t, "mode") or "hmac"
         if mode not in SECURITY_MODES:
-            _bad(name, "[security] mode must be one of %s" % ", ".join(SECURITY_MODES))
+            _bad("[security] mode must be one of %s" % ", ".join(SECURITY_MODES))
         for other, keys in SECURITY_MODES.items():
             for key in keys:
                 if other != mode and key in sec_t:
-                    _bad(name, "[security] %s is for mode = \"%s\", not \"%s\"" % (key, other, mode))
-        label = _str(name, sec_t, "label", required=True) if mode == "hmac" else None
+                    _bad("[security] %s is for mode = \"%s\", not \"%s\"" % (key, other, mode))
+        label = _str(sec_t, "label", required=True) if mode == "hmac" else None
         if label is not None and not label.isascii():
-            _bad(name, "[security] label must be ASCII")
+            _bad("[security] label must be ASCII")
         security = Security(None if label is None else label.encode("ascii"),
-                            _str(name, sec_t, "master_file", required=mode == "hmac"),
-                            _int(name, sec_t, "device_id_did", 0, 0xFFFF, default=0xF18C),
-                            _level(name, sec_t, "level_extended", 0x01),
-                            _level(name, sec_t, "level_programming", 0x03),
+                            _str(sec_t, "master_file", required=mode == "hmac"),
+                            _int(sec_t, "device_id_did", 0, 0xFFFF, default=0xF18C),
+                            _level(sec_t, "level_extended", 0x01),
+                            _level(sec_t, "level_programming", 0x03),
                             mode=mode,
-                            private_key_file=_str(name, sec_t, "private_key_file", required=mode == "ecdsa"))
+                            private_key_file=_str(sec_t, "private_key_file", required=mode == "ecdsa"))
     img_t, board_t, busy_t = d.get("image", {}), d.get("board"), d.get("busy")
     board_names = {}
     if board_t is not None:
         names = board_t.get("names", {})
         if not isinstance(names, dict) or not all(k.isascii() and k.isdigit() and isinstance(v, str)
                                                   for k, v in names.items()):
-            _bad(name, "[board] names must map hw_id numbers to board names")
+            _bad("[board] names must map hw_id numbers to board names")
         board_names = {int(k): v for k, v in names.items()}
     busy = None
     if busy_t is not None:
-        busy = BusyDetector(_int(name, busy_t, "id", 0, 0x7FF, required=True),
-                            _int(name, busy_t, "byte", 0, 7, required=True), _ints(name, busy_t, "values", 0, 0xFF))
-    compression = _str(name, img_t, "compression") or "none"
+        busy = BusyDetector(_int(busy_t, "id", 0, 0x7FF, required=True),
+                            _int(busy_t, "byte", 0, 7, required=True), _ints(busy_t, "values", 0, 0xFF))
+    compression = _str(img_t, "compression") or "none"
     if compression not in COMPRESSION:
-        _bad(name, "[image] compression must be one of %s" % ", ".join(COMPRESSION))
-    image_format = _str(name, img_t, "format") or "esp-idf"
+        _bad("[image] compression must be one of %s" % ", ".join(COMPRESSION))
+    image_format = _str(img_t, "format") or "esp-idf"
     if image_format not in FORMATS:
-        _bad(name, "[image] format must be one of %s" % ", ".join(FORMATS))
+        _bad("[image] format must be one of %s" % ", ".join(FORMATS))
     if image_format == "esp-idf" and "header_offset" in img_t:
-        _bad(name, "[image] header_offset is for format = \"bare\"")
+        _bad("[image] header_offset is for format = \"bare\"")
     if image_format == "bare" and "header_offset" not in img_t:
-        _bad(name, "[image] format = \"bare\" needs header_offset, the bare header's offset in the image")
-    header_offset = _int(name, img_t, "header_offset", 0, 0xFFFFFFFF)
+        _bad("[image] format = \"bare\" needs header_offset, the bare header's offset in the image")
+    header_offset = _int(img_t, "header_offset", 0, 0xFFFFFFFF)
     upd_t = d.get("update", {})
-    flow = _str(name, upd_t, "flow") or "app"
+    flow = _str(upd_t, "flow") or "app"
     if flow not in FLOWS:
-        _bad(name, "[update] flow must be one of %s" % ", ".join(FLOWS))
+        _bad("[update] flow must be one of %s" % ", ".join(FLOWS))
     if flow == "app" and "start_timeout_s" in upd_t:
-        _bad(name, "[update] start_timeout_s is for flow = \"bootloader\"")
+        _bad("[update] start_timeout_s is for flow = \"bootloader\"")
     if flow == "bootloader" and security is not None:
-        _bad(name, "[security] is for flow = \"app\": the boot core serves no SecurityAccess (0x27) to unlock")
-    start_timeout_s = _int(name, upd_t, "start_timeout_s", 1, 600, default=START_TIMEOUT_DEFAULT)
-    dids = tuple(_did_entry(name, key, entry) for key, entry in d.get("dids", {}).items())
+        _bad("[security] is for flow = \"app\": the boot core serves no SecurityAccess (0x27) to unlock")
+    start_timeout_s = _int(upd_t, "start_timeout_s", 1, 600, default=START_TIMEOUT_DEFAULT)
+    dids = tuple(_did_entry(key, entry) for key, entry in d.get("dids", {}).items())
     names = [e.name for e in dids if e.writable]
     for n in names:
         if names.count(n) > 1:
-            _bad(name, "[dids] two writable keys are named %s" % n)
-    return Profile(name=name, interface=_str(name, can_t, "interface"), req_id=req_id, resp_id=resp_id,
-                   deny_tx=deny_tx, product=_str(name, img_t, "product"), hw_ids=_ints(name, img_t, "hw_ids", 0, 0xFF),
-                   layout_id=_int(name, img_t, "layout_id", 0, 0xFF),
-                   slot_size=_int(name, img_t, "slot_size", 1, 0xFFFFFFFF, default=SLOT_SIZE_DEFAULT),
+            _bad("[dids] two writable keys are named %s" % n)
+    return Profile(name=name, interface=_str(can_t, "interface"), req_id=req_id, resp_id=resp_id,
+                   deny_tx=deny_tx, product=_str(img_t, "product"), hw_ids=_ints(img_t, "hw_ids", 0, 0xFF),
+                   layout_id=_int(img_t, "layout_id", 0, 0xFF),
+                   slot_size=_int(img_t, "slot_size", 1, 0xFFFFFFFF, default=SLOT_SIZE_DEFAULT),
                    security=security,
-                   board_did=None if board_t is None else _int(name, board_t, "did", 0, 0xFFFF, required=True),
+                   board_did=None if board_t is None else _int(board_t, "did", 0, 0xFFFF, required=True),
                    board_names=board_names, busy=busy,
-                   preroll_frames=_int(name, d.get("preroll", {}), "tester_present_frames", 0, 64, default=0),
+                   preroll_frames=_int(d.get("preroll", {}), "tester_present_frames", 0, 64, default=0),
                    dids=dids, func_id=func_id, compression=compression,
-                   quiet_bus=func_t is not None and _bool(name, func_t, "quiet_bus", False),
-                   config=_config(name, d.get("config"), dids), dtcs=_dtcs(name, d.get("dtcs", {})),
+                   quiet_bus=func_t is not None and _bool(func_t, "quiet_bus", False),
+                   config=_config(d.get("config"), dids), dtcs=_dtcs(d.get("dtcs", {})),
                    image_format=image_format, header_offset=header_offset, flow=flow, start_timeout_s=start_timeout_s)
 
 
