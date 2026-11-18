@@ -6,9 +6,9 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ### Changed
 
-- **Breaking**, client: a profile with `[image] format = "bare"` and `[update] flow = "app"`, or with `flow = "bootloader"` and `format = "esp-idf"`, is refused when it loads, saying why. An A/B server takes only an ESP-IDF image and the boot core only a bare one, so both pairs loaded and failed on the unit. Set `format = "bare"` with `flow = "bootloader"`, or neither.
+- **Breaking**, client: a profile with `[image] format = "bare"` and `[update] flow = "app"`, or with `flow = "bootloader"` and `format = "esp-idf"`, is refused when it loads, saying why. An A/B server takes only an ESP-IDF image and the boot core only a bare one, so both pairs loaded and failed on the unit. Set `format = "bare"` with `flow = "bootloader"`, or neither. `update.flash_bootloader` no longer takes `bases`, `diff_format` or `deflate_ok`, since a bare image refuses deltas.
 - Client: a profile that is wrong in two tables at once may now report the other table's fault first, as each table is validated whole and in a fixed order. A profile with one fault, and every message, is as before.
-- **Breaking**, client: `update.flash`, `flash_app`, `flash_bootloader`, `confirm`, `confirm_cmd`, `wait_for_image`, `wait_for_boot`, `wait_for_start`, `wait_for_power_up`, `poll_restarted`, `download`, `send_payload` and `config.config_set` no longer take `sleep=` and `clock=`: they use `uds.sleep` and `uds.clock`, which `Uds(client, sleep=..., clock=...)` takes. A caller that passed them passes them to `Uds` instead.
+- **Breaking**, client: `update.flash`, `flash_app`, `flash_bootloader`, `confirm`, `confirm_cmd`, `wait_for_image`, `wait_for_boot`, `wait_for_start`, `wait_for_power_up`, `poll_restarted`, `download`, `send_payload` and `config.config_set` no longer take `sleep=` or `clock=` (`download`, `send_payload` and `wait_for_power_up` took only `clock=`): they use `uds.sleep` and `uds.clock`, which `Uds(client, sleep=..., clock=...)` takes. A caller that passed them passes them to `Uds` instead.
 
 ## [0.18.0] - 2026-11-18
 

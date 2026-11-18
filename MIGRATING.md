@@ -165,6 +165,6 @@ A profile written for the bootloader flow, which 0.17 introduced, is refused in 
 
 ## 0.18.x to 0.19.0
 
-A client profile that sets `[image] format = "bare"` with `[update] flow = "app"` (the default flow), or `flow = "bootloader"` with `format = "esp-idf"` (the default format), is refused when it loads. The two always go together: an A/B server takes only an ESP-IDF image and the boot core only a bare one, so such a profile failed on the unit. Add the missing half of the pair, or drop the one that was set by mistake.
+A client profile that sets `[image] format = "bare"` with `[update] flow = "app"` (the default flow), or `flow = "bootloader"` with `format = "esp-idf"` (the default format), is refused when it loads. The two always go together: an A/B server takes only an ESP-IDF image and the boot core only a bare one, so such a profile failed on the unit. Add the missing half of the pair, or drop the one that was set by mistake. A caller of `update.flash_bootloader` that passed `bases`, `diff_format` or `deflate_ok` drops them: a bare image refuses deltas.
 
 A caller of `update.flash` or `config.config_set` (or of `confirm`, `download` or the `wait_for_*` functions) that passed `sleep=` or `clock=` passes them to `Uds(client, sleep=..., clock=...)` instead, and the functions read `uds.sleep` and `uds.clock`; a call that still passes them raises `TypeError`. `log=` and `preroll=` are unchanged. The `udsota` command passed neither.
