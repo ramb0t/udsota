@@ -85,9 +85,10 @@ static UDSErr_t on_event(UDSServer_t *srv, UDSEvent_t ev, void *arg)
 
 Then five things, each of which matters. Call `udsota_poll` after every `UDSServerPoll`, or iso14229's timers wrap
 after 24.86 days. Set `srv.p2_ms = 5` after `UDSServerInit` (Known limits says why). Turn on
-`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` with two OTA slots. Choose the `27` keys: with `key_pubkey` the tester signs each seed and the unit holds only the public key (`udsota keygen` makes
-the pair); with `key_label` and `key_master` each unit's key derives from a master; with neither, anything on the bus
-can update the unit. And turn on ESP-IDF's app signing, so the verify step refuses an image you did not sign.
+`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` with two OTA slots. Choose the `27` keys: with `key_pubkey` the tester signs
+each seed and the unit holds only the public key (`udsota keygen` makes the pair); with `key_label` and `key_master`
+each unit's key derives from a master; with neither, anything on the bus can update the unit. And turn on ESP-IDF's
+app signing, so the verify step refuses an image you did not sign.
 
 [`examples/esp32`](examples/esp32/README.md) is the smallest complete app, and
 [`examples/candash_ws43`](examples/candash_ws43/README.md) a real product's. `udsota.h` documents the hooks you may
