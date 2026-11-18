@@ -4932,7 +4932,9 @@ UPDATE_BL = '\n[update]\nflow = "bootloader"\n'
 # image's ID, 176..208; and FULL under it, for [security] and [board].
 BARE_BL = BARE.replace("header_offset = 0x100", "header_offset = 48") + UPDATE_BL
 PBL = profile.from_dict("bare-boot", tomllib.loads(BARE_BL))
-PFB = profile.from_dict("full-boot", tomllib.loads(FULL + UPDATE_BL))
+# PFB has [security] under the bootloader flow, which the loader refuses (the boot core serves no 0x27), so it is
+# built past the loader: these tests drive flash's unlock and board paths against a unit that does serve them.
+PFB = dataclasses.replace(profile.from_dict("full-boot", tomllib.loads(FULL)), flow="bootloader")
 BL_IMG = build_bare_image(header_offset=48, size=4800)
 BL_ID = bare_id(BL_IMG, 48)         # BL_IMG's image ID
 BL_PRECHECK = [(0x22, 0xF1F4), (0x10, 2), (0x22, 0xF1F0), (0x22, 0xF1F3), (0x22, 0xF1F5)]   # F1F4 to the app, then the hop
@@ -5721,6 +5723,23 @@ def test_update_flow_profile_values():
 def test_bad_update_flow_is_refused(text, why):
     with pytest.raises(errors.Refused, match="profile u: " + re.escape(why)):
         profile.from_dict("u", tomllib.loads(CAN + text))
+
+
+# Check a [board] names key that is not a plain number, such as a superscript two (str.isdigit() is true for it, int()
+# refuses it), is the loader's refusal and not a ValueError.
+@pytest.mark.parametrize("key", ["²", "1.5", "-1", "0x1", "a", ""])
+def test_board_names_key_that_is_not_a_number_is_refused(key):
+    with pytest.raises(errors.Refused, match=re.escape("profile b: [board] names must map hw_id numbers to board names")):
+        profile.from_dict("b", tomllib.loads(CAN + '[board]\ndid = 0xF191\nnames = { "%s" = "x" }\n' % key))
+
+
+# Check [security] with [update] flow = "bootloader" is refused when the profile loads: the boot core serves no 0x27.
+@pytest.mark.parametrize("security", [SEC, SEC_E + 'private_key_file = "k.pem"\n'])
+def test_bootloader_flow_with_security_is_refused(security):
+    with pytest.raises(errors.Refused, match=re.escape('profile u: [security] is for flow = "app": the boot core '
+                                                      'serves no SecurityAccess (0x27) to unlock')):
+        profile.from_dict("u", tomllib.loads(security + UPDATE_BL))
+    profile.from_dict("u", tomllib.loads(security + '\n[update]\nflow = "app"\n'))
 
 
 # Check example.toml's commented [update] loads once uncommented.

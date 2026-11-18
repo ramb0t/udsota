@@ -26,7 +26,8 @@ names = { 1 = "devkit" }              # board name for each hw_id; flash refuses
 
 # [update] picks the update sequence. "app", the default, is udsota's: an A/B updater in the app, ending in
 # ConfirmImage. "bootloader" is for a single-slot unit whose resident bootloader is its only UDS server: flash's
-# 10 02 resets the app into it, and flash ends once the new app answers F1F4 (docs/wire.md); confirm is refused.
+# 10 02 resets the app into it, and flash ends once the new app answers F1F4 (docs/wire.md); confirm is refused, and
+# so is [security]: the boot core serves no 0x27.
 # [update]
 # flow = "bootloader"                 # "app" or "bootloader"
 # start_timeout_s = 60                # bootloader only: how long flash polls F1F4 after the 3 s reboot wait (1 to 600)
