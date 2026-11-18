@@ -137,9 +137,10 @@ def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep
                      deflate_ok=deflate_ok)
 
 
-# `flash` on an A/B unit: the precheck, the programming session and unlock, the download, FF01 and ActivateImage, then
-# the restart and ConfirmImage; img is image parsed, the other arguments flash's. An image the other slot already
-# holds verified skips the download. The patches of a delta are built before the programming session opens.
+# `flash` on an A/B unit (docs/wire.md): the precheck, the programming session and unlock, the download, FF01 and
+# ActivateImage, then the restart and ConfirmImage; img is image parsed, the other arguments flash's. An image the
+# other slot already holds verified skips the download. The patches of a delta are built before the programming
+# session opens.
 def flash_app(uds, profile, image, img, secret, drop_76, preroll, sleep, clock, log, quiet, compress, bases,
               diff_format, deflate_ok):
     state, running_sha, _, board = read_unit(uds, profile)
@@ -321,16 +322,17 @@ def installed_project(uds):
     return cstr(d) if d else None
 
 
-# `flash` on a single-slot unit; img is image parsed, the other arguments flash's. One F1F4 read in the default
-# session first: an app already running this image and healthy is left running. Then 10 02 (with wait_for_unit,
-# wait_for_power_up sends it): the app answers 7F 10 78 and resets into the bootloader, which sends the 50 02; a late
-# answer to an F1F4 read that went unanswered, such as a bootloader's 7F 22 31 to one the adapter held, is passed over
-# ahead of it (Uds.exchange). Then, all in the programming session, the precheck reads (no unlock: a profile with
-# [security] is refused under this flow), download, FF01 and ActivateImage; wait_for_start is the proof of life, with
-# no ConfirmImage. An image the unit already holds gets 11 01 and the same proof. quiet() is held from the 10 02,
-# which stops the app. An image of another project than F1F5 reports is refused, with the unit left in its
-# bootloader, unless allow_product_change (--allow-product-change), which logs both names and goes on; any negative
-# answer to F1F5 goes on too: nothing is installed, or the bootloader does not know the DID.
+# `flash` on a single-slot unit (docs/wire.md#bootloader-flow); img is image parsed, the other arguments flash's. One
+# F1F4 read in the default session first: an app already running this image and healthy is left running. Then 10 02
+# (with wait_for_unit, wait_for_power_up sends it): the app answers 7F 10 78 and resets into the bootloader, which
+# sends the 50 02; a late answer to an F1F4 read that went unanswered, such as a bootloader's 7F 22 31 to one the
+# adapter held, is passed over ahead of it (Uds.exchange). Then, all in the programming session, the precheck reads
+# (no unlock: a profile with [security] is refused under this flow), download, FF01 and ActivateImage;
+# wait_for_start is the proof of life, with no ConfirmImage. An image the unit already holds gets 11 01 and the same
+# proof. quiet() is held from the 10 02, which stops the app. An image of another project than F1F5 reports is
+# refused, with the unit left in its bootloader, unless allow_product_change (--allow-product-change), which logs
+# both names and goes on; any negative answer to F1F5 goes on too: nothing is installed, or the bootloader does not
+# know the DID.
 def flash_bootloader(uds, profile, image, img, drop_76=None, preroll=lambda: None, sleep=time.sleep,
                      clock=time.monotonic, log=print, quiet=contextlib.nullcontext, compress="none", bases=None,
                      diff_format="auto", deflate_ok=True, wait_for_unit=None, allow_product_change=False):
