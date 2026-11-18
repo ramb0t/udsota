@@ -1,16 +1,13 @@
-# udsota: the host test with and without delta downloads and the fuzzer's replay with its delta seeds, the bootloader
-# core's tests (test_udsota_boot, test_udsota_boot_asserts, test_udsota_boot_pure, test_udsota_app) and the headers'
-# as C11 and C++20 (test_headers_c, test_headers_cxx), the client's tests and the release tool's, the client against
-# udsota_lite_server, built with delta downloads, over the pipe and on vcan0, and against udsota_boot_server over the
-# pipe (test_e2e_boot.py), with gcc and clang builds of each and the fuzzer's libFuzzer build on clang; the bootloader
-# core cross-compiled for Cortex-M3 under a size gate; the CANDash example built with a throwaway signing key for the
-# ws43, the ws43b, the ws43 at -O2 and the ws43 with delta downloads; and what a release of this commit would carry
-# (release-assets.yml): the client's wheel and sdist and examples/esp32's image for esp32s3 and esp32. Every image
-# build fails on a compiler warning, and every image must pass udsota's image rules (tools/image_check.c) while a copy
-# with a broken descriptor must not.
+# udsota's CI: everything the root CMakeLists.txt builds and tests, on gcc and clang, plus what a build file cannot
+# say. The client's tests run alone and against both servers (over a pipe, and on vcan0 for udsota_lite_server). The
+# boot core is cross-compiled for Cortex-M3 under a size gate. The CANDash example is built four ways with a throwaway
+# signing key, and with release-assets.yml the assets a release of this commit would carry. Every image build fails
+# on a compiler warning, and every image must pass udsota's image rules (tools/image_check.c) and fail them with its
+# descriptor broken.
 name: ci
 on: [push, pull_request]
 jobs:
+  # The default build: every test, and with clang the fuzzer's libFuzzer build too.
   host:
     runs-on: ubuntu-latest
     strategy:
@@ -35,6 +32,7 @@ jobs:
           CC: ${{ matrix.cc }}
           CXX: ${{ matrix.cc == 'clang' && 'clang++' || 'g++' }}
           FUZZ_LIBFUZZER: ${{ matrix.cc == 'clang' && 'ON' || 'OFF' }}
+  # The client's tests without a server, so its end-to-end files only skip here; e2e runs them.
   client:
     runs-on: ubuntu-latest
     steps:
@@ -47,11 +45,15 @@ jobs:
         run: python -m pytest -q tools/test_release.py && python tools/release.py notes v0.14.2 > /dev/null
       - name: Smoke-test the installed client from outside the tree
         run: cd /tmp && python -c "from udsota import profile; print(profile.load('example'))"
+  # The client against both servers, the lite one built with delta downloads.
   e2e:
     runs-on: ubuntu-latest
     strategy:
       matrix:
         cc: [gcc, clang]
+    env:
+      UDSOTA_LITE_SERVER: ${{ github.workspace }}/build/udsota_lite_server
+      UDSOTA_BOOT_SERVER: ${{ github.workspace }}/build/udsota_boot_server
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -66,9 +68,6 @@ jobs:
       - run: |
           python -m pip install "./client[diff]" pytest
           python -m pytest -q -rsx client/tests/test_e2e_lite.py client/tests/test_e2e_boot.py
-        env:
-          UDSOTA_LITE_SERVER: ${{ github.workspace }}/build/udsota_lite_server
-          UDSOTA_BOOT_SERVER: ${{ github.workspace }}/build/udsota_boot_server
       - name: Set up vcan0
         run: |
           if ! sudo modprobe vcan; then
@@ -84,8 +83,8 @@ jobs:
       - name: Run the end-to-end tests on vcan0 (UDSOTA_VCAN makes a missing vcan fail, not skip)
         run: python -m pytest -q -rsx client/tests/test_e2e_lite_vcan.py
         env:
-          UDSOTA_LITE_SERVER: ${{ github.workspace }}/build/udsota_lite_server
           UDSOTA_VCAN: vcan0
+  # The boot core's size, which the unit tests do not see.
   boot-arm:
     runs-on: ubuntu-latest
     steps:
@@ -106,6 +105,7 @@ jobs:
           # the gate catches the core growing, not a few bytes' change.
           text=$(arm-none-eabi-size udsota_boot.o | awk 'NR == 2 { print $1 }')
           [ "$text" -le 3700 ] || { echo "udsota_boot.o has $text bytes of text, over the gate of 3700"; exit 1; }
+  # The ESP-IDF builds, which CMake's host build cannot run.
   esp32:
     runs-on: ubuntu-latest
     container: espressif/idf:v6.1
@@ -143,11 +143,13 @@ jobs:
         with:
           name: candash
           path: out/*
+  # What a release of this commit would carry, built warning-free before any tag exists.
   release-assets:
     uses: ./.github/workflows/release-assets.yml
     with:
       ref: ${{ github.sha }}
       fail_on_warning: true
+  # udsota's image rules on the images the two jobs above built.
   image-check:
     needs: [esp32, release-assets]
     runs-on: ubuntu-latest
