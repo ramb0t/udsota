@@ -5170,14 +5170,15 @@ UPDATE_BL = '\n[update]\nflow = "bootloader"\n'
 # image's ID, 176..208; and FULL under it, for [security] and [board].
 BARE_BL = BARE.replace("header_offset = 0x100", "header_offset = 48") + UPDATE_BL
 PBL = profile.from_dict("bare-boot", tomllib.loads(BARE_BL))
-# PFB has [security] under the bootloader flow, which the loader refuses (the boot core serves no 0x27), so it is
-# built past the loader: these tests drive flash's unlock and board paths against a unit that does serve them.
-PFB = dataclasses.replace(profile.from_dict("full-boot", tomllib.loads(FULL)), flow="bootloader")
+# PFB is FULL without [security], which the loader refuses under the bootloader flow (the boot core serves no 0x27):
+# an ESP-IDF image with the [board] check and deltas.
+PFB = profile.from_dict("full-boot", tomllib.loads(FULL.replace(FULL[FULL.index("[security]"):FULL.index("[image]")], "")
+                                                   + UPDATE_BL))
 BL_IMG = build_bare_image(header_offset=48, size=4800)
 BL_ID = bare_id(BL_IMG, 48)         # BL_IMG's image ID
 BL_PRECHECK = [(0x22, 0xF1F4), (0x10, 2), (0x22, 0xF1F0), (0x22, 0xF1F3), (0x22, 0xF1F5)]   # F1F4 to the app, then the hop
-# With [security] and [board]: the F1F5 read follows F1F3, before the profile's board DID and the device ID.
-BL_SECURE_PRECHECK = BL_PRECHECK[:4] + [(0x22, 0xF1F5), (0x22, 0xF191), (0x22, 0xF18C)]
+# With [board]: the F1F5 read follows F1F3, before the profile's board DID.
+BL_BOARD_PRECHECK = BL_PRECHECK[:4] + [(0x22, 0xF1F5), (0x22, 0xF191)]
 POLLS = [(0x22, 0xF1F4)] * 3        # the app answers the third, after start_silence
 
 
@@ -5287,18 +5288,17 @@ def test_bootloader_flow_bootloader_answering_f1f4_names_the_cause(kw, why):
 # Check the programming session is entered again after the delta patches are built, even when none is worth sending:
 # building them can outlast S3, and the full download's 34 must not meet the default session.
 def test_bootloader_flow_reenters_after_unused_deltas(monkeypatch):
-    d = BootloaderUnit(sha=elf_sha(DELTA_BASE))
+    d = BootloaderUnit(security=False, sha=elf_sha(DELTA_BASE))
 
     def slow_build(base, new, dfi):        # outlasts S3, and is bigger than the image
-        d.session, d.unlocked = 1, 0
+        d.session = 1
         return bytes(2 * len(new))
 
     monkeypatch.setattr(pack, "build_delta", slow_build)
-    rc, _, lines = run_boot(d, image=DELTA_NEW, prof=PFB, master=MASTER, compress="none",
-                            bases=[("a.bin", DELTA_BASE)])
+    rc, _, lines = run_boot(d, image=DELTA_NEW, prof=PFB, compress="none", bases=[("a.bin", DELTA_BASE)])
     assert rc == 0 and d.dfis == [0x00] and bytes(d.written) == DELTA_NEW
     first_34 = d.log.index((0x34, None))
-    assert d.log[:first_34] == BL_SECURE_PRECHECK + UNLOCK_PROG[1:] + UNLOCK_PROG
+    assert d.log[:first_34] == BL_BOARD_PRECHECK + [(0x10, 2)]
     assert any(ln.startswith("no delta over DFI 0x20") for ln in lines)
 
 
@@ -5363,19 +5363,19 @@ def test_bootloader_flow_other_prefix_fails():
         run_boot(d)
 
 
-# Check [security] under the bootloader flow: every precheck read, the device ID last, before the programming unlock,
-# all after 10 02; and the board check refuses after them, saying the unit is left in its bootloader.
-def test_bootloader_flow_unlocks_after_the_precheck_reads():
-    d = BootloaderUnit()
-    rc, _, lines = run_boot(d, image=make_image(), prof=PFB, master=MASTER)
-    assert rc == 0 and d.log == BL_SECURE_PRECHECK + UNLOCK_PROG[1:] + DOWNLOAD + POLLS
+# Check [board] under the bootloader flow: every precheck read after 10 02, the board DID last; and the board check
+# refuses after them, saying the unit is left in its bootloader.
+def test_bootloader_flow_checks_the_board_after_the_precheck_reads():
+    d = BootloaderUnit(security=False)
+    rc, _, lines = run_boot(d, image=make_image(), prof=PFB)
+    assert rc == 0 and d.log == BL_BOARD_PRECHECK + DOWNLOAD + POLLS
     assert lines[0] == "image 0.3.0 for devkit, 4800 bytes, app_elf_sha256 a0a1a2a3a4a5a6a7"
-    d = BootloaderUnit()
+    d = BootloaderUnit(security=False)
     with pytest.raises(errors.Refused, match="^image is for devkit-three but the server is devkit. The unit is in its "
                                              "bootloader and returns to its app when its programming session times "
                                              "out, unless it is held there$"):
-        run_boot(d, image=make_image(hw_id=3), prof=PFB, master=MASTER)
-    assert d.log == BL_SECURE_PRECHECK + UNLOCK_PROG[1:]
+        run_boot(d, image=make_image(hw_id=3), prof=PFB)
+    assert d.log == BL_BOARD_PRECHECK
 
 
 # Check a bootloader that does not serve F1F0 is refused as no udsota server, after the 10 02 alone, saying the unit is
@@ -5390,11 +5390,8 @@ def test_bootloader_flow_without_f1f0_is_refused():
     assert d.log == BL_PRECHECK[:3]
 
 
-# Check reset under the bootloader flow: 10 02, the device ID and the programming unlock when keyed, then 11 01.
+# Check reset under the bootloader flow: 10 02, then 11 01.
 def test_bootloader_flow_reset():
-    ft, d = FakeTime(), BootloaderUnit()
-    assert update.reset(uds_for(d, ft), PFB, MASTER, log=lambda *a: None) == 0
-    assert d.log == [(0x10, 2), (0x22, 0xF18C), (0x27, 3), (0x27, 4), (0x11, 1)] and d.in_app
     ft, d = FakeTime(), BootloaderUnit(security=False)
     assert update.reset(uds_for(d, ft), PBL, None, log=lambda *a: None) == 0
     assert d.log == [(0x10, 2), (0x11, 1)]
@@ -5439,10 +5436,10 @@ def test_bootloader_flow_refuses_a_product_change():
                                              r"session times out, unless it is held there$"):
         run_boot(d)
     assert d.log == BL_PRECHECK
-    d = BootloaderUnit(project=b"widget")
+    d = BootloaderUnit(security=False, project=b"widget")
     with pytest.raises(errors.Refused, match="--allow-product-change"):
-        run_boot(d, image=make_image(project=b"example"), prof=PFB, master=MASTER)
-    assert d.log == BL_SECURE_PRECHECK + UNLOCK_PROG[1:] and not d.written
+        run_boot(d, image=make_image(project=b"example"), prof=PFB)
+    assert d.log == BL_BOARD_PRECHECK and not d.written
 
 
 # Check --allow-product-change logs both names and goes on to flash, and says nothing when the project is the same.

@@ -133,7 +133,7 @@ udsota's flash worker runs at priority 2 with an 8 KB stack and no core affinity
 
 Testers lose DFI 20 delta downloads (and DFI 30 unless the app turns delta on, from 0.16), F1F2, functional addressing, the answered repeat of a 36 or 37 (a lost answer fails the run, and the next run starts from the first byte), the 0x78 to 27, and the 0x21 to a request sent while a job answers 0x78: iso14229 reads no other request meanwhile, udsota's job or the app's, and answers only the last one sent, after the job ends. Padding and the 1 s N_Cr go too, unless the build sets them ([Build](#build)).
 
-Updating a unit that runs CANDash v0.3.0 to v0.5.0 (udsota v0.3.0 to v0.11.0, -O2) uses that unit's own isotp-c, built without -fwrapv. A block can fail with a false N_Cr once every 71.6 min of uptime. The client resends it once (`send_block` in `client/udsota/update.py`); if the run still fails, run it again.
+Updating a unit that runs CANDash v0.3.0 to v0.5.0 (udsota v0.3.0 to v0.11.0, -O2) uses that unit's own isotp-c, built without -fwrapv. A block can fail with a false N_Cr once every 71.6 min of uptime. The client resends it once (`send_block` in `client/udsota/download.py`); if the run still fails, run it again.
 
 ## Host tests
 

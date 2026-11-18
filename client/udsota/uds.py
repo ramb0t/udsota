@@ -1,4 +1,5 @@
 """The UDS requests the client makes, over a udsoncan Client (NRC 0x78 is handled inside udsoncan)."""
+import contextlib
 import errno
 import time
 
@@ -144,13 +145,10 @@ class Uds:
     # send's) unless busy_ends, when the send being awaited is this one and 0x21 is its answer. The second-tester
     # monitor counts the wait as a request of ours.
     def await_answer(self, service, window_s, busy_ends=False, stale=None, pending_s=P2_STAR_S):
-        sid, conn = service.request_id(), self.client.conn
+        sid = service.request_id()
         timeout = window_s
         while True:
-            expect = getattr(conn, "expect", None)
-            if expect is not None:
-                expect()
-            frame = conn.wait_frame(timeout=timeout)
+            frame = self.listen(timeout)
             if frame is None:
                 return None
             if len(frame) >= 3 and frame[0] == 0x7F and frame[1] == sid:
@@ -167,15 +165,21 @@ class Uds:
     # to earlier sends, which the next request must not take for its own, nor reach the server while it still sends
     # them. The second-tester monitor counts the wait as a request of ours. Returns how many frames it passed over.
     def drain(self, settle_s, max_s):
-        conn, end, n = self.client.conn, self.clock() + max_s, 0
+        end, n = self.clock() + max_s, 0
         while (left := end - self.clock()) > 0:
-            expect = getattr(conn, "expect", None)
-            if expect is not None:
-                expect()
-            if conn.wait_frame(timeout=min(settle_s, left)) is None:
+            if self.listen(min(settle_s, left)) is None:
                 break
             n += 1
         return n
+
+    # Wait up to timeout seconds for one frame, telling the second-tester monitor (when the connection has one) that
+    # an answer is awaited with no send of ours; None when none comes.
+    def listen(self, timeout):
+        conn = self.client.conn
+        expect = getattr(conn, "expect", None)
+        if expect is not None:
+            expect()
+        return conn.wait_frame(timeout=timeout)
 
     # send_request, resent once after an ISO-TP send error (OSError: no FC within N_Bs, e.g. one a rate cap
     # dropped). Safe: without the FC the server never got the request, and a seed stays valid 30 s. A second error
@@ -204,18 +208,13 @@ class Uds:
     # never come faster than one per window_s.
     def try_session(self, n, window_s):
         service = services.DiagnosticSessionControl
-        p2, p2_star = self.client.config["p2_timeout"], self.client.config["p2_star_timeout"]
-        self.client.set_config("p2_timeout", window_s)
-        self.client.set_config("p2_star_timeout", window_s)
         try:
-            answer = self.exchange(service, Request(service=service, subfunction=n))
+            with self.timeouts(p2_timeout=window_s, p2_star_timeout=window_s):
+                answer = self.exchange(service, Request(service=service, subfunction=n))
         except NoResponse:
             return False
         except UpdateFailed:
             answer = None
-        finally:
-            self.client.set_config("p2_timeout", p2)
-            self.client.set_config("p2_star_timeout", p2_star)
         if answer is None:
             try:
                 answer = self.await_answer(service, window_s, pending_s=window_s)
@@ -278,13 +277,22 @@ class Uds:
             return                                   # already unlocked
         if len(seed) != SEED_LEN:
             raise UpdateFailed("seed is %d bytes, expected %d" % (len(seed), SEED_LEN))
-        key, p2 = keys.key(seed, seed_level), self.client.config["p2_timeout"]
-        if len(key) > SEED_LEN:
-            self.client.set_config("p2_timeout", max(p2, SIG_P2_S))
-        try:
+        key = keys.key(seed, seed_level)
+        longer = {"p2_timeout": max(self.client.config["p2_timeout"], SIG_P2_S)} if len(key) > SEED_LEN else {}
+        with self.timeouts(**longer):
             self.request(services.SecurityAccess, seed_level + 1, key)
+
+    # Set udsoncan config values (timeouts) for the with-block, and put the old ones back after it.
+    @contextlib.contextmanager
+    def timeouts(self, **config):
+        old = {key: self.client.config[key] for key in config}
+        for key, value in config.items():
+            self.client.set_config(key, value)
+        try:
+            yield
         finally:
-            self.client.set_config("p2_timeout", p2)
+            for key, value in old.items():
+                self.client.set_config(key, value)
 
     # RequestDownload of size bytes at address 0, in data format dfi (DL_DFI_DEFLATE: the blocks carry a raw DEFLATE
     # stream of those size bytes); returns the data bytes per 0x36 block.
