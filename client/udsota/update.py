@@ -519,7 +519,8 @@ def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep
 # session: an app already running this image and healthy needs nothing, so it is left running. Then 10 02: the app
 # answers 7F 10 78 and resets into the bootloader, which sends the 50 02; a late answer to an F1F4 read that went
 # unanswered, such as a bootloader's 7F 22 31 to one the adapter held, is passed over ahead of it (Uds.exchange).
-# Then, all in the programming session, the precheck reads, the unlock, download, FF01, ActivateImage and
+# Then, all in the programming session, the precheck reads (no unlock: a profile with [security] is refused under this
+# flow), download, FF01, ActivateImage and
 # wait_for_start, the proof of life; no ConfirmImage. An image the unit already holds gets 11 01 and the same proof.
 # quiet() is held from the 10 02, which stops the app. The precheck includes F1F5, the installed app's project: an
 # image of another project is refused, with the unit left in its bootloader, unless allow_product_change
@@ -752,8 +753,7 @@ def keyed_reset(uds, profile, keys):
 
 
 # `reset`: ECUReset from the extended session, keyed when the profile has [security]. Under flow "bootloader", from
-# the programming session instead (10 02, the device ID, the programming unlock, 11 01): the unit leaves its
-# bootloader for its app.
+# the programming session instead (10 02, 11 01, with no unlock): the unit leaves its bootloader for its app.
 def reset(uds, profile, secret, log=print):
     if profile.flow == "bootloader":
         uds.session(SESSION_PROGRAMMING)
