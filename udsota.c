@@ -669,7 +669,8 @@ STEP bool ready_to_program(void)
     return slots_settled() && !worker_busy() && !transferring();
 }
 
-/* The download is over, and F1F1 says why. */
+/* The download is over, and F1F1 says why. It does not close an open image: the caller sets close_pending first, or
+ * calls abort_download, which does. */
 STEP void end_download(uint8_t reason)
 {
     U.phase = PHASE_IDLE;
