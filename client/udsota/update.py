@@ -476,7 +476,7 @@ def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep
     log("image %s for %s, %d bytes, %s %s" % (img.version, board_of, img.size, id_name(profile),
                                               img.elf_sha[:8].hex()))
     if profile.flow == "bootloader":
-        return flash_bootloader(uds, profile, image, img, secret, drop_76=drop_76, preroll=preroll, sleep=sleep,
+        return flash_bootloader(uds, profile, image, img, drop_76=drop_76, preroll=preroll, sleep=sleep,
                                 clock=clock, log=log, quiet=quiet, compress=compress, bases=bases,
                                 diff_format=diff_format, deflate_ok=deflate_ok, wait_for_unit=wait_for_unit,
                                 allow_product_change=allow_product_change)
@@ -551,7 +551,7 @@ def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep
 # (--allow-product-change), which logs both names and goes on. Any negative answer to F1F5 goes on: nothing is
 # installed, or the bootloader does not know the DID.
 # With wait_for_unit, wait_for_power_up sends the 10 02.
-def flash_bootloader(uds, profile, image, img, secret, drop_76=None, preroll=lambda: None, sleep=time.sleep,
+def flash_bootloader(uds, profile, image, img, drop_76=None, preroll=lambda: None, sleep=time.sleep,
                      clock=time.monotonic, log=print, quiet=contextlib.nullcontext, compress="none", bases=None,
                      diff_format="auto", deflate_ok=True, wait_for_unit=None, allow_product_change=False):
     try:
@@ -573,8 +573,6 @@ def flash_bootloader(uds, profile, image, img, secret, drop_76=None, preroll=lam
         running_sha = uds.read_did(DID_RUNNING_SHA)
         installed = installed_project(uds)       # a 22 of its own: a request for several DIDs fails whole
         board = None if profile.board_did is None else cstr(uds.read_did(profile.board_did))
-        keys = device_keys(uds, profile, secret)
-        unlock_programming(uds, profile, keys)
         if installed is not None and installed != img.project:
             if not allow_product_change:
                 raise Refused("the unit runs project %r and the image is project %r: pass --allow-product-change to "
@@ -592,18 +590,15 @@ def flash_bootloader(uds, profile, image, img, secret, drop_76=None, preroll=lam
         board_of = profile.board_names.get(img.hw_id, "hw_id %d" % img.hw_id)
         if board is not None and board != profile.board_names.get(img.hw_id):
             raise Refused("image is for %s but the server is %s. %s" % (board_of, board, LEFT_IN_BOOTLOADER))
-        verified = state["other_state"] == OTHER_VERIFIED and state["other_sha_prefix"] == img.elf_sha[:8]
         deltas = []
-        if bases is not None and not verified:
+        if bases is not None:
             deltas = plan_deltas(bases, image, running_sha, compress, diff_format, log=log, deflate_ok=deflate_ok)
-            enter_programming(uds, profile, keys)   # building the patches, used or not, may have outlasted S3
-        if verified:
-            log("the other slot already holds this image, verified: skipping to ActivateImage")
-        need_download, recovered, resent, activated = not verified, False, False, True
+            uds.session(SESSION_PROGRAMMING)   # building the patches, used or not, may have outlasted S3
+        need_download, recovered, resent, activated = True, False, False, True
         while True:
             if need_download:
                 download(uds, image, drop_76=drop_76, log=log, compress=compress, clock=clock, deltas=deltas,
-                         reenter=lambda: enter_programming(uds, profile, keys))
+                         reenter=lambda: uds.session(SESSION_PROGRAMMING))
                 check_image(uds, log=log)
                 need_download, drop_76 = False, None   # the fault injection applies to the first download only
             try:
@@ -789,7 +784,6 @@ def keyed_reset(uds, profile, keys):
 def reset(uds, profile, secret, log=print):
     if profile.flow == "bootloader":
         uds.session(SESSION_PROGRAMMING)
-        unlock_programming(uds, profile, device_keys(uds, profile, secret))
         uds.ecu_reset()
         log("reset accepted: the unit leaves its bootloader for its app")
         return 0
