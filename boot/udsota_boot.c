@@ -809,18 +809,29 @@ void udsota_boot_poll(void)
     }
 }
 
-void udsota_boot_rx(uint8_t bus, uint32_t id, const uint8_t *data, uint8_t len)
+/* A tester frame, which holds the window, restarts the idle exit's time and locks its bus: 02 10 02/82 or 02 3E 00/80. */
+static bool tester_frame(const uint8_t *d, uint8_t len)
+{
+    return len >= 3u && d[0] == 0x02u &&
+           ((d[1] == 0x10u && (d[2] & 0x7Fu) == UDS_LEV_DS_PRGS) || (d[1] == 0x3Eu && (d[2] & 0x7Fu) == 0u));
+}
+
+void udsota_boot_rx(uint8_t bus,uint32_t id, const uint8_t *data, uint8_t len)
 {
     if (B.state == STOPPED || B.state == STARTING || bus == 0u || bus > B.cfg->buses || len > 8u ||
-        id != B.cfg->request_id || ((B.state == TESTER || busy()) && bus != B.bus) ||
-        (B.state != TESTER && !bus_open(bus))) {
-        return;
+        id != B.cfg->request_id) {
+        return;                                          /* not a frame for the core */
+    }
+    if ((B.state == TESTER || busy()) && bus != B.bus) {
+        return;                                          /* another bus than the locked one, or the request's */
+    }
+    if (B.state != TESTER && !bus_open(bus)) {
+        return;                                          /* a bus that does not take updates, before a lock */
     }
     const uint32_t now = UDSMillis();
     B.bus = bus;
-    if (len >= 3u && data[0] == 0x02u &&
-        ((data[1] == 0x10u && (data[2] & 0x7Fu) == UDS_LEV_DS_PRGS) || (data[1] == 0x3Eu && (data[2] & 0x7Fu) == 0u))) {
-        if (B.state != TESTER) {                         /* a tester frame: 02 10 02/82 or 02 3E 00/80 */
+    if (tester_frame(data, len)) {
+        if (B.state != TESTER) {
             stop_buses(bus);
         }
         B.state = TESTER;
