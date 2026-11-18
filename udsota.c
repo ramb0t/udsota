@@ -63,7 +63,7 @@ _Static_assert(sizeof(tinfl_decompressor) == 10992u && TINFL_LZ_DICT_SIZE == 327
 #define PATCH_MAGIC     0xFCCDDE10u   /* a delta patch's first 4 bytes, little-endian (esp_delta_ota's) */
 #define PATCH_HDR_LEN   64u        /* the magic, the base's appended SHA-256 and 28 reserved bytes */
 
-/* A step of a longer function, named and called from that one place. -Og keeps even a small static as a call, so this
+/* A named step of a longer function, or a rule read in two places. -Og keeps even a small static as a call, so this
  * forces the inline: the name costs no flash. */
 #define STEP static inline __attribute__((always_inline))
 
@@ -557,6 +557,44 @@ static int ecdsa_check(const uint8_t seed[UDSOTA_SEED_LEN], uint8_t level, const
     return v;
 }
 
+/* HMAC mode, at init: this device's key, HMAC-SHA256(key_master, key_label || device ID). */
+STEP void derive_device_key(const udsota_cfg_t *cfg)
+{
+    uint8_t msg[LABEL_MAX + UDSOTA_KEYS_ID_MAX];
+    const size_t ln = strnlen(cfg->key_label, LABEL_MAX + 1u);
+    if (ln <= LABEL_MAX && udsota_psa_lock(UDSOTA_PSA_WAIT_FOREVER)) {
+        memcpy(msg, cfg->key_label, ln);
+        memcpy(&msg[ln], U.devid, U.devid_len);
+        U.key_ok = udsota_plat_hmac(cfg->key_master, cfg->key_master_len, msg, ln + U.devid_len, U.kdev);
+        udsota_psa_unlock();
+    }
+    wipe(msg, sizeof msg);
+}
+
+/* 0x27: ECDSA wins over HMAC. Any key field turns it on, and an incomplete set then unlocks nothing; with none, 0x27 is
+ * the app's and downloads need no key. */
+STEP void keys_init(const udsota_cfg_t *cfg)
+{
+    U.sec_ecdsa = (cfg->key_pubkey != NULL || cfg->key_pubkey_len != 0u);
+    U.sec_on = U.sec_ecdsa || cfg->key_label != NULL || cfg->key_master != NULL || cfg->key_master_len != 0u;
+    if (U.devid_len == 0u) {
+        LOGW("no device ID (a bad device_id_len, or no MAC)");
+    } else if (U.sec_ecdsa) {
+        if (cfg->key_pubkey != NULL && cfg->key_pubkey_len == UDSOTA_KEYS_PUBKEY_LEN &&
+            udsota_psa_lock(UDSOTA_PSA_WAIT_FOREVER)) {
+            U.key_ok = udsota_plat_ecdsa_key(cfg->key_pubkey) == 0;
+            udsota_psa_unlock();
+        }
+    } else if (U.sec_on && cfg->key_label != NULL && cfg->key_master != NULL) {
+        derive_device_key(cfg);
+    }
+    if (!U.sec_on) {
+        LOGW("security off: no key, so 0x27 is the app's and any node can download");
+    } else if (!U.key_ok) {
+        LOGW("0x27 keys unusable: nothing unlocks");
+    }
+}
+
 /* ==== 5. The updater ==== */
 
 static void status_now(udsota_status_t *st)
@@ -600,7 +638,7 @@ static bool worker_busy(void)
 }
 
 /* The precondition of 10 02 and 34: settled slots, an idle worker and no transfer open. */
-static bool ready_to_program(void)
+STEP bool ready_to_program(void)
 {
     return slots_settled() && !worker_busy() && !U.dl_active;
 }
@@ -1366,13 +1404,9 @@ bool udsota_event(UDSServer_t *srv, UDSEvent_t ev, void *arg, UDSErr_t *rc)
 
 static void psa_lock_init(void);                         /* the platform's: section 7 */
 
-int udsota_init(const udsota_cfg_t *cfg)
+/* This image's identity: the product it accepts images for, its own version, and the device ID. */
+STEP void read_identity(const udsota_cfg_t *cfg)
 {
-    if (U.started || cfg == NULL || udsota_image_desc.magic != UDSOTA_IMG_DESC_MAGIC) {
-        return -1;
-    }
-    psa_lock_init();
-    U.cfg = *cfg;
     U.product = (cfg->product != NULL) ? cfg->product : udsota_plat_project();
     const char *v = udsota_plat_version();
     const size_t vlen = strnlen(v, 32);
@@ -1385,34 +1419,17 @@ int udsota_init(const udsota_cfg_t *cfg)
         memcpy(U.devid, cfg->device_id, cfg->device_id_len);
         U.devid_len = cfg->device_id_len;
     }
-    /* 0x27: ECDSA wins over HMAC. Any key field turns it on, and an incomplete set then unlocks nothing; with none,
-     * 0x27 is the app's and downloads need no key. */
-    U.sec_ecdsa = (cfg->key_pubkey != NULL || cfg->key_pubkey_len != 0u);
-    U.sec_on = U.sec_ecdsa || cfg->key_label != NULL || cfg->key_master != NULL || cfg->key_master_len != 0u;
-    if (U.devid_len == 0u) {
-        LOGW("no device ID (a bad device_id_len, or no MAC)");
-    } else if (U.sec_ecdsa) {
-        if (cfg->key_pubkey != NULL && cfg->key_pubkey_len == UDSOTA_KEYS_PUBKEY_LEN &&
-            udsota_psa_lock(UDSOTA_PSA_WAIT_FOREVER)) {
-            U.key_ok = udsota_plat_ecdsa_key(cfg->key_pubkey) == 0;
-            udsota_psa_unlock();
-        }
-    } else if (U.sec_on && cfg->key_label != NULL && cfg->key_master != NULL) {
-        uint8_t msg[LABEL_MAX + UDSOTA_KEYS_ID_MAX];
-        const size_t ln = strnlen(cfg->key_label, LABEL_MAX + 1u);
-        if (ln <= LABEL_MAX && udsota_psa_lock(UDSOTA_PSA_WAIT_FOREVER)) {
-            memcpy(msg, cfg->key_label, ln);
-            memcpy(&msg[ln], U.devid, U.devid_len);
-            U.key_ok = udsota_plat_hmac(cfg->key_master, cfg->key_master_len, msg, ln + U.devid_len, U.kdev);
-            udsota_psa_unlock();
-        }
-        wipe(msg, sizeof msg);
+}
+
+int udsota_init(const udsota_cfg_t *cfg)
+{
+    if (U.started || cfg == NULL || udsota_image_desc.magic != UDSOTA_IMG_DESC_MAGIC) {
+        return -1;
     }
-    if (!U.sec_on) {
-        LOGW("security off: no key, so 0x27 is the app's and any node can download");
-    } else if (!U.key_ok) {
-        LOGW("0x27 keys unusable: nothing unlocks");
-    }
+    psa_lock_init();
+    U.cfg = *cfg;
+    read_identity(cfg);
+    keys_init(cfg);
     U.started = true;
     return udsota_plat_start();
 }
