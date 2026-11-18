@@ -885,12 +885,12 @@ static int finish_done(int result, uint8_t *status, size_t *status_len)
 {
     (void)status;
     *status_len = 0;
+    if (!image_open()) {                                 /* another service ended the download while the 37 ran */
+        return UDS_NRC_GeneralProgrammingFailure;        /* F1F1 keeps ABORTED, and the image is closed already */
+    }
     if (result != UDSOTA_DL_OK) {
         U.close_pending = true;                          /* the stream is closed: only the flash side remains */
         end_download((uint8_t)result);
-        return UDS_NRC_GeneralProgrammingFailure;
-    }
-    if (!image_open()) {                                 /* another service ended the download while the 37 ran */
         return UDS_NRC_GeneralProgrammingFailure;
     }
     U.written = U.announced;

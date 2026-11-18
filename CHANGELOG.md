@@ -10,7 +10,7 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ### Fixed
 
-- `udsota.c`: when another service arrives while a compressed download's 37 is inflating the end of the stream, the download is ended and the 37's job then finishes, so F1F1 says ABORTED as it did before and the 37 is answered 0x72 as a failed 37 is; it was answered positive, with F1F1 OK, for a download that had ended.
+- `udsota.c`: when another service arrives while a compressed download's 37 is inflating the end of the stream, the download is ended and the 37's job then finishes, so F1F1 says ABORTED as it did before and the 37 is answered 0x72 as a failed 37 is; it was answered positive, with F1F1 OK, for a download that had ended. Should the job fail, F1F1 keeps ABORTED too, and not the job's reason.
 
 ## [0.18.0] - 2026-11-18
 
