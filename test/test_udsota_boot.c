@@ -1231,6 +1231,39 @@ static void test_the_idle_exit_runs_in_the_default_session_only(void)
     CHECK(fake.started == BOTH && ASK(0x22, 0xF1, 0x86) && ANS(0x62, 0xF1, 0x86, 0x01));
 }
 
+/* A session entered without a tester frame (10 02 with a byte more), then 10 01: the unit listens in the default session
+ * with no lock, and when the boot rules say the app would start it leaves as the idle exit does, once the answer has
+ * gone. A held unit and a unit with no valid app keep listening. */
+static void test_a_default_session_after_an_unlocked_one_leaves_for_the_app(void)
+{
+    install_app(0x31);
+    CHECK(boot(POWER_ON) == WINDOW && ask_on(1u, REQ(0x10, 0x02, 0x00)) && SESSION_ANSWER(0x02));
+    wait_ms(100u);                                               /* the window ends in the programming session */
+    CHECK(fake.starts == 0 && fake.resets == 0);
+    CHECK(ASK(0x10, 0x01) && SESSION_ANSWER(0x01));
+    wait_ms(10u);
+    CHECK(fake.resets == 1 && fake.starts == 0);
+
+    CHECK(boot(POWER_ON) == WINDOW && ask_on(1u, REQ(0x10, 0x02, 0x00)) && SESSION_ANSWER(0x02));
+    wait_ms(100u);                                               /* entered again while listening after the window */
+    CHECK(ASK(0x10, 0x02, 0x00) && SESSION_ANSWER(0x02));
+    wait_ms(3000u);
+    CHECK(fake.resets == 1 && ASK(0x10, 0x01) && SESSION_ANSWER(0x01));
+    wait_ms(10u);
+    CHECK(fake.resets == 2 && fake.starts == 0);
+
+    CHECK(boot_held() && ASK(0x10, 0x02, 0x00) && SESSION_ANSWER(0x02));   /* held: listening, as before */
+    CHECK(ASK(0x10, 0x01) && SESSION_ANSWER(0x01));
+    wait_ms(10000u);
+    CHECK(fake.resets == 2 && fake.started == BOTH && ASK(0x22, 0xF1, 0x86) && ANS(0x62, 0xF1, 0x86, 0x01));
+
+    install(g_old, 0u);                                          /* no valid app */
+    CHECK(boot(POWER_ON) == NO_APP && ASK(0x10, 0x02, 0x00) && SESSION_ANSWER(0x02));
+    CHECK(ASK(0x10, 0x01) && SESSION_ANSWER(0x01));
+    wait_ms(10000u);
+    CHECK(fake.resets == 2 && fake.started == BOTH && ASK(0x22, 0xF1, 0x86) && ANS(0x62, 0xF1, 0x86, 0x01));
+}
+
 static void test_ignored_frames(void)
 {
     CHECK(boot(POWER_ON) == NO_APP);
@@ -1788,6 +1821,7 @@ static const struct {
     TEST(test_a_tester_frame_locks_its_bus_until_listening_again),
     TEST(test_the_idle_exit_waits_for_a_request_in_flight),
     TEST(test_the_idle_exit_runs_in_the_default_session_only),
+    TEST(test_a_default_session_after_an_unlocked_one_leaves_for_the_app),
     TEST(test_ignored_frames),
     TEST(test_window),
     TEST(test_the_window_ends_in_a_start_only_for_a_valid_app_in_the_default_session),

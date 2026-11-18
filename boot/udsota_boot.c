@@ -680,13 +680,19 @@ static void reset(void)
     udsota_boot_port_reset();
 }
 
+/* Whether the boot rules, run as after a session, would start the app. */
+static bool would_start_app(void)
+{
+    const udsota_boot_inputs_t in = {.count_word = udsota_boot_port_keep_read(UDSOTA_KEEP_WORD_COUNT),
+                                     .cause = UDSOTA_BOOT_RESET_OTHER, .app_valid = B.app_valid};
+    return udsota_boot_decide(B.cfg, &in, &B.count) == UDSOTA_BOOT_DECIDE_START_APP;
+}
+
 /* S3's expiry and the idle exit: a reset when the boot rules would start the app, else listening again on every
  * open bus, with iso14229 from scratch, no lock and no window; what is installed now says which buses are open. */
 static void session_exit(void)
 {
-    const udsota_boot_inputs_t in = {.count_word = udsota_boot_port_keep_read(UDSOTA_KEEP_WORD_COUNT),
-                                     .cause = UDSOTA_BOOT_RESET_OTHER, .app_valid = B.app_valid};
-    if (udsota_boot_decide(B.cfg, &in, &B.count) == UDSOTA_BOOT_DECIDE_START_APP) {
+    if (would_start_app()) {
         reset();
         return;
     }
@@ -782,6 +788,9 @@ void udsota_boot_poll(void)
     } else if (B.state == S3_EXPIRED || (B.state == TESTER && B.srv.sessionType == UDS_LEV_DS_DS && !busy() &&
                                          now - B.since >= IDLE_MS)) {
         session_exit();
+    } else if (B.state == LISTENING && B.app_valid && B.srv.sessionType == UDS_LEV_DS_DS && !busy() &&
+               would_start_app()) {                      /* back in the default session with no lock and no deadline */
+        reset();
     }
 }
 

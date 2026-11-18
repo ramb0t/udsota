@@ -30,6 +30,9 @@
  *   idle exit          5100 ms in the default session, from the udsota_boot_rx call that carried the last tester
  *                      frame, once no request is in flight
  *   S3                 5100 ms outside the default session, from the last 10 or 3E that iso14229 served
+ *   default session    listening in it with no tester frame's lock, a valid app and the boot rules saying it would
+ *                      start (a 10 01 after a session that no tester frame opened), it resets once the answer has
+ *                      gone, as the idle exit does; a held unit and one with no valid app keep listening
  *   reset              60 ms, from the first poll that served 11 01 or F001
  *   answers            5 ms apart (P2); the first after each init, the handover's 50 02 included, about 6 ms after
  *                      it; the 10's answer gives P2* 5000 ms, covering the handover's reboot
