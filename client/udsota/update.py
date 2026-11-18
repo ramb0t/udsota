@@ -74,6 +74,33 @@ def id_name(profile):
     return "image ID" if profile.image_format == "bare" else "app_elf_sha256"
 
 
+# What the precheck reads of the unit, in the order the flows send it: (F1F0's state, F1F3's running SHA, the installed
+# project, the board DID's name). The state is None when F1F0 answers 0x31, and nothing else is read. The installed
+# project is F1F5, a bootloader-flow read, in a 22 of its own: a request for several DIDs fails whole; None otherwise.
+# The board is None when the profile names no board DID.
+def read_unit(uds, profile, project=False):
+    status = read_record(uds, DID_STATUS)
+    if status is None:
+        return None, None, None, None
+    state = decode_status(status)
+    running_sha = uds.read_did(DID_RUNNING_SHA)
+    installed = installed_project(uds) if project else None
+    board = None if profile.board_did is None else cstr(uds.read_did(profile.board_did))
+    return state, running_sha, installed, board
+
+
+# What names img's board: the profile's [board] name for its hw_id, else the hw_id.
+def board_name(profile, img):
+    return profile.board_names.get(img.hw_id, "hw_id %d" % img.hw_id)
+
+
+# "image is for X but the server is Y" when the unit's board DID names another board than the image's, else None.
+def wrong_board(profile, img, board):
+    if board is not None and board != profile.board_names.get(img.hw_id):
+        return "image is for %s but the server is %s" % (board_name(profile, img), board)
+    return None
+
+
 # `flash`: precheck, programming session (and unlock), download, FF01, ActivateImage, the restart and
 # ConfirmImage. Returns 0 or raises ToolError. secret is the master or private key (make_keys), unused when the
 # profile has no [security]. quiet() is entered once an update is needed and held until the end (the transport's
@@ -98,20 +125,27 @@ def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep
     deflate_ok = compress != "none"             # before the profile's default: see the comment above
     compress = profile.compression if compress is None else compress
     img = parse_image(profile, image)
-    board_of = profile.board_names.get(img.hw_id, "hw_id %d" % img.hw_id)
-    log("image %s for %s, %d bytes, %s %s" % (img.version, board_of, img.size, id_name(profile),
+    log("image %s for %s, %d bytes, %s %s" % (img.version, board_name(profile, img), img.size, id_name(profile),
                                               img.elf_sha[:8].hex()))
     if profile.flow == "bootloader":
         return flash_bootloader(uds, profile, image, img, drop_76=drop_76, preroll=preroll, sleep=sleep,
                                 clock=clock, log=log, quiet=quiet, compress=compress, bases=bases,
                                 diff_format=diff_format, deflate_ok=deflate_ok, wait_for_unit=wait_for_unit,
                                 allow_product_change=allow_product_change)
-    status = read_record(uds, DID_STATUS)
-    if status is None:                        # 0x31: no udsota status DID, so no udsota server
+    return flash_app(uds, profile, image, img, secret, drop_76=drop_76, preroll=preroll, sleep=sleep, clock=clock,
+                     log=log, quiet=quiet, compress=compress, bases=bases, diff_format=diff_format,
+                     deflate_ok=deflate_ok)
+
+
+# `flash` on an A/B unit (docs/wire.md): the precheck reads, the programming session and unlock, the download, FF01 and
+# ActivateImage, then the restart and ConfirmImage; img is image parsed, the other arguments flash's. An image the
+# other slot already holds verified skips the download. The precheck stops at an image already running (confirming it
+# when it is pending), one for another board, and a running image still unconfirmed.
+def flash_app(uds, profile, image, img, secret, drop_76, preroll, sleep, clock, log, quiet, compress, bases,
+              diff_format, deflate_ok):
+    state, running_sha, _, board = read_unit(uds, profile)
+    if state is None:                         # 0x31: no udsota status DID, so no udsota server
         raise Refused(NOT_UDSOTA)
-    state = decode_status(status)
-    running_sha = uds.read_did(DID_RUNNING_SHA)
-    board = None if profile.board_did is None else cstr(uds.read_did(profile.board_did))
     device_id = read_device_id(uds, profile)   # read in the precheck, used only once an update is needed
     if running_sha == img.elf_sha:
         if state["running_state"] == IMG_PENDING_VERIFY:   # an earlier run stopped before ConfirmImage
@@ -121,8 +155,8 @@ def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep
         return 0
     if state["running_state"] == IMG_PENDING_VERIFY:
         raise Refused("the running image is unconfirmed: run `confirm`, or `reset` to roll it back")
-    if board is not None and board != profile.board_names.get(img.hw_id):
-        raise Refused("image is for %s but the server is %s" % (board_of, board))
+    if (why := wrong_board(profile, img, board)) is not None:
+        raise Refused(why)
     verified = state["other_state"] == OTHER_VERIFIED and state["other_sha_prefix"] == img.elf_sha[:8]
     keys = make_keys(profile, secret, device_id)
     deltas = []
@@ -149,19 +183,26 @@ def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep
                     raise
                 resent = True                     # the request itself was lost: send it once more
             except Nrc as e:
-                if e.code == NRC_CONDITIONS:
-                    raise UpdateFailed(ACTIVATE_CONDITIONS) from e
                 if e.code == NRC_PROGRAMMING_FAILURE:
                     activation_failed(uds, profile, keys, e, log=log)
                     break
-                if recovered or e.code != NRC_SEQUENCE:
-                    raise
-                log("ActivateImage answered 0x24 (the slot is not verified): downloading again")
+                download_again(e, recovered, "slot", log)
                 recovered = need_download = True   # one re-download per run
         log("activated; waiting for the server to restart")
         wait_for_image(uds, img.elf_sha, preroll, sleep=sleep, clock=clock)
         log("the server runs %s; confirming" % img.version)
         return confirm(uds, sleep=sleep, clock=clock, log=log)
+
+
+# What both flows make of the NRC e to ActivateImage when neither 0x72 nor a resend's answer: 0x22 ends the run; the first
+# 0x24 says what is not verified (what: "slot" or "image") and returns, for the caller to download again, once per run
+# (recovered); anything else is e again.
+def download_again(e, recovered, what, log):
+    if e.code == NRC_CONDITIONS:
+        raise UpdateFailed(ACTIVATE_CONDITIONS) from e
+    if recovered or e.code != NRC_SEQUENCE:
+        raise e
+    log("ActivateImage answered 0x24 (the %s is not verified): downloading again" % what)
 
 
 # After no answer to ActivateImage: True when the server activated anyway, so its answer, not the request, was
@@ -309,13 +350,9 @@ def flash_bootloader(uds, profile, image, img, drop_76=None, preroll=lambda: Non
             uds.session(SESSION_PROGRAMMING)
         else:
             wait_for_power_up(uds, wait_for_unit, log=log, clock=clock)
-        status = read_record(uds, DID_STATUS)
-        if status is None:
+        state, running_sha, installed, board = read_unit(uds, profile, project=True)
+        if state is None:
             raise Refused("%s %s" % (NOT_UDSOTA, LEFT_IN_BOOTLOADER))
-        state = decode_status(status)
-        running_sha = uds.read_did(DID_RUNNING_SHA)
-        installed = installed_project(uds)       # a 22 of its own: a request for several DIDs fails whole
-        board = None if profile.board_did is None else cstr(uds.read_did(profile.board_did))
         if installed is not None and installed != img.project:
             if not allow_product_change:
                 raise Refused("the unit runs project %r and the image is project %r: pass --allow-product-change to "
@@ -330,9 +367,8 @@ def flash_bootloader(uds, profile, image, img, drop_76=None, preroll=lambda: Non
             uds.ecu_reset()
             return wait_for_start(uds, profile, img.elf_sha, preroll, sleep=sleep, clock=clock, log=log,
                                   buses=update_buses(profile, image))
-        board_of = profile.board_names.get(img.hw_id, "hw_id %d" % img.hw_id)
-        if board is not None and board != profile.board_names.get(img.hw_id):
-            raise Refused("image is for %s but the server is %s. %s" % (board_of, board, LEFT_IN_BOOTLOADER))
+        if (why := wrong_board(profile, img, board)) is not None:
+            raise Refused("%s. %s" % (why, LEFT_IN_BOOTLOADER))
         deltas = []
         if bases is not None:
             deltas = plan_deltas(bases, image, running_sha, compress, diff_format, log=log, deflate_ok=deflate_ok)
@@ -362,13 +398,9 @@ def flash_bootloader(uds, profile, image, img, drop_76=None, preroll=lambda: Non
                         % e.code)
                     activated = False
                     break
-                if e.code == NRC_CONDITIONS:
-                    raise UpdateFailed(ACTIVATE_CONDITIONS) from e
                 if e.code == NRC_PROGRAMMING_FAILURE:
                     raise UpdateFailed("ActivateImage failed (0x72); read F1F0 with `info`") from e
-                if recovered or e.code != NRC_SEQUENCE:
-                    raise
-                log("ActivateImage answered 0x24 (the image is not verified): downloading again")
+                download_again(e, recovered, "image", log)
                 recovered = need_download = True   # one re-download per run
         return wait_for_start(uds, profile, img.elf_sha, preroll, sleep=sleep, clock=clock, log=log,
                               activated=activated, buses=update_buses(profile, image))
