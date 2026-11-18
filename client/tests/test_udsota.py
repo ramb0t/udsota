@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 import tomllib
+import types
 import zlib
 from collections import deque
 
@@ -4675,12 +4676,16 @@ def test_diff_flags(capsys):
     assert "invalid choice" in capsys.readouterr().err
 
 
-# Check --diff-from without detools installed exits 2 before any bus opens, naming the extra to install.
-def test_main_diff_from_without_detools(tmp_path, full_path, capsys, monkeypatch):
+# Check --diff-from without detools installed exits 2 before any bus opens, naming the extra to install, also when
+# all `import detools` finds is the repository's detools/ directory of C sources, an empty namespace package.
+@pytest.mark.parametrize("found", [None, types.ModuleType("detools")], ids=["missing", "namespace"])
+def test_main_diff_from_without_detools(tmp_path, full_path, capsys, monkeypatch, found):
     img, master = tmp_path / "i.bin", tmp_path / "m.bin"
     img.write_bytes(DELTA_NEW)
     master.write_bytes(MASTER)
-    monkeypatch.setitem(sys.modules, "detools", None)       # import detools raises ImportError
+    if found is not None:
+        found.__path__ = [str(REPO / "detools")]
+    monkeypatch.setitem(sys.modules, "detools", found)      # None: import detools raises ImportError
     rc = cli.main(["--profile", full_path, "--master", str(master), "flash", str(img), "--diff-from", str(img)],
                   transport=no_transport)
     assert rc == 2 and 'pip install "./client[diff]"' in capsys.readouterr().err

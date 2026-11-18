@@ -38,10 +38,20 @@ def header(base_hash):
     return struct.pack("<I", MAGIC) + bytes(base_hash) + bytes(HEADER_LEN - 4 - HASH_LEN)
 
 
+# The detools package, the optional extra only a delta download needs, or ImportError without it. Run from the
+# repository root, `import detools` alone finds udsota's vendored C sources in detools/ as an empty namespace package,
+# so the package is told by what it provides.
+def import_detools():
+    import detools
+    if not hasattr(detools, "create_patch"):
+        raise ImportError("detools is not installed (found only the directory %s)" % list(detools.__path__))
+    return detools
+
+
 # The detools sequential patch from base to new, compressed with compression ("heatshrink" or "none"), behind the
 # header. Raises ImportError without detools and ValueError for a base with no validation hash.
 def make_patch(base, new, compression):
-    import detools   # the optional extra: only a delta download needs it
+    detools = import_detools()
     base_hash = validation_hash(base)
     if base_hash is None:
         raise ValueError("the base image has no valid appended SHA-256, so a device cannot be matched to it")
