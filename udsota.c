@@ -889,9 +889,7 @@ static int transfer_data(UDSServer_t *srv, const uint8_t *data, size_t len, bool
 
 static int exit_ok(void)
 {
-    if (image_open()) {                                  /* not after an abort that closed it while the 37 ran */
-        U.phase = PHASE_RECEIVED;
-    }
+    U.phase = PHASE_RECEIVED;
     U.last_reason = UDSOTA_DL_OK;
     U.last_bytes = U.received;
     return 0;
@@ -904,6 +902,9 @@ static int finish_done(int result, uint8_t *status, size_t *status_len)
     if (result != UDSOTA_DL_OK) {
         U.close_pending = true;                          /* the stream is closed: only the flash side remains */
         end_download((uint8_t)result);
+        return UDS_NRC_GeneralProgrammingFailure;
+    }
+    if (!image_open()) {                                 /* another service ended the download while the 37 ran */
         return UDS_NRC_GeneralProgrammingFailure;
     }
     U.written = U.announced;

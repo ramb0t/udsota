@@ -1174,8 +1174,9 @@ static void compress_cases(const uint8_t *img, size_t img_len, const uint8_t *im
                 got = 0;
             }
         }
-        CHECK(sent && got > 0u);
+        CHECK(sent && got == 3u && resp[0] == 0x7F && resp[1] == 0x37 && resp[2] == 0x72);
     }
+    CHECK(result_is(UDSOTA_DL_ABORTED, (uint32_t)n));
     EXPECT(B(0x31, 0x01, 0xFF, 0x01), B(0x7F, 0x31, 0x24));   /* the image the job finished was closed */
     CHECK(!P.open && !udsota_busy());
 
