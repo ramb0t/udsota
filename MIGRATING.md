@@ -1,6 +1,6 @@
 # Migrating to udsota 0.15 and later
 
-How to move an ESP-IDF app from udsota 0.14 or earlier, where udsota was the UDS server, to 0.15, where `udsota.c` answers updates inside the app's own iso14229 server. An app on lite-v0.1.0 needs only [From lite-v0.1.0](#from-lite-v010), and one already on 0.15 needs only the sections from its release on: [0.15.x to 0.16.0](#015x-to-0160), [0.16.x to 0.17.0](#016x-to-0170) and [0.17.x to 0.18.0](#017x-to-0180). An A/B app that takes the component whole needs nothing in any of them.
+How to move an ESP-IDF app from udsota 0.14 or earlier, where udsota was the UDS server, to 0.15, where `udsota.c` answers updates inside the app's own iso14229 server. An app on lite-v0.1.0 needs only [From lite-v0.1.0](#from-lite-v010), and one already on 0.15 needs only the sections from its release on: [0.15.x to 0.16.0](#015x-to-0160), [0.16.x to 0.17.0](#016x-to-0170) and [0.17.x to 0.18.0](#017x-to-0180). An A/B app that takes the component whole needs nothing in any of them, unless it defined `UDSOTA_IMG_DESC_MAGIC` itself ([0.17](#016x-to-0170)).
 
 The app now owns the server. It builds iso14229 from this component, starts the server, the ISO-TP transport and their task itself, and hands every event to `udsota_event` first. Each piece of 0.14's `udsota_esp32_start` and its hooks becomes a field of `udsota_cfg_t`, an iso14229 event the app serves, or state the app keeps; the sections below map every one. [`examples/esp32/main/main.c`](examples/esp32/main/main.c) is the whole integration in one file, and [`examples/candash_ws43`](examples/candash_ws43/README.md) a product's.
 
@@ -151,7 +151,7 @@ To serve delta downloads (DFI 30), define `UDSOTA_DELTA=1` build-wide and set `c
 
 ## 0.16.x to 0.17.0
 
-Nothing is needed for an A/B app that takes the component whole, and the wire and the client's commands are unchanged for it. `udsota.h` now includes `udsota_wire.h` and `udsota_image.h`, which hold the "Wire contract" block and `udsota_image_desc_t` it had before, under the same names and values, so an app that copies files takes all three. An app that defined `UDSOTA_IMG_DESC_MAGIC` itself, as 0.15's guide said, drops its definition: `udsota_wire.h` has it now, and one spelled differently from the header's gets a redefinition diagnostic. After a delta download `flash` prints the delta's size and time and the image's size, where it printed an estimate of a full download's time.
+An app that defined `UDSOTA_IMG_DESC_MAGIC` itself, as 0.15's guide said, drops its definition: `udsota_wire.h` has it now, and one spelled differently from the header's gets a redefinition diagnostic, an error under `-Werror`. Nothing else is needed for an A/B app that takes the component whole, and the wire and the client's commands are unchanged for it. `udsota.h` now includes `udsota_wire.h` and `udsota_image.h`, which hold the "Wire contract" block and `udsota_image_desc_t` it had before, under the same names and values, so an app that copies files takes all three. After a delta download `flash` prints the delta's size and time and the image's size, where it printed an estimate of a full download's time.
 
 The bootloader core, `udsota_app.h` and the client's `[image] format = "bare"` and `[update] flow = "bootloader"` are new here and change nothing for a profile that sets neither.
 
