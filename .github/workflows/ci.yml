@@ -1,9 +1,9 @@
 # udsota's CI: everything the root CMakeLists.txt builds and tests, on gcc and clang, plus what a build file cannot
 # say. The client's tests run alone and against both servers (over a pipe, and on vcan0 for udsota_lite_server). The
-# boot core is cross-compiled for Cortex-M3 under a size gate. The CANDash example is built four ways with a throwaway
-# signing key, and with release-assets.yml the assets a release of this commit would carry. Every image build fails
-# on a compiler warning, and every image must pass udsota's image rules (tools/image_check.c) and fail them with its
-# descriptor broken.
+# boot core is cross-compiled for Cortex-M3 under a size gate, and its STM32F1 port with it. The CANDash example is
+# built four ways with a throwaway signing key, and with release-assets.yml the assets a release of this commit would
+# carry. Every image build fails on a compiler warning, and every image must pass udsota's image rules
+# (tools/image_check.c) and fail them with its descriptor broken.
 name: ci
 on: [push, pull_request]
 permissions:
@@ -21,6 +21,8 @@ jobs:
         run: cd iso14229 && sha256sum -c SHA256SUMS
       - name: The vendored detools files match detools/SHA256SUMS
         run: cd detools && sha256sum -c SHA256SUMS
+      - name: The vendored CMSIS headers match test/boot/stm32f1/cmsis/SHA256SUMS
+        run: cd test/boot/stm32f1/cmsis && sha256sum -c SHA256SUMS
       - name: The host tests, test_udsota_delta, the fuzzer's delta seeds and the bootloader core's tests among them
         run: |
           # udsota_lite_server is built without delta downloads here, so its sources compile that way under -Werror too.
@@ -91,18 +93,18 @@ jobs:
         run: python -m pytest -q -rsx client/tests/test_e2e_lite_vcan.py
         env:
           UDSOTA_VCAN: vcan0
-  # The boot core's size, which the unit tests do not see.
+  # The boot core's size, and the STM32F1 port on its target, which the unit tests do not see.
   boot-arm:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install the distribution's arm-none-eabi-gcc and newlib
         run: sudo apt-get update && sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi
-      - name: The bootloader core compiles for Cortex-M3 with every warning an error, and its text stays under the gate
+      - name: The bootloader core and the STM32F1 port compile for Cortex-M3 with every warning an error, and the core's text stays under the gate
         run: |
           arm-none-eabi-gcc --version | head -n 1
           cmake -S . -B build
-          cmake --build build --target udsota_boot_arm_size
+          cmake --build build --target udsota_boot_arm_size udsota_boot_port_stm32f1_arm
   # The ESP-IDF builds, which CMake's host build cannot run.
   esp32:
     runs-on: ubuntu-latest
