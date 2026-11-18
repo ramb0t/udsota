@@ -4,6 +4,8 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ## [Unreleased]
 
+## [0.18.1] - 2026-11-18
+
 ### Fixed
 
 - Client: a pre-roll that cannot be sent while the unit restarts after ActivateImage, `config set --reset` or the bootloader flow's activation no longer ends `flash` with a raw python-can error and the new image unconfirmed (python-can raises `CanOperationError` when nothing on the bus acknowledges and the adapter's queue fills): the wait goes on polling to its deadline. The pre-flight's pre-roll still fails as before.
