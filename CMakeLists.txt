@@ -236,7 +236,9 @@ if(UDSOTA_ARM_GCC AND UDSOTA_ARM_SIZE)
         VERBATIM)
     # The STM32F1 port's three sources compiled, not linked, for Cortex-M3 with every warning an error, against the
     # vendored CMSIS headers and the host tests' device and slot (CI's boot-arm job builds this target too), so that a
-    # change to the core that breaks the port fails there. No size gate: the port's size is the product's.
+    # change to the core's header that breaks the port's build, such as a changed prototype, fails there. Nothing is
+    # linked, so a port function the core newly needs shows only when a product links. No size gate: the port's size is
+    # the product's.
     set(udsota_f1_arm_defs ${UDSOTA_F1_DEFS})
     list(TRANSFORM udsota_f1_arm_defs PREPEND -D)
     list(APPEND udsota_f1_arm_defs ${udsota_arm_defs})

@@ -33,6 +33,8 @@ jobs:
           ctest --test-dir build --output-on-failure
           # CMake leaves test_headers_cxx out when it finds no C++ compiler; here it must be there.
           ctest --test-dir build -N -R '^test_headers_cxx$' | grep -q 'Total Tests: 1'
+          # The STM32F1 port's three host tests are registered on every host.
+          ctest --test-dir build -N -R '^test_(port_f1|port_f1_flash|f1_bxcan)$' | grep -q 'Total Tests: 3'
         env:
           CC: ${{ matrix.cc }}
           CXX: ${{ matrix.cc == 'clang' && 'clang++' || 'g++' }}

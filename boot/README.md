@@ -8,7 +8,7 @@ It is experimental: outside udsota's 1.0 promise until a product has run on it i
 
 A product writes three things against `udsota_boot.h`, whose comments are the contract: a `const udsota_boot_cfg_t` with the unit's identity, slot and policy; the port, the `udsota_boot_port_*` functions the core calls, linked in at build time; and a main loop that calls `udsota_boot_init` once, then passes each received frame to `udsota_boot_rx` and calls `udsota_boot_poll`, as the header's example `main()` does. The board starts the port's clock before init; on a Cortex-M3 or M4 that is the DWT cycle counter (TRCENA, then CYCCNTENA), counted into microseconds with the remainder carried.
 
-For STM32F1 parts with bxCAN, [`ports/stm32f1/`](ports/stm32f1/README.md) is a reference port from the first product's bootloader, on CMSIS registers with no HAL: every `udsota_boot_port_*` function but the three CAN ones, which the board writes on the port's polled bxCAN driver, since only the board knows its controllers, bit rates and filter banks. Its README says what a product adds around it. Its host tests run with the others, and CI compiles it for Cortex-M3 against the core.
+For STM32F1 parts with bxCAN, [`ports/stm32f1/`](ports/stm32f1/README.md) is a reference port from the first product's bootloader, on CMSIS registers with no HAL: every `udsota_boot_port_*` function but the three CAN ones, which the board writes on the port's polled bxCAN driver, since only the board knows its controllers, bit rates and filter banks. Its README says what a product adds around it. Its host tests run with the others, and CI compiles it for Cortex-M3 against the core's header, without linking.
 
 The board also resets every CAN controller it owns before `udsota_boot_init`. A controller that the chip's reset does not reach keeps running through a software reset, so after a handover it would still be in the app's mode with the app's filters, acknowledging frames; check which of yours survive a reset.
 
@@ -61,11 +61,11 @@ The app then keeps the duties `udsota_app.h` lists, with its helpers for the two
 ## Tests and the host process
 
 ```sh
-cmake -S . -B build && cmake --build build -j && ctest --test-dir build -R 'udsota_(boot|app)|headers'
+cmake -S . -B build && cmake --build build -j && ctest --test-dir build -R 'udsota_(boot|app)|headers|port_f1|f1_bxcan'
 python -m pytest client/tests/test_e2e_boot.py     # runs build/udsota_boot_server, or $UDSOTA_BOOT_SERVER
 ```
 
-`test/test_udsota_boot.c` drives the core frame by frame through the fake port in `test/boot/`; `test_udsota_boot_pure.c` covers the CRC, the image rules, the boot rules and an image the client stamped; `test_udsota_app.c` covers the app's side. `udsota_boot_server` (`test/e2e/boot_server.c`) runs the core and a stand-in app as a Linux process, with CAN frames as text lines on stdin and stdout, which is the pipe `test_e2e_boot.py` drives the client over. It takes a unit's identity and geometry as arguments, so another product's profile and stamped image run against it unchanged:
+`test/test_udsota_boot.c` drives the core frame by frame through the fake port in `test/boot/`; `test_udsota_boot_pure.c` covers the CRC, the image rules, the boot rules and an image the client stamped; `test_udsota_app.c` covers the app's side. `test/boot/stm32f1/` holds the STM32F1 port's three tests, which run it over a stand-in `stm32f1xx.h` with the peripherals in RAM. `udsota_boot_server` (`test/e2e/boot_server.c`) runs the core and a stand-in app as a Linux process, with CAN frames as text lines on stdin and stdout, which is the pipe `test_e2e_boot.py` drives the client over. It takes a unit's identity and geometry as arguments, so another product's profile and stamped image run against it unchanged:
 
 ```sh
 build/udsota_boot_server --req-id 0x7A0 --resp-id 0x7A8 --product widget --hw-id 7 --layout-id 3 \
