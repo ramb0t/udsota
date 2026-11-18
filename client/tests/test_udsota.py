@@ -748,6 +748,34 @@ def test_keygen_writes_a_matching_pair(tmp_path):
         keys.keygen(tmp_path / "keys")                      # the header alone blocks a new pair too
 
 
+# Check a failed write of the private key leaves no file behind, so the next keygen into the directory works, and a
+# file that appeared between the check and the open (O_EXCL fails) is left as it was.
+def test_keygen_removes_only_the_private_key_it_created(tmp_path, monkeypatch):
+    def full(fd, mode):
+        os.close(fd)
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    with monkeypatch.context() as m:
+        m.setattr(keys.os, "fdopen", full)
+        with pytest.raises(errors.Refused, match="No space left on device"):
+            keys.keygen(tmp_path / "keys")
+    assert not (tmp_path / "keys" / "udsota_private.pem").exists()
+    private, _ = keys.keygen(tmp_path / "keys")             # not refused: nothing was left behind
+    assert private.exists()
+    private.unlink()
+    (tmp_path / "keys" / "udsota_pubkey.h").unlink()
+    real_open = os.open
+
+    def raced(path, flags, mode=0o777):
+        pathlib.Path(path).write_text("someone else's")
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(keys.os, "open", raced)
+    with pytest.raises(errors.Refused):
+        keys.keygen(tmp_path / "keys")
+    assert private.read_text() == "someone else's"
+
+
 # ---- TX-ID hard limit ----
 
 # Check every ID but standard 0x710 is refused, and the hard-limit IDs say so.
