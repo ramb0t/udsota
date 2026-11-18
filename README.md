@@ -2,7 +2,24 @@
 
 [![ci](https://github.com/ramb0t/udsota/actions/workflows/ci.yml/badge.svg)](https://github.com/ramb0t/udsota/actions/workflows/ci.yml)
 
-**Safe A/B firmware updates over CAN for an ESP32 that runs [iso14229](https://github.com/driftregion/iso14229)'s UDS server: `udsota.c` and its headers `udsota.h` and `udsota_wire.h`, a call in the event callback you already have, and one after each `UDSServerPoll`.** Any UDS tester can then update the device. Each image is checked before anything is erased, verified before it boots, and rolled back if it is never confirmed. Up to 0.14 udsota was a UDS server of its own; [MIGRATING.md](MIGRATING.md) takes an app on that API to this one.
+udsota updates firmware over UDS on CAN: any UDS tester can send an image, and the device checks it before it erases anything, verifies it before it boots and, on an A/B unit, rolls it back if it is never confirmed. It is three parts on one [wire contract](docs/wire.md), so a product takes the part its hardware needs and updates every unit with the same client.
+
+| Part | What it is | Status |
+|---|---|---|
+| The ESP-IDF component: `udsota.c` with `udsota.h`, `udsota_wire.h` and `udsota_image.h`, on the vendored [iso14229](https://github.com/driftregion/iso14229) | Safe A/B updates, served inside the app's own UDS server | Released |
+| [`boot/`](boot/README.md), with `udsota_app.h` | A resident bootloader core for a microcontroller with one app slot, which a product completes with a port of a few flash, CAN and reset functions | Experimental, outside the 1.0 promise until a product has run on it |
+| [`client/`](client/README.md) | `udsota`, the command for Linux with SocketCAN | Released; it also updates units still on a 0.14.x server |
+
+## Start
+
+**Without hardware**, build and run the tests; the second line runs the client against udsota as a Linux process:
+
+```sh
+cmake -S . -B build && cmake --build build -j && ctest --test-dir build   # the host tests and the fuzzer; also builds both servers
+pip install "./client[diff]" pytest && python -m pytest client/tests      # the client's tests, and the end-to-end tests
+```
+
+**An ESP32 app.** `examples/esp32` is the smallest complete app ([its page](examples/esp32/README.md)); `examples/candash_ws43` is a product's ([its page](examples/candash_ws43/README.md)). Your own app makes two calls into the iso14229 server it already owns:
 
 ```c
 #include "udsota.h"
@@ -26,114 +43,42 @@ static UDSErr_t on_event(UDSServer_t *srv, UDSEvent_t ev, void *arg)   // iso142
 }
 ```
 
-The app keeps iso14229, the CAN bus and every service an update doesn't need. udsota answers only `10 01/02/03`, `11 01`, `27` at levels 01/02 and 03/04 (when keys are set), DIDs F186, F189, F18C, F1F0, F1F1 and F1F3, routines FF01 and F000–F002, a `34` to address 0, and the `36`s and `37` of its own transfer. Every other service, DID, routine, session, security level and transfer (a `34` elsewhere, `35`, `38`) passes back to the app. An accepted `10 01/02/03` relocks every level and ends any transfer, the app's included, because iso14229 on its own keeps both across a `10`. A `10` to one of the app's own sessions is the app's, and so is any relock it needs.
+Link or copy this directory into your project's `components/` as `udsota` and add `udsota` to `main`'s requirements. Call `udsota_poll(srv)` after every `UDSServerPoll`, on the server's task: it is mandatory, because without it iso14229's timers wrap after 24.86 days. Set `s_srv.p2_ms = 5` right after `UDSServerInit`, as both examples do: at iso14229's 50 ms default, its gap between answers can push a multi-frame answer past the client's P2. Place `UDSOTA_IMAGE_DESC` once, since it is this image's identity and every image you send must carry a matching one. Set `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y` and give the partition table two OTA slots. Pick the 0x27 keys: with `key_pubkey` the tester signs each seed and the device holds only the public key (`udsota keygen` makes the pair), with `key_label` and `key_master` each device's key derives from a master that every image carries, and with neither 0x27 is the app's and any node on the bus can update the unit. Turn on ESP-IDF's app signing too, so the verify step refuses an image you did not sign. [MIGRATING.md](MIGRATING.md) takes an app on udsota 0.14's own server to this API.
 
-`udsota.h` documents the app's hooks. The ones an app most often needs: `udsota_busy()` says an update is running; the optional `gate` callback refuses the steps `udsota_op_t` lists, for example while the vehicle moves; and `udsota_end_session(srv)`, called on the server's task between polls and never from the event callback, ends a session with udsota's own abort and relock, for example when another tester appears.
+A version is `PROJECT_VER`. A clean `X.Y.Z` is a release, which a device takes only when it is newer than the one it runs; anything with a suffix is a dev build, taken when its `X.Y.Z` is at least the running one's. `cfg.allow_downgrade` lifts this rule alone, for a dev unit; leave it off in a release build.
 
-## How it fits together
+udsota answers only an update's requests (`10 01/02/03`, `11 01`, `27`, DIDs F186, F189, F18C, F1F0, F1F1 and F1F3, routines FF01 and F000–F002, a `34` to address 0 and its `36`s and `37`) and passes every other service back to the app. An accepted `10 01/02/03` relocks every level and ends any transfer, the app's included, because iso14229 on its own keeps both across a `10`. A `10` to one of the app's own sessions is the app's, and so is any relock it needs. `udsota.h` documents the hooks an app most often needs: `udsota_busy()`, the `gate` callback that refuses an update's steps, for example while the vehicle moves, and `udsota_end_session()`.
 
-```mermaid
-flowchart TB
-    tester(["udsota client, or any UDS tester"])
-    subgraph project["One ESP-IDF project"]
-        subgraph app["Your app"]
-            io["TWAI driver and server task"]
-            callback["Event callback"]
-            own["Your own services"]
-        end
-        subgraph iso["iso14229/: vendored, unmodified"]
-            isotp["isotp-c: ISO-TP"]
-            server["UDSServer_t: framing,<br/>sessions, timing, 0x78"]
-        end
-        subgraph udsota["udsota.c"]
-            updater["Updater: 34 36 37,<br/>routines, DIDs, image rules"]
-            worker["Flash worker: esp_ota_*,<br/>A/B slots, 0x27 keys"]
-        end
-        idf["ESP-IDF: esp_ota_*, bootloader rollback, PSA crypto"]
-    end
-    tester <-->|CAN| io
-    io <-->|frames| isotp
-    isotp <--> server
-    io -->|"every 1 ms: UDSServerPoll()"| server
-    io -->|"after each poll: udsota_poll()"| updater
-    updater -.->|"expired timers to now − 1"| server
-    server -->|"fn(event)"| callback
-    callback -->|"first: udsota_event()"| updater
-    callback -->|"then: what it passes back"| own
-    updater --> worker --> idf
-```
+An update runs `10 02`, `27 03/04`, `34`, `36`…, `37`, `31 01 FF01` (verify) and `31 01 F001` (activate; the device restarts), then `10 03` and `31 01 F002` (confirm); `udsota flash` does all of it. The first block is held until its product, board, partition layout, CAN IDs, version and chip match this device, and only then does the slot start to fill. Blocks carry the image as it is (DFI 00) or as raw DEFLATE (DFI 10), and a build that defines `UDSOTA_DELTA=1` with `cfg.allow_delta` set also takes a patch from the running image (DFI 30). [docs/wire.md](docs/wire.md) has every byte, and the sequence for a flasher other than the client; [docs/iso14229.md](docs/iso14229.md) shows how udsota sits in the server.
 
-An update runs `10 02`, `27 03/04`, `34`, `36`…, `37`, `31 01 FF01` (verify) and `31 01 F001` (activate; the device restarts), then `10 03` and `31 01 F002` (confirm). `udsota flash` in [`client/`](client/README.md) does all of it. The first block is held until its product, board, partition layout, CAN IDs, version and chip match this device, and only then does the slot start to fill. Blocks carry the image as it is (DFI 00) or as raw DEFLATE (DFI 10), which the ESP32's ROM inflates. A build that defines `UDSOTA_DELTA=1` and sets `cfg.allow_delta` also takes a delta (DFI 30): a patch from the running image, from which the device rebuilds the new one, so a small change costs kilobytes on the bus; the rebuilt image gets the same checks as any other. Flash work runs on a worker task while iso14229 answers 0x78, and each block erases only the sectors it writes, so the erase is spread over the download. With `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`, an image that is never confirmed rolls back at the next reset. The [wire reference](docs/wire.md) has every byte, and the sequence for a flasher other than the client.
+**A single-slot microcontroller.** Its resident bootloader is its UDS server, which [`boot/README.md`](boot/README.md) shows how to build; the client drives it with `[update] flow = "bootloader"`.
 
-A microcontroller with one app slot is updated differently: its resident bootloader is its UDS server, and the client drives it with `[update] flow = "bootloader"`. [`boot/`](boot/README.md) is such a bootloader's core, on unmodified iso14229, which a product completes with its configuration and a port of a few flash, CAN and reset functions. It is experimental, outside the 1.0 promise until a product has run on it.
-
-## Adding it to a project
-
-[`examples/esp32`](examples/esp32/README.md) is the smallest complete app, and [`examples/candash_ws43`](examples/candash_ws43/README.md) a product's. Copy or link this directory into your project's `components/` as `udsota`, and add `udsota` to `main`'s requirements. The component builds iso14229 from `iso14229/` with `-fwrapv` (see Known limits), so an app with its own copy drops it. Then:
-
-- Call `udsota_poll(srv)` after every `UDSServerPoll`, on the server's task. It keeps iso14229's timers from wrapping after 24.86 days of uptime.
-- Place `UDSOTA_IMAGE_DESC` once in the app. It is this image's identity, and every image you send must carry a matching one.
-- Set `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y`, and give the partition table two OTA slots.
-- Pick 0x27 keys. With `key_pubkey`, the tester signs each seed and the device holds only the public key (`udsota keygen` makes the pair). With `key_label` and `key_master`, each device's key is derived from a master that every image carries. With neither, 0x27 is the app's and downloads need no key, so any node on the bus can update the unit. Turn on ESP-IDF's app signing too, so the verify step refuses an image you did not sign.
-
-A version is `PROJECT_VER`. A clean `X.Y.Z` is a release, which a device takes only when it is newer than the one it runs. Anything with a suffix is a dev build, taken when its `X.Y.Z` is at least the running one's. `cfg.allow_downgrade` lifts this rule alone, for a dev unit; leave it off in a release build.
+**The client.** `pip install ./client`, then `udsota --profile my.toml info` and `udsota --profile my.toml flash --compress app.bin`. The [client page](client/README.md) has the commands and the profile.
 
 ## Known limits
 
-Three things udsota 0.14's own server had are gone: the boot-loop breaker, the ISO-TP counters (F1F2) and functional addressing. Delta downloads are back as DFI 30 only, off by default, and DFI 20 (heatshrink) gets 0x31, so the client sends DFI 30 or the full image instead. Delta in this form has run on a ws43b, with CANDash and the example ([bench results](examples/candash_ws43/README.md#bench-results-2026-10-26)). Its own limits:
+No download resumes: one that is cut off starts again from its `34`, and a lost positive answer to a `36` or `37` fails the run, so run `flash` again. A delta download needs the base to be the very `.bin` that was flashed, so keep the signed `.bin` exactly as flashed ([why](docs/wire.md#delta-downloads)). Delta has run on a ws43b with CANDash and the example ([bench results](examples/candash_ws43/BENCH.md#bench-results-2026-10-26)); no run has used flash encryption, which CANDash can't build with, and with it each base read goes through a temporary map of the running slot, correct by ESP-IDF's source but slower. The bootloader core is experimental.
 
-- A delta can't resume: like every download here, one that is cut off starts again from its `34`.
-- The base must be the very `.bin` that was flashed, since the patch names it by the SHA-256 ESP-IDF appends to the image. A rebuild of the same source that is not byte-identical names another base: the device refuses it at the `36` that carries the patch's header, with 0x31 and DL_BAD_BASE, before anything is erased, and the client sends the full image. A copy signed again after the build is worse, because the signature sector comes after the appended SHA-256 and signing leaves that hash as it was: the base passes, the patch rebuilds the new image with the wrong signature sector, FF01 refuses it with reason 8 and the run fails. Keep the signed `.bin` exactly as flashed.
-- No run has used flash encryption, which CANDash can't build with. With it, each base read goes through a temporary map of the running slot, correct by ESP-IDF's source but slower.
-
-The rest come from using iso14229 as it is, and each is a candidate for an upstream fix:
-
-- S3 restarts only on `10` and `3E`, not on every request, so a tester keeps a session with `3E`; the client sends one before any request or 0x21 retry that comes 2 s or more after the last `10` or `3E`. During udsota's own flash job the tester waits on 0x78s and can't send one, so udsota holds the session itself, for up to 90 s.
-- While any job answers 0x78, udsota's or the app's, iso14229 reads no other request. Only the last request sent meanwhile is answered, after the job ends, where 0.14's server answered each with 0x21. An app's own 0x78 job gets no S3 hold, so the app restarts `srv->s3_session_timeout_timer` on each pass of its job, as udsota does for its own.
-- `27` gets no 0x78, because iso14229 counts a pending answer as a failed key. A P-256 signature takes about 0.45 s to check on an ESP32-S3, past P2, so the client waits up to 2 s for that answer.
-- A lost positive answer to a `36` or `37` fails the run, and the next run starts from the first byte. The resent `36` gets 0x24, which ends the transfer, and the resent `37` gets 0x70, which the client doesn't take as the first one's success.
-- The answer to `10` carries iso14229's client defaults, P2 150 ms and P2* 1500 ms. udsota raises that P2* to the server's own (5000 ms), because the server's 0x78s come every 1.5 s and would race 1500 ms.
-- iso14229 holds each answer until at least `srv->p2_ms` after the previous one (`p2_timer`, iso14229.c:2829-2851): it uses P2, which ISO 14229-2 defines as the *maximum* time a server may take to start answering, as a *minimum* gap between answers, and the standard asks for no such gap on ordinary (non-0x78) answers. At iso14229's 50 ms default (`UDS_SERVER_DEFAULT_P2_MS`) a multi-frame answer behind a CAN frame-rate cap can pass the client's 150 ms P2: a 6-frame `22 F1F3` under a 50 frames/s cap ended at about 155 ms on the ws43b. **The examples and the e2e server set `s_srv.p2_ms = 5` right after `UDSServerInit`** — server state the app is free to set — which brings that case to about 110 ms while leaving a token rate limit, and an integrator should do the same. udsota's ActivateImage reset delay is `p2_ms + 60 ms` and stays correct at the lower value, because the answer and the reset both derive from `p2_ms`. Dropping the gate on ordinary answers is the upstream candidate.
-- ISO-TP frames are not padded, and N_Bs and N_Cr are 100 ms. Compile definitions `ISO_TP_FRAME_PADDING` and `ISO_TP_DEFAULT_RESPONSE_TIMEOUT_US=1000000` change both without touching iso14229's code. In an ESP-IDF project they go in the `COMPILE_DEFINITIONS` build property; `idf.py -D` sets CMake variables, not these.
-- isotp-c's timer check subtracts as `int32_t`, which overflows each time its 32-bit µs clock passes 2³¹, every 71.6 minutes. At -O1 and above, GCC and Clang fold it to a compare that ends a transfer in flight with a false N_Bs or N_Cr timeout. The component compiles `iso14229.c` with `-fwrapv`, a build flag rather than a change to iso14229, and `test_isotp_wrap` fails without it. An app that builds its own copy of iso14229 needs the flag too.
-
-**Uptime past 24.86 days.** iso14229 compares its millisecond deadlines as signed 32-bit differences, which read an expired deadline as pending again once it is 2³¹ ms (24.86 days) old. `udsota_poll` keeps them younger than that. An app that doesn't call it after every `UDSServerPoll` meets both failures. A request that comes more than 24.86 days after the server's last answer, or after `UDSServerInit` if it has answered nothing, gets its answer only 49.71 days after that, and nothing else is read meanwhile. From 24.86 to 49.71 days after `UDSServerInit`, or after a failed key, every `27` gets 0x37, or 0x36.
-
-## What udsota sets in iso14229
-
-udsota never changes iso14229's code. Where iso14229 has no call for what an update needs, udsota sets the server's state itself, here and nowhere else:
-
-- `securityLevel` and `xferIsActive`, cleared on every accepted `10 01/02/03` and S3 timeout, and `sessionType` too when udsota ends a session: its own, or the app's through `udsota_end_session`.
-- `xferTotalBytes`: a raw-DEFLATE or delta download's byte limit, raised to the stream's bound, because iso14229 counts the bytes against memorySize, the image's size.
-- `ecuResetScheduled` and `ecuResetTimer`: the restart after ActivateImage, at least 60 ms after its answer. Unlike iso14229's own `11 01`, it keeps reading requests until then.
-- `s3_session_timeout_timer`, during udsota's own flash job.
-- `p2_timer`, `sec_access_boot_delay_timer` and `sec_access_auth_fail_timer`, in `udsota_poll`: each that has expired moves to now − 1 on every pass, which still reads as expired, so none gets old enough to wrap.
-- In event arguments, as iso14229 provides: the `10`'s `p2_star_ms`, raised to the server's P2*, and `maxNumberOfBlockLength` in udsota's own `34`s.
+The rest come from using iso14229 as it is, each a candidate for an upstream fix, and [docs/iso14229.md](docs/iso14229.md) has them in full. Build `iso14229.c` with `-fwrapv`, which the component does and an app with its own copy of iso14229 must too, or a transfer fails every 71.6 minutes of uptime. A tester keeps a session with `3E`, which the client does. While any job answers 0x78, iso14229 reads no other request, and only the last one sent meanwhile is answered.
 
 ## Where everything is
 
 | Path | What it is |
 |---|---|
-| `udsota.c`, `udsota.h`, `udsota_wire.h`, `udsota_image.h` | The updater, iso14229's events and the ESP-IDF platform. `udsota.h` ends with the platform functions a port to another MCU would supply; `udsota_wire.h`, which it includes, is the wire contract with no `#include` of its own, for a bootloader or tester to take alone, and `udsota_image.h` the image descriptor and the bare header as C types |
+| `udsota.c`, `udsota.h`, `udsota_wire.h`, `udsota_image.h` | The updater and its ESP-IDF platform. `udsota.h`, which includes the other two, ends with the platform functions a port to another MCU would supply; `udsota_wire.h` is the wire contract with no `#include`, for a bootloader or tester to take alone, and `udsota_image.h` the image descriptor and the bare header as C types |
 | `udsota_app.h` | The app's side of a [`boot/`](boot/README.md) bootloader, header-only: the handover, the F1F4 answer and the healthy mark |
-| `iso14229/` | iso14229, vendored unmodified, with its MIT licence and `SHA256SUMS`, which CI checks; its commit is in [THIRD_PARTY.md](THIRD_PARTY.md) |
-| `detools/` | detools' C library, vendored unmodified, with its BSD-2-Clause licence and `SHA256SUMS`, which CI checks, compiled only in a build that defines `UDSOTA_DELTA=1`; its tag is in [THIRD_PARTY.md](THIRD_PARTY.md) |
-| [`boot/`](boot/README.md) | The bootloader core for single-slot units (`udsota_boot.c`, `udsota_boot.h`) and its porting guide; experimental |
-| `CMakeLists.txt` | The ESP-IDF component, or on a host the tests |
-| [`examples/esp32`](examples/esp32/README.md) | The smallest app, for any ESP32 with TWAI, with the client's `example` profile's identity; its image is the one a release carries |
+| [`boot/`](boot/README.md) | The bootloader core and its porting guide |
+| `iso14229/`, `detools/` | The vendored libraries, unmodified, each with its licence and a `SHA256SUMS` that CI checks; their versions are in [THIRD_PARTY.md](THIRD_PARTY.md). detools compiles only in a build that defines `UDSOTA_DELTA=1` |
+| `CMakeLists.txt` | The ESP-IDF component, or on a host the tests, whose comments say what each target covers |
+| [`examples/esp32`](examples/esp32/README.md) | The smallest app, for any ESP32 with TWAI; its image is the one a release carries |
 | [`examples/candash_ws43`](examples/candash_ws43/README.md) | An app on the CANDash ws43 or ws43b (ESP32-S3) with CANDash's identity, so updates go both ways |
-| `test/test_udsota.c` | The host test: updates through iso14229's mock transport into a RAM slot, plain and raw DEFLATE, under ASan and UBSan; built again as `test_udsota_delta`, it also runs delta downloads from a running image on the fixtures `tools/make_delta_fixtures.py` writes |
-| `test/fuzz_udsota.c` | The fuzzer: CAN frames through iso14229's isotp-c into udsota built with delta downloads (`fuzz_udsota_nodelta` without), its seeds, their mutants, random programs and mutants of a delta's patch, the same in every ctest run, under ASan and UBSan; with `-DUDSOTA_FUZZ_LIBFUZZER=ON` (clang) also a libFuzzer target |
-| `test/test_udsota_boot.c`, `test/test_udsota_boot_pure.c`, `test/test_udsota_app.c`, `test/boot/` | The bootloader core's tests: frame by frame through a fake port, its pure functions, and the app's side, under ASan and UBSan |
-| `test/e2e/` | `udsota_lite_server`: udsota and iso14229 as a Linux process with RAM A/B slots, for the client's end-to-end tests over a frame pipe or on a vcan; `-DUDSOTA_DELTA=ON` builds it with delta downloads. `udsota_boot_server`: the bootloader core and a stand-in app as a Linux process, over a frame pipe |
-| `tools/` | `release.py` ([RELEASING.md](RELEASING.md)); `image_check.c`, udsota's image rules run on a built image, which CI runs on every example image; and `make_delta_fixtures.py` and `make_boot_fixtures.py`, which write the delta tests' and the bootloader core's fixtures |
-| [`client/`](client/README.md) | The `udsota` command-line tool, for Linux with SocketCAN; it also updates units still on a 0.14.x server |
-| [`docs/wire.md`](docs/wire.md) | The wire reference: services, DIDs, routines, NRCs, reasons, timing, the descriptor, the 0x27 keys and flashing without the client |
-| [`MIGRATING.md`](MIGRATING.md) | From udsota 0.14's API, or from lite-v0.1.0, to this one |
+| `test/` | The host tests, among them `test_isotp_wrap.c`, isotp-c's timers across its 2³¹ µs point, built at -O2, which fails without the component's `-fwrapv` on `iso14229.c`; the fuzzer, the bootloader core's tests, and the two servers the client's end-to-end tests drive: `udsota_lite_server` (udsota and iso14229 as a Linux process) and `udsota_boot_server` (the bootloader core and a stand-in app) |
+| `tools/` | `release.py` ([RELEASING.md](RELEASING.md)), `image_check.c` (udsota's image rules run on a built image, which CI runs on every example image), the fixture writers and the Cortex-M3 size gate |
+| [`client/`](client/README.md) | The `udsota` command and its tests |
+| [`docs/`](docs/wire.md) | `wire.md`, the wire contract: services, DIDs, routines, NRCs, reasons, timing, the descriptor, the 0x27 keys and flashing without the client; `iso14229.md`, udsota inside the server |
 
-```sh
-cmake -S . -B build && cmake --build build -j && ctest --test-dir build   # the host tests and the fuzzer; also builds both servers
-pip install "./client[diff]" pytest && python -m pytest client/tests      # the client's tests, and the end-to-end tests
-```
+## Build and test
 
-What changed in each release is in the [changelog](CHANGELOG.md). MIT licence. Third-party code is listed in [THIRD_PARTY.md](THIRD_PARTY.md).
+The commands under Start build and test everything on a host. `udsota_lite_server` is built with delta downloads, which `-DUDSOTA_DELTA=OFF` leaves out, and the client's end-to-end tests skip a case whose server, vcan or kernel ISO-TP module is missing (`pytest -rs` says which). [`.github/workflows/ci.yml`](.github/workflows/ci.yml) is the full list: it adds clang, the end-to-end tests on a vcan, the ESP-IDF builds of both examples with every warning an error, and the Cortex-M3 size gate on the bootloader core (`cmake --build build --target udsota_boot_arm_size`, with arm-none-eabi-gcc installed).
+
+What changed in each release is in the [changelog](CHANGELOG.md), and [MIGRATING.md](MIGRATING.md) says what a product must do to move between them. MIT licence.

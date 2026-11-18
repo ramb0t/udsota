@@ -20,6 +20,7 @@ import sys
 
 import can
 
+from . import delta
 from .profile import load as load_profile
 from .errors import Refused, ToolError
 from .config import config_set, config_show, group_writes, parse_writes, writable_keys
@@ -160,7 +161,7 @@ def read_file(path):
 # Refuses when detools, which builds the patches, is not installed.
 def load_bases(path):
     try:
-        import detools   # noqa: F401  (only checked here; delta.make_patch imports it)
+        delta.import_detools()   # only checked here; delta.make_patch imports it
     except ImportError:
         raise Refused(DETOOLS_HINT) from None
     files = sorted(f for f in path.glob("*.bin") if f.is_file()) if path.is_dir() else [path]
