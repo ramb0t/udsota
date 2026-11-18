@@ -4,7 +4,7 @@
 
 [can]
 interface = "can0"                    # your SocketCAN interface; set it for your system, or pass --interface
-req_id = 0x710                        # the server's request ID: the only ID the tool transmits on
+req_id = 0x710                        # the server's request ID, which the tool transmits on (and [functional]'s)
 resp_id = 0x718                       # the server's response ID
 deny_tx = []                          # IDs the tool must never transmit on, e.g. other nodes' diagnostic IDs
 
@@ -26,7 +26,8 @@ names = { 1 = "devkit" }              # board name for each hw_id; flash refuses
 
 # [update] picks the update sequence. "app", the default, is udsota's: an A/B updater in the app, ending in
 # ConfirmImage. "bootloader" is for a single-slot unit whose resident bootloader is its only UDS server: flash's
-# 10 02 resets the app into it, and flash ends once the new app answers F1F4 (docs/wire.md); confirm is refused.
+# 10 02 resets the app into it, and flash ends once the new app answers F1F4 (docs/wire.md); confirm is refused, and
+# so is [security]: the boot core serves no 0x27.
 # [update]
 # flow = "bootloader"                 # "app" or "bootloader"
 # start_timeout_s = 60                # bootloader only: how long flash polls F1F4 after the 3 s reboot wait (1 to 600)
@@ -80,7 +81,7 @@ names = { 1 = "devkit" }              # board name for each hw_id; flash refuses
 # [config]
 # commit_rid = 0x1234                 # RoutineControl RID that commits the staged values; status 00 = stored
 # status_did = 0xF1B2                 # a DID reporting the device's config state, printed as hex
-# hash = { did = 0xF1B0, first = 0x0200, last = 0x02FF, schema = 1 }   # SHA-256 check, see the client README
+# hash = { did = 0xF1B0, first = 0x0200, last = 0x02FF, schema = 1 }   # SHA-256 check, as compute_hash in config.py
 # groups = [{ name = "device", first = 0x0200, last = 0x027F }, { name = "prefs", first = 0x0280, last = 0x02FF }]
 
 # [dtcs] gives `dtc show` a description for each DTC. A key is an SAE J2012 code, which names every failure-type

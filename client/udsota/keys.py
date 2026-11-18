@@ -130,15 +130,19 @@ def keygen(out_dir):
     for p in (private, header):
         if p.exists():
             raise Refused("%s exists; keygen never overwrites a key" % p)
+    created = False
     try:
         out.mkdir(mode=0o700, parents=True, exist_ok=True)
         key = ec.generate_private_key(ec.SECP256R1())
         pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
                                 serialization.NoEncryption())
         fd = os.open(private, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        created = True
         with os.fdopen(fd, "wb") as f:
             f.write(pem)
     except OSError as e:
+        if created:
+            private.unlink(missing_ok=True)   # only a file this call made: O_EXCL failing leaves another's alone
         raise Refused("cannot write the key pair in %s: %s" % (out, e.strerror))
     try:
         with open(header, "x") as f:

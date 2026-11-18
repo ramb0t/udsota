@@ -346,7 +346,8 @@ def from_dict(name, d):
     board_names = {}
     if board_t is not None:
         names = board_t.get("names", {})
-        if not isinstance(names, dict) or not all(k.isdigit() and isinstance(v, str) for k, v in names.items()):
+        if not isinstance(names, dict) or not all(k.isascii() and k.isdigit() and isinstance(v, str)
+                                                  for k, v in names.items()):
             _bad(name, "[board] names must map hw_id numbers to board names")
         board_names = {int(k): v for k, v in names.items()}
     busy = None
@@ -370,6 +371,8 @@ def from_dict(name, d):
         _bad(name, "[update] flow must be one of %s" % ", ".join(FLOWS))
     if flow == "app" and "start_timeout_s" in upd_t:
         _bad(name, "[update] start_timeout_s is for flow = \"bootloader\"")
+    if flow == "bootloader" and security is not None:
+        _bad(name, "[security] is for flow = \"app\": the boot core serves no SecurityAccess (0x27) to unlock")
     start_timeout_s = _int(name, upd_t, "start_timeout_s", 1, 600, default=START_TIMEOUT_DEFAULT)
     dids = tuple(_did_entry(name, key, entry) for key, entry in d.get("dids", {}).items())
     names = [e.name for e in dids if e.writable]

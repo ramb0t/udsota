@@ -6,7 +6,7 @@ import time
 
 from .delta import validation_hash
 from .errors import NoResponse, Nrc, Refused, SendFailed, UpdateFailed
-from .image import parse_image
+from .image import parse_image, update_buses
 from .keys import DeviceKeys, SigningKeys
 from .pack import build_patch, encode, rank_deltas, refuse_bare_delta
 from .wire import (DID_COUNTERS, DID_DEVICE_ID, DID_IMAGE_PREFIX, DID_PROJECT, DID_RESULT, DID_RUNNING_SHA, DID_SESSION,
@@ -51,6 +51,15 @@ PRODUCT_NEEDS_BOOTLOADER = '--allow-product-change is for [update] flow = "bootl
 # What a --wait-for-unit that gives up adds: 10 02s the CAN adapter could not send while the unit was off stay queued.
 WAIT_QUEUED = ("If the unit is off, 10 02s still queued in the CAN adapter will hold it in its bootloader for about "
                "5 s at its next power-up, once; taking the interface down and up clears them")
+
+
+# Refuses a compressed download under [update] flow = "bootloader", where the boot core takes only DFI 0x00 and would
+# answer the 34 with 0x31 once the app has been reset into it: compress, flash's argument, or the profile's [image]
+# compression when it is None, must be "none".
+def refuse_bootloader_compression(profile, compress):
+    if profile.flow == "bootloader" and (profile.compression if compress is None else compress) != "none":
+        raise Refused("profile %s: compressed downloads (--compress, --compress-auto, [image] compression) are for "
+                      "flow = \"app\": the boot core takes only DFI 0x00" % profile.name)
 
 
 # What F1F3 holds for profile's images: an ESP-IDF image's app_elf_sha256, or a bare image's image ID.
@@ -435,6 +444,7 @@ def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep
         raise Refused("--drop-76 is for full and compressed downloads, not with --diff-from")
     if bases is not None:
         refuse_bare_delta(profile)
+    refuse_bootloader_compression(profile, compress)
     deflate_ok = compress != "none"             # before the profile's default: see the comment above
     compress = profile.compression if compress is None else compress
     img = parse_image(profile, image)
@@ -509,7 +519,8 @@ def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep
 # session: an app already running this image and healthy needs nothing, so it is left running. Then 10 02: the app
 # answers 7F 10 78 and resets into the bootloader, which sends the 50 02; a late answer to an F1F4 read that went
 # unanswered, such as a bootloader's 7F 22 31 to one the adapter held, is passed over ahead of it (Uds.exchange).
-# Then, all in the programming session, the precheck reads, the unlock, download, FF01, ActivateImage and
+# Then, all in the programming session, the precheck reads (no unlock: a profile with [security] is refused under this
+# flow), download, FF01, ActivateImage and
 # wait_for_start, the proof of life; no ConfirmImage. An image the unit already holds gets 11 01 and the same proof.
 # quiet() is held from the 10 02, which stops the app. The precheck includes F1F5, the installed app's project: an
 # image of another project is refused, with the unit left in its bootloader, unless allow_product_change
@@ -552,7 +563,8 @@ def flash_bootloader(uds, profile, image, img, secret, drop_76=None, preroll=lam
             log("the unit already holds this image (%s)%s: resetting into it" % (
                 img.elf_sha[:8].hex(), "; the reset releases it for another try" if held else ""))
             uds.ecu_reset()
-            return wait_for_start(uds, profile, img.elf_sha, preroll, sleep=sleep, clock=clock, log=log)
+            return wait_for_start(uds, profile, img.elf_sha, preroll, sleep=sleep, clock=clock, log=log,
+                                  buses=update_buses(profile, image))
         board_of = profile.board_names.get(img.hw_id, "hw_id %d" % img.hw_id)
         if board is not None and board != profile.board_names.get(img.hw_id):
             raise Refused("image is for %s but the server is %s. %s" % (board_of, board, LEFT_IN_BOOTLOADER))
@@ -597,7 +609,7 @@ def flash_bootloader(uds, profile, image, img, secret, drop_76=None, preroll=lam
                 log("ActivateImage answered 0x24 (the image is not verified): downloading again")
                 recovered = need_download = True   # one re-download per run
         return wait_for_start(uds, profile, img.elf_sha, preroll, sleep=sleep, clock=clock, log=log,
-                              activated=activated)
+                              activated=activated, buses=update_buses(profile, image))
 
 
 # The bootloader flow's 10 02 under --wait-for-unit, for a unit whose app runs but cannot hand over. The first 10 02
@@ -637,12 +649,18 @@ def wait_for_power_up(uds, seconds, log=print, clock=time.monotonic):
     log("10 02 answered after %.1f s, at try %d%s" % (took, tries, passed))
 
 
+# What a silent F1F4 may also mean when the image does not take updates on every bus (its header's update_buses).
+CLOSED_BUS = (". Or it has, and this is a bus the image closes: its update_buses is 0x%04X, and on a bus that does not "
+              "name, the app runs but answers nothing")
+
+
 # The bootloader flow's proof of life after ActivateImage or 11 01: wait REBOOT_WAIT_S, then poll F1F4 until the
 # unit's app answers it, which it does once healthy, for up to the profile's start_timeout_s, and check it is the first
 # 4 bytes of sha. Returns 0, or raises UpdateFailed: another prefix (the app runs another image), 0x31 (the bootloader
 # answers: the app did not start, F1F0 saying whether the unit holds itself there; or, when activated is False because
 # no F001 was answered, perhaps never activated), or nothing within the timeout. Silence is never success.
-def wait_for_start(uds, profile, sha, preroll, sleep=time.sleep, clock=time.monotonic, log=print, activated=True):
+def wait_for_start(uds, profile, sha, preroll, sleep=time.sleep, clock=time.monotonic, log=print, activated=True,
+                   buses=0xFFFF):
     uds.restarted()
     sleep(REBOOT_WAIT_S)
     deadline = clock() + profile.start_timeout_s
@@ -653,7 +671,8 @@ def wait_for_start(uds, profile, sha, preroll, sleep=time.sleep, clock=time.mono
         except (NoResponse, SendFailed):   # the unit is restarting, or its app is not healthy yet
             if clock() >= deadline:
                 raise UpdateFailed("nothing answered F1F4 in %d s of polling after the restart, so the app has not "
-                                   "reported healthy" % profile.start_timeout_s)
+                                   "reported healthy%s" % (profile.start_timeout_s, CLOSED_BUS % buses
+                                                           if buses != 0xFFFF else ""))
             sleep(BOOT_POLL_S)
             continue
         except Nrc as e:
@@ -742,8 +761,7 @@ def keyed_reset(uds, profile, keys):
 
 
 # `reset`: ECUReset from the extended session, keyed when the profile has [security]. Under flow "bootloader", from
-# the programming session instead (10 02, the device ID, the programming unlock, 11 01): the unit leaves its
-# bootloader for its app.
+# the programming session instead (10 02, 11 01, with no unlock): the unit leaves its bootloader for its app.
 def reset(uds, profile, secret, log=print):
     if profile.flow == "bootloader":
         uds.session(SESSION_PROGRAMMING)

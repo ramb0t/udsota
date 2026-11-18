@@ -7,8 +7,9 @@ dtc show [--ext CODE] / dtc clear (the device's DTCs: 0x19, and 0x14 unlocked as
 payloads flash would send, with a manifest, for another flasher; no bus), stamp FILE (a bare image's header, after its
 build; no bus) and keygen (a key pair for the ecdsa mode; it needs no profile and no bus).
 The profile (--profile NAME or a .toml path) holds everything product-specific. Every frame goes out on
-the profile's req_id only, never on a deny_tx ID. Before sending, the tool listens LISTEN_S seconds and
-stops on the profile's busy value or on any resp_id frame, then pre-rolls a quiet bus if the profile asks.
+the profile's req_id, and on its [functional] id when it has one (quiet_bus), never on a deny_tx ID. Before
+sending, the tool listens LISTEN_S seconds and stops on the profile's busy value or on any resp_id frame, then
+pre-rolls a quiet bus if the profile asks.
 """
 import argparse
 import contextlib
@@ -28,7 +29,8 @@ from .keys import keygen, load_master, load_private_key
 from .transport import Transport
 from .delta import DETOOLS_HINT
 from .pack import DFIS, pack, refuse_bare_delta
-from .update import DIFF_DFIS, PRODUCT_NEEDS_BOOTLOADER, WAIT_NEEDS_BOOTLOADER, confirm_cmd, flash, info, reset
+from .update import (DIFF_DFIS, PRODUCT_NEEDS_BOOTLOADER, WAIT_NEEDS_BOOTLOADER, confirm_cmd, flash, info,
+                     refuse_bootloader_compression, reset)
 
 
 # A --dfi value: one of pack's DFIs, written 0x00, 0x10, 0x20 or 0x30.
@@ -260,6 +262,7 @@ def main(argv=None, transport=Transport):
                 raise Refused("--drop-76 takes a block number from 1")
             if args.diff_format is not None and args.diff_from is None:
                 raise Refused("--diff-format needs --diff-from")
+            refuse_bootloader_compression(prof, args.compress)
             if args.wait_for_unit is not None and prof.flow != "bootloader":   # flash refuses it too
                 raise Refused("profile %s: %s" % (prof.name, WAIT_NEEDS_BOOTLOADER))
             if args.allow_product_change and prof.flow != "bootloader":

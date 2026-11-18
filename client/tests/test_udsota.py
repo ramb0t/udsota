@@ -748,6 +748,34 @@ def test_keygen_writes_a_matching_pair(tmp_path):
         keys.keygen(tmp_path / "keys")                      # the header alone blocks a new pair too
 
 
+# Check a failed write of the private key leaves no file behind, so the next keygen into the directory works, and a
+# file that appeared between the check and the open (O_EXCL fails) is left as it was.
+def test_keygen_removes_only_the_private_key_it_created(tmp_path, monkeypatch):
+    def full(fd, mode):
+        os.close(fd)
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    with monkeypatch.context() as m:
+        m.setattr(keys.os, "fdopen", full)
+        with pytest.raises(errors.Refused, match="No space left on device"):
+            keys.keygen(tmp_path / "keys")
+    assert not (tmp_path / "keys" / "udsota_private.pem").exists()
+    private, _ = keys.keygen(tmp_path / "keys")             # not refused: nothing was left behind
+    assert private.exists()
+    private.unlink()
+    (tmp_path / "keys" / "udsota_pubkey.h").unlink()
+    real_open = os.open
+
+    def raced(path, flags, mode=0o777):
+        pathlib.Path(path).write_text("someone else's")
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(keys.os, "open", raced)
+    with pytest.raises(errors.Refused):
+        keys.keygen(tmp_path / "keys")
+    assert private.read_text() == "someone else's"
+
+
 # ---- TX-ID hard limit ----
 
 # Check every ID but standard 0x710 is refused, and the hard-limit IDs say so.
@@ -4904,7 +4932,9 @@ UPDATE_BL = '\n[update]\nflow = "bootloader"\n'
 # image's ID, 176..208; and FULL under it, for [security] and [board].
 BARE_BL = BARE.replace("header_offset = 0x100", "header_offset = 48") + UPDATE_BL
 PBL = profile.from_dict("bare-boot", tomllib.loads(BARE_BL))
-PFB = profile.from_dict("full-boot", tomllib.loads(FULL + UPDATE_BL))
+# PFB has [security] under the bootloader flow, which the loader refuses (the boot core serves no 0x27), so it is
+# built past the loader: these tests drive flash's unlock and board paths against a unit that does serve them.
+PFB = dataclasses.replace(profile.from_dict("full-boot", tomllib.loads(FULL)), flow="bootloader")
 BL_IMG = build_bare_image(header_offset=48, size=4800)
 BL_ID = bare_id(BL_IMG, 48)         # BL_IMG's image ID
 BL_PRECHECK = [(0x22, 0xF1F4), (0x10, 2), (0x22, 0xF1F0), (0x22, 0xF1F3), (0x22, 0xF1F5)]   # F1F4 to the app, then the hop
@@ -5071,6 +5101,20 @@ def test_bootloader_flow_silent_app_times_out(timeout):
     start = update.REBOOT_WAIT_S + timeout
     assert start <= d.clock() < start + update.BOOT_POLL_S
     assert d.log[len(BL_PRECHECK + DOWNLOAD):] == [(0x22, 0xF1F4)] * (timeout + 1)
+
+
+# Check the timeout names the image's update_buses when the image does not take updates on every bus, since from a bus
+# it closes a healthy app is silent too.
+def test_bootloader_flow_silent_app_on_an_image_that_closes_buses():
+    data = bytearray(BL_IMG)
+    struct.pack_into("<H", data, 48 + image.BARE_HDR_UPDATE_BUSES_OFFSET, 0x0004)
+    closing = image.stamp(bytes(data), 48)
+    assert image.update_buses(PBL, closing) == 0x0004 and image.update_buses(PBL, BL_IMG) == 0xFFFF
+    d = BootloaderUnit(security=False, app_silent=True)
+    with pytest.raises(errors.UpdateFailed, match="reported healthy. Or it has, and this is a bus the image closes: "
+                                                  "its update_buses is 0x0004, and on a bus that does not name, the "
+                                                  "app runs but answers nothing$"):
+        run_boot(d, image=closing)
 
 
 # Check an app that answers F1F4 with another image's prefix fails the run.
@@ -5693,6 +5737,52 @@ def test_update_flow_profile_values():
 def test_bad_update_flow_is_refused(text, why):
     with pytest.raises(errors.Refused, match="profile u: " + re.escape(why)):
         profile.from_dict("u", tomllib.loads(CAN + text))
+
+
+# Check a [board] names key that is not a plain number, such as a superscript two (str.isdigit() is true for it, int()
+# refuses it), is the loader's refusal and not a ValueError.
+@pytest.mark.parametrize("key", ["²", "1.5", "-1", "0x1", "a", ""])
+def test_board_names_key_that_is_not_a_number_is_refused(key):
+    with pytest.raises(errors.Refused, match=re.escape("profile b: [board] names must map hw_id numbers to board names")):
+        profile.from_dict("b", tomllib.loads(CAN + '[board]\ndid = 0xF191\nnames = { "%s" = "x" }\n' % key))
+
+
+# Check [security] with [update] flow = "bootloader" is refused when the profile loads: the boot core serves no 0x27.
+@pytest.mark.parametrize("security", [SEC, SEC_E + 'private_key_file = "k.pem"\n'])
+def test_bootloader_flow_with_security_is_refused(security):
+    with pytest.raises(errors.Refused, match=re.escape('profile u: [security] is for flow = "app": the boot core '
+                                                      'serves no SecurityAccess (0x27) to unlock')):
+        profile.from_dict("u", tomllib.loads(security + UPDATE_BL))
+    profile.from_dict("u", tomllib.loads(security + '\n[update]\nflow = "app"\n'))
+
+
+# Check a compressed download is refused under the bootloader flow (exit 2) before any bus opens, as it is by flash
+# itself before any frame: --compress, --compress-auto and a profile's compression other than "none", where the boot
+# core takes only DFI 0x00. --no-compress over such a profile, and no compression at all, are not refused.
+def test_bootloader_flow_refuses_compression(tmp_path, capsys):
+    img = tmp_path / "fw.bin"
+    img.write_bytes(BL_IMG)
+    for setting in ("none", "deflate", "auto"):
+        prof = tmp_path / ("boot-%s.toml" % setting)
+        prof.write_text(BARE_BL.replace("[image]\n", '[image]\ncompression = "%s"\n' % setting))
+        why = ("profile boot-%s: compressed downloads (--compress, --compress-auto, [image] compression) are for "
+               'flow = "app": the boot core takes only DFI 0x00' % setting)
+        for flags, refused in (([], setting != "none"), (["--compress"], True), (["--compress-auto"], True),
+                               (["--no-compress"], False)):
+            if refused:
+                assert cli.main(["--profile", str(prof), "flash", str(img), *flags], transport=no_transport) == 2
+                assert why in capsys.readouterr().err
+            else:
+                with pytest.raises(AssertionError, match="transport opened"):   # past the refusals: the bus opens
+                    cli.main(["--profile", str(prof), "flash", str(img), *flags], transport=no_transport)
+    for kw, profile_compression in ((dict(compress="deflate"), "none"), (dict(compress="auto"), "none"),
+                                    (dict(), "deflate"), (dict(), "auto")):
+        d = BootloaderUnit(security=False)
+        with pytest.raises(errors.Refused, match=re.escape("profile bare-boot: compressed downloads")):
+            run_boot(d, prof=dataclasses.replace(PBL, compression=profile_compression), **kw)
+        assert d.log == []
+    d = BootloaderUnit(security=False)
+    assert run_boot(d, prof=dataclasses.replace(PBL, compression="deflate"), compress="none")[0] == 0
 
 
 # Check example.toml's commented [update] loads once uncommented.

@@ -55,6 +55,7 @@
         .magic = UDSOTA_IMG_DESC_MAGIC, .desc_version = 1u, .hw_id = (uint8_t)(hw),                      \
         .partition_layout_id = (uint8_t)(layout), .diag_request_id = (uint16_t)(req_id),                 \
         .diag_response_id = (uint16_t)(resp_id), .flags = UDSOTA_IMG_RELEASE ? 0x01u : 0x00u,            \
+        .reserved = { 0u },                                                                              \
     }
 extern const udsota_image_desc_t udsota_image_desc;
 
