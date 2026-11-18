@@ -6,8 +6,8 @@ import hashlib
 import time
 
 from .errors import NoResponse, Nrc, Refused, SecondTester, ToolError, UpdateFailed
-from .update import device_keys, read_record, wait_for_boot
-from .wire import DECODE, NRC_CONDITIONS, NRC_NOT_SUPPORTED, NRC_OUT_OF_RANGE, NRC_SEQUENCE, SESSION_EXTENDED
+from .update import device_keys, enter_extended, read_record, wait_for_boot
+from .wire import DECODE, NRC_CONDITIONS, NRC_NOT_SUPPORTED, NRC_OUT_OF_RANGE, NRC_SEQUENCE
 
 NO_CONFIG_WRITES = "this firmware has no config writes"
 
@@ -209,9 +209,7 @@ def config_set(uds, profile, writes, secret, commit=False, reset=False, preroll=
                sleep=time.sleep, clock=time.monotonic, log=print):
     groups = group_writes(profile, writes, commit)
     keys = device_keys(uds, profile, secret)
-    uds.session(SESSION_EXTENDED)
-    if keys is not None:
-        uds.unlock(profile.security.level_extended, keys)
+    enter_extended(uds, profile, keys)
     for i, (name, group) in enumerate(groups):
         at_commit = False
         try:

@@ -53,11 +53,9 @@ class GuardedBus:
         check_tx_id(self.profile, msg.arbitration_id, msg.is_extended_id)
         self.bus.send(msg, timeout)
 
-    # Receive one frame or None after timeout seconds.
     def recv(self, timeout=None):
         return self.bus.recv(timeout)
 
-    # Close the underlying bus.
     def shutdown(self):
         self.bus.shutdown()
 
@@ -119,18 +117,18 @@ class QuietBus:
         try:
             self._burst(QUIET_START)
         except (OSError, can.CanError):
-            self._release(quiet=True)
+            self._release(swallow=True)
             raise
         self._thread = threading.Thread(target=self._keepalive, name="udsota-quiet", daemon=True)
         self._thread.start()
         return self
 
-    # The release burst; with quiet=True a send error is dropped (another error is already on its way).
-    def _release(self, quiet):
+    # The release burst; with swallow=True a send error is dropped (another error is already on its way).
+    def _release(self, swallow):
         try:
             self._burst(QUIET_END)
         except (OSError, can.CanError):
-            if not quiet:
+            if not swallow:
                 raise
 
     # Stop the keepalive and release the bus. A release that fails never hides the error that ended the update.
@@ -138,7 +136,7 @@ class QuietBus:
         self._stop.set()
         if self._thread is not None:
             self._thread.join()
-        self._release(quiet=exc_type is not None)
+        self._release(swallow=exc_type is not None)
 
 
 # Listen listen_s seconds; raise Busy on a busy value, SecondTester on any response-ID frame; pre-roll
@@ -228,20 +226,16 @@ class GuardedConnection(BaseConnection):
         BaseConnection.__init__(self, "udsota")
         self.inner, self.monitor = inner, monitor
 
-    # Open the inner connection.
     def open(self):
         self.inner.open()
         return self
 
-    # Close the inner connection.
     def close(self):
         self.inner.close()
 
-    # True while the inner connection is open.
     def is_open(self):
         return self.inner.is_open()
 
-    # Drop unread responses.
     def empty_rxqueue(self):
         self.inner.empty_rxqueue()
 
@@ -366,7 +360,6 @@ class Transport:
         self.client.open()
         return Uds(self.client)
 
-    # Enter the with-block.
     def __enter__(self):
         return self
 

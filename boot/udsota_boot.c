@@ -48,36 +48,39 @@
 #define CRC_PIECE      4096u   /* the slot's CRC runs in pieces this long, with the watchdog reloaded between */
 #define DATA_MAX       (UDS_SERVER_RECV_BUF_SIZE - 2u)   /* a 36's data */
 
-/* What the core is doing. LISTENING and the three after it serve; S3's expiry can end any of them. */
+/* What the core is doing. LISTENING and the two after it serve. */
 enum {
     STOPPED = 0,   /* BAD_CFG, or port_reset or port_start_app returned: the poll only reloads the watchdog */
     STARTING,      /* START_APP: the next poll starts the app */
     LISTENING,     /* serving; leaves only for 11 01, F001 or a default session the boot rules would start from */
     WINDOW,        /* serving in the power-up window, which ends at since + window_ms */
     TESTER,        /* serving with B.bus locked, the others stopped: the idle exit comes at since + IDLE_MS */
-    S3_EXPIRED,    /* serving, and S3 expired in this poll, which ends in a session exit */
 };
-/* A download: OPEN from its 34 to its end, ENDED once its 37 passed, VERIFIED once FF01 passed, until the next 34. */
-enum { DL_NONE = 0, DL_OPEN, DL_ENDED, DL_VERIFIED };
+/* A download's phase: OPEN from its 34 until it fails or its 37 passes, RECEIVED once its 37 passed, VERIFIED once FF01
+ * passed, until the next 34. */
+enum { DL_NONE = 0, DL_OPEN, DL_RECEIVED, DL_VERIFIED };
 
 /* Every piece of the core's state. udsota_boot_init clears it all, so nothing relies on a zeroed .bss. */
 static struct {
     const udsota_boot_cfg_t *cfg;
     uint8_t  state;                /* the enum above */
+    bool     s3_expired;           /* S3 expired in a poll: its session exit follows, and listen() clears it */
+    bool     leaving;              /* 11 01 or F001 served at leaving_since (ms): the reset follows the delay */
     uint32_t since;                /* ms: when the window opened, or the last tester frame */
-    bool     reset;                /* 11 01 or F001 served at reset_at (ms): the reset follows the delay */
-    uint32_t reset_at;
+    uint32_t leaving_since;
     uint32_t last_us, ms, rem_us;  /* UDSMillis: its last sample, the count, the microseconds not yet counted */
 
-    bool     app_valid;            /* the valid app (udsota_boot_internal.h) */
+    bool     app_valid;            /* the valid app (udsota_boot.h) */
     uint8_t  count;                /* the start count after the boot rules, at init or a session exit */
 
     uint8_t  bus;                  /* TESTER's, else the bus of the request in flight (busy()) or of the last frame */
     bool     replay;               /* the handover's 10 02, for iso14229's first receive */
 
-    uint8_t  dl;                   /* DL_* */
-    uint8_t  last_reason;          /* F1F1 byte 0 */
-    uint32_t announced, received;  /* the 34's memorySize; the data bytes the 36s carried (F1F1 bytes 1-4) */
+    struct {
+        uint8_t  phase;            /* DL_* */
+        uint8_t  reason;           /* F1F1 byte 0 */
+        uint32_t announced, received;   /* the 34's memorySize; the data bytes the 36s carried (F1F1 bytes 1-4) */
+    } dl;
 
     UDSServer_t srv;
     struct {
@@ -137,6 +140,9 @@ static uint16_t str_len(const char *s, uint16_t max)
     return n;
 }
 
+/* Whether x is a multiple of unit, which is a power of two. */
+static bool multiple_of(uint32_t x, uint32_t unit) { return (x & (unit - 1u)) == 0u; }
+
 /* ==== 3. The image rules ==== */
 
 /* A header's 32-byte project field against product: the same characters, then a NUL, or no NUL when product fills
@@ -155,7 +161,7 @@ static bool project_is(const uint8_t *field, const char *product)
 }
 
 /* The rules on the header's own fields, the first three of the image rules: UDSOTA_DL_OK, BAD_HEADER or TOO_BIG. The
- * boot check runs these alone, with its image_length as mem_size. */
+ * boot check (below) runs these alone, with its image_length as mem_size. */
 static udsota_reason_t header_rules(const udsota_boot_cfg_t *cfg, const uint8_t *hdr, uint32_t mem_size)
 {
     if (le32(hdr) != UDSOTA_BARE_HDR_MAGIC || le16(hdr + 4) < 1u ||
@@ -286,19 +292,6 @@ static void stop_buses(uint8_t keep)
     }
 }
 
-/* The open buses started, one that does not start being absent, and every other bus stopped. */
-static void listen(void)
-{
-    for (uint8_t b = 1; b <= B.cfg->buses; b++) {
-        if (bus_open(b)) {
-            (void)udsota_boot_port_can_start(b, B.cfg->request_id);
-        } else {
-            udsota_boot_port_can_stop(b);
-        }
-        tick();
-    }
-}
-
 static UDSErr_t tp_send(UDSTp_t *hdl, const uint8_t *buf, size_t len, const UDSSDU_t *info)
 {
     (void)hdl;
@@ -334,39 +327,15 @@ static UDSErr_t tp_poll(UDSTp_t *hdl)
     return UDS_OK;
 }
 
-static UDSErr_t on_event(UDSServer_t *srv, UDSEvent_t ev, void *arg);
-
-/* iso14229 from scratch, as each boot and each return to listening has it, with the state the core writes. */
-static void server_init(void)
-{
-    (void)UDSServerInit(&B.srv);
-    B.srv.fn = on_event;
-    B.srv.tp = &B.tp.hdl;
-    B.srv.p2_ms = P2_MS;
-    B.srv.s3_ms = IDLE_MS;
-    B.srv.p2_timer = UDSMillis() + P2_MS;
-    B.tp.hdl.send = tp_send;
-    B.tp.hdl.recv = tp_recv;
-    B.tp.hdl.poll = tp_poll;
-    isotp_init_link(&B.tp.link, B.cfg->response_id, B.tp.tx, sizeof B.tp.tx, B.tp.rx, sizeof B.tp.rx);
-}
-
 /* ==== 6. The slot ==== */
 
-/* The image in the slot: UDSOTA_DL_OK, or why not. For FF01 the image rules against the download's memorySize, else
- * the boot check's header rules; then the CRC over [0, image_length) without the crc32 field, in pieces. */
-static udsota_reason_t slot_check(bool ff01)
+/* Whether the header's crc32 is the CRC over [0, image_length) without that field, run in pieces with the watchdog
+ * reloaded between. Run after the header rules, which keep the field inside the image and the image inside the slot. */
+static bool crc_ok(const uint8_t *slot)
 {
-    const udsota_boot_cfg_t *cfg = B.cfg;
-    const uint8_t *const slot = udsota_boot_port_slot();
-    const uint8_t *hdr = slot + cfg->image_header_offset;
+    const uint8_t *const hdr = slot + B.cfg->image_header_offset;
     const uint32_t len = le32(hdr + UDSOTA_BARE_HDR_LENGTH_OFFSET);
-    const udsota_reason_t why = ff01 ? udsota_boot_image_rules(cfg, hdr, UDSOTA_BARE_HDR_LEN, B.announced)
-                                     : header_rules(cfg, hdr, len);
-    if (why != UDSOTA_DL_OK) {
-        return why;
-    }
-    const uint32_t crc_at = cfg->image_header_offset + UDSOTA_BARE_HDR_CRC_OFFSET;
+    const uint32_t crc_at = B.cfg->image_header_offset + UDSOTA_BARE_HDR_CRC_OFFSET;
     uint32_t crc = 0, off = 0;
     while (off < len) {
         if (off == crc_at) {
@@ -379,7 +348,29 @@ static udsota_reason_t slot_check(bool ff01)
         tick();
         off += n;
     }
-    return (crc == le32(hdr + UDSOTA_BARE_HDR_CRC_OFFSET)) ? UDSOTA_DL_OK : UDSOTA_DL_VERIFY_FAILED;
+    return crc == le32(hdr + UDSOTA_BARE_HDR_CRC_OFFSET);
+}
+
+/* The boot check: whether the slot holds a valid app, by the header rules alone, its image_length as mem_size, and the
+ * CRC. */
+static bool boot_check(void)
+{
+    const uint8_t *const slot = udsota_boot_port_slot();
+    const uint8_t *const hdr = slot + B.cfg->image_header_offset;
+    return header_rules(B.cfg, hdr, le32(hdr + UDSOTA_BARE_HDR_LENGTH_OFFSET)) == UDSOTA_DL_OK && crc_ok(slot);
+}
+
+/* FF01's check of the downloaded image: UDSOTA_DL_OK, or the first image rule against the download's memorySize that
+ * fails, else VERIFY_FAILED for the CRC. */
+static udsota_reason_t ff01_check(void)
+{
+    const uint8_t *const slot = udsota_boot_port_slot();
+    const uint8_t *const hdr = slot + B.cfg->image_header_offset;
+    const udsota_reason_t why = udsota_boot_image_rules(B.cfg, hdr, UDSOTA_BARE_HDR_LEN, B.dl.announced);
+    if (why != UDSOTA_DL_OK) {
+        return why;
+    }
+    return crc_ok(slot) ? UDSOTA_DL_OK : UDSOTA_DL_VERIFY_FAILED;
 }
 
 /* One 36's flash work at off: the erase units that start in its range, then n bytes programmed and compared. */
@@ -394,22 +385,29 @@ static bool write_block(uint32_t off, const uint8_t *data, uint32_t n)
 
 /* ==== 7. The services ==== */
 
-/* The open download ends, and F1F1 names why. One that has already ended keeps its reason, so a later ABORTED never
- * overwrites an image rule's or a flash failure's. */
-static void dl_end(uint8_t why)
+/* The open download fails, and F1F1 names why. One no longer open (failed, received or verified) keeps its reason, so a
+ * later ABORTED never overwrites an image rule's or a flash failure's. */
+static void dl_fail(uint8_t why)
 {
-    if (B.dl == DL_OPEN) {
-        B.last_reason = why;
-        B.dl = DL_NONE;
+    if (B.dl.phase == DL_OPEN) {
+        B.dl.reason = why;
+        B.dl.phase = DL_NONE;
     }
 }
 
 /* iso14229 ends a transfer without an event (0x24, 0x71, a 36 shorter than 2 bytes): noticed after every poll. */
-static void xfer_check(void)
+static void notice_dropped_transfer(void)
 {
-    if (B.dl == DL_OPEN && !B.srv.xferIsActive) {
-        dl_end(UDSOTA_DL_ABORTED);
+    if (B.dl.phase == DL_OPEN && !B.srv.xferIsActive) {
+        dl_fail(UDSOTA_DL_ABORTED);
     }
+}
+
+/* A session change ends the download, and iso14229 would keep its transfer open across it. */
+static void abort_download(UDSServer_t *srv)
+{
+    dl_fail(UDSOTA_DL_ABORTED);
+    srv->xferIsActive = false;
 }
 
 /* The unit holds: the start count the last decision used is at the threshold. */
@@ -426,9 +424,9 @@ static const uint8_t *installed(uint32_t off)
 static UDSErr_t leave(void)
 {
     udsota_boot_port_keep_write(UDSOTA_KEEP_WORD_COUNT, UDSOTA_START_COUNT_CLEAR);
-    if (!B.reset) {
-        B.reset = true;
-        B.reset_at = UDSMillis();
+    if (!B.leaving) {
+        B.leaving = true;
+        B.leaving_since = UDSMillis();
     }
     return UDS_PositiveResponse;
 }
@@ -475,11 +473,11 @@ static UDSErr_t read_did(UDSServer_t *srv, const UDSRDBIArgs_t *a)
         n = 16u;
         break;
     case UDSOTA_DID_RESULT:
-        b[0] = B.last_reason;
-        b[1] = (uint8_t)(B.received >> 24);
-        b[2] = (uint8_t)(B.received >> 16);
-        b[3] = (uint8_t)(B.received >> 8);
-        b[4] = (uint8_t)B.received;
+        b[0] = B.dl.reason;
+        b[1] = (uint8_t)(B.dl.received >> 24);
+        b[2] = (uint8_t)(B.dl.received >> 16);
+        b[3] = (uint8_t)(B.dl.received >> 8);
+        b[4] = (uint8_t)B.dl.received;
         n = 5u;
         break;
     case UDSOTA_DID_RUNNING_SHA:
@@ -509,18 +507,15 @@ static UDSErr_t request_download(const UDSServer_t *srv, UDSRequestDownloadArgs_
     const udsota_boot_cfg_t *cfg = B.cfg;
     const uint8_t alfid = srv->r.recv_buf[2];            /* not in the event's arguments; iso14229 allows 1 to 8 */
     const uint8_t size_len = alfid >> 4, addr_len = alfid & 0x0Fu;
-    if (srv->sessionType != UDS_LEV_DS_PRGS) {
-        return UDS_NRC_ServiceNotSupportedInActiveSession;
-    }
     if (size_len < 1u || size_len > 4u || addr_len < 1u || addr_len > 4u || a->addr != 0u ||
         a->dataFormatIdentifier != UDSOTA_DL_DFI || a->size < cfg->image_header_offset + UDSOTA_BARE_HDR_LEN ||
         a->size > cfg->slot_size || (a->size & 3u) != 0u) {
         return UDS_NRC_RequestOutOfRange;
     }
-    B.dl = DL_OPEN;
-    B.last_reason = UDSOTA_DL_OK;
-    B.announced = (uint32_t)a->size;
-    B.received = 0u;
+    B.dl.phase = DL_OPEN;
+    B.dl.reason = UDSOTA_DL_OK;
+    B.dl.announced = (uint32_t)a->size;
+    B.dl.received = 0u;
     a->maxNumberOfBlockLength = UDS_SERVER_RECV_BUF_SIZE;
     return UDS_PositiveResponse;
 }
@@ -532,18 +527,18 @@ static UDSErr_t request_download(const UDSServer_t *srv, UDSRequestDownloadArgs_
 static UDSErr_t transfer_data(UDSServer_t *srv, const UDSTransferDataArgs_t *a)
 {
     const udsota_boot_cfg_t *cfg = B.cfg;
-    const uint32_t len = a->len, at = B.received, unit = cfg->slot_write_unit;
-    if (len == 0u || (at + len != B.announced && (len & (unit - 1u)) != 0u)) {
-        dl_end(UDSOTA_DL_ABORTED);
+    const uint32_t len = a->len, at = B.dl.received, unit = cfg->slot_write_unit;
+    if (len == 0u || (at + len != B.dl.announced && !multiple_of(len, unit))) {
+        dl_fail(UDSOTA_DL_ABORTED);
         return UDS_NRC_IncorrectMessageLengthOrInvalidFormat;
     }
     uint8_t *data = &srv->r.recv_buf[2];                 /* a->data, past the SID and the counter, writable */
     if (at == 0u) {
         const uint32_t off = cfg->image_header_offset;
         const uint32_t hdr_len = (len > off) ? len - off : 0u;
-        const udsota_reason_t why = udsota_boot_image_rules(cfg, data + off, hdr_len, B.announced);
+        const udsota_reason_t why = udsota_boot_image_rules(cfg, data + off, hdr_len, B.dl.announced);
         if (why != UDSOTA_DL_OK) {
-            dl_end(why);
+            dl_fail(why);
             return UDS_NRC_RequestOutOfRange;
         }
         B.app_valid = false;                             /* the first erase */
@@ -551,21 +546,21 @@ static UDSErr_t transfer_data(UDSServer_t *srv, const UDSTransferDataArgs_t *a)
     const uint32_t n = (len + unit - 1u) & ~(uint32_t)(unit - 1u);
     memset(data + len, 0xFF, n - len);
     if (!write_block(at, data, n)) {
-        dl_end(UDSOTA_DL_FLASH_ERROR);
+        dl_fail(UDSOTA_DL_FLASH_ERROR);
         return UDS_NRC_GeneralProgrammingFailure;
     }
-    B.received = at + len;
+    B.dl.received = at + len;
     return UDS_PositiveResponse;
 }
 
 /* 37: no data, and once every announced byte has arrived. */
 static UDSErr_t transfer_exit(const UDSRequestTransferExitArgs_t *a)
 {
-    if (a->len != 0u || B.received != B.announced) {
-        dl_end(UDSOTA_DL_ABORTED);
+    if (a->len != 0u || B.dl.received != B.dl.announced) {
+        dl_fail(UDSOTA_DL_ABORTED);
         return (a->len != 0u) ? UDS_NRC_IncorrectMessageLengthOrInvalidFormat : UDS_NRC_RequestSequenceError;
     }
-    B.dl = DL_ENDED;
+    B.dl.phase = DL_RECEIVED;
     return UDS_PositiveResponse;
 }
 
@@ -573,9 +568,6 @@ static UDSErr_t transfer_exit(const UDSRequestTransferExitArgs_t *a)
  * the slot's bytes, then the CRC; its status is also F1F1 byte 0, and a pass answers 00 again until the next 34. */
 static UDSErr_t routine(UDSServer_t *srv, UDSRoutineCtrlArgs_t *a)
 {
-    if (srv->sessionType != UDS_LEV_DS_PRGS) {
-        return UDS_NRC_ServiceNotSupportedInActiveSession;
-    }
     if (a->id != UDSOTA_RID_CHECK_PROG_DEPS && a->id != UDSOTA_RID_ACTIVATE_IMAGE) {
         return UDS_NRC_RequestOutOfRange;
     }
@@ -586,31 +578,35 @@ static UDSErr_t routine(UDSServer_t *srv, UDSRoutineCtrlArgs_t *a)
         return UDS_NRC_IncorrectMessageLengthOrInvalidFormat;
     }
     if (a->id == UDSOTA_RID_ACTIVATE_IMAGE) {
-        return (B.dl == DL_VERIFIED) ? leave() : UDS_NRC_RequestSequenceError;
+        return (B.dl.phase == DL_VERIFIED) ? leave() : UDS_NRC_RequestSequenceError;
     }
-    if (B.dl == DL_ENDED) {
-        B.last_reason = (uint8_t)slot_check(true);
-        B.app_valid = (B.last_reason == UDSOTA_DL_OK);
-        B.dl = B.app_valid ? DL_VERIFIED : DL_NONE;
-    } else if (B.dl != DL_VERIFIED) {
+    if (B.dl.phase == DL_RECEIVED) {
+        B.dl.reason = (uint8_t)ff01_check();
+        B.app_valid = (B.dl.reason == UDSOTA_DL_OK);
+        B.dl.phase = B.app_valid ? DL_VERIFIED : DL_NONE;
+    } else if (B.dl.phase != DL_VERIFIED) {
         return UDS_NRC_RequestSequenceError;
     }
-    return (UDSErr_t)a->copyStatusRecord(srv, &B.last_reason, 1u);
+    return (UDSErr_t)a->copyStatusRecord(srv, &B.dl.reason, 1u);
 }
 
 /* iso14229's events. Its own refusals of a malformed or untimely request come first; every event the core does not
  * serve answers 0x11, never iso14229's default positive answer. */
 static UDSErr_t on_event(UDSServer_t *srv, UDSEvent_t ev, void *arg)
 {
-    const bool prog = (srv->sessionType == UDS_LEV_DS_PRGS);
+    if (srv->sessionType != UDS_LEV_DS_PRGS &&           /* these services exist only in the programming session */
+        (ev == UDS_EVT_EcuReset || ev == UDS_EVT_SecAccessRequestSeed || ev == UDS_EVT_SecAccessValidateKey ||
+         ev == UDS_EVT_RoutineCtrl || ev == UDS_EVT_RequestDownload)) {
+        return UDS_NRC_ServiceNotSupportedInActiveSession;
+    }
     switch (ev) {
     case UDS_EVT_Err:                                    /* a lost answer: the next request is still served */
     case UDS_EVT_DoScheduledReset:                       /* 11 01 resets on the core's own delay */
         return UDS_PositiveResponse;
     case UDS_EVT_SessionTimeout:
-        dl_end(UDSOTA_DL_ABORTED);
-        srv->xferIsActive = false;
-        B.state = S3_EXPIRED;
+        abort_download(srv);
+        B.state = LISTENING;                             /* as S3_EXPIRED was: no window end, no lock until the exit */
+        B.s3_expired = true;
         return UDS_PositiveResponse;
     case UDS_EVT_DiagSessCtrl: {
         UDSDiagSessCtrlArgs_t *a = arg;
@@ -618,19 +614,13 @@ static UDSErr_t on_event(UDSServer_t *srv, UDSEvent_t ev, void *arg)
             return UDS_NRC_SubFunctionNotSupported;
         }
         a->p2_star_ms = P2_STAR_MS;
-        dl_end(UDSOTA_DL_ABORTED);
-        srv->xferIsActive = false;
+        abort_download(srv);
         return UDS_PositiveResponse;
     }
     case UDS_EVT_EcuReset:
-        return !prog                                                    ? UDS_NRC_ServiceNotSupportedInActiveSession
-             : (((UDSECUResetArgs_t *)arg)->type != UDS_LEV_RT_HR)      ? UDS_NRC_SubFunctionNotSupported
-                                                                        : leave();
+        return (((UDSECUResetArgs_t *)arg)->type == UDS_LEV_RT_HR) ? leave() : UDS_NRC_SubFunctionNotSupported;
     case UDS_EVT_ReadDataByIdent:
         return read_did(srv, arg);
-    case UDS_EVT_SecAccessRequestSeed:                   /* 27 is not served */
-    case UDS_EVT_SecAccessValidateKey:
-        return prog ? UDS_NRC_ServiceNotSupported : UDS_NRC_ServiceNotSupportedInActiveSession;
     case UDS_EVT_RoutineCtrl:
         return routine(srv, arg);
     case UDS_EVT_RequestDownload:
@@ -639,7 +629,7 @@ static UDSErr_t on_event(UDSServer_t *srv, UDSEvent_t ev, void *arg)
         return transfer_data(srv, arg);
     case UDS_EVT_RequestTransferExit:
         return transfer_exit(arg);
-    default:
+    default:                                             /* 27 included: it is not served */
         return UDS_NRC_ServiceNotSupported;
     }
 }
@@ -654,11 +644,13 @@ static bool cfg_ok(const udsota_boot_cfg_t *c)
     }
     const uint32_t unit = c->slot_write_unit;
     return c->request_id <= 0x7FFu && c->response_id <= 0x7FFu && c->request_id != c->response_id &&
-           c->buses >= 1u && c->buses <= 15u && (c->product == NULL || str_len(c->product, 33u) <= 32u) &&
-           c->boot_version != NULL && c->hold_after_starts != 0u && unit != 0u && (unit & (unit - 1u)) == 0u &&
-           (c->slot_size & (unit - 1u)) == 0u && (DATA_MAX & (unit - 1u)) == 0u &&
-           c->image_header_offset <= DATA_MAX - UDSOTA_BARE_HDR_LEN &&
-           c->slot_size >= c->image_header_offset + UDSOTA_BARE_HDR_LEN;
+           c->buses >= 1u && c->buses <= 15u &&
+           (c->product == NULL || str_len(c->product, 33u) <= 32u) &&
+           c->boot_version != NULL &&
+           c->hold_after_starts != 0u &&
+           unit != 0u && (unit & (unit - 1u)) == 0u &&
+           multiple_of(c->slot_size, unit) && c->slot_size >= c->image_header_offset + UDSOTA_BARE_HDR_LEN &&
+           multiple_of(DATA_MAX, unit) && c->image_header_offset <= DATA_MAX - UDSOTA_BARE_HDR_LEN;
 }
 
 /* The start of the app: the start count up by one (below 255, since it was below hold_after_starts), the buses
@@ -688,17 +680,72 @@ static bool would_start_app(void)
     return udsota_boot_decide(B.cfg, &in, &B.count) == UDSOTA_BOOT_DECIDE_START_APP;
 }
 
-/* S3's expiry and the idle exit: a reset when the boot rules would start the app, else listening again on every
- * open bus, with iso14229 from scratch, no lock and no window; what is installed now says which buses are open. */
+/* iso14229 from scratch, as each boot and each return to listening has it, with the state the core writes. */
+static void server_init(void)
+{
+    (void)UDSServerInit(&B.srv);
+    B.srv.fn = on_event;
+    B.srv.tp = &B.tp.hdl;
+    B.srv.p2_ms = P2_MS;
+    B.srv.s3_ms = IDLE_MS;
+    B.srv.p2_timer = UDSMillis() + P2_MS;
+    B.tp.hdl.send = tp_send;
+    B.tp.hdl.recv = tp_recv;
+    B.tp.hdl.poll = tp_poll;
+    isotp_init_link(&B.tp.link, B.cfg->response_id, B.tp.tx, sizeof B.tp.tx, B.tp.rx, sizeof B.tp.rx);
+}
+
+/* Listening: the open buses started, one that does not start being absent, every other bus stopped, and iso14229 from
+ * scratch with no lock; init opens the power-up window after it. What is installed now says which buses are open. */
+static void listen(void)
+{
+    for (uint8_t b = 1; b <= B.cfg->buses; b++) {
+        if (bus_open(b)) {
+            (void)udsota_boot_port_can_start(b, B.cfg->request_id);
+        } else {
+            udsota_boot_port_can_stop(b);
+        }
+        tick();
+    }
+    server_init();
+    B.state = LISTENING;
+    B.s3_expired = false;
+}
+
+/* S3's expiry and the idle exit: a reset when the boot rules would start the app, else listening again. */
 static void session_exit(void)
 {
     if (would_start_app()) {
         reset();
         return;
     }
-    B.state = LISTENING;
     listen();
-    server_init();
+}
+
+/* The boot rules' inputs, read in the order udsota_boot.h lists: the reset cause, the handover words (taken once,
+ * cleared and read back), the boot check, the start count word. */
+static udsota_boot_inputs_t boot_inputs(void)
+{
+    udsota_boot_inputs_t in = {.cause = udsota_boot_port_reset_cause()};
+    const uint16_t mark = udsota_boot_port_keep_read(UDSOTA_KEEP_WORD_MARK);
+    in.handover = udsota_boot_port_keep_read(UDSOTA_KEEP_WORD_HANDOVER);
+    if (mark == UDSOTA_HANDOVER_MARK) {
+        udsota_boot_port_keep_write(UDSOTA_KEEP_WORD_MARK, 0u);
+        udsota_boot_port_keep_write(UDSOTA_KEEP_WORD_HANDOVER, 0u);
+        in.handover_ok = udsota_boot_port_keep_read(UDSOTA_KEEP_WORD_MARK) != UDSOTA_HANDOVER_MARK;
+    }
+    in.app_valid = B.app_valid = boot_check();
+    in.count_word = udsota_boot_port_keep_read(UDSOTA_KEEP_WORD_COUNT);
+    return in;
+}
+
+/* The handed-over bus, started for the replayed 10 02: whether it is open and starts. */
+static bool start_handover_bus(uint8_t bus)
+{
+    B.bus = bus;
+    B.replay = bus_open(bus) && udsota_boot_port_can_start(bus, B.cfg->request_id);
+    tick();
+    return B.replay;
 }
 
 udsota_boot_decision_t udsota_boot_init(const udsota_boot_cfg_t *cfg)
@@ -710,38 +757,27 @@ udsota_boot_decision_t udsota_boot_init(const udsota_boot_cfg_t *cfg)
     }
     B.cfg = cfg;
     B.last_us = udsota_boot_port_us();
-    udsota_boot_inputs_t in = {.cause = udsota_boot_port_reset_cause()};
-    const uint16_t mark = udsota_boot_port_keep_read(UDSOTA_KEEP_WORD_MARK);
-    in.handover = udsota_boot_port_keep_read(UDSOTA_KEEP_WORD_HANDOVER);
-    if (mark == UDSOTA_HANDOVER_MARK) {
-        udsota_boot_port_keep_write(UDSOTA_KEEP_WORD_MARK, 0u);
-        udsota_boot_port_keep_write(UDSOTA_KEEP_WORD_HANDOVER, 0u);
-        in.handover_ok = udsota_boot_port_keep_read(UDSOTA_KEEP_WORD_MARK) != UDSOTA_HANDOVER_MARK;
-    }
-    in.app_valid = B.app_valid = (slot_check(false) == UDSOTA_DL_OK);
-    in.count_word = udsota_boot_port_keep_read(UDSOTA_KEEP_WORD_COUNT);
+    udsota_boot_inputs_t in = boot_inputs();
     udsota_boot_decision_t d = udsota_boot_decide(cfg, &in, &B.count);
-    if (d == UDSOTA_BOOT_DECIDE_HANDOVER) {
-        B.bus = (uint8_t)in.handover;
-        if (bus_open(B.bus) && udsota_boot_port_can_start(B.bus, cfg->request_id)) {
-            B.replay = true;
-        } else {
-            in.handover_ok = false;
-            d = udsota_boot_decide(cfg, &in, &B.count);
-        }
-        tick();
+    if (d == UDSOTA_BOOT_DECIDE_HANDOVER && !start_handover_bus((uint8_t)in.handover)) {
+        in.handover_ok = false;
+        d = udsota_boot_decide(cfg, &in, &B.count);
     }
     udsota_boot_port_keep_write(UDSOTA_KEEP_WORD_COUNT, UDSOTA_START_COUNT_WORD(B.count));
     if (d == UDSOTA_BOOT_DECIDE_START_APP) {
         B.state = STARTING;
         return d;
     }
-    if (d != UDSOTA_BOOT_DECIDE_HANDOVER) {
+    if (d == UDSOTA_BOOT_DECIDE_HANDOVER) {
+        server_init();
+        B.state = TESTER;
+    } else {
         listen();
+        if (d == UDSOTA_BOOT_DECIDE_WINDOW) {
+            B.state = WINDOW;
+        }
     }
-    server_init();
     B.since = UDSMillis();                               /* the window's start, or the replayed 10 02's time */
-    B.state = (d == UDSOTA_BOOT_DECIDE_HANDOVER) ? TESTER : (d == UDSOTA_BOOT_DECIDE_WINDOW) ? WINDOW : LISTENING;
     return d;
 }
 
@@ -761,6 +797,15 @@ static void age_timers(uint32_t now)
     }
 }
 
+/* The power-up window has run its time. */
+static bool window_over(uint32_t now) { return B.state == WINDOW && now - B.since >= B.cfg->window_ms; }
+
+/* A tester frame locked a bus, and the session is the default with no request in flight, IDLE_MS after the last frame. */
+static bool idle_exit_due(uint32_t now)
+{
+    return B.state == TESTER && B.srv.sessionType == UDS_LEV_DS_DS && !busy() && now - B.since >= IDLE_MS;
+}
+
 void udsota_boot_poll(void)
 {
     udsota_boot_port_watchdog_reload();
@@ -774,39 +819,49 @@ void udsota_boot_poll(void)
     UDSServerPoll(&B.srv);
     const uint32_t now = UDSMillis();
     age_timers(now);
-    xfer_check();
-    if (B.reset) {
-        if (now - B.reset_at >= RESET_DELAY_MS) {
+    notice_dropped_transfer();
+    if (B.leaving) {
+        if (now - B.leaving_since >= RESET_DELAY_MS) {
             reset();
         }
-    } else if (B.state == WINDOW && now - B.since >= B.cfg->window_ms) {
+    } else if (window_over(now)) {
         if (B.app_valid && B.srv.sessionType == UDS_LEV_DS_DS) {
             start_app();
         } else {
             B.state = LISTENING;                         /* a tester at work without a tester frame */
         }
-    } else if (B.state == S3_EXPIRED || (B.state == TESTER && B.srv.sessionType == UDS_LEV_DS_DS && !busy() &&
-                                         now - B.since >= IDLE_MS)) {
+    } else if (B.s3_expired || idle_exit_due(now)) {
         session_exit();
     } else if (B.state == LISTENING && B.app_valid && B.srv.sessionType == UDS_LEV_DS_DS && !busy() &&
                would_start_app()) {                      /* back in the default session with no lock and no deadline */
-        B.reset = true;                                  /* the answer to the 10 01 has time to leave first */
-        B.reset_at = now;
+        B.leaving = true;                                /* the answer to the 10 01 has time to leave first */
+        B.leaving_since = now;
     }
+}
+
+/* A tester frame, which holds the window, restarts the idle exit and locks its bus: 02 10 02/82 or 02 3E 00/80. */
+static bool tester_frame(const uint8_t *d, uint8_t len)
+{
+    return len >= 3u && d[0] == 0x02u &&
+           ((d[1] == 0x10u && (d[2] & 0x7Fu) == UDS_LEV_DS_PRGS) || (d[1] == 0x3Eu && (d[2] & 0x7Fu) == 0u));
 }
 
 void udsota_boot_rx(uint8_t bus, uint32_t id, const uint8_t *data, uint8_t len)
 {
     if (B.state == STOPPED || B.state == STARTING || bus == 0u || bus > B.cfg->buses || len > 8u ||
-        id != B.cfg->request_id || ((B.state == TESTER || busy()) && bus != B.bus) ||
-        (B.state != TESTER && !bus_open(bus))) {
-        return;
+        id != B.cfg->request_id) {
+        return;                                          /* not a frame for the core */
+    }
+    if ((B.state == TESTER || busy()) && bus != B.bus) {
+        return;                                          /* another bus than the locked one, or the request's */
+    }
+    if (B.state != TESTER && !bus_open(bus)) {
+        return;                                          /* a bus that does not take updates, before a lock */
     }
     const uint32_t now = UDSMillis();
     B.bus = bus;
-    if (len >= 3u && data[0] == 0x02u &&
-        ((data[1] == 0x10u && (data[2] & 0x7Fu) == UDS_LEV_DS_PRGS) || (data[1] == 0x3Eu && (data[2] & 0x7Fu) == 0u))) {
-        if (B.state != TESTER) {                         /* a tester frame: 02 10 02/82 or 02 3E 00/80 */
+    if (tester_frame(data, len)) {
+        if (B.state != TESTER) {
             stop_buses(bus);
         }
         B.state = TESTER;

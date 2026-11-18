@@ -189,7 +189,7 @@ udsota_sanitize(test_udsota_app address,undefined)
 add_test(NAME test_udsota_app COMMAND test_udsota_app)
 
 # The boot core for Cortex-M3 with every warning an error, under a gate on its text (CI's boot-arm job builds this
-# target; it needs arm-none-eabi-gcc and its size). The gate is the 3,139 bytes measured with arm-none-eabi-gcc 14.3.1
+# target; it needs arm-none-eabi-gcc and its size). The gate is the 3,119 bytes measured with arm-none-eabi-gcc 14.3.1
 # (boot/README.md, "Size") plus about a fifth, since another compiler release lays the code out differently: it
 # catches the core growing, not a few bytes' change.
 find_program(UDSOTA_ARM_GCC arm-none-eabi-gcc)

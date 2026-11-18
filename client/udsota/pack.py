@@ -10,7 +10,7 @@ import os
 from . import __version__
 from .delta import DETOOLS_HINT, build as build_delta, deflate, validation_hash
 from .errors import Refused, UpdateFailed
-from .image import parse_image
+from .image import APP_ELF_SHA, parse_image
 from .wire import DL_DFI, DL_DFI_DEFLATE, DL_DFI_DELTA, DL_DFI_DELTA_DEFLATE
 
 DELTA_DFIS = (DL_DFI_DELTA, DL_DFI_DELTA_DEFLATE)
@@ -53,39 +53,37 @@ def rank_deltas(sizes, full):
     return [d for d in ranked if sizes[d] < full], [d for d in ranked if sizes[d] >= full]
 
 
-# `pack`: checks image against profile, writes one payload per DFI in dfis (all that the arguments allow when None)
-# to out as <stem>.dfi<XX>.bin, and <stem>.manifest.json listing them in the order `flash --compress-auto
-# --diff-from` tries them (rank_deltas against the 0x10 payload): deltas smallest first, 0x10, then 0x00. A delta
-# no smaller than 0x10, which flash would not send, is still written, flagged smaller_than_dfi_10 false and listed
-# after 0x10: it needs less device memory than 0x10, so a flasher may still try it before 0x00. Never overwrites: a
-# <stem> file already in out is refused, and a failed write leaves nothing behind. Returns the manifest.
-def pack(profile, image, stem, out, dfis=None, base=None, log=print):
-    if base is not None or any(d in DELTA_DFIS for d in dfis or ()):
-        refuse_bare_delta(profile)
-    img = parse_image(profile, image)
-    if dfis is None:
-        dfis = DFIS if base is not None else (DL_DFI, DL_DFI_DEFLATE)
-    if base is not None:
-        if not any(d in DELTA_DFIS for d in dfis):
-            raise Refused("--diff-from is for DFI 0x20 and 0x30")
-        if bytes(base) == bytes(image):
-            raise Refused("the base is the new image itself")
-        # Not the profile's full check: a base may predate a layout or slot-size change.
-        try:
-            was = parse_image(dataclasses.replace(profile, layout_id=None, slot_size=len(base)), base)
-        except Refused as e:
-            raise Refused("the base: %s" % e) from None
-        if (was.project, was.hw_id) != (img.project, img.hw_id):
-            raise Refused("the base is %s for hw_id %d, the image %s for hw_id %d"
-                          % (was.project, was.hw_id, img.project, img.hw_id))
-        base_hash = validation_hash(base)
-        if base_hash is None:
-            raise Refused("the base image has no valid appended SHA-256, so a device cannot be matched to it")
-    elif any(d in DELTA_DFIS for d in dfis):
-        raise Refused("DFI 0x20 and 0x30 need --diff-from, the image the device runs")
-    name = "%s.manifest.json" % stem
-    mine = lambda n: n.casefold() == name.casefold() or (n.casefold().startswith((stem + ".dfi").casefold())
-                                                         and n.casefold().endswith(".bin"))
+# The base's validation hash when pack has a base, else None; Refused unless the DFIs, the base and the image fit
+# together: a delta DFI needs a base, a base needs a delta DFI, and it is another build of the same project and board
+# with the appended SHA-256 a device matches it by.
+def _check_base(profile, img, image, base, dfis):
+    if base is None:
+        if any(d in DELTA_DFIS for d in dfis):
+            raise Refused("DFI 0x20 and 0x30 need --diff-from, the image the device runs")
+        return None
+    if not any(d in DELTA_DFIS for d in dfis):
+        raise Refused("--diff-from is for DFI 0x20 and 0x30")
+    if bytes(base) == bytes(image):
+        raise Refused("the base is the new image itself")
+    # Not the profile's full check: a base may predate a layout or slot-size change.
+    try:
+        was = parse_image(dataclasses.replace(profile, layout_id=None, slot_size=len(base)), base)
+    except Refused as e:
+        raise Refused("the base: %s" % e) from None
+    if (was.project, was.hw_id) != (img.project, img.hw_id):
+        raise Refused("the base is %s for hw_id %d, the image %s for hw_id %d"
+                      % (was.project, was.hw_id, img.project, img.hw_id))
+    base_hash = validation_hash(base)
+    if base_hash is None:
+        raise Refused("the base image has no valid appended SHA-256, so a device cannot be matched to it")
+    return base_hash
+
+
+# Refused when out is a file, or already holds a file named for stem (the manifest, or a .dfi*.bin payload), in any
+# letter case: pack never overwrites.
+def _refuse_taken(out, stem, manifest_name):
+    mine = lambda n: n.casefold() == manifest_name.casefold() or (n.casefold().startswith((stem + ".dfi").casefold())
+                                                                  and n.casefold().endswith(".bin"))
     if out.exists() and not out.is_dir():
         raise Refused("--out %s is not a directory" % out)
     try:
@@ -95,6 +93,40 @@ def pack(profile, image, stem, out, dfis=None, base=None, log=print):
     if taken:
         raise Refused("%s already holds %s: pack never overwrites, so give each image and base its own --out"
                       % (out, ", ".join(taken)))
+
+
+# Write files, (name, bytes) pairs, into out: every one whole under a .part name first, then renamed, the manifest
+# (the last) at the end; a failure removes what was written.
+def _write_all(out, files):
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+        for f, data in files:
+            (out / (f + ".part")).write_bytes(data)
+        for f, _ in files:
+            os.replace(out / (f + ".part"), out / f)
+    except OSError as e:
+        for f, _ in files:
+            for p in (out / (f + ".part"), out / f):
+                with contextlib.suppress(OSError):
+                    p.unlink()
+        raise Refused("cannot write in %s: %s" % (out, e.strerror)) from None
+
+
+# `pack`: checks image against profile, writes one payload per DFI in dfis (all that the arguments allow when None)
+# to out as <stem>.dfi<XX>.bin, and <stem>.manifest.json listing them in the order `flash --compress-auto
+# --diff-from` tries them (rank_deltas against the 0x10 payload): deltas smallest first, 0x10, then 0x00. A delta
+# no smaller than 0x10, which flash would not send, is still written, flagged smaller_than_dfi_10 false and listed
+# after 0x10: it needs less device memory than 0x10, so a flasher may still try it before 0x00. Returns the manifest.
+# Never overwrites (_refuse_taken), and a failed write leaves nothing behind (_write_all).
+def pack(profile, image, stem, out, dfis=None, base=None, log=print):
+    if base is not None or any(d in DELTA_DFIS for d in dfis or ()):
+        refuse_bare_delta(profile)
+    img = parse_image(profile, image)
+    if dfis is None:
+        dfis = DFIS if base is not None else (DL_DFI, DL_DFI_DEFLATE)
+    base_hash = _check_base(profile, img, image, base, dfis)
+    name = "%s.manifest.json" % stem
+    _refuse_taken(out, stem, name)
     payloads = {d: build_patch(image, d, base) if d in DELTA_DFIS else encode(image, d) for d in dfis}
     worth, rest, z_len = [], [], None
     if base is not None:                        # only a delta is ranked against the 0x10 payload
@@ -110,26 +142,13 @@ def pack(profile, image, stem, out, dfis=None, base=None, log=print):
         entry = {"dfi": dfi, "file": "%s.dfi%02x.bin" % (stem, dfi), "payload_size": len(data),
                  "payload_sha256": hashlib.sha256(data).hexdigest(), **common}
         if dfi in DELTA_DFIS:
-            entry.update(base_elf_sha256=bytes(base[176:208]).hex(), base_validation_sha256=base_hash.hex(),
+            entry.update(base_elf_sha256=bytes(base[APP_ELF_SHA]).hex(), base_validation_sha256=base_hash.hex(),
                          smaller_than_dfi_10=dfi in worth)
         entries.append(entry)
     manifest = {"udsota_version": __version__, "profile": profile.name, "payloads": entries}
     files = [(e["file"], payloads[e["dfi"]]) for e in entries]
     files.append((name, (json.dumps(manifest, indent=2) + "\n").encode()))
-    parts = []
-    try:
-        out.mkdir(parents=True, exist_ok=True)
-        for f, data in files:                   # every file whole under a .part name first, then renamed, manifest last
-            parts.append(out / (f + ".part"))
-            parts[-1].write_bytes(data)
-        for f, _ in files:
-            os.replace(out / (f + ".part"), out / f)
-    except OSError as e:
-        for f, _ in files:
-            for p in (out / (f + ".part"), out / f):
-                with contextlib.suppress(OSError):
-                    p.unlink()
-        raise Refused("cannot write in %s: %s" % (out, e.strerror)) from None
+    _write_all(out, files)
     for e in entries:
         log("DFI 0x%02X: %s, %d -> %d bytes (%.0f%%)%s" % (e["dfi"], e["file"], img.size, e["payload_size"],
             100.0 * e["payload_size"] / img.size,

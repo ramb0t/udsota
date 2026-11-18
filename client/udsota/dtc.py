@@ -5,10 +5,10 @@ gives each code its description."""
 import re
 
 from .errors import Nrc, Refused, UpdateFailed
-from .update import device_keys
+from .update import device_keys, enter_extended
 from .wire import (DTC_GROUP_ALL, DTC_RECORD_ALL, DTC_STATUS_BITS, NRC_NOT_SUPPORTED, NRC_OUT_OF_RANGE,
                    NRC_RESPONSE_TOO_LONG, NRC_SUBFUNCTION_NOT_SUPPORTED, RDTC_BY_MASK, RDTC_COUNT_BY_MASK,
-                   RDTC_EXT_DATA, SESSION_EXTENDED)
+                   RDTC_EXT_DATA)
 
 NO_DTC_SERVICES = "this firmware has no DTC services"
 SAE_FORMATS = (0x00, 0x04)   # DTCFormatIdentifiers whose DTC is a 2-byte SAE J2012 code and a failure-type byte
@@ -120,7 +120,10 @@ def dtc_ext(uds, profile, dtc, code, log=print):
     if len(d) < 4 or int.from_bytes(d[:3], "big") != dtc:
         raise UpdateFailed("19 06 answered %s, not DTC %06X and its status" % (d.hex(" ") or "nothing", dtc))
     log(dtc_line(profile, dtc, d[3], fmt))
-    log("extended data: %s" % d[4:].hex(" ") if len(d) > 4 else "no extended data stored")
+    if len(d) > 4:
+        log("extended data: %s" % d[4:].hex(" "))
+    else:
+        log("no extended data stored")
     return 0
 
 
@@ -129,9 +132,7 @@ def dtc_ext(uds, profile, dtc, code, log=print):
 # set's is. NRC 0x11 is firmware without DTC services (exit 2); any other is named (exit 1).
 def dtc_clear(uds, profile, secret, log=print):
     keys = device_keys(uds, profile, secret)
-    uds.session(SESSION_EXTENDED)
-    if keys is not None:
-        uds.unlock(profile.security.level_extended, keys)
+    enter_extended(uds, profile, keys)
     try:
         uds.clear_dtc(DTC_GROUP_ALL)
     except Nrc as e:

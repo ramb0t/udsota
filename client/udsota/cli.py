@@ -28,8 +28,9 @@ from .image import BARE_HDR_CRC_OFFSET, parse_image, stamp
 from .keys import keygen, load_master, load_private_key
 from .transport import Transport
 from .delta import DETOOLS_HINT
+from .download import DIFF_DFIS
 from .pack import DFIS, pack, refuse_bare_delta
-from .update import (DIFF_DFIS, PRODUCT_NEEDS_BOOTLOADER, WAIT_NEEDS_BOOTLOADER, confirm_cmd, flash, info,
+from .update import (DROP_76_WITH_BASES, PRODUCT_NEEDS_BOOTLOADER, WAIT_NEEDS_BOOTLOADER, confirm_cmd, flash, info,
                      refuse_bootloader_compression, reset)
 
 
@@ -142,6 +143,19 @@ def load_secret(prof, args):
     return load_master(args.master or prof.security.master_file)
 
 
+# load_secret when the profile has [security], else None (nothing to unlock).
+def secret_for(prof, args):
+    return load_secret(prof, args) if prof.security is not None else None
+
+
+# path's bytes; Refused (exit 2) when it cannot be read.
+def read_file(path):
+    try:
+        return path.read_bytes()
+    except OSError as e:
+        raise Refused("cannot read %s: %s" % (path, e.strerror))
+
+
 # The base images --diff-from names, as (name, bytes) pairs: path itself, or every *.bin directly in a directory.
 # Refuses when detools, which builds the patches, is not installed.
 def load_bases(path):
@@ -152,10 +166,33 @@ def load_bases(path):
     files = sorted(f for f in path.glob("*.bin") if f.is_file()) if path.is_dir() else [path]
     if not files:
         raise Refused("--diff-from %s: the directory holds no .bin files" % path)
+    return [(str(f), read_file(f)) for f in files]
+
+
+# Write data to out through a temporary file in the same directory, then replace the target, so a failure leaves the
+# target as it was; an existing target keeps its permissions. A symlink is written through to its target, and a hard
+# link is split.
+def replace_file(out, data):
+    dest = out.resolve()
+    if not dest.name or dest.is_dir():
+        raise Refused("cannot write %s: it is a directory" % out)
+    part = dest.with_name(".%s.%d.part" % (dest.name, os.getpid()))
     try:
-        return [(str(f), f.read_bytes()) for f in files]
+        fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            if dest.exists():
+                os.chmod(part, dest.stat().st_mode & 0o7777)
+            os.replace(part, dest)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                part.unlink()
+            raise
     except OSError as e:
-        raise Refused("cannot read %s: %s" % (e.filename, e.strerror))
+        raise Refused("cannot write %s: %s" % (out, e.strerror)) from None
 
 
 # `keygen`: writes the key pair and says where the private key belongs.
@@ -174,54 +211,105 @@ def pack_cmd(prof, args):
     if args.diff_from is not None and args.diff_from.is_dir():
         raise Refused("pack --diff-from takes one base file, the image the devices run: with no device to ask, it "
                       "cannot choose from a directory as flash does")
-    try:
-        image = args.file.read_bytes()
-        base = None if args.diff_from is None else args.diff_from.read_bytes()
-    except OSError as e:
-        raise Refused("cannot read %s: %s" % (e.filename, e.strerror))
+    image = read_file(args.file)
+    base = None if args.diff_from is None else read_file(args.diff_from)
     pack(prof, image, args.file.stem, args.out, dfis=None if args.dfi is None else tuple(dict.fromkeys(args.dfi)),
          base=base)
     return 0
 
 
 # `stamp`: FILE stamped (image.stamp) at the profile's header_offset and checked against the profile, written to
-# --out or in place. The write goes to a temporary file in the same directory, then replaces the target, so a failure
-# leaves the target as it was; an existing target keeps its permissions.
+# --out or in place (replace_file).
 def stamp_cmd(prof, args, log=print):
     if prof.image_format != "bare":
         raise Refused("profile %s: stamp is for [image] format = \"bare\", and its format is \"%s\""
                       % (prof.name, prof.image_format))
-    try:
-        data = args.file.read_bytes()
-    except OSError as e:
-        raise Refused("cannot read %s: %s" % (args.file, e.strerror))
-    img = stamp(data, prof.header_offset)
-    info = parse_image(prof, img)
+    img = stamp(read_file(args.file), prof.header_offset)
+    stamped = parse_image(prof, img)
     out = args.out or args.file
-    dest = out.resolve()   # through a symlink to its target, which the replace then keeps; a hard link is split
-    if not dest.name or dest.is_dir():
-        raise Refused("cannot write %s: it is a directory" % out)
-    part = dest.with_name(".%s.%d.part" % (dest.name, os.getpid()))
-    try:
-        fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
-        try:
-            with os.fdopen(fd, "wb") as f:
-                f.write(img)
-                f.flush()
-                os.fsync(f.fileno())
-            if dest.exists():
-                os.chmod(part, dest.stat().st_mode & 0o7777)
-            os.replace(part, dest)
-        except BaseException:
-            with contextlib.suppress(OSError):
-                part.unlink()
-            raise
-    except OSError as e:
-        raise Refused("cannot write %s: %s" % (out, e.strerror)) from None
+    replace_file(out, img)
     at = prof.header_offset + BARE_HDR_CRC_OFFSET
     crc = int.from_bytes(img[at:at + 4], "little")
-    log("stamped %s: %d bytes, crc32 0x%08X, image ID %s..." % (out, len(img), crc, info.elf_sha[:4].hex()))
+    log("stamped %s: %d bytes, crc32 0x%08X, image ID %s..." % (out, len(img), crc, stamped.elf_sha[:4].hex()))
     return 0
+
+
+# The bus commands. Each prepare_* takes the loaded profile and the arguments, makes the command's refusals before
+# any key is read or the bus opens, loads the 0x27 secret last when the command is keyed and the profile has
+# [security], and returns run(uds, t), which runs the command on the open bus (t is the transport).
+def prepare_info(prof, args):
+    return lambda uds, t: info(uds, prof)
+
+
+def prepare_flash(prof, args):
+    image = read_file(args.file)
+    parse_image(prof, image)
+    if args.drop_76 is not None and args.drop_76 < 1:
+        raise Refused("--drop-76 takes a block number from 1")
+    if args.diff_format is not None and args.diff_from is None:
+        raise Refused("--diff-format needs --diff-from")
+    refuse_bootloader_compression(prof, args.compress)
+    if args.wait_for_unit is not None and prof.flow != "bootloader":   # flash refuses it too
+        raise Refused("profile %s: %s" % (prof.name, WAIT_NEEDS_BOOTLOADER))
+    if args.allow_product_change and prof.flow != "bootloader":
+        raise Refused("profile %s: %s" % (prof.name, PRODUCT_NEEDS_BOOTLOADER))
+    bases = None
+    if args.diff_from is not None:
+        if args.drop_76 is not None:            # flash refuses it too; here before any key or bus
+            raise Refused(DROP_76_WITH_BASES)
+        refuse_bare_delta(prof)
+        bases = load_bases(args.diff_from)
+    secret = secret_for(prof, args)
+    return lambda uds, t: flash(uds, prof, image, secret, drop_76=args.drop_76, preroll=t.preroll,
+                                quiet=getattr(t, "quiet", contextlib.nullcontext), compress=args.compress,
+                                bases=bases, diff_format=args.diff_format or "auto",
+                                wait_for_unit=args.wait_for_unit, allow_product_change=args.allow_product_change)
+
+
+def prepare_confirm(prof, args):
+    if prof.flow == "bootloader":
+        raise Refused("profile %s: [update] flow = \"bootloader\" has no ConfirmImage; flash ends once the app "
+                      "reports healthy" % prof.name)
+    return lambda uds, t: confirm_cmd(uds)
+
+
+def prepare_reset(prof, args):
+    secret = secret_for(prof, args)
+    return lambda uds, t: reset(uds, prof, secret)
+
+
+# config and dtc are for a unit whose app serves UDS, which a bootloader-flow unit's does not.
+def refuse_bootloader_flow(prof, cmd):
+    if prof.flow == "bootloader":
+        raise Refused("profile %s: [update] flow = \"bootloader\" has no %s: the unit's app serves no UDS"
+                      % (prof.name, cmd))
+
+
+def prepare_config(prof, args):
+    refuse_bootloader_flow(prof, "config")
+    if args.config_cmd == "show":
+        writable_keys(prof)
+        return lambda uds, t: config_show(uds, prof)
+    writes = parse_writes(prof, args.assignments, args.commit, args.reset)
+    group_writes(prof, writes, args.commit)     # stage-only across groups: refused here
+    secret = secret_for(prof, args)
+    return lambda uds, t: config_set(uds, prof, writes, secret, commit=args.commit, reset=args.reset,
+                                     preroll=t.preroll)
+
+
+def prepare_dtc(prof, args):
+    refuse_bootloader_flow(prof, "dtc")
+    if args.dtc_cmd == "clear":
+        secret = secret_for(prof, args)
+        return lambda uds, t: dtc_clear(uds, prof, secret)
+    if args.ext is None:
+        return lambda uds, t: dtc_show(uds, prof)
+    ext = ext_code(args.ext)
+    return lambda uds, t: dtc_ext(uds, prof, ext, args.ext)
+
+
+PREPARE = {"info": prepare_info, "flash": prepare_flash, "confirm": prepare_confirm, "reset": prepare_reset,
+           "config": prepare_config, "dtc": prepare_dtc}
 
 
 # Entry point; returns the exit code (0 ok, 1 failed, 2 refused, 3 server busy, 4 second tester).
@@ -245,65 +333,10 @@ def main(argv=None, transport=Transport):
         interface = args.interface or prof.interface
         if interface is None:
             raise Refused("profile %s names no CAN interface: pass --interface" % prof.name)
-        image = secret = writes = bases = ext = None
-        if args.cmd == "confirm" and prof.flow == "bootloader":
-            raise Refused("profile %s: [update] flow = \"bootloader\" has no ConfirmImage; flash ends once the app "
-                          "reports healthy" % prof.name)
-        if args.cmd in ("config", "dtc") and prof.flow == "bootloader":
-            raise Refused("profile %s: [update] flow = \"bootloader\" has no %s: the unit's app serves no UDS"
-                          % (prof.name, args.cmd))
-        if args.cmd == "flash":
-            try:
-                image = args.file.read_bytes()
-            except OSError as e:
-                raise Refused("cannot read %s: %s" % (args.file, e.strerror))
-            parse_image(prof, image)
-            if args.drop_76 is not None and args.drop_76 < 1:
-                raise Refused("--drop-76 takes a block number from 1")
-            if args.diff_format is not None and args.diff_from is None:
-                raise Refused("--diff-format needs --diff-from")
-            refuse_bootloader_compression(prof, args.compress)
-            if args.wait_for_unit is not None and prof.flow != "bootloader":   # flash refuses it too
-                raise Refused("profile %s: %s" % (prof.name, WAIT_NEEDS_BOOTLOADER))
-            if args.allow_product_change and prof.flow != "bootloader":
-                raise Refused("profile %s: %s" % (prof.name, PRODUCT_NEEDS_BOOTLOADER))
-            if args.diff_from is not None:
-                if args.drop_76 is not None:            # flash refuses it too; here before any key or bus
-                    raise Refused("--drop-76 is for full and compressed downloads, not with --diff-from")
-                refuse_bare_delta(prof)
-                bases = load_bases(args.diff_from)
-        if args.cmd == "config" and args.config_cmd == "set":
-            writes = parse_writes(prof, args.assignments, args.commit, args.reset)
-            group_writes(prof, writes, args.commit)     # stage-only across groups: refused here
-        elif args.cmd == "config":
-            writable_keys(prof)
-        if args.cmd == "dtc" and args.dtc_cmd == "show" and args.ext is not None:
-            ext = ext_code(args.ext)
-        keyed = args.cmd in ("flash", "reset") or writes is not None or (args.cmd == "dtc" and args.dtc_cmd == "clear")
-        if keyed and prof.security is not None:
-            secret = load_secret(prof, args)
+        run = PREPARE[args.cmd](prof, args)
         with transport(prof, interface) as t:
             t.preflight()
-            uds = t.uds()
-            if args.cmd == "info":
-                return info(uds, prof)
-            if args.cmd == "flash":
-                return flash(uds, prof, image, secret, drop_76=args.drop_76, preroll=t.preroll,
-                             quiet=getattr(t, "quiet", contextlib.nullcontext), compress=args.compress,
-                             bases=bases, diff_format=args.diff_format or "auto", wait_for_unit=args.wait_for_unit,
-                             allow_product_change=args.allow_product_change)
-            if args.cmd == "confirm":
-                return confirm_cmd(uds)
-            if args.cmd == "config":
-                if writes is None:
-                    return config_show(uds, prof)
-                return config_set(uds, prof, writes, secret, commit=args.commit, reset=args.reset,
-                                  preroll=t.preroll)
-            if args.cmd == "dtc":
-                if args.dtc_cmd == "clear":
-                    return dtc_clear(uds, prof, secret)
-                return dtc_show(uds, prof) if ext is None else dtc_ext(uds, prof, ext, args.ext)
-            return reset(uds, prof, secret)
+            return run(t.uds(), t)
     except ToolError as e:
         print("udsota: %s" % e, file=sys.stderr)
         return e.exit_code
