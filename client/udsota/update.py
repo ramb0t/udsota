@@ -390,7 +390,8 @@ def wait_for_image(uds, sha, preroll, sleep=time.sleep, clock=time.monotonic):
                            "read F1F0 with `info`" % (running[:8].hex(), sha[:8].hex()))
 
 
-# ConfirmImage in the extended session, retrying NRC 0x22 until the product's soak and health check pass.
+# ConfirmImage in the extended session, retrying NRC 0x22 until the product's soak and health check pass, and a
+# request or answer that is lost: the server answers positive at once for an image already valid, so a repeat is safe.
 def confirm(uds, sleep=time.sleep, clock=time.monotonic, log=print):
     uds.session(SESSION_EXTENDED)
     deadline = clock() + CONFIRM_TIMEOUT_S
@@ -401,6 +402,12 @@ def confirm(uds, sleep=time.sleep, clock=time.monotonic, log=print):
         except Nrc as e:
             if e.code != NRC_CONDITIONS or clock() >= deadline:
                 raise
+            sleep(CONFIRM_RETRY_S)
+        except NoResponse as e:
+            if clock() >= deadline:
+                raise NoResponse("ConfirmImage got no answer in %d s: the new image is not confirmed and rolls back "
+                                 "at the unit's next reset; run \"udsota confirm\" before then to finish it"
+                                 % CONFIRM_TIMEOUT_S) from e
             sleep(CONFIRM_RETRY_S)
     log("confirmed: %s" % describe_status(decode_status(uds.read_did(DID_STATUS))))
     return 0

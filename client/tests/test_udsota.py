@@ -2090,6 +2090,47 @@ def test_confirm_gives_up_after_timeout():
     assert ft.t >= update.CONFIRM_TIMEOUT_S
 
 
+# A server whose first n ConfirmImage requests, or their answers, are lost: "request" never reaches it, "answer" is
+# served and its 71 is lost. Later ones answer as FakeServer does (a repeat for an image already valid answers
+# positive, as the core's does).
+class LosesConfirm(FakeServer):
+    # lost: "request" or "answer"; n: how many F002s it loses.
+    def __init__(self, lost, n=1, **kw):
+        FakeServer.__init__(self, running_state=2, confirm_refusals=0, **kw)
+        self.lost, self.lose_n = lost, n
+
+    # F002 as FakeServer, losing the first lose_n.
+    def s31(self, req, rid):
+        if rid != 0xF002 or not self.lose_n:
+            return super().s31(req, rid)
+        self.lose_n -= 1
+        if self.lost == "answer":
+            super().s31(req, rid)
+        return []
+
+
+# Check a ConfirmImage whose request or answer is lost is sent again, as NRC 0x22 is, and confirms, in the command and
+# at the end of flash; the repeat is safe because F002 answers positive at once for an image already valid.
+@pytest.mark.parametrize("lost", ["request", "answer"])
+def test_confirm_resends_a_lost_confirm_image(lost):
+    ft, d = FakeTime(), LosesConfirm(lost)
+    assert update.confirm_cmd(uds_for(d, ft), sleep=ft.sleep, clock=ft.clock, log=lambda *a: None) == 0
+    assert d.log.count((0x31, 0xF002)) == 2 and d.running_state == 3 and ft.sleeps == [update.CONFIRM_RETRY_S]
+    rc, _, _ = run_flash(LosesConfirm(lost, sha=NEW_SHA))
+    assert rc == 0
+
+
+# Check a ConfirmImage that never gets an answer stops at confirm's deadline, saying the image is not confirmed and that
+# `udsota confirm` before the unit resets finishes the job.
+def test_confirm_with_no_answer_says_the_image_is_unconfirmed():
+    ft, d = FakeTime(), LosesConfirm("request", n=10 ** 6)
+    with pytest.raises(errors.NoResponse) as e:
+        update.confirm(uds_for(d, ft), sleep=ft.sleep, clock=ft.clock, log=lambda *a: None)
+    assert ft.t >= update.CONFIRM_TIMEOUT_S and d.running_state == 2
+    assert "the new image is not confirmed" in str(e.value) and '"udsota confirm"' in str(e.value)
+    assert "rolls back" in str(e.value)
+
+
 # Check reset unlocks level 01/02 in the extended session with the vector key, then sends 11 01.
 def test_reset_is_keyed():
     ft, d = FakeTime(), FakeServer()
