@@ -23,6 +23,9 @@ BOOT_TIMEOUT_S = 60.0
 BOOT_POLL_S = 1.0
 CONFIRM_RETRY_S = 2.0    # between ConfirmImage tries; Uds's 3E 00 keepalive holds the extended session meanwhile
 CONFIRM_TIMEOUT_S = 120.0   # a product's soak plus its health check, with margin
+NRC_SERVICE_IN_SESSION = 0x7F   # serviceNotSupportedInActiveSession: ConfirmImage met the default session (S3 lapsed)
+UNCONFIRMED = ("the new image is not confirmed and rolls back at the unit's next reset; run \"udsota confirm\" "
+               "before then to finish it")
 WAIT_RETRY_S = 0.05      # flash --wait-for-unit: the next 10 02 at most this long after the last went unanswered,
                          # so that one lands in a bootloader's power-up window (100 ms in udsota's examples)
 WAIT_SETTLE_S = 0.25     # then the answers to earlier 10 02s, which a unit sends a P2 (50 ms) apart, are passed
@@ -395,19 +398,22 @@ def wait_for_image(uds, sha, preroll, sleep=time.sleep, clock=time.monotonic):
 def confirm(uds, sleep=time.sleep, clock=time.monotonic, log=print):
     uds.session(SESSION_EXTENDED)
     deadline = clock() + CONFIRM_TIMEOUT_S
+    lost = False                                # a send or an answer was lost: S3 may have lapsed since
     while True:
         try:
             uds.routine(RID_CONFIRM)
             break
         except Nrc as e:
-            if e.code != NRC_CONDITIONS or clock() >= deadline:
-                raise
-            sleep(CONFIRM_RETRY_S)
-        except NoResponse as e:
+            if e.code == NRC_CONDITIONS and clock() < deadline:
+                sleep(CONFIRM_RETRY_S)
+                continue
+            if e.code != NRC_CONDITIONS and (lost or e.code == NRC_SERVICE_IN_SESSION):
+                raise Nrc(e.sid, e.code, UNCONFIRMED) from e
+            raise
+        except (NoResponse, SendFailed) as e:   # a failed send never reached the server
+            lost = True
             if clock() >= deadline:
-                raise NoResponse("ConfirmImage got no answer in %d s: the new image is not confirmed and rolls back "
-                                 "at the unit's next reset; run \"udsota confirm\" before then to finish it"
-                                 % CONFIRM_TIMEOUT_S) from e
+                raise type(e)("ConfirmImage got no answer in %d s: %s" % (CONFIRM_TIMEOUT_S, UNCONFIRMED)) from e
             sleep(CONFIRM_RETRY_S)
     log("confirmed: %s" % describe_status(decode_status(uds.read_did(DID_STATUS))))
     return 0

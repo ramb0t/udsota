@@ -2188,6 +2188,49 @@ def test_confirm_with_no_answer_says_the_image_is_unconfirmed():
     assert "rolls back" in str(e.value)
 
 
+# A server whose ConfirmImage sends fail on the PC's side (the request never reaches it): OSError(err) from the first n
+# F002 sends, which send_resending turns into SendFailed after its one resend.
+class FailsConfirmSend(FakeServer):
+    def __init__(self, err, n, **kw):
+        FakeServer.__init__(self, running_state=2, confirm_refusals=0, **kw)
+        self.err, self.fail_n = err, n
+
+    def handle(self, req):
+        if req[0] == 0x31 and req[2:4] == b"\xf0\x02" and self.fail_n:
+            self.fail_n -= 1
+            raise OSError(self.err, os.strerror(self.err))
+        return super().handle(req)
+
+
+# Check a ConfirmImage whose send fails twice (ENOBUFS, or ECOMM from a frame nobody acknowledged) is sent again, as a
+# lost one is, and confirms; and that one that never goes stops at the deadline saying the image is not confirmed.
+@pytest.mark.parametrize("err", [errno.ENOBUFS, errno.ECOMM])
+def test_confirm_resends_a_failed_send(err):
+    ft, d = FakeTime(), FailsConfirmSend(err, 2)
+    assert update.confirm(uds_for(d, ft), sleep=ft.sleep, clock=ft.clock, log=lambda *a: None) == 0
+    assert d.running_state == 3
+    ft, d = FakeTime(), FailsConfirmSend(err, 10 ** 6)
+    with pytest.raises(errors.UpdateFailed) as e:
+        update.confirm(uds_for(d, ft), sleep=ft.sleep, clock=ft.clock, log=lambda *a: None)
+    assert ft.t >= update.CONFIRM_TIMEOUT_S and d.running_state == 2
+    assert "the new image is not confirmed" in str(e.value) and '"udsota confirm"' in str(e.value)
+
+
+# Check a resent ConfirmImage that meets the default session (S3 lapsed during the outage: 0x7F) says the image is not
+# confirmed, and that `udsota confirm` finishes it, as the deadline's error does.
+def test_confirm_refused_after_a_lost_one_says_the_image_is_unconfirmed():
+    class LapsesS3(LosesConfirm):
+        def s31(self, req, rid):
+            if rid == 0xF002 and self.lose_n:
+                self.session = 1                # the outage outlasted S3
+            return super().s31(req, rid)
+    ft, d = FakeTime(), LapsesS3("request")
+    with pytest.raises(errors.Nrc) as e:
+        update.confirm(uds_for(d, ft), sleep=ft.sleep, clock=ft.clock, log=lambda *a: None)
+    assert e.value.code == 0x7F and d.running_state == 2
+    assert "the new image is not confirmed" in str(e.value) and '"udsota confirm"' in str(e.value)
+
+
 # Check reset unlocks level 01/02 in the extended session with the vector key, then sends 11 01.
 def test_reset_is_keyed():
     ft, d = FakeTime(), FakeServer()
