@@ -52,7 +52,7 @@
 enum {
     STOPPED = 0,   /* BAD_CFG, or port_reset or port_start_app returned: the poll only reloads the watchdog */
     STARTING,      /* START_APP: the next poll starts the app */
-    LISTENING,     /* serving, with no deadline of the core's own */
+    LISTENING,     /* serving; leaves only for 11 01, F001 or a default session the boot rules would start from */
     WINDOW,        /* serving in the power-up window, which ends at since + window_ms */
     TESTER,        /* serving with B.bus locked, the others stopped: the idle exit comes at since + IDLE_MS */
     S3_EXPIRED,    /* serving, and S3 expired in this poll, which ends in a session exit */
@@ -790,7 +790,8 @@ void udsota_boot_poll(void)
         session_exit();
     } else if (B.state == LISTENING && B.app_valid && B.srv.sessionType == UDS_LEV_DS_DS && !busy() &&
                would_start_app()) {                      /* back in the default session with no lock and no deadline */
-        reset();
+        B.reset = true;                                  /* the answer to the 10 01 has time to leave first */
+        B.reset_at = now;
     }
 }
 

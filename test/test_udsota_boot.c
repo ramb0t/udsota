@@ -1241,16 +1241,22 @@ static void test_a_default_session_after_an_unlocked_one_leaves_for_the_app(void
     wait_ms(100u);                                               /* the window ends in the programming session */
     CHECK(fake.starts == 0 && fake.resets == 0);
     CHECK(ASK(0x10, 0x01) && SESSION_ANSWER(0x01));
-    wait_ms(10u);
-    CHECK(fake.resets == 1 && fake.starts == 0);
+    wait_ms(30u);
+    CHECK(fake.resets == 0);                                     /* the answer has time to leave first */
+    wait_ms(40u);
+    CHECK(fake.resets == 1 && fake.starts == 0 && fake.reset_us - g_ans_us >= 60000u &&
+          fake.reset_us - g_ans_us <= 62000u);
 
     CHECK(boot(POWER_ON) == WINDOW && ask_on(1u, REQ(0x10, 0x02, 0x00)) && SESSION_ANSWER(0x02));
     wait_ms(100u);                                               /* entered again while listening after the window */
     CHECK(ASK(0x10, 0x02, 0x00) && SESSION_ANSWER(0x02));
     wait_ms(3000u);
     CHECK(fake.resets == 1 && ASK(0x10, 0x01) && SESSION_ANSWER(0x01));
-    wait_ms(10u);
-    CHECK(fake.resets == 2 && fake.starts == 0);
+    wait_ms(30u);
+    CHECK(fake.resets == 1);
+    wait_ms(40u);
+    CHECK(fake.resets == 2 && fake.starts == 0 && fake.reset_us - g_ans_us >= 60000u &&
+          fake.reset_us - g_ans_us <= 62000u);
 
     CHECK(boot_held() && ASK(0x10, 0x02, 0x00) && SESSION_ANSWER(0x02));   /* held: listening, as before */
     CHECK(ASK(0x10, 0x01) && SESSION_ANSWER(0x01));

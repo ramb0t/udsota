@@ -30,9 +30,10 @@
  *   idle exit          5100 ms in the default session, from the udsota_boot_rx call that carried the last tester
  *                      frame, once no request is in flight
  *   S3                 5100 ms outside the default session, from the last 10 or 3E that iso14229 served
- *   default session    listening in it with no tester frame's lock, a valid app and the boot rules saying it would
- *                      start (a 10 01 after a session that no tester frame opened), it resets once the answer has
- *                      gone, as the idle exit does; a held unit and one with no valid app keep listening
+ *   default session    60 ms, from the first poll after the answer to a 10 01 was handed to can_send, when the core
+ *                      is listening in the default session with no tester frame's lock, no request in flight, a
+ *                      valid app and the boot rules saying it would start (a session that no tester frame opened,
+ *                      ended by 10 01); a held unit and one with no valid app keep listening
  *   reset              60 ms, from the first poll that served 11 01 or F001
  *   answers            5 ms apart (P2); the first after each init, the handover's 50 02 included, about 6 ms after
  *                      it; the 10's answer gives P2* 5000 ms, covering the handover's reboot
@@ -205,7 +206,8 @@ void udsota_boot_port_watchdog_start(uint32_t period_ms);
 void udsota_boot_port_watchdog_reload(void);
 
 /* Resets the chip. The core calls it only from udsota_boot_poll, after iso14229's poll has returned: 60 ms after the
- * first poll that served 11 01 or F001, and when a session exit's decision is to start the app. The core has already
+ * first poll that served 11 01 or F001, 60 ms after the first poll that finds it listening in the default session
+ * with a valid app it would start (see the timing table), and when a session exit's decision is to start the app. The core has already
  * written the words it needs. On a target it does not return. If it returns, the core is stopped: udsota_boot_poll
  * only reloads the watchdog and udsota_boot_rx ignores frames, until udsota_boot_init is called again. A host fake
  * returns, which is how a test sees the reset. */
@@ -291,7 +293,8 @@ udsota_boot_decision_t udsota_boot_init(const udsota_boot_cfg_t *cfg);
 /* Call from the main loop as often as it can run. The product's own work between two calls stays under 5 ms
  * (iso14229's UDSServerPoll contract). One call reloads the watchdog, polls the server, ages iso14229's timers so a
  * unit that stays in its bootloader for weeks still answers at once, keeps the F1F1 bookkeeping, and applies the
- * session rules of the timing table: the window, the idle exit, S3 and the pending reset. Both session exits, the idle
+ * session rules of the timing table: the window, the idle exit, S3, the default-session exit and the pending reset. A
+ * listening unit with a valid app reads the keep words in every poll for the default-session exit. Both session exits, the idle
  * exit and S3's expiry, apply the boot rules again with no handover and cause OTHER (udsota_boot_internal.h) and reset
  * exactly when they answer START_APP; otherwise the core returns to listening on the open buses. On a target it does not
  * return once it resets or starts the app. */
