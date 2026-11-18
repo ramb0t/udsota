@@ -1,12 +1,14 @@
 /* udsota: safe A/B firmware updates over UDS on iso14229's server (see udsota.h). One file:
- *   1. the limits and state; the wire contract is in udsota.h
+ *   1. the limits and state (the wire contract, every number a tester sees, is udsota_wire.h's)
  *   2. the image rules: what the first 320 bytes must say before anything is erased
  *   3. coded downloads: raw DEFLATE through the ROM's tinfl into the image, or for a delta into detools, which
  *      rebuilds the image from the running one
- *   4. 0x27 keys: HMAC per device, or ECDSA signatures, and the PSA lock around udsota's PSA calls
+ *   4. 0x27 keys: HMAC per device, or ECDSA signatures, and their setup at init
  *   5. the updater: 34, 36, 37, the routines, the DIDs and the session rules
- *   6. iso14229's events
- *   7. the ESP-IDF platform: the flash worker on esp_ota_*, the slot status, identity, crypto and a delta's base
+ *   6. iso14229's events, one handler each
+ *   7. the API: udsota_init, udsota_event and the rest of udsota.h's functions
+ *   8. the platform: on ESP-IDF the flash worker on esp_ota_*, the slot status, identity, crypto, a delta's base and
+ *      the PSA lock; on a host the PSA lock alone, the rest being the build's
  * iso14229 keeps ISO-TP, framing, timing, the 0x78 cadence and the 0x27 attempt delays; it is used as it is. */
 #include "udsota.h"
 #include <stdlib.h>
@@ -14,12 +16,11 @@
 #if UDSOTA_DELTA
 #include <limits.h>
 #include "detools.h"
-#endif
-
 /* UDSOTA_DELTA=1 comes with detools' defines from udsota's CMakeLists, which also adds detools.c; without them it was
  * set where that CMakeLists never saw it, and the link would fail on detools_* instead. */
-#if UDSOTA_DELTA && !defined(DETOOLS_CONFIG_COMPRESSION_HEATSHRINK)
+#if !defined(DETOOLS_CONFIG_COMPRESSION_HEATSHRINK)
 #error "UDSOTA_DELTA=1 without detools: set it as udsota.h says, or on a host with udsota_with_delta()"
+#endif
 #endif
 
 #if defined(ESP_PLATFORM)
@@ -44,15 +45,17 @@ _Static_assert(sizeof(tinfl_decompressor) == 10992u && TINFL_LZ_DICT_SIZE == 327
 #include "psa/crypto.h"
 #define CHIP_ID CONFIG_IDF_FIRMWARE_CHIP_ID
 #define LOGW(...) ESP_LOGW("udsota", __VA_ARGS__)
+#define RESTART() esp_restart()
 #else
 #include "miniz.h"                 /* host builds: miniz's tinfl */
 #ifndef CHIP_ID
 #define CHIP_ID 9u                 /* ESP32-S3, for host tests; tools/image_check sets the chip it checks for */
 #endif
 #define LOGW(...) ((void)0)
+#define RESTART() ((void)0)
 #endif
 
-/* ==== 1. Limits and state (the wire contract is udsota.h's) ==== */
+/* ==== 1. Limits and state ==== */
 
 #define KEY_LOCK_MS     40u        /* 0x27's wait for the PSA lock: an app that holds it longer gets 0x22 */
 #define LABEL_MAX       32u
@@ -64,19 +67,32 @@ _Static_assert(sizeof(tinfl_decompressor) == 10992u && TINFL_LZ_DICT_SIZE == 327
 
 enum { DL_PLAIN, DL_DEFLATE, DL_DELTA };   /* a download's mode: the 34's DFI 00, 10 or 30 */
 
+/* Where a download is, 34 to FF01. Idle is 0, which power-on and udsota_test_reboot leave in place. Two bits carry what
+ * the rest of the code asks: the tester is mid-transfer, and an image is open on the flash side. */
+#define IN_TRANSFER  0x01u
+#define IMAGE_HELD   0x02u
+enum {
+    PHASE_IDLE,                                       /* no download, and no image waiting or verified */
+    PHASE_ANNOUNCED = IN_TRANSFER,                    /* a plain 34 is accepted and waits for its first 36 */
+    PHASE_OPEN = IN_TRANSFER | IMAGE_HELD,            /* blocks arrive: a coded 34, or a plain first 36 that passed */
+    PHASE_RECEIVED = IMAGE_HELD,                      /* the 37 is accepted: the image is whole and waits for FF01 */
+    PHASE_VERIFIED = 0x04u,                           /* FF01 passed: F001 may activate it; a session change keeps it */
+};
+
 typedef int (*done_fn)(int result, uint8_t *status, size_t *status_len);
 
-typedef struct {                   /* a coded download: tinfl (then detools) into buf, the image's next bytes */
-    tinfl_decompressor *r;
-    uint8_t *dict;                 /* TINFL_LZ_DICT_SIZE bytes: tinfl's window, whose new bytes are copied out */
-    size_t   dict_ofs, pend_ofs, pend;
+typedef struct {                   /* a coded download: tinfl (then detools) into zbuf, the image's next bytes */
+    tinfl_decompressor *inflater;
+    uint8_t *window;               /* TINFL_LZ_DICT_SIZE bytes: tinfl's window, whose new bytes are copied out */
+    size_t   window_at;            /* where tinfl writes next in the window */
+    size_t   fresh_at, fresh;      /* the bytes tinfl made last, and how many of them are not yet copied out */
     int      status;
     uint32_t produced, written;    /* image bytes inflated, and written to flash */
-    size_t   held;                 /* bytes waiting in buf */
+    size_t   held;                 /* bytes waiting in zbuf */
     bool     begun, ended, trailing;
     uint8_t  failed;               /* the first udsota_reason_t */
 #if UDSOTA_DELTA
-    struct detools_apply_patch_t *dt;   /* a delta's patch state, between tinfl and buf; NULL for DFI 10 */
+    struct detools_apply_patch_t *patch;   /* a delta's patch state, between tinfl and zbuf; NULL for DFI 10 */
     uint8_t  hdr[PATCH_HDR_LEN];   /* the patch's header, checked before any byte reaches detools */
     size_t   hdr_len;
     int64_t  base_off;             /* where detools' next base read starts */
@@ -94,7 +110,7 @@ static struct {
     size_t         devid_len;
     /* 0x27 */
     bool           sec_on, sec_ecdsa, key_ok;
-    uint8_t        kdev[32];
+    uint8_t        device_key[32];
     bool           seed_valid;
     uint8_t        seed_level, seed[UDSOTA_SEED_LEN];
     uint32_t       seed_ms;
@@ -102,10 +118,9 @@ static struct {
     uint8_t        last_reason;
     uint32_t       last_bytes;
     uint32_t       announced, received, written;
-    bool           dl_active;      /* between an accepted 34 and 37 or an abort */
-    bool           ota_open;       /* an image is open on the flash side (from the first 36, or the 34 when coded) */
+    uint8_t        phase;          /* PHASE_*: where the download is, from a 34 to FF01 */
     uint8_t        mode;           /* DL_PLAIN, DL_DEFLATE or DL_DELTA */
-    bool           dl_complete, slot_verified, activating, reset_mine, close_pending;
+    bool           activating, reset_mine, close_pending;
     uint8_t        progress_stage, progress_reason;
     bool           progress_block;
     /* A job on the worker */
@@ -113,11 +128,23 @@ static struct {
     uint8_t        job_sid;
     uint32_t       job_ms;
     done_fn        job_done;
-    size_t         blk_len;
-    uint8_t        blk[BUF_LEN];   /* the 36 being written: the worker reads it */
+    size_t         block_len;
+    uint8_t        block[BUF_LEN]; /* the 36 being written: the worker reads it */
     uint8_t        zbuf[BUF_LEN];  /* a coded download's image bytes on their way to flash */
     zdl_t          z;
 } U;
+
+/* Between an accepted 34 and the 37 or an abort: the tester is mid-transfer. */
+static inline bool transferring(void)
+{
+    return (U.phase & IN_TRANSFER) != 0u;
+}
+
+/* An image is open on the flash side, from the first 36 (the 34 when coded) to FF01 or an abort. */
+static inline bool image_open(void)
+{
+    return (U.phase & IMAGE_HELD) != 0u;
+}
 
 static uint16_t le16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
 static uint32_t le32(const uint8_t *p)
@@ -163,57 +190,76 @@ static bool parse_version(const char *s, size_t n, uint8_t out[3], bool *clean)
     return true;
 }
 
+/* Where the rules look in an ESP-IDF image's first bytes: its 24-byte header, the header of the first segment, and
+ * esp_app_desc_t at the start of that segment, with udsota's descriptor (udsota_image_desc_t) 256 bytes on. */
+enum {
+    HDR_MAGIC = 0, HDR_SEGMENTS = 1, HDR_SPI_MODE = 2, HDR_CHIP_ID = 12,
+    SEGMENT_LEN = 28,                   /* the first segment's length, in the header that follows the image's own */
+    SEGMENT_MIN = 256 + 32,             /* esp_app_desc_t and the descriptor behind it */
+    APP_DESC = 32,
+    APP_VERSION = APP_DESC + 16, APP_PROJECT = APP_DESC + 48,
+};
+#define ESP_IMAGE_MAGIC     0xE9u
+#define ESP_APP_DESC_MAGIC  0xABCD5432u
+
+/* An ESP-IDF image for this chip that the platform can boot, with room for the descriptor. */
+static bool is_esp_image(const uint8_t *b, size_t len, uint32_t size)
+{
+    return b != NULL && len >= IMAGE_MIN && size >= IMAGE_MIN && b[HDR_MAGIC] == ESP_IMAGE_MAGIC &&
+           b[HDR_SEGMENTS] != 0u && b[HDR_SEGMENTS] <= 16u && b[HDR_SPI_MODE] <= 5u &&
+           le16(&b[HDR_CHIP_ID]) == CHIP_ID && le32(&b[SEGMENT_LEN]) >= SEGMENT_MIN &&
+           le32(&b[APP_DESC]) == ESP_APP_DESC_MAGIC && udsota_plat_compatible(b, len);
+}
+
+/* SemVer: a release must be newer than the running image, or the same core when that is a dev build; a dev build
+ * needs a core at least equal. allow_downgrade skips the newer rule and nothing else. */
+static bool newer_enough(const uint8_t ver[3], bool release)
+{
+    const int c = memcmp(ver, U.running_version, 3);
+    return U.cfg.allow_downgrade || (release ? (c > 0 || (c == 0 && !U.running_release)) : c >= 0);
+}
+
+/* A field of udsota's descriptor in an image's first bytes b. */
+#define DESC(b, field) (&(b)[UDSOTA_IMG_DESC_OFFSET + offsetof(udsota_image_desc_t, field)])
+
 /* The first IMAGE_MIN bytes of an image of `size` bytes, before anything is erased: an ESP-IDF image for this chip
  * that the platform can boot, this product, board, layout and CAN IDs, a newer version, and a size that fits. */
 static udsota_reason_t check_first(const uint8_t *b, size_t len, uint32_t size)
 {
-    if (b == NULL || len < IMAGE_MIN || size < IMAGE_MIN || b[0] != 0xE9u || b[1] == 0u || b[1] > 16u ||
-        b[2] > 5u || le16(&b[12]) != CHIP_ID || le32(&b[28]) < 256u + 32u || le32(&b[32]) != 0xABCD5432u ||
-        !udsota_plat_compatible(b, len)) {
+    if (!is_esp_image(b, len, size)) {
         return UDSOTA_DL_BAD_HEADER;
     }
-    const char *project = (const char *)&b[32 + 48];
+    const char *project = (const char *)&b[APP_PROJECT];
     const size_t plen = strnlen(U.product, 33);
     if (plen > 32u || memcmp(project, U.product, plen) != 0 || (plen < 32u && project[plen] != '\0')) {
         return UDSOTA_DL_BAD_PROJECT;
     }
-    const uint8_t *d = &b[UDSOTA_IMG_DESC_OFFSET];
-    if (le32(d) != udsota_image_desc.magic || le16(d + 4) < 1u || d[6] != udsota_image_desc.hw_id) {
+    if (le32(DESC(b, magic)) != udsota_image_desc.magic || le16(DESC(b, desc_version)) < 1u ||
+        *DESC(b, hw_id) != udsota_image_desc.hw_id) {
         return UDSOTA_DL_BAD_BOARD;
     }
-    if (d[7] != udsota_image_desc.partition_layout_id) {
+    if (*DESC(b, partition_layout_id) != udsota_image_desc.partition_layout_id) {
         return UDSOTA_DL_BAD_LAYOUT;
     }
-    if (le16(d + 8) != udsota_image_desc.diag_request_id || le16(d + 10) != udsota_image_desc.diag_response_id) {
+    if (le16(DESC(b, diag_request_id)) != udsota_image_desc.diag_request_id ||
+        le16(DESC(b, diag_response_id)) != udsota_image_desc.diag_response_id) {
         return UDSOTA_DL_BAD_DIAG_IDS;
     }
-    /* SemVer: a release must be newer than the running image, or the same core when that is a dev build; a dev
-     * build needs a core at least equal. The release flag must agree with the version string. allow_downgrade skips
-     * the newer rule and nothing else. */
+    /* The release flag must agree with the version string. */
     uint8_t ver[3];
     bool clean;
-    const bool release = (d[12] & 0x01u) != 0u;
-    if (!parse_version((const char *)&b[32 + 16], 32u, ver, &clean) || clean != release) {
+    const bool release = (*DESC(b, flags) & 0x01u) != 0u;
+    if (!parse_version((const char *)&b[APP_VERSION], 32u, ver, &clean) || clean != release) {
         return UDSOTA_DL_BAD_HEADER;
     }
-    const int c = memcmp(ver, U.running_version, 3);
-    if (!U.cfg.allow_downgrade && !(release ? (c > 0 || (c == 0 && !U.running_release)) : c >= 0)) {
+    if (!newer_enough(ver, release)) {
         return UDSOTA_DL_NOT_NEWER;
     }
     return (size > udsota_plat_slot_size()) ? UDSOTA_DL_TOO_BIG : UDSOTA_DL_OK;
 }
+#undef DESC
 
 /* ==== 3. Coded downloads (DFI 0x10: raw DEFLATE; 0x30: a delta patch in it; memorySize the image's size) ==== */
-
-static void zdl_close(void)
-{
-    free(U.z.r);
-    free(U.z.dict);
-#if UDSOTA_DELTA
-    free(U.z.dt);
-#endif
-    memset(&U.z, 0, sizeof U.z);
-}
 
 static uint8_t zdl_fail(udsota_reason_t r)
 {
@@ -223,13 +269,18 @@ static uint8_t zdl_fail(udsota_reason_t r)
     return U.z.failed;
 }
 
+/* The bytes the image rules need before anything is erased: IMAGE_MIN, or the whole of a smaller image. */
+static inline size_t zdl_first_len(void)
+{
+    return (U.announced < IMAGE_MIN) ? U.announced : IMAGE_MIN;
+}
+
 /* Worker: the image's bytes into flash. Nothing is erased until the first IMAGE_MIN bytes pass check_first. */
 static uint8_t zdl_take(size_t n, bool last)
 {
     U.z.held += n;
     U.z.produced += (uint32_t)n;
-    const size_t first = (U.announced < IMAGE_MIN) ? U.announced : IMAGE_MIN;
-    if (!U.z.begun && (U.z.held >= first || last)) {
+    if (!U.z.begun && (U.z.held >= zdl_first_len() || last)) {
         const udsota_reason_t why = check_first(U.zbuf, U.z.held, U.announced);
         if (why != UDSOTA_DL_OK) {
             return zdl_fail(why);
@@ -245,6 +296,25 @@ static uint8_t zdl_take(size_t n, bool last)
         }
         U.z.written += (uint32_t)U.z.held;
         U.z.held = 0;
+    }
+    return U.z.failed;
+}
+
+/* Worker: n image bytes into zbuf, split where it fills. The image never grows past memorySize: BAD_STREAM. */
+static uint8_t zdl_put(const uint8_t *d, size_t n)
+{
+    while (n > 0u) {
+        size_t k = BUF_LEN - U.z.held;
+        k = (k < n) ? k : n;
+        if (k == 0u || U.z.produced + k > U.announced) {
+            return zdl_fail(UDSOTA_DL_BAD_STREAM);              /* past memorySize */
+        }
+        memcpy(&U.zbuf[U.z.held], d, k);
+        d += k;
+        n -= k;
+        if (zdl_take(k, false) != UDSOTA_DL_OK) {
+            return U.z.failed;
+        }
     }
     return U.z.failed;
 }
@@ -278,31 +348,17 @@ static int base_seek(void *arg, int offset)
 }
 
 /* Worker, detools' output: the rebuilt image's next n bytes into zbuf. detools writes runs of up to 128 bytes at any
- * alignment, so each is split where zbuf fills, as job_zwrite splits tinfl's. A patch for an image of another size than
- * memorySize is BAD_STREAM before its first byte reaches the image rules. The memorySize bound is also what ends a
- * chunk whose size has the sign bit: detools' own bound wraps and lets it run on once that many bytes are rebuilt. */
+ * alignment, so each goes through zdl_put, as tinfl's do. A patch for an image of another size than memorySize is
+ * BAD_STREAM before its first byte reaches the image rules. The memorySize bound is also what ends a chunk whose size
+ * has the sign bit: detools' own bound wraps and lets it run on once that many bytes are rebuilt. */
 static int patch_write(void *arg, const uint8_t *buf, size_t n)
 {
     (void)arg;
-    if (U.z.dt->to_size != U.announced) {
+    if (U.z.patch->to_size != U.announced) {
         (void)zdl_fail(UDSOTA_DL_BAD_STREAM);
         return -1;
     }
-    while (n > 0u) {
-        size_t k = BUF_LEN - U.z.held;
-        k = (k < n) ? k : n;
-        if (k == 0u || U.z.produced + k > U.announced) {
-            (void)zdl_fail(UDSOTA_DL_BAD_STREAM);              /* past memorySize */
-            return -1;
-        }
-        memcpy(&U.zbuf[U.z.held], buf, k);
-        buf += k;
-        n -= k;
-        if (zdl_take(k, false) != UDSOTA_DL_OK) {
-            return -1;
-        }
-    }
-    return 0;
+    return (zdl_put(buf, n) == UDSOTA_DL_OK) ? 0 : -1;
 }
 
 /* Worker: n inflated patch bytes. The 64-byte header comes first, and no byte reaches detools before it passes: a wrong
@@ -332,78 +388,122 @@ static uint8_t patch_take(const uint8_t *d, size_t n)
     if (n == 0u) {
         return UDSOTA_DL_OK;
     }
-    struct detools_apply_patch_t *dt = U.z.dt;
+    struct detools_apply_patch_t *dt = U.z.patch;
     const bool ended = (dt->state == detools_apply_patch_state_done_t);
     const int res = ended ? 0 : detools_apply_patch_process(dt, d, n);
     const bool bad = ended || res < 0 || dt->state == detools_apply_patch_state_failed_t ||
                      (dt->state != detools_apply_patch_state_init_t && dt->to_size != U.announced) ||
                      dt->chunk.offset != n;            /* detools stops at its end: the rest came after it */
-    return (bad && U.z.failed == UDSOTA_DL_OK) ? zdl_fail(UDSOTA_DL_BAD_STREAM) : U.z.failed;
+    return bad ? zdl_fail(UDSOTA_DL_BAD_STREAM) : U.z.failed;
 }
 
 /* detools' state for a patch of unknown length: SIZE_MAX keeps its uncompressed reader's bound out of the way. */
 static bool patch_open(void)
 {
-    U.z.dt = malloc(sizeof *U.z.dt);
-    return U.z.dt != NULL &&
-           detools_apply_patch_init(U.z.dt, base_read, base_seek, SIZE_MAX, patch_write, NULL) == 0;
+    U.z.patch = malloc(sizeof *U.z.patch);
+    return U.z.patch != NULL &&
+           detools_apply_patch_init(U.z.patch, base_read, base_seek, SIZE_MAX, patch_write, NULL) == 0;
 }
+
+static inline void patch_close(void)
+{
+    free(U.z.patch);
+}
+
+/* Worker, the 37: detools' state ends too. Its uncompressed reader holds nothing back, so the 36s wrote every byte the
+ * patch makes: finalize only lets detools reach its end, and its result is no verdict, since with SIZE_MAX as the
+ * patch's length the reader's end always reports a corrupt patch. */
+static inline void patch_end(void)
+{
+    (void)detools_apply_patch_finalize(U.z.patch);
+    if (U.z.patch->state != detools_apply_patch_state_done_t || U.z.patch->to_offset != U.z.patch->to_size ||
+        U.z.patch->to_size != U.announced) {
+        (void)zdl_fail(UDSOTA_DL_BAD_STREAM);
+    }
+}
+#else
+/* A build without delta downloads: DFI 30 is never accepted, so none of this runs. */
+static inline bool patch_open(void) { return false; }
+static inline uint8_t patch_take(const uint8_t *d, size_t n)
+{
+    (void)d;
+    (void)n;
+    return zdl_fail(UDSOTA_DL_BAD_STREAM);
+}
+static inline void patch_close(void) {}
+static inline void patch_end(void) {}
 #endif
+
+static void zdl_close(void)
+{
+    free(U.z.inflater);
+    free(U.z.window);
+    patch_close();
+    memset(&U.z, 0, sizeof U.z);
+}
 
 /* The inflater, and for a delta detools' state after it; NO_MEMORY, holding nothing, when either can't be had. */
 static udsota_reason_t zdl_open(bool delta)
 {
     zdl_close();
-    U.z.r = malloc(sizeof *U.z.r);
-    U.z.dict = calloc(1, TINFL_LZ_DICT_SIZE);   /* zeroed: a back-reference before the start reads zeros */
-    bool ok = U.z.r != NULL && U.z.dict != NULL;
-#if UDSOTA_DELTA
-    ok = ok && (!delta || patch_open());
-#else
-    ok = ok && !delta;
-#endif
-    if (!ok) {
+    U.z.inflater = malloc(sizeof *U.z.inflater);
+    U.z.window = calloc(1, TINFL_LZ_DICT_SIZE);   /* zeroed: a back-reference before the start reads zeros */
+    if (U.z.inflater == NULL || U.z.window == NULL || (delta && !patch_open())) {
         zdl_close();
         return UDSOTA_DL_NO_MEMORY;
     }
-    tinfl_init(U.z.r);
+    tinfl_init(U.z.inflater);
     U.z.status = TINFL_STATUS_NEEDS_MORE_INPUT;
     return UDSOTA_DL_OK;
 }
 
-/* Worker: inflates n bytes of one 36 through tinfl's window, copying each run into zbuf, or for a delta handing it to
- * the patch stage whole. Either way the size checks count image bytes. */
-static int job_zwrite(void)
+/* Worker: what tinfl made last (fresh bytes of its window) on its way: to the patch stage whole for a delta, else into
+ * zbuf. Either way the size checks count image bytes. */
+static uint8_t zdl_drain(void)
 {
-    const uint8_t *in = U.blk;
-    size_t n = U.blk_len;
+    const uint8_t *made = &U.z.window[U.z.fresh_at];
+    const size_t n = U.z.fresh;
+    U.z.fresh = 0;
+    return (UDSOTA_DELTA && U.mode == DL_DELTA) ? patch_take(made, n) : zdl_put(made, n);
+}
+
+/* Worker: one tinfl call over the rest of the 36 (*in, *n) into its window, whose new bytes wait in fresh. False when
+ * it made no progress; a failure is recorded in U.z.failed and the caller's loop ends on it. */
+static bool zdl_inflate(const uint8_t **in, size_t *n)
+{
+    size_t in_n = *n, out_n = TINFL_LZ_DICT_SIZE - U.z.window_at;
+    U.z.status = tinfl_decompress(U.z.inflater, *in, &in_n, U.z.window, U.z.window + U.z.window_at, &out_n,
+                                  TINFL_FLAG_HAS_MORE_INPUT);
+    if (U.z.status == TINFL_STATUS_DONE) {                     /* give back whole bytes read past the end */
+        const size_t ahead = U.z.inflater->m_num_bits >> 3;
+        if (ahead > in_n) {
+            (void)zdl_fail(UDSOTA_DL_BAD_STREAM);              /* it read past the end in an earlier call */
+            return true;                                       /* the caller's loop ends on the failure */
+        }
+        in_n -= ahead;
+        U.z.inflater->m_num_bits &= 7u;
+    }
+    *in += in_n;
+    *n -= in_n;
+    U.z.fresh_at = U.z.window_at;
+    U.z.fresh = out_n;
+    U.z.window_at = (U.z.window_at + out_n) & (TINFL_LZ_DICT_SIZE - 1u);
+    return in_n != 0u || out_n != 0u || U.z.status == TINFL_STATUS_DONE;
+}
+
+/* Worker: inflates one 36. Each pass drains what tinfl made, then either the stream has ended, or failed, or wants
+ * more than this block holds, or tinfl runs again. */
+static int job_inflate(void)
+{
+    const uint8_t *in = U.block;
+    size_t n = U.block_len;
     while (U.z.failed == UDSOTA_DL_OK) {
-        while (U.z.pend > 0u) {                                /* copy out what tinfl made */
-#if UDSOTA_DELTA
-            if (U.mode == DL_DELTA) {
-                const size_t k = U.z.pend;
-                U.z.pend = 0;
-                if (patch_take(&U.z.dict[U.z.pend_ofs], k) != UDSOTA_DL_OK) {
-                    return U.z.failed;
-                }
-                continue;
-            }
-#endif
-            size_t k = BUF_LEN - U.z.held;
-            k = (k < U.z.pend) ? k : U.z.pend;
-            if (k == 0u || U.z.produced + k > U.announced) {
-                return zdl_fail(UDSOTA_DL_BAD_STREAM);        /* past memorySize */
-            }
-            memcpy(&U.zbuf[U.z.held], &U.z.dict[U.z.pend_ofs], k);
-            U.z.pend -= k;
-            U.z.pend_ofs += k;
-            if (zdl_take(k, false) != UDSOTA_DL_OK) {
-                return U.z.failed;
-            }
+        if (U.z.fresh > 0u && zdl_drain() != UDSOTA_DL_OK) {
+            return U.z.failed;
         }
         if (U.z.status == TINFL_STATUS_DONE) {
-            if (!U.z.begun && U.z.held < ((U.announced < IMAGE_MIN) ? U.announced : IMAGE_MIN)) {
-                return zdl_fail(UDSOTA_DL_BAD_HEADER);   /* ended before the image check had its bytes */
+            if (!U.z.begun && U.z.held < zdl_first_len()) {
+                return zdl_fail(UDSOTA_DL_BAD_HEADER);         /* ended before the image check had its bytes */
             }
             U.z.ended = true;
             U.z.trailing = U.z.trailing || n > 0u;
@@ -415,25 +515,7 @@ static int job_zwrite(void)
         if (n == 0u && U.z.status == TINFL_STATUS_NEEDS_MORE_INPUT) {
             return UDSOTA_DL_OK;
         }
-        size_t in_n = n, out_n = TINFL_LZ_DICT_SIZE - U.z.dict_ofs;
-        U.z.status = tinfl_decompress(U.z.r, in, &in_n, U.z.dict, U.z.dict + U.z.dict_ofs, &out_n,
-                                      TINFL_FLAG_HAS_MORE_INPUT);
-        if (U.z.status == TINFL_STATUS_DONE) {                 /* give back whole bytes read past the end */
-            const size_t ahead = U.z.r->m_num_bits >> 3;
-            if (ahead > in_n) {
-                return zdl_fail(UDSOTA_DL_BAD_STREAM);         /* it read past the end in an earlier call */
-            }
-            in_n -= ahead;
-            U.z.r->m_num_bits &= 7u;
-        }
-        if (in_n > 0u) {
-            in += in_n;
-            n -= in_n;
-        }
-        U.z.pend_ofs = U.z.dict_ofs;
-        U.z.pend = out_n;
-        U.z.dict_ofs = (U.z.dict_ofs + out_n) & (TINFL_LZ_DICT_SIZE - 1u);
-        if (in_n == 0u && out_n == 0u && U.z.status != TINFL_STATUS_DONE) {
+        if (!zdl_inflate(&in, &n)) {
             return (n == 0u) ? UDSOTA_DL_OK : zdl_fail(UDSOTA_DL_BAD_STREAM);
         }
     }
@@ -441,20 +523,12 @@ static int job_zwrite(void)
 }
 
 /* Worker, the 37: the stream ended at exactly memorySize bytes, all written, with nothing after it, and a delta's patch
- * ended too. detools' uncompressed reader holds nothing back, so the 36s wrote every byte the patch makes: finalize
- * only lets detools reach its end, and its result is no verdict, since with SIZE_MAX as the patch's length the reader's
- * end always reports a corrupt patch. */
-static int job_zend(void)
+ * ended too. */
+static int job_finish(void)
 {
-#if UDSOTA_DELTA
-    if (U.mode == DL_DELTA && U.z.failed == UDSOTA_DL_OK) {
-        (void)detools_apply_patch_finalize(U.z.dt);
-        if (U.z.dt->state != detools_apply_patch_state_done_t || U.z.dt->to_offset != U.z.dt->to_size ||
-            U.z.dt->to_size != U.announced) {
-            (void)zdl_fail(UDSOTA_DL_BAD_STREAM);
-        }
+    if (UDSOTA_DELTA && U.mode == DL_DELTA && U.z.failed == UDSOTA_DL_OK) {
+        patch_end();
     }
-#endif
     if (U.z.failed == UDSOTA_DL_OK && U.z.ended && !U.z.trailing && U.z.produced == U.announced) {
         (void)zdl_take(0, true);
     }
@@ -465,64 +539,7 @@ static int job_zend(void)
     return ok ? UDSOTA_DL_OK : (failed != UDSOTA_DL_OK ? failed : UDSOTA_DL_BAD_STREAM);
 }
 
-/* ==== 4. 0x27 keys and the PSA lock ==== */
-
-/* The PSA lock (udsota.h). On ESP-IDF a FreeRTOS mutex in static storage, created by udsota_init before its key
- * setup, so the worker inherits a waiting task's priority while it holds it. A host build is one task: the lock is a
- * depth that the host test reads, and a wait on it held fails at once. */
-#if defined(ESP_PLATFORM)
-static StaticSemaphore_t s_psa_storage;
-static SemaphoreHandle_t s_psa;
-
-static void psa_lock_init(void)
-{
-    if (s_psa == NULL) {
-        s_psa = xSemaphoreCreateMutexStatic(&s_psa_storage);
-    }
-}
-
-bool udsota_psa_lock(uint32_t wait_ms)
-{
-    if (s_psa == NULL) {
-        return true;                                     /* before udsota_init: only start code runs */
-    }
-    const TickType_t ticks = (wait_ms == UDSOTA_PSA_WAIT_FOREVER) ? portMAX_DELAY : pdMS_TO_TICKS(wait_ms);
-    return xSemaphoreTake(s_psa, ticks) == pdTRUE;
-}
-
-void udsota_psa_unlock(void)
-{
-    if (s_psa != NULL) {
-        (void)xSemaphoreGive(s_psa);
-    }
-}
-#else
-static int s_psa_depth;
-
-static void psa_lock_init(void) {}
-
-bool udsota_psa_lock(uint32_t wait_ms)
-{
-    (void)wait_ms;
-    if (s_psa_depth != 0) {
-        return false;
-    }
-    s_psa_depth++;
-    return true;
-}
-
-void udsota_psa_unlock(void)
-{
-    s_psa_depth--;
-}
-
-#if defined(UDSOTA_TEST)
-int udsota_test_psa_depth(void)
-{
-    return s_psa_depth;
-}
-#endif
-#endif
+/* ==== 4. 0x27 keys (the PSA lock around their crypto is the platform's: section 8) ==== */
 
 /* HMAC mode: the expected key for seed at requestSeed level: HMAC-SHA256(K_dev, seed || level || ID)[0..15]. */
 static bool hmac_key(const uint8_t seed[UDSOTA_SEED_LEN], uint8_t level, uint8_t key[UDSOTA_KEY_LEN])
@@ -533,7 +550,7 @@ static bool hmac_key(const uint8_t seed[UDSOTA_SEED_LEN], uint8_t level, uint8_t
     memcpy(&msg[UDSOTA_SEED_LEN + 1u], U.devid, U.devid_len);
     bool ok = U.key_ok && udsota_psa_lock(KEY_LOCK_MS);
     if (ok) {
-        ok = udsota_plat_hmac(U.kdev, sizeof U.kdev, msg, UDSOTA_SEED_LEN + 1u + U.devid_len, full);
+        ok = udsota_plat_hmac(U.device_key, sizeof U.device_key, msg, UDSOTA_SEED_LEN + 1u + U.devid_len, full);
         udsota_psa_unlock();
     }
     memcpy(key, full, UDSOTA_KEY_LEN);
@@ -562,6 +579,44 @@ static int ecdsa_check(const uint8_t seed[UDSOTA_SEED_LEN], uint8_t level, const
     return v;
 }
 
+/* HMAC mode, at init: this device's key, HMAC-SHA256(key_master, key_label || device ID). */
+static void derive_device_key(const udsota_cfg_t *cfg)
+{
+    uint8_t msg[LABEL_MAX + UDSOTA_KEYS_ID_MAX];
+    const size_t ln = strnlen(cfg->key_label, LABEL_MAX + 1u);
+    if (ln <= LABEL_MAX && udsota_psa_lock(UDSOTA_PSA_WAIT_FOREVER)) {
+        memcpy(msg, cfg->key_label, ln);
+        memcpy(&msg[ln], U.devid, U.devid_len);
+        U.key_ok = udsota_plat_hmac(cfg->key_master, cfg->key_master_len, msg, ln + U.devid_len, U.device_key);
+        udsota_psa_unlock();
+    }
+    wipe(msg, sizeof msg);
+}
+
+/* 0x27: ECDSA wins over HMAC. Any key field turns it on, and an incomplete set then unlocks nothing; with none, 0x27 is
+ * the app's and downloads need no key. */
+static void keys_init(const udsota_cfg_t *cfg)
+{
+    U.sec_ecdsa = (cfg->key_pubkey != NULL || cfg->key_pubkey_len != 0u);
+    U.sec_on = U.sec_ecdsa || cfg->key_label != NULL || cfg->key_master != NULL || cfg->key_master_len != 0u;
+    if (U.devid_len == 0u) {
+        LOGW("no device ID (a bad device_id_len, or no MAC)");
+    } else if (U.sec_ecdsa) {
+        if (cfg->key_pubkey != NULL && cfg->key_pubkey_len == UDSOTA_KEYS_PUBKEY_LEN &&
+            udsota_psa_lock(UDSOTA_PSA_WAIT_FOREVER)) {
+            U.key_ok = udsota_plat_ecdsa_key(cfg->key_pubkey) == 0;
+            udsota_psa_unlock();
+        }
+    } else if (U.sec_on && cfg->key_label != NULL && cfg->key_master != NULL) {
+        derive_device_key(cfg);
+    }
+    if (!U.sec_on) {
+        LOGW("security off: no key, so 0x27 is the app's and any node can download");
+    } else if (!U.key_ok) {
+        LOGW("0x27 keys unusable: nothing unlocks");
+    }
+}
+
 /* ==== 5. The updater ==== */
 
 static void status_now(udsota_status_t *st)
@@ -570,13 +625,18 @@ static void status_now(udsota_status_t *st)
     udsota_plat_status(st);
 }
 
+/* The next reset boots the running slot. */
+static inline bool boots_itself(const udsota_status_t *st)
+{
+    return st->running_slot != UDSOTA_SLOT_NONE && st->boot_slot == st->running_slot;
+}
+
 /* The slot rule for 10 02 and 34: the boot slot is the running one and the running image is confirmed. */
 static bool slots_settled(void)
 {
     udsota_status_t st;
     status_now(&st);
-    return st.running_slot != UDSOTA_SLOT_NONE && st.boot_slot == st.running_slot &&
-           st.running_state != UDSOTA_IMG_PENDING_VERIFY;
+    return boots_itself(&st) && st.running_state != UDSOTA_IMG_PENDING_VERIFY;
 }
 
 static uint8_t gate(udsota_op_t op)
@@ -585,7 +645,7 @@ static uint8_t gate(udsota_op_t op)
 }
 
 /* An open image is closed once the worker is idle: now, or at the next event. */
-static void settle(void)
+static void close_when_idle(void)
 {
     if (U.close_pending && udsota_plat_poll() != UDSOTA_PENDING) {
         zdl_close();
@@ -599,21 +659,33 @@ static bool worker_busy(void)
     return U.job_running || U.close_pending || udsota_plat_poll() == UDSOTA_PENDING;
 }
 
-/* Ends the download or an open, unverified image; F1F1 says ABORTED. */
-static void abort_download(void)
+/* The precondition of 10 02 and 34: settled slots, an idle worker and no transfer open. */
+static bool ready_to_program(void)
 {
-    U.dl_complete = false;
-    if (!U.dl_active && !U.ota_open) {
-        return;
-    }
-    if (U.ota_open) {
-        U.close_pending = true;
-        settle();
-    }
-    U.dl_active = false;
-    U.ota_open = false;
-    U.last_reason = UDSOTA_DL_ABORTED;
+    return slots_settled() && !worker_busy() && !transferring();
+}
+
+/* The download is over, and F1F1 says why. It does not close an open image: the caller sets close_pending first, or
+ * calls abort_download, which does. */
+static void end_download(uint8_t reason)
+{
+    U.phase = PHASE_IDLE;
+    U.last_reason = reason;
     U.last_bytes = U.received;
+}
+
+/* Ends the download or an open, unverified image; F1F1 says ABORTED. A verified image stays. Called from many places,
+ * and -O2 would copy it into each. */
+__attribute__((noinline)) static void abort_download(void)
+{
+    if (!transferring() && !image_open()) {
+        return;                                          /* idle, or verified */
+    }
+    if (image_open()) {
+        U.close_pending = true;
+        close_when_idle();
+    }
+    end_download(UDSOTA_DL_ABORTED);
 }
 
 static int verify_done(int result, uint8_t *status, size_t *status_len);
@@ -625,8 +697,8 @@ static udsota_progress_t progress_of(void)
         p.stage = UDSOTA_STAGE_ACTIVATING;
     } else if (U.job_running && U.job_done == verify_done) {
         p.stage = UDSOTA_STAGE_VERIFYING;
-    } else if (U.dl_active || (U.dl_complete && U.ota_open)) {
-        p.stage = (U.dl_active && U.received == 0u) ? UDSOTA_STAGE_ERASING : UDSOTA_STAGE_WRITING;
+    } else if (transferring() || U.phase == PHASE_RECEIVED) {
+        p.stage = (transferring() && U.received == 0u) ? UDSOTA_STAGE_ERASING : UDSOTA_STAGE_WRITING;
         p.total = U.announced;
         p.done = (U.written < p.total) ? U.written : p.total;
     }
@@ -664,19 +736,32 @@ static int run_job(int (*fn)(void), done_fn done, uint8_t sid, uint8_t *status, 
 
 /* ---- 34, 36, 37 ---- */
 
+/* Keys are configured and the programming level is not unlocked. */
+static inline bool locked(const UDSServer_t *srv)
+{
+    return U.sec_on && srv->securityLevel != UDSOTA_SA_SEED_PROGRAMMING;
+}
+
 /* 34/36/37: 0x7F outside the programming session, 0x33 while locked. */
 static int dl_access(const UDSServer_t *srv)
 {
     if (srv->sessionType != UDS_LEV_DS_PRGS) {
         return UDS_NRC_ServiceNotSupportedInActiveSession;
     }
-    return (U.sec_on && srv->securityLevel != UDSOTA_SA_SEED_PROGRAMMING) ? UDS_NRC_SecurityAccessDenied : 0;
+    return locked(srv) ? UDS_NRC_SecurityAccessDenied : 0;
 }
 
-static void dl_flash_failed(void)
+/* Ends the download, with `reason` in F1F1 in place of ABORTED. */
+static void fail_download(uint8_t reason)
 {
     abort_download();
-    U.last_reason = UDSOTA_DL_FLASH_ERROR;
+    U.last_reason = reason;
+}
+
+/* The download is DFI 10 or 30, not 00. */
+static inline bool coded(void)
+{
+    return U.mode != DL_PLAIN;
 }
 
 /* 34: access, then settled slots, an idle worker, no transfer and the gate, then DFI 00 or 10 (or 30, with delta
@@ -687,7 +772,7 @@ static int request_download(const UDSServer_t *srv, uint8_t dfi, uint32_t addr, 
     if (rc != 0) {
         return rc;
     }
-    if (!slots_settled() || worker_busy() || U.dl_active) {
+    if (!ready_to_program()) {
         return UDS_NRC_ConditionsNotCorrect;
     }
     if ((rc = gate(UDSOTA_OP_START_DOWNLOAD)) != 0) {
@@ -698,18 +783,16 @@ static int request_download(const UDSServer_t *srv, uint8_t dfi, uint32_t addr, 
         return UDS_NRC_ConditionsNotCorrect;
     }
     int mode = (dfi == UDSOTA_DL_DFI) ? DL_PLAIN : (dfi == UDSOTA_DL_DFI_DEFLATE) ? DL_DEFLATE : -1;
-#if UDSOTA_DELTA
-    if (dfi == UDSOTA_DL_DFI_DELTA_DEFLATE && U.cfg.allow_delta) {
+    if (UDSOTA_DELTA && dfi == UDSOTA_DL_DFI_DELTA_DEFLATE && U.cfg.allow_delta) {
         mode = DL_DELTA;
     }
-#endif
     if (mode < 0 || addr != 0u || size == 0u || size > udsota_plat_slot_size()) {
         return UDS_NRC_RequestOutOfRange;
     }
-    if (U.ota_open) {                                    /* a finished image that never passed FF01 */
+    if (image_open()) {                                  /* a finished image that never passed FF01 */
         U.close_pending = true;
-        settle();
-        U.ota_open = false;
+        close_when_idle();
+        U.phase = PHASE_IDLE;
     }
     if (mode != DL_PLAIN && zdl_open(mode == DL_DELTA) != UDSOTA_DL_OK) {
         U.last_reason = UDSOTA_DL_NO_MEMORY;
@@ -717,11 +800,8 @@ static int request_download(const UDSServer_t *srv, uint8_t dfi, uint32_t addr, 
         return UDS_NRC_ConditionsNotCorrect;
     }
     udsota_plat_unverify();
-    U.slot_verified = false;
-    U.dl_active = true;
-    U.ota_open = (mode != DL_PLAIN);                     /* the inflater is held from here */
+    U.phase = (mode != DL_PLAIN) ? PHASE_OPEN : PHASE_ANNOUNCED;   /* a coded download holds its inflater from here */
     U.mode = (uint8_t)mode;
-    U.dl_complete = false;
     U.announced = size;
     U.received = U.written = 0u;
     U.last_reason = UDSOTA_DL_OK;
@@ -731,13 +811,13 @@ static int request_download(const UDSServer_t *srv, uint8_t dfi, uint32_t addr, 
 
 static int job_write(void)
 {
-    return udsota_plat_write(U.blk, U.blk_len);
+    return udsota_plat_write(U.block, U.block_len);
 }
 
 static int job_first(void)
 {
     const int r = udsota_plat_begin(U.announced);
-    return (r != UDSOTA_DL_OK) ? UDSOTA_DL_FLASH_ERROR : udsota_plat_write(U.blk, U.blk_len);
+    return (r != UDSOTA_DL_OK) ? UDSOTA_DL_FLASH_ERROR : udsota_plat_write(U.block, U.block_len);
 }
 
 /* 36's answer once the worker has written the block: positive, 0x72 for a flash failure, 0x31 for a coded block the
@@ -746,18 +826,16 @@ static int block_done(int result, uint8_t *status, size_t *status_len)
 {
     (void)status;
     *status_len = 0;
-    if (result != UDSOTA_DL_OK && U.mode != DL_PLAIN && result != UDSOTA_DL_FLASH_ERROR &&
-        result != UDSOTA_DL_NO_MEMORY) {
-        abort_download();
-        U.last_reason = (uint8_t)result;
+    if (result != UDSOTA_DL_OK && coded() && result != UDSOTA_DL_FLASH_ERROR && result != UDSOTA_DL_NO_MEMORY) {
+        fail_download((uint8_t)result);
         return UDS_NRC_RequestOutOfRange;
     }
     if (result != UDSOTA_DL_OK) {
-        dl_flash_failed();
+        fail_download(UDSOTA_DL_FLASH_ERROR);
         return UDS_NRC_GeneralProgrammingFailure;
     }
-    U.received += (uint32_t)U.blk_len;
-    U.written = (U.mode != DL_PLAIN) ? U.z.written : U.written + (uint32_t)U.blk_len;
+    U.received += (uint32_t)U.block_len;
+    U.written = coded() ? U.z.written : U.written + (uint32_t)U.block_len;
     U.progress_block = true;
     U.last_bytes = U.received;
     return 0;
@@ -775,7 +853,7 @@ static int transfer_data(UDSServer_t *srv, const uint8_t *data, size_t len, bool
     if (len < 1u || len + 2u > UDSOTA_DL_MAX_BLOCK_LEN) {
         return UDS_NRC_IncorrectMessageLengthOrInvalidFormat;
     }
-    if (!U.dl_active) {
+    if (!transferring()) {
         return UDS_NRC_RequestSequenceError;
     }
     if ((rc = gate(UDSOTA_OP_CONTINUE_TRANSFER)) != 0) {
@@ -785,25 +863,24 @@ static int transfer_data(UDSServer_t *srv, const uint8_t *data, size_t len, bool
         }
         return rc;
     }
-    const uint64_t limit = (U.mode != DL_PLAIN) ? UDSOTA_DL_Z_BOUND(U.announced) : U.announced;
+    const uint64_t limit = coded() ? UDSOTA_DL_Z_BOUND(U.announced) : U.announced;
     if ((uint64_t)U.received + len > limit) {
         abort_download();
         return UDS_NRC_TransferDataSuspended;
     }
-    if (U.mode != DL_PLAIN) {
+    if (coded()) {
         srv->xferTotalBytes = (limit > SIZE_MAX) ? SIZE_MAX : (size_t)limit;   /* iso14229 counts memorySize */
     }
-    memcpy(U.blk, data, len);
-    U.blk_len = len;
-    int (*job)(void) = (U.mode != DL_PLAIN) ? job_zwrite : job_write;
-    if (U.mode == DL_PLAIN && !U.ota_open) {             /* the first block: check it before anything is erased */
+    memcpy(U.block, data, len);
+    U.block_len = len;
+    int (*job)(void) = coded() ? job_inflate : job_write;
+    if (U.phase == PHASE_ANNOUNCED) {                    /* the first block: check it before anything is erased */
         const udsota_reason_t why = check_first(data, len, U.announced);
         if (why != UDSOTA_DL_OK) {
-            abort_download();
-            U.last_reason = (uint8_t)why;
+            fail_download((uint8_t)why);
             return UDS_NRC_RequestOutOfRange;
         }
-        U.ota_open = true;
+        U.phase = PHASE_OPEN;
         job = job_first;
     }
     size_t none = 0;
@@ -812,22 +889,21 @@ static int transfer_data(UDSServer_t *srv, const uint8_t *data, size_t len, bool
 
 static int exit_ok(void)
 {
-    U.dl_active = false;
-    U.dl_complete = true;
+    if (image_open()) {                                  /* not after an abort that closed it while the 37 ran */
+        U.phase = PHASE_RECEIVED;
+    }
     U.last_reason = UDSOTA_DL_OK;
     U.last_bytes = U.received;
     return 0;
 }
 
-static int zend_done(int result, uint8_t *status, size_t *status_len)
+static int finish_done(int result, uint8_t *status, size_t *status_len)
 {
     (void)status;
     *status_len = 0;
     if (result != UDSOTA_DL_OK) {
-        U.ota_open = false;                              /* the stream is closed: only the flash side remains */
-        U.close_pending = true;
-        abort_download();
-        U.last_reason = (uint8_t)result;
+        U.close_pending = true;                          /* the stream is closed: only the flash side remains */
+        end_download((uint8_t)result);
         return UDS_NRC_GeneralProgrammingFailure;
     }
     U.written = U.announced;
@@ -845,11 +921,11 @@ static int transfer_exit(const UDSServer_t *srv, size_t extra)
     if (extra != 0u) {
         return UDS_NRC_IncorrectMessageLengthOrInvalidFormat;
     }
-    if (!U.dl_active || (U.mode == DL_PLAIN && U.received != U.announced)) {
+    if (!transferring() || (!coded() && U.received != U.announced)) {
         return UDS_NRC_RequestSequenceError;
     }
     size_t none = 0;
-    return (U.mode != DL_PLAIN) ? run_job(job_zend, zend_done, 0x37, NULL, &none) : exit_ok();
+    return coded() ? run_job(job_finish, finish_done, 0x37, NULL, &none) : exit_ok();
 }
 
 /* ---- 31 01: FF01 verify, F000 resume point, F001 activate, F002 confirm ---- */
@@ -887,7 +963,9 @@ static int one_byte(uint8_t *status, size_t *status_len, uint8_t b)
 static int verify_done(int result, uint8_t *status, size_t *status_len)
 {
     const uint8_t reason = (result >= 0 && result <= UDSOTA_DL_BAD_BASE) ? (uint8_t)result : UDSOTA_DL_VERIFY_FAILED;
-    U.slot_verified = (reason == UDSOTA_DL_OK);
+    if (reason == UDSOTA_DL_OK) {
+        U.phase = PHASE_VERIFIED;
+    }
     U.last_reason = reason;
     return one_byte(status, status_len, reason);
 }
@@ -897,7 +975,7 @@ static int activate_done(int result, uint8_t *status, size_t *status_len)
     (void)status;
     *status_len = 0;
     if (result != UDSOTA_DL_OK) {
-        U.slot_verified = false;
+        U.phase = PHASE_IDLE;
         return UDS_NRC_GeneralProgrammingFailure;
     }
     U.activating = true;
@@ -930,7 +1008,7 @@ static int routine(const UDSServer_t *srv, uint8_t ctrl, uint16_t rid, size_t op
     if (srv->sessionType != (confirm ? UDS_LEV_DS_EXTDS : UDS_LEV_DS_PRGS)) {
         return UDS_NRC_RequestOutOfRange;
     }
-    if (!confirm && U.sec_on && srv->securityLevel != UDSOTA_SA_SEED_PROGRAMMING) {
+    if (!confirm && locked(srv)) {
         return UDS_NRC_SecurityAccessDenied;
     }
     if (opt_len != 0u) {
@@ -939,19 +1017,19 @@ static int routine(const UDSServer_t *srv, uint8_t ctrl, uint16_t rid, size_t op
     int rc;
     switch (rid) {
     case UDSOTA_RID_CHECK_PROG_DEPS:
-        if (U.slot_verified && !U.ota_open) {
+        if (U.phase == PHASE_VERIFIED) {
             return one_byte(status, status_len, UDSOTA_DL_OK);   /* a repeat after a pass */
         }
-        if (!U.dl_complete || !U.ota_open) {
+        if (U.phase != PHASE_RECEIVED) {
             return UDS_NRC_RequestSequenceError;
         }
-        U.dl_complete = U.ota_open = U.slot_verified = false;   /* the verify closes the image either way */
+        U.phase = PHASE_IDLE;                                    /* the verify closes the image either way */
         U.last_reason = UDSOTA_DL_WORKER_TIMEOUT;                /* until the verdict */
         return run_job(job_verify, verify_done, 0x31, status, status_len);
     case UDSOTA_RID_GET_RESUME_POINT:
         return one_byte(status, status_len, UDSOTA_RESUME_NOT_AVAILABLE);
     case UDSOTA_RID_ACTIVATE_IMAGE:
-        if (!U.slot_verified) {
+        if (U.phase != PHASE_VERIFIED) {
             return UDS_NRC_RequestSequenceError;
         }
         if ((rc = worker_busy() ? UDS_NRC_ConditionsNotCorrect : gate(UDSOTA_OP_ACTIVATE)) != 0) {
@@ -964,7 +1042,7 @@ static int routine(const UDSServer_t *srv, uint8_t ctrl, uint16_t rid, size_t op
         }
         udsota_status_t st;
         status_now(&st);
-        if (st.running_slot == UDSOTA_SLOT_NONE || st.boot_slot != st.running_slot) {
+        if (!boots_itself(&st)) {
             return UDS_NRC_ConditionsNotCorrect;
         }
         if (st.running_state == UDSOTA_IMG_VALID || st.running_state == UDSOTA_IMG_UNDEFINED) {
@@ -1028,7 +1106,7 @@ static size_t read_did(const UDSServer_t *srv, uint16_t did, uint8_t *out)
  * itself relocks only on S3, so an unlock would otherwise outlive 10 01 for good). */
 static void session_changed(UDSServer_t *srv)
 {
-    const bool waited = U.job_running && (U.dl_active || U.ota_open || U.job_done == verify_done);   /* the cap, or S3 */
+    const bool waited = U.job_running && (transferring() || image_open() || U.job_done == verify_done);  /* cap or S3 */
     U.job_running = false;                               /* a running job finishes on the worker by itself */
     abort_download();
     if (waited) {
@@ -1085,25 +1163,67 @@ static UDSErr_t as_err(int rc)
     return (rc == UDSOTA_PENDING) ? UDS_NRC_RequestCorrectlyReceived_ResponsePending : (UDSErr_t)rc;
 }
 
-static UDSErr_t on_session(UDSServer_t *srv, uint8_t type)
+/* Each handler below answers one event: false when the event is the app's (a request udsota does not serve), else true
+ * with *rc, which starts as UDS_PositiveResponse, set to the answer. */
+
+static bool on_scheduled_reset(void)
 {
+    if (!U.reset_mine) {
+        return false;
+    }
+    if (U.cfg.reset != NULL) {
+        U.cfg.reset(U.cfg.ctx);
+    } else {
+        RESTART();
+    }
+    return true;
+}
+
+static bool on_session_ctrl(UDSServer_t *srv, UDSDiagSessCtrlArgs_t *a, UDSErr_t *rc)
+{
+    if (a->type < UDS_LEV_DS_DS || a->type > UDS_LEV_DS_EXTDS) {
+        return false;
+    }
+    if (a->p2_star_ms < srv->p2_star_ms) {               /* iso14229 sends its client default, 1500 ms, which the 0x78s
+                                                            (every 0.3 x P2*) would race; P2 keeps its 150 ms */
+        a->p2_star_ms = srv->p2_star_ms;
+    }
     uint8_t nrc = 0;
-    if (type == UDS_LEV_DS_PRGS) {
-        nrc = (!slots_settled() || worker_busy() || U.dl_active) ? UDS_NRC_ConditionsNotCorrect
-                                                                 : gate(UDSOTA_OP_ENTER_PROGRAMMING);
-    } else if (type == UDS_LEV_DS_EXTDS) {
+    if (a->type == UDS_LEV_DS_PRGS) {
+        nrc = ready_to_program() ? gate(UDSOTA_OP_ENTER_PROGRAMMING) : UDS_NRC_ConditionsNotCorrect;
+    } else if (a->type == UDS_LEV_DS_EXTDS) {
         nrc = gate(UDSOTA_OP_ENTER_EXTENDED);
     }
     if (nrc != 0u) {
-        return (UDSErr_t)nrc;
+        *rc = (UDSErr_t)nrc;
+    } else {
+        session_changed(srv);
     }
-    session_changed(srv);
-    return UDS_PositiveResponse;
+    return true;
 }
 
-/* 27 at our two levels, in their sessions: a fresh single-use seed, then its key. iso14229 delays retries. */
-static UDSErr_t on_security(UDSServer_t *srv, uint8_t level, const uint8_t *key, size_t len, bool seed,
-                            UDSSecAccessRequestSeedArgs_t *sa)
+static bool on_ecu_reset(UDSServer_t *srv, UDSECUResetArgs_t *a, UDSErr_t *rc)
+{
+    if (a->type != UDS_LEV_RT_HR) {
+        return false;
+    }
+    *rc = (srv->sessionType == UDS_LEV_DS_DS)                       ? UDS_NRC_ServiceNotSupportedInActiveSession
+        : (U.sec_on && srv->securityLevel == 0u)                    ? UDS_NRC_SecurityAccessDenied
+        : worker_busy()                                             ? UDS_NRC_ConditionsNotCorrect
+                                                                    : (UDSErr_t)gate(UDSOTA_OP_RESET);
+    U.reset_mine = U.reset_mine || *rc == UDS_PositiveResponse;
+    return true;
+}
+
+/* 27 is udsota's at its two pairs of levels, when keys are configured. */
+static inline bool level_is_ours(uint8_t level)
+{
+    return U.sec_on && (level == UDSOTA_SA_SEED_EXTENDED || level == UDSOTA_SA_SEED_PROGRAMMING);
+}
+
+/* What 27 at `level` meets first, in either direction: the level's session (0x7F in the default session), then an idle
+ * worker, which may be using the crypto. UDS_PositiveResponse: neither refuses. */
+static UDSErr_t security_refusal(const UDSServer_t *srv, uint8_t level)
 {
     if (srv->sessionType == UDS_LEV_DS_DS) {
         return UDS_NRC_ServiceNotSupportedInActiveSession;
@@ -1111,46 +1231,151 @@ static UDSErr_t on_security(UDSServer_t *srv, uint8_t level, const uint8_t *key,
     if (srv->sessionType != (level == UDSOTA_SA_SEED_PROGRAMMING ? UDS_LEV_DS_PRGS : UDS_LEV_DS_EXTDS)) {
         return UDS_NRC_SubFunctionNotSupportedInActiveSession;
     }
-    if (worker_busy()) {
-        return UDS_NRC_ConditionsNotCorrect;             /* the worker may be using the crypto */
+    return worker_busy() ? UDS_NRC_ConditionsNotCorrect : UDS_PositiveResponse;
+}
+
+/* 27 requestSeed: a fresh single-use seed. iso14229 delays retries. */
+static bool on_request_seed(UDSServer_t *srv, UDSSecAccessRequestSeedArgs_t *a, UDSErr_t *rc)
+{
+    if (!level_is_ours(a->level)) {
+        return false;
     }
-    if (seed) {
-        if (len != 0u) {
-            return UDS_NRC_IncorrectMessageLengthOrInvalidFormat;
-        }
-        U.seed_valid = udsota_plat_rng16(U.seed);
-        if (!U.seed_valid) {
-            return UDS_NRC_ConditionsNotCorrect;
-        }
-        U.seed_level = level;
-        U.seed_ms = UDSMillis();
-        return (UDSErr_t)sa->copySeed(srv, U.seed, UDSOTA_SEED_LEN);
+    if ((*rc = security_refusal(srv, a->level)) != UDS_PositiveResponse) {
+        return true;
     }
-    if (len != (U.sec_ecdsa ? UDSOTA_KEYS_SIG_LEN : UDSOTA_KEY_LEN)) {
-        return UDS_NRC_IncorrectMessageLengthOrInvalidFormat;   /* the seed stays */
+    if (a->len != 0u) {
+        *rc = UDS_NRC_IncorrectMessageLengthOrInvalidFormat;
+        return true;
     }
-    const bool fresh = U.seed_valid && U.seed_level == level &&
+    U.seed_valid = udsota_plat_rng16(U.seed);
+    if (!U.seed_valid) {
+        *rc = UDS_NRC_ConditionsNotCorrect;
+        return true;
+    }
+    U.seed_level = a->level;
+    U.seed_ms = UDSMillis();
+    *rc = (UDSErr_t)a->copySeed(srv, U.seed, UDSOTA_SEED_LEN);
+    return true;
+}
+
+/* 27 sendKey: the key for the seed, once. */
+static bool on_validate_key(UDSServer_t *srv, const UDSSecAccessValidateKeyArgs_t *a, UDSErr_t *rc)
+{
+    if (!level_is_ours(a->level)) {
+        return false;
+    }
+    if ((*rc = security_refusal(srv, a->level)) != UDS_PositiveResponse) {
+        return true;
+    }
+    if (a->len != (U.sec_ecdsa ? UDSOTA_KEYS_SIG_LEN : UDSOTA_KEY_LEN)) {
+        *rc = UDS_NRC_IncorrectMessageLengthOrInvalidFormat;   /* the seed stays */
+        return true;
+    }
+    const bool fresh = U.seed_valid && U.seed_level == a->level &&
                        (uint32_t)(UDSMillis() - U.seed_ms) < UDSOTA_SA_SEED_VALID_MS;
     U.seed_valid = false;
-    UDSErr_t rc = UDS_NRC_RequestSequenceError;
+    *rc = UDS_NRC_RequestSequenceError;
     if (fresh && U.sec_ecdsa) {
-        const int v = ecdsa_check(U.seed, level, key);
-        rc = (v == 1) ? UDS_PositiveResponse : (v < 0) ? UDS_NRC_ConditionsNotCorrect : UDS_NRC_InvalidKey;
+        const int v = ecdsa_check(U.seed, a->level, a->key);
+        *rc = (v == 1) ? UDS_PositiveResponse : (v < 0) ? UDS_NRC_ConditionsNotCorrect : UDS_NRC_InvalidKey;
     } else if (fresh) {
         uint8_t expect[UDSOTA_KEY_LEN];
         volatile uint8_t diff = 0;
-        if (!hmac_key(U.seed, level, expect)) {
-            rc = UDS_NRC_ConditionsNotCorrect;
+        if (!hmac_key(U.seed, a->level, expect)) {
+            *rc = UDS_NRC_ConditionsNotCorrect;
         } else {
             for (size_t i = 0; i < UDSOTA_KEY_LEN; i++) {
-                diff |= (uint8_t)(expect[i] ^ key[i]);   /* constant time */
+                diff |= (uint8_t)(expect[i] ^ a->key[i]);   /* constant time */
             }
-            rc = (diff == 0u) ? UDS_PositiveResponse : UDS_NRC_InvalidKey;
+            *rc = (diff == 0u) ? UDS_PositiveResponse : UDS_NRC_InvalidKey;
         }
         wipe(expect, sizeof expect);
     }
     wipe(U.seed, sizeof U.seed);
-    return rc;
+    return true;
+}
+
+static bool on_read_did(UDSServer_t *srv, UDSRDBIArgs_t *a, UDSErr_t *rc)
+{
+    uint8_t buf[64];
+    const size_t n = read_did(srv, a->dataId, buf);
+    if (n == 0u) {
+        return false;
+    }
+    *rc = (UDSErr_t)a->copy(srv, buf, (uint16_t)n);
+    return true;
+}
+
+static bool on_routine(UDSServer_t *srv, UDSRoutineCtrlArgs_t *a, UDSErr_t *rc)
+{
+    uint8_t status[8];
+    size_t status_len = 0;
+    int r;
+    if (U.job_running) {
+        r = resume(srv, 0x31, status, &status_len);
+    } else {
+        r = routine(srv, a->ctrlType, a->id, a->len, status, &status_len);
+        if (r < 0) {
+            return false;
+        }
+    }
+    activation_check(srv);
+    *rc = as_err(r);
+    if (*rc == UDS_PositiveResponse && status_len != 0u) {
+        *rc = (UDSErr_t)a->copyStatusRecord(srv, status, (uint16_t)status_len);
+    }
+    return true;
+}
+
+static bool on_request_download(UDSServer_t *srv, UDSRequestDownloadArgs_t *a, UDSErr_t *rc)
+{
+    if (a->addr != 0u) {
+        return false;                                    /* udsota's images go to address 0; the rest are the app's */
+    }
+    *rc = (a->size > UINT32_MAX)
+              ? UDS_NRC_RequestOutOfRange
+              : as_err(request_download(srv, a->dataFormatIdentifier, (uint32_t)a->addr, (uint32_t)a->size));
+    if (*rc == UDS_PositiveResponse) {
+        a->maxNumberOfBlockLength = UDSOTA_DL_MAX_BLOCK_LEN;
+    }
+    return true;
+}
+
+/* 36 and 37, while udsota's own download or job is open. */
+static bool on_transfer(UDSServer_t *srv, UDSEvent_t ev, void *arg, UDSErr_t *rc)
+{
+    const uint8_t sid = (ev == UDS_EVT_TransferData) ? 0x36 : 0x37;
+    if (!transferring() && !U.job_running) {
+        return false;                                    /* a transfer the app opened (34, 35 or 38) */
+    }
+    size_t none = 0;
+    bool end = false;
+    int r;
+    if (U.job_running) {
+        r = resume(srv, sid, NULL, &none);
+    } else if (ev == UDS_EVT_TransferData) {
+        const UDSTransferDataArgs_t *a = arg;
+        r = transfer_data(srv, a->data, a->len, &end);
+    } else {
+        r = transfer_exit(srv, ((UDSRequestTransferExitArgs_t *)arg)->len);
+    }
+    *rc = as_err(r);
+    if (*rc != UDS_PositiveResponse && *rc != UDS_NRC_RequestCorrectlyReceived_ResponsePending) {
+        abort_download();                                /* iso14229 ends its transfer on any NRC */
+    }
+    if (end) {
+        end_session(srv);
+    }
+    return true;
+}
+
+/* iso14229 ended a transfer without an event (0x24, 0x70, 0x71): udsota's download ends with it. */
+static void follow_iso14229(const UDSServer_t *srv)
+{
+    if (!srv->xferIsActive && transferring()) {
+        abort_download();
+        progress_sync();
+    }
 }
 
 bool udsota_event(UDSServer_t *srv, UDSEvent_t ev, void *arg, UDSErr_t *rc)
@@ -1159,149 +1384,56 @@ bool udsota_event(UDSServer_t *srv, UDSEvent_t ev, void *arg, UDSErr_t *rc)
     if (!U.started) {
         return false;
     }
-    settle();
-    if (!srv->xferIsActive && U.dl_active) {             /* iso14229 ended a transfer without an event (0x24, 0x70, 0x71) */
-        abort_download();
-        progress_sync();
-    }
-    uint8_t status[8], buf[64];
-    size_t status_len = 0;
-    bool end = false, mine = true;
+    close_when_idle();
+    follow_iso14229(srv);
+    bool ours;
     switch (ev) {
     case UDS_EVT_SessionTimeout:
         session_changed(srv);
         return false;                                    /* the app may want it too */
-    case UDS_EVT_DoScheduledReset:
-        if (!U.reset_mine) {
-            return false;
-        }
-        if (U.cfg.reset != NULL) {
-            U.cfg.reset(U.cfg.ctx);
-        } else {
-#if defined(ESP_PLATFORM)
-            esp_restart();
-#endif
-        }
-        return true;
-    case UDS_EVT_DiagSessCtrl: {
-        UDSDiagSessCtrlArgs_t *a = arg;
-        if (a->type < UDS_LEV_DS_DS || a->type > UDS_LEV_DS_EXTDS) {
-            return false;
-        }
-        if (a->p2_star_ms < srv->p2_star_ms) {           /* iso14229 sends its client default, 1500 ms, which the 0x78s
-                                                            (every 0.3 x P2*) would race; P2 keeps its 150 ms */
-            a->p2_star_ms = srv->p2_star_ms;
-        }
-        *rc = on_session(srv, a->type);
+    case UDS_EVT_DoScheduledReset:                       /* this and the 22 change no stage: nothing to sync */
+        return on_scheduled_reset();
+    case UDS_EVT_ReadDataByIdent:
+        return on_read_did(srv, arg, rc);
+    case UDS_EVT_DiagSessCtrl:
+        ours = on_session_ctrl(srv, arg, rc);
         break;
-    }
     case UDS_EVT_EcuReset:
-        if (((UDSECUResetArgs_t *)arg)->type != UDS_LEV_RT_HR) {
-            return false;
-        }
-        *rc = (srv->sessionType == UDS_LEV_DS_DS)                       ? UDS_NRC_ServiceNotSupportedInActiveSession
-            : (U.sec_on && srv->securityLevel == 0u)                    ? UDS_NRC_SecurityAccessDenied
-            : worker_busy()                                             ? UDS_NRC_ConditionsNotCorrect
-                                                                        : (UDSErr_t)gate(UDSOTA_OP_RESET);
-        U.reset_mine = U.reset_mine || *rc == UDS_PositiveResponse;
+        ours = on_ecu_reset(srv, arg, rc);
         break;
-    case UDS_EVT_SecAccessRequestSeed: {
-        UDSSecAccessRequestSeedArgs_t *a = arg;
-        if (!U.sec_on || (a->level != UDSOTA_SA_SEED_EXTENDED && a->level != UDSOTA_SA_SEED_PROGRAMMING)) {
-            return false;
-        }
-        *rc = on_security(srv, a->level, NULL, a->len, true, a);
+    case UDS_EVT_SecAccessRequestSeed:
+        ours = on_request_seed(srv, arg, rc);
         break;
-    }
-    case UDS_EVT_SecAccessValidateKey: {
-        const UDSSecAccessValidateKeyArgs_t *a = arg;
-        if (!U.sec_on || (a->level != UDSOTA_SA_SEED_EXTENDED && a->level != UDSOTA_SA_SEED_PROGRAMMING)) {
-            return false;
-        }
-        *rc = on_security(srv, a->level, a->key, a->len, false, NULL);
+    case UDS_EVT_SecAccessValidateKey:
+        ours = on_validate_key(srv, arg, rc);
         break;
-    }
-    case UDS_EVT_ReadDataByIdent: {
-        UDSRDBIArgs_t *a = arg;
-        const size_t n = read_did(srv, a->dataId, buf);
-        if (n == 0u) {
-            return false;
-        }
-        *rc = (UDSErr_t)a->copy(srv, buf, (uint16_t)n);
-        return true;
-    }
-    case UDS_EVT_RoutineCtrl: {
-        UDSRoutineCtrlArgs_t *a = arg;
-        int r;
-        if (U.job_running) {
-            r = resume(srv, 0x31, status, &status_len);
-        } else {
-            r = routine(srv, a->ctrlType, a->id, a->len, status, &status_len);
-            if (r < 0) {
-                return false;
-            }
-        }
-        activation_check(srv);
-        *rc = as_err(r);
-        if (*rc == UDS_PositiveResponse && status_len != 0u) {
-            *rc = (UDSErr_t)a->copyStatusRecord(srv, status, (uint16_t)status_len);
-        }
+    case UDS_EVT_RoutineCtrl:
+        ours = on_routine(srv, arg, rc);
         break;
-    }
-    case UDS_EVT_RequestDownload: {
-        UDSRequestDownloadArgs_t *a = arg;
-        if (a->addr != 0u) {
-            return false;                                /* udsota's images go to address 0; the rest are the app's */
-        }
-        *rc = (a->size > UINT32_MAX)
-                  ? UDS_NRC_RequestOutOfRange
-                  : as_err(request_download(srv, a->dataFormatIdentifier, (uint32_t)a->addr, (uint32_t)a->size));
-        if (*rc == UDS_PositiveResponse) {
-            a->maxNumberOfBlockLength = UDSOTA_DL_MAX_BLOCK_LEN;
-        }
+    case UDS_EVT_RequestDownload:
+        ours = on_request_download(srv, arg, rc);
         break;
-    }
     case UDS_EVT_TransferData:
-    case UDS_EVT_RequestTransferExit: {
-        const uint8_t sid = (ev == UDS_EVT_TransferData) ? 0x36 : 0x37;
-        if (!U.dl_active && !U.job_running) {
-            return false;                                /* a transfer the app opened (34, 35 or 38) */
-        }
-        int r;
-        if (U.job_running) {
-            r = resume(srv, sid, status, &status_len);
-        } else if (ev == UDS_EVT_TransferData) {
-            const UDSTransferDataArgs_t *a = arg;
-            r = transfer_data(srv, a->data, a->len, &end);
-        } else {
-            r = transfer_exit(srv, ((UDSRequestTransferExitArgs_t *)arg)->len);
-        }
-        *rc = as_err(r);
-        if (*rc != UDS_PositiveResponse && *rc != UDS_NRC_RequestCorrectlyReceived_ResponsePending) {
-            abort_download();                            /* iso14229 ends its transfer on any NRC */
-        }
-        if (end) {
-            end_session(srv);
-        }
+    case UDS_EVT_RequestTransferExit:
+        ours = on_transfer(srv, ev, arg, rc);
         break;
-    }
     default:
-        mine = false;
-        break;
+        progress_sync();                                 /* not udsota's, but tell of any change since */
+        return false;
     }
-    progress_sync();
-    return mine;
+    if (ours) {
+        progress_sync();
+    }
+    return ours;
 }
 
-/* ==== The API ==== */
+/* ==== 7. The API ==== */
 
-int udsota_init(const udsota_cfg_t *cfg)
+static void psa_lock_init(void);                         /* the platform's: section 8 */
+
+/* This image's identity: the product it accepts images for, its own version, and the device ID. */
+static void read_identity(const udsota_cfg_t *cfg)
 {
-    if (U.started || cfg == NULL || udsota_image_desc.magic != 0x5544534Fu) {
-        return -1;
-    }
-    psa_lock_init();
-    U.cfg = *cfg;
     U.product = (cfg->product != NULL) ? cfg->product : udsota_plat_project();
     const char *v = udsota_plat_version();
     const size_t vlen = strnlen(v, 32);
@@ -1314,34 +1446,17 @@ int udsota_init(const udsota_cfg_t *cfg)
         memcpy(U.devid, cfg->device_id, cfg->device_id_len);
         U.devid_len = cfg->device_id_len;
     }
-    /* 0x27: ECDSA wins over HMAC. Any key field turns it on, and an incomplete set then unlocks nothing; with none,
-     * 0x27 is the app's and downloads need no key. */
-    U.sec_ecdsa = (cfg->key_pubkey != NULL || cfg->key_pubkey_len != 0u);
-    U.sec_on = U.sec_ecdsa || cfg->key_label != NULL || cfg->key_master != NULL || cfg->key_master_len != 0u;
-    if (U.devid_len == 0u) {
-        LOGW("no device ID (a bad device_id_len, or no MAC)");
-    } else if (U.sec_ecdsa) {
-        if (cfg->key_pubkey != NULL && cfg->key_pubkey_len == UDSOTA_KEYS_PUBKEY_LEN &&
-            udsota_psa_lock(UDSOTA_PSA_WAIT_FOREVER)) {
-            U.key_ok = udsota_plat_ecdsa_key(cfg->key_pubkey) == 0;
-            udsota_psa_unlock();
-        }
-    } else if (U.sec_on && cfg->key_label != NULL && cfg->key_master != NULL) {
-        uint8_t msg[LABEL_MAX + UDSOTA_KEYS_ID_MAX];
-        const size_t ln = strnlen(cfg->key_label, LABEL_MAX + 1u);
-        if (ln <= LABEL_MAX && udsota_psa_lock(UDSOTA_PSA_WAIT_FOREVER)) {
-            memcpy(msg, cfg->key_label, ln);
-            memcpy(&msg[ln], U.devid, U.devid_len);
-            U.key_ok = udsota_plat_hmac(cfg->key_master, cfg->key_master_len, msg, ln + U.devid_len, U.kdev);
-            udsota_psa_unlock();
-        }
-        wipe(msg, sizeof msg);
+}
+
+int udsota_init(const udsota_cfg_t *cfg)
+{
+    if (U.started || cfg == NULL || udsota_image_desc.magic != UDSOTA_IMG_DESC_MAGIC) {
+        return -1;
     }
-    if (!U.sec_on) {
-        LOGW("security off: no key, so 0x27 is the app's and any node can download");
-    } else if (!U.key_ok) {
-        LOGW("0x27 keys unusable: nothing unlocks");
-    }
+    psa_lock_init();
+    U.cfg = *cfg;
+    read_identity(cfg);
+    keys_init(cfg);
     U.started = true;
     return udsota_plat_start();
 }
@@ -1365,7 +1480,7 @@ void udsota_poll(UDSServer_t *srv)
 
 bool udsota_busy(void)
 {
-    return U.started && (worker_busy() || U.dl_active);
+    return U.started && (worker_busy() || transferring());
 }
 
 /* See udsota.h. A poll either reads a request or sends its answer, never both, and iso14229 keeps requestInProgress
@@ -1378,7 +1493,7 @@ bool udsota_end_session(UDSServer_t *srv)
     }
     if (srv->sessionType != UDS_LEV_DS_DS && srv->ecuResetScheduled == 0u) {
         if (U.started) {
-            settle();
+            close_when_idle();
             end_session(srv);
         } else {
             srv->sessionType = UDS_LEV_DS_DS;
@@ -1398,8 +1513,7 @@ bool udsota_unconfirmed(void)
 {
     udsota_status_t st;
     status_now(&st);
-    return st.running_slot != UDSOTA_SLOT_NONE && st.boot_slot == st.running_slot &&
-           st.running_state == UDSOTA_IMG_PENDING_VERIFY;
+    return boots_itself(&st) && st.running_state == UDSOTA_IMG_PENDING_VERIFY;
 }
 
 #if defined(UDSOTA_TEST)
@@ -1424,8 +1538,36 @@ size_t udsota_test_held(size_t *cap)
 }
 #endif
 
-/* ==== 7. The ESP-IDF platform ==== */
+/* ==== 8. The platform ==== */
 #if defined(ESP_PLATFORM)
+
+/* The PSA lock (udsota.h): a FreeRTOS mutex in static storage, created by udsota_init before its key setup, so the
+ * worker inherits a waiting task's priority while it holds it. */
+static StaticSemaphore_t s_psa_storage;
+static SemaphoreHandle_t s_psa;
+
+static void psa_lock_init(void)
+{
+    if (s_psa == NULL) {
+        s_psa = xSemaphoreCreateMutexStatic(&s_psa_storage);
+    }
+}
+
+bool udsota_psa_lock(uint32_t wait_ms)
+{
+    if (s_psa == NULL) {
+        return true;                                     /* before udsota_init: only start code runs */
+    }
+    const TickType_t ticks = (wait_ms == UDSOTA_PSA_WAIT_FOREVER) ? portMAX_DELAY : pdMS_TO_TICKS(wait_ms);
+    return xSemaphoreTake(s_psa, ticks) == pdTRUE;
+}
+
+void udsota_psa_unlock(void)
+{
+    if (s_psa != NULL) {
+        (void)xSemaphoreGive(s_psa);
+    }
+}
 
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 static udsota_status_t s_st = {.running_slot = UDSOTA_SLOT_NONE, .boot_slot = UDSOTA_SLOT_NONE};
@@ -1437,11 +1579,6 @@ static int (*s_job)(void);
 static int s_result;
 static bool s_busy = true;                       /* until the worker has read the slots */
 static psa_key_id_t s_pub;
-#if UDSOTA_DELTA
-static const esp_partition_t *s_running;         /* a delta download's base */
-static uint8_t s_base_hash[32];
-static bool s_base_hash_ok;                      /* s_base_hash is read, and kept for the boot */
-#endif
 
 static uint8_t slot_of(const esp_partition_t *p)
 {
@@ -1522,6 +1659,46 @@ static void worker(void *arg)
         taskEXIT_CRITICAL(&s_mux);
     }
 }
+
+#if UDSOTA_DELTA
+static const esp_partition_t *s_running;         /* a delta download's base */
+static uint8_t s_base_hash[32];
+static bool s_base_hash_ok;                      /* s_base_hash is read, and kept for the boot */
+
+/* The worker, a delta download's base: n bytes of the running slot at off, bounded by the slot and not the image, so a
+ * signature block past the image reads too. esp_partition_read is esp_flash_read, or under flash encryption a map made
+ * and dropped for each read. Never hold a map of the slot: with XIP from PSRAM a held map turns the cache off for every
+ * erase and write. */
+bool udsota_plat_base_read(uint32_t off, void *buf, size_t n)
+{
+    return s_running != NULL && (uint64_t)off + n <= s_running->size &&
+           esp_partition_read(s_running, off, buf, n) == ESP_OK;
+}
+
+/* The worker, the base's identity: the SHA-256 the running image appends, as esp_image_get_metadata reads it, which
+ * hashes nothing and takes no PSA lock. The first call reads it and later ones reuse it, as the running image never
+ * changes. A base that no longer matches its stored hash only rebuilds an image FF01 refuses. */
+bool udsota_plat_base_hash(uint8_t out[32])
+{
+    if (!s_base_hash_ok && s_running != NULL) {
+        const esp_partition_pos_t pos = {.offset = s_running->address, .size = s_running->size};
+        esp_image_metadata_t md;
+        const esp_err_t err = esp_image_get_metadata(&pos, &md);
+        s_base_hash_ok = (err == ESP_OK && md.image.hash_appended == 1u);
+        if (s_base_hash_ok) {
+            memcpy(s_base_hash, md.image_digest, sizeof s_base_hash);
+        } else if (err != ESP_OK) {
+            LOGW("can't read the running image to match a delta's base against: %s", esp_err_to_name(err));
+        } else {
+            LOGW("the running image has no appended SHA-256 to match a delta's base against");
+        }
+    }
+    if (s_base_hash_ok) {
+        memcpy(out, s_base_hash, sizeof s_base_hash);
+    }
+    return s_base_hash_ok;
+}
+#endif
 
 int udsota_plat_start(void)
 {
@@ -1696,42 +1873,6 @@ void udsota_plat_status(udsota_status_t *out)
     taskEXIT_CRITICAL(&s_mux);
 }
 
-#if UDSOTA_DELTA
-/* The worker, a delta download's base: n bytes of the running slot at off, bounded by the slot and not the image, so a
- * signature block past the image reads too. esp_partition_read is esp_flash_read, or under flash encryption a map made
- * and dropped for each read. Never hold a map of the slot: with XIP from PSRAM a held map turns the cache off for every
- * erase and write. */
-bool udsota_plat_base_read(uint32_t off, void *buf, size_t n)
-{
-    return s_running != NULL && (uint64_t)off + n <= s_running->size &&
-           esp_partition_read(s_running, off, buf, n) == ESP_OK;
-}
-
-/* The worker, the base's identity: the SHA-256 the running image appends, as esp_image_get_metadata reads it, which
- * hashes nothing and takes no PSA lock. The first call reads it and later ones reuse it, as the running image never
- * changes. A base that no longer matches its stored hash only rebuilds an image FF01 refuses. */
-bool udsota_plat_base_hash(uint8_t out[32])
-{
-    if (!s_base_hash_ok && s_running != NULL) {
-        const esp_partition_pos_t pos = {.offset = s_running->address, .size = s_running->size};
-        esp_image_metadata_t md;
-        const esp_err_t err = esp_image_get_metadata(&pos, &md);
-        s_base_hash_ok = (err == ESP_OK && md.image.hash_appended == 1u);
-        if (s_base_hash_ok) {
-            memcpy(s_base_hash, md.image_digest, sizeof s_base_hash);
-        } else if (err != ESP_OK) {
-            LOGW("can't read the running image to match a delta's base against: %s", esp_err_to_name(err));
-        } else {
-            LOGW("the running image has no appended SHA-256 to match a delta's base against");
-        }
-    }
-    if (s_base_hash_ok) {
-        memcpy(out, s_base_hash, sizeof s_base_hash);
-    }
-    return s_base_hash_ok;
-}
-#endif
-
 uint32_t udsota_plat_slot_size(void) { return (s_target != NULL) ? s_target->size : 0u; }
 const char *udsota_plat_version(void) { return esp_app_get_description()->version; }
 const char *udsota_plat_project(void) { return esp_app_get_description()->project_name; }
@@ -1791,4 +1932,33 @@ int udsota_plat_ecdsa(const uint8_t *msg, size_t n, const uint8_t sig[UDSOTA_KEY
     return (st == PSA_SUCCESS) ? 1 : (st == PSA_ERROR_INSUFFICIENT_MEMORY || st == PSA_ERROR_HARDWARE_FAILURE) ? -1 : 0;
 }
 
+#else
+/* ==== The host build's PSA lock ====
+ * A host build is one task: the lock is a depth that the host test reads, and a wait on it held fails at once. The rest
+ * of the platform is the build's to supply (udsota.h). */
+static int s_psa_depth;
+
+static void psa_lock_init(void) {}
+
+bool udsota_psa_lock(uint32_t wait_ms)
+{
+    (void)wait_ms;
+    if (s_psa_depth != 0) {
+        return false;
+    }
+    s_psa_depth++;
+    return true;
+}
+
+void udsota_psa_unlock(void)
+{
+    s_psa_depth--;
+}
+
+#if defined(UDSOTA_TEST)
+int udsota_test_psa_depth(void)
+{
+    return s_psa_depth;
+}
+#endif
 #endif

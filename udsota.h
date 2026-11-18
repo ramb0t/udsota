@@ -144,9 +144,8 @@ bool     udsota_unconfirmed(void);
  * for esp_ota_end (FF01) and esp_ota_set_boot_partition (F001) on the flash worker. Takes it within wait_ms
  * (UDSOTA_PSA_WAIT_FOREVER: no limit); true when held. Any task but an ISR; it is not recursive. On ESP-IDF it
  * returns true without locking before udsota_init, udsota's 0x27 check waits 40 ms for it and answers 0x22 when the
- * app holds it longer, and the worker waits as long as it takes. A host build is one task: the lock is a depth
- * counter that locks before udsota_init too, and any take while it is held fails at once, so 0x27 answers 0x22,
- * FF01 fails with UDSOTA_DL_VERIFY_FAILED and F001 answers 0x72. */
+ * app holds it longer, and the worker waits as long as it takes. (A host build's lock is described under "Porting and
+ * host tests".) */
 #define UDSOTA_PSA_WAIT_FOREVER UINT32_MAX
 bool     udsota_psa_lock(uint32_t wait_ms);
 /* Releases the lock udsota_psa_lock() took, on the same task. */
@@ -155,7 +154,10 @@ void     udsota_psa_unlock(void);
 /* ---- Porting and host tests ----
  * The platform under the updater. On ESP-IDF udsota.c defines these; anywhere else the build supplies them (the
  * host test does, and so would a port to another MCU). Jobs run on a worker task; the flash functions run inside
- * jobs and return a udsota_reason_t. */
+ * jobs and return a udsota_reason_t.
+ * udsota.c defines udsota_psa_lock on every build. A host build is one task, so its udsota_psa_lock is a depth
+ * counter that locks before udsota_init too, and any take while it is held fails at once: 0x27 answers 0x22, FF01
+ * fails with UDSOTA_DL_VERIFY_FAILED and F001 answers 0x72. */
 #define UDSOTA_PENDING 0x7FFFFFFF                 /* a job is still running */
 
 /* F1F0: the A/B slots. Wire layout; enum values as the updater reads them. */
@@ -172,7 +174,8 @@ typedef struct {
 int         udsota_plat_start(void);                               /* 0 or -1 */
 int         udsota_plat_run(int (*job)(void));                     /* UDSOTA_PENDING once queued, else -1 */
 int         udsota_plat_poll(void);                                /* UDSOTA_PENDING, or the last job's result */
-void        udsota_plat_abort(void);                               /* close an open image; deferred if a job runs */
+void        udsota_plat_abort(void);                               /* close an open image at once; the core calls it
+                                                                      only while no job runs */
 bool        udsota_plat_compatible(const uint8_t *first, size_t len);   /* chip revision etc. vs the running app */
 int         udsota_plat_begin(uint32_t size);                      /* open the inactive slot for size bytes */
 int         udsota_plat_write(const uint8_t *d, size_t n);         /* append; erases as it goes */
@@ -180,7 +183,8 @@ int         udsota_plat_end(void);                                 /* FF01: clos
 int         udsota_plat_activate(void);                            /* make it the boot slot */
 int         udsota_plat_confirm(void);                             /* mark the running image valid */
 void        udsota_plat_unverify(void);                            /* a new download: the slot is not verified */
-void        udsota_plat_status(udsota_status_t *out);
+void        udsota_plat_status(udsota_status_t *out);                  /* an app may call it from any task, for F1F0's
+                                                                          snapshot of the slots */
 uint32_t    udsota_plat_slot_size(void);
 const char *udsota_plat_version(void);                             /* the running image's, NUL-terminated */
 const char *udsota_plat_project(void);
