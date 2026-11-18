@@ -14,12 +14,11 @@
 #if UDSOTA_DELTA
 #include <limits.h>
 #include "detools.h"
-#endif
-
 /* UDSOTA_DELTA=1 comes with detools' defines from udsota's CMakeLists, which also adds detools.c; without them it was
  * set where that CMakeLists never saw it, and the link would fail on detools_* instead. */
-#if UDSOTA_DELTA && !defined(DETOOLS_CONFIG_COMPRESSION_HEATSHRINK)
+#if !defined(DETOOLS_CONFIG_COMPRESSION_HEATSHRINK)
 #error "UDSOTA_DELTA=1 without detools: set it as udsota.h says, or on a host with udsota_with_delta()"
+#endif
 #endif
 
 #if defined(ESP_PLATFORM)
@@ -205,16 +204,6 @@ static udsota_reason_t check_first(const uint8_t *b, size_t len, uint32_t size)
 
 /* ==== 3. Coded downloads (DFI 0x10: raw DEFLATE; 0x30: a delta patch in it; memorySize the image's size) ==== */
 
-static void zdl_close(void)
-{
-    free(U.z.r);
-    free(U.z.dict);
-#if UDSOTA_DELTA
-    free(U.z.dt);
-#endif
-    memset(&U.z, 0, sizeof U.z);
-}
-
 static uint8_t zdl_fail(udsota_reason_t r)
 {
     if (U.z.failed == UDSOTA_DL_OK) {
@@ -348,7 +337,43 @@ static bool patch_open(void)
     return U.z.dt != NULL &&
            detools_apply_patch_init(U.z.dt, base_read, base_seek, SIZE_MAX, patch_write, NULL) == 0;
 }
+
+static inline void patch_close(void)
+{
+    free(U.z.dt);
+}
+
+/* Worker, the 37: detools' state ends too. Its uncompressed reader holds nothing back, so the 36s wrote every byte the
+ * patch makes: finalize only lets detools reach its end, and its result is no verdict, since with SIZE_MAX as the
+ * patch's length the reader's end always reports a corrupt patch. */
+static inline void patch_end(void)
+{
+    (void)detools_apply_patch_finalize(U.z.dt);
+    if (U.z.dt->state != detools_apply_patch_state_done_t || U.z.dt->to_offset != U.z.dt->to_size ||
+        U.z.dt->to_size != U.announced) {
+        (void)zdl_fail(UDSOTA_DL_BAD_STREAM);
+    }
+}
+#else
+/* A build without delta downloads: DFI 30 is never accepted, so none of this runs. */
+static inline bool patch_open(void) { return false; }
+static inline uint8_t patch_take(const uint8_t *d, size_t n)
+{
+    (void)d;
+    (void)n;
+    return zdl_fail(UDSOTA_DL_BAD_STREAM);
+}
+static inline void patch_close(void) {}
+static inline void patch_end(void) {}
 #endif
+
+static void zdl_close(void)
+{
+    free(U.z.r);
+    free(U.z.dict);
+    patch_close();
+    memset(&U.z, 0, sizeof U.z);
+}
 
 /* The inflater, and for a delta detools' state after it; NO_MEMORY, holding nothing, when either can't be had. */
 static udsota_reason_t zdl_open(bool delta)
@@ -356,13 +381,7 @@ static udsota_reason_t zdl_open(bool delta)
     zdl_close();
     U.z.r = malloc(sizeof *U.z.r);
     U.z.dict = calloc(1, TINFL_LZ_DICT_SIZE);   /* zeroed: a back-reference before the start reads zeros */
-    bool ok = U.z.r != NULL && U.z.dict != NULL;
-#if UDSOTA_DELTA
-    ok = ok && (!delta || patch_open());
-#else
-    ok = ok && !delta;
-#endif
-    if (!ok) {
+    if (U.z.r == NULL || U.z.dict == NULL || (delta && !patch_open())) {
         zdl_close();
         return UDSOTA_DL_NO_MEMORY;
     }
@@ -379,8 +398,7 @@ static int job_zwrite(void)
     size_t n = U.blk_len;
     while (U.z.failed == UDSOTA_DL_OK) {
         while (U.z.pend > 0u) {                                /* copy out what tinfl made */
-#if UDSOTA_DELTA
-            if (U.mode == DL_DELTA) {
+            if (UDSOTA_DELTA && U.mode == DL_DELTA) {
                 const size_t k = U.z.pend;
                 U.z.pend = 0;
                 if (patch_take(&U.z.dict[U.z.pend_ofs], k) != UDSOTA_DL_OK) {
@@ -388,7 +406,6 @@ static int job_zwrite(void)
                 }
                 continue;
             }
-#endif
             size_t k = BUF_LEN - U.z.held;
             k = (k < U.z.pend) ? k : U.z.pend;
             if (k == 0u || U.z.produced + k > U.announced) {
@@ -441,20 +458,12 @@ static int job_zwrite(void)
 }
 
 /* Worker, the 37: the stream ended at exactly memorySize bytes, all written, with nothing after it, and a delta's patch
- * ended too. detools' uncompressed reader holds nothing back, so the 36s wrote every byte the patch makes: finalize
- * only lets detools reach its end, and its result is no verdict, since with SIZE_MAX as the patch's length the reader's
- * end always reports a corrupt patch. */
+ * ended too. */
 static int job_zend(void)
 {
-#if UDSOTA_DELTA
-    if (U.mode == DL_DELTA && U.z.failed == UDSOTA_DL_OK) {
-        (void)detools_apply_patch_finalize(U.z.dt);
-        if (U.z.dt->state != detools_apply_patch_state_done_t || U.z.dt->to_offset != U.z.dt->to_size ||
-            U.z.dt->to_size != U.announced) {
-            (void)zdl_fail(UDSOTA_DL_BAD_STREAM);
-        }
+    if (UDSOTA_DELTA && U.mode == DL_DELTA && U.z.failed == UDSOTA_DL_OK) {
+        patch_end();
     }
-#endif
     if (U.z.failed == UDSOTA_DL_OK && U.z.ended && !U.z.trailing && U.z.produced == U.announced) {
         (void)zdl_take(0, true);
     }
@@ -722,11 +731,9 @@ static int request_download(const UDSServer_t *srv, uint8_t dfi, uint32_t addr, 
         return UDS_NRC_ConditionsNotCorrect;
     }
     int mode = (dfi == UDSOTA_DL_DFI) ? DL_PLAIN : (dfi == UDSOTA_DL_DFI_DEFLATE) ? DL_DEFLATE : -1;
-#if UDSOTA_DELTA
-    if (dfi == UDSOTA_DL_DFI_DELTA_DEFLATE && U.cfg.allow_delta) {
+    if (UDSOTA_DELTA && dfi == UDSOTA_DL_DFI_DELTA_DEFLATE && U.cfg.allow_delta) {
         mode = DL_DELTA;
     }
-#endif
     if (mode < 0 || addr != 0u || size == 0u || size > udsota_plat_slot_size()) {
         return UDS_NRC_RequestOutOfRange;
     }
@@ -1455,11 +1462,6 @@ static int (*s_job)(void);
 static int s_result;
 static bool s_busy = true;                       /* until the worker has read the slots */
 static psa_key_id_t s_pub;
-#if UDSOTA_DELTA
-static const esp_partition_t *s_running;         /* a delta download's base */
-static uint8_t s_base_hash[32];
-static bool s_base_hash_ok;                      /* s_base_hash is read, and kept for the boot */
-#endif
 
 static uint8_t slot_of(const esp_partition_t *p)
 {
@@ -1540,6 +1542,46 @@ static void worker(void *arg)
         taskEXIT_CRITICAL(&s_mux);
     }
 }
+
+#if UDSOTA_DELTA
+static const esp_partition_t *s_running;         /* a delta download's base */
+static uint8_t s_base_hash[32];
+static bool s_base_hash_ok;                      /* s_base_hash is read, and kept for the boot */
+
+/* The worker, a delta download's base: n bytes of the running slot at off, bounded by the slot and not the image, so a
+ * signature block past the image reads too. esp_partition_read is esp_flash_read, or under flash encryption a map made
+ * and dropped for each read. Never hold a map of the slot: with XIP from PSRAM a held map turns the cache off for every
+ * erase and write. */
+bool udsota_plat_base_read(uint32_t off, void *buf, size_t n)
+{
+    return s_running != NULL && (uint64_t)off + n <= s_running->size &&
+           esp_partition_read(s_running, off, buf, n) == ESP_OK;
+}
+
+/* The worker, the base's identity: the SHA-256 the running image appends, as esp_image_get_metadata reads it, which
+ * hashes nothing and takes no PSA lock. The first call reads it and later ones reuse it, as the running image never
+ * changes. A base that no longer matches its stored hash only rebuilds an image FF01 refuses. */
+bool udsota_plat_base_hash(uint8_t out[32])
+{
+    if (!s_base_hash_ok && s_running != NULL) {
+        const esp_partition_pos_t pos = {.offset = s_running->address, .size = s_running->size};
+        esp_image_metadata_t md;
+        const esp_err_t err = esp_image_get_metadata(&pos, &md);
+        s_base_hash_ok = (err == ESP_OK && md.image.hash_appended == 1u);
+        if (s_base_hash_ok) {
+            memcpy(s_base_hash, md.image_digest, sizeof s_base_hash);
+        } else if (err != ESP_OK) {
+            LOGW("can't read the running image to match a delta's base against: %s", esp_err_to_name(err));
+        } else {
+            LOGW("the running image has no appended SHA-256 to match a delta's base against");
+        }
+    }
+    if (s_base_hash_ok) {
+        memcpy(out, s_base_hash, sizeof s_base_hash);
+    }
+    return s_base_hash_ok;
+}
+#endif
 
 int udsota_plat_start(void)
 {
@@ -1713,42 +1755,6 @@ void udsota_plat_status(udsota_status_t *out)
     *out = s_st;
     taskEXIT_CRITICAL(&s_mux);
 }
-
-#if UDSOTA_DELTA
-/* The worker, a delta download's base: n bytes of the running slot at off, bounded by the slot and not the image, so a
- * signature block past the image reads too. esp_partition_read is esp_flash_read, or under flash encryption a map made
- * and dropped for each read. Never hold a map of the slot: with XIP from PSRAM a held map turns the cache off for every
- * erase and write. */
-bool udsota_plat_base_read(uint32_t off, void *buf, size_t n)
-{
-    return s_running != NULL && (uint64_t)off + n <= s_running->size &&
-           esp_partition_read(s_running, off, buf, n) == ESP_OK;
-}
-
-/* The worker, the base's identity: the SHA-256 the running image appends, as esp_image_get_metadata reads it, which
- * hashes nothing and takes no PSA lock. The first call reads it and later ones reuse it, as the running image never
- * changes. A base that no longer matches its stored hash only rebuilds an image FF01 refuses. */
-bool udsota_plat_base_hash(uint8_t out[32])
-{
-    if (!s_base_hash_ok && s_running != NULL) {
-        const esp_partition_pos_t pos = {.offset = s_running->address, .size = s_running->size};
-        esp_image_metadata_t md;
-        const esp_err_t err = esp_image_get_metadata(&pos, &md);
-        s_base_hash_ok = (err == ESP_OK && md.image.hash_appended == 1u);
-        if (s_base_hash_ok) {
-            memcpy(s_base_hash, md.image_digest, sizeof s_base_hash);
-        } else if (err != ESP_OK) {
-            LOGW("can't read the running image to match a delta's base against: %s", esp_err_to_name(err));
-        } else {
-            LOGW("the running image has no appended SHA-256 to match a delta's base against");
-        }
-    }
-    if (s_base_hash_ok) {
-        memcpy(out, s_base_hash, sizeof s_base_hash);
-    }
-    return s_base_hash_ok;
-}
-#endif
 
 uint32_t udsota_plat_slot_size(void) { return (s_target != NULL) ? s_target->size : 0u; }
 const char *udsota_plat_version(void) { return esp_app_get_description()->version; }
