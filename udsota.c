@@ -570,13 +570,18 @@ static void status_now(udsota_status_t *st)
     udsota_plat_status(st);
 }
 
+/* The next reset boots the running slot. (The one-line predicates are `inline`: -Og leaves a small static as a call.) */
+static inline bool boots_itself(const udsota_status_t *st)
+{
+    return st->running_slot != UDSOTA_SLOT_NONE && st->boot_slot == st->running_slot;
+}
+
 /* The slot rule for 10 02 and 34: the boot slot is the running one and the running image is confirmed. */
 static bool slots_settled(void)
 {
     udsota_status_t st;
     status_now(&st);
-    return st.running_slot != UDSOTA_SLOT_NONE && st.boot_slot == st.running_slot &&
-           st.running_state != UDSOTA_IMG_PENDING_VERIFY;
+    return boots_itself(&st) && st.running_state != UDSOTA_IMG_PENDING_VERIFY;
 }
 
 static uint8_t gate(udsota_op_t op)
@@ -597,6 +602,12 @@ static void settle(void)
 static bool worker_busy(void)
 {
     return U.job_running || U.close_pending || udsota_plat_poll() == UDSOTA_PENDING;
+}
+
+/* The precondition of 10 02 and 34: settled slots, an idle worker and no transfer open. */
+static bool ready_to_program(void)
+{
+    return slots_settled() && !worker_busy() && !U.dl_active;
 }
 
 /* Ends the download or an open, unverified image; F1F1 says ABORTED. */
@@ -664,19 +675,32 @@ static int run_job(int (*fn)(void), done_fn done, uint8_t sid, uint8_t *status, 
 
 /* ---- 34, 36, 37 ---- */
 
+/* Keys are configured and the programming level is not unlocked. */
+static inline bool locked(const UDSServer_t *srv)
+{
+    return U.sec_on && srv->securityLevel != UDSOTA_SA_SEED_PROGRAMMING;
+}
+
 /* 34/36/37: 0x7F outside the programming session, 0x33 while locked. */
 static int dl_access(const UDSServer_t *srv)
 {
     if (srv->sessionType != UDS_LEV_DS_PRGS) {
         return UDS_NRC_ServiceNotSupportedInActiveSession;
     }
-    return (U.sec_on && srv->securityLevel != UDSOTA_SA_SEED_PROGRAMMING) ? UDS_NRC_SecurityAccessDenied : 0;
+    return locked(srv) ? UDS_NRC_SecurityAccessDenied : 0;
 }
 
-static void dl_flash_failed(void)
+/* Ends the download, with `reason` in F1F1 in place of ABORTED. */
+static void fail_download(uint8_t reason)
 {
     abort_download();
-    U.last_reason = UDSOTA_DL_FLASH_ERROR;
+    U.last_reason = reason;
+}
+
+/* The download is DFI 10 or 30, not 00. */
+static inline bool coded(void)
+{
+    return U.mode != DL_PLAIN;
 }
 
 /* 34: access, then settled slots, an idle worker, no transfer and the gate, then DFI 00 or 10 (or 30, with delta
@@ -687,7 +711,7 @@ static int request_download(const UDSServer_t *srv, uint8_t dfi, uint32_t addr, 
     if (rc != 0) {
         return rc;
     }
-    if (!slots_settled() || worker_busy() || U.dl_active) {
+    if (!ready_to_program()) {
         return UDS_NRC_ConditionsNotCorrect;
     }
     if ((rc = gate(UDSOTA_OP_START_DOWNLOAD)) != 0) {
@@ -746,18 +770,16 @@ static int block_done(int result, uint8_t *status, size_t *status_len)
 {
     (void)status;
     *status_len = 0;
-    if (result != UDSOTA_DL_OK && U.mode != DL_PLAIN && result != UDSOTA_DL_FLASH_ERROR &&
-        result != UDSOTA_DL_NO_MEMORY) {
-        abort_download();
-        U.last_reason = (uint8_t)result;
+    if (result != UDSOTA_DL_OK && coded() && result != UDSOTA_DL_FLASH_ERROR && result != UDSOTA_DL_NO_MEMORY) {
+        fail_download((uint8_t)result);
         return UDS_NRC_RequestOutOfRange;
     }
     if (result != UDSOTA_DL_OK) {
-        dl_flash_failed();
+        fail_download(UDSOTA_DL_FLASH_ERROR);
         return UDS_NRC_GeneralProgrammingFailure;
     }
     U.received += (uint32_t)U.blk_len;
-    U.written = (U.mode != DL_PLAIN) ? U.z.written : U.written + (uint32_t)U.blk_len;
+    U.written = coded() ? U.z.written : U.written + (uint32_t)U.blk_len;
     U.progress_block = true;
     U.last_bytes = U.received;
     return 0;
@@ -785,22 +807,21 @@ static int transfer_data(UDSServer_t *srv, const uint8_t *data, size_t len, bool
         }
         return rc;
     }
-    const uint64_t limit = (U.mode != DL_PLAIN) ? UDSOTA_DL_Z_BOUND(U.announced) : U.announced;
+    const uint64_t limit = coded() ? UDSOTA_DL_Z_BOUND(U.announced) : U.announced;
     if ((uint64_t)U.received + len > limit) {
         abort_download();
         return UDS_NRC_TransferDataSuspended;
     }
-    if (U.mode != DL_PLAIN) {
+    if (coded()) {
         srv->xferTotalBytes = (limit > SIZE_MAX) ? SIZE_MAX : (size_t)limit;   /* iso14229 counts memorySize */
     }
     memcpy(U.blk, data, len);
     U.blk_len = len;
-    int (*job)(void) = (U.mode != DL_PLAIN) ? job_zwrite : job_write;
-    if (U.mode == DL_PLAIN && !U.ota_open) {             /* the first block: check it before anything is erased */
+    int (*job)(void) = coded() ? job_zwrite : job_write;
+    if (!coded() && !U.ota_open) {                       /* the first block: check it before anything is erased */
         const udsota_reason_t why = check_first(data, len, U.announced);
         if (why != UDSOTA_DL_OK) {
-            abort_download();
-            U.last_reason = (uint8_t)why;
+            fail_download((uint8_t)why);
             return UDS_NRC_RequestOutOfRange;
         }
         U.ota_open = true;
@@ -826,8 +847,7 @@ static int zend_done(int result, uint8_t *status, size_t *status_len)
     if (result != UDSOTA_DL_OK) {
         U.ota_open = false;                              /* the stream is closed: only the flash side remains */
         U.close_pending = true;
-        abort_download();
-        U.last_reason = (uint8_t)result;
+        fail_download((uint8_t)result);
         return UDS_NRC_GeneralProgrammingFailure;
     }
     U.written = U.announced;
@@ -845,11 +865,11 @@ static int transfer_exit(const UDSServer_t *srv, size_t extra)
     if (extra != 0u) {
         return UDS_NRC_IncorrectMessageLengthOrInvalidFormat;
     }
-    if (!U.dl_active || (U.mode == DL_PLAIN && U.received != U.announced)) {
+    if (!U.dl_active || (!coded() && U.received != U.announced)) {
         return UDS_NRC_RequestSequenceError;
     }
     size_t none = 0;
-    return (U.mode != DL_PLAIN) ? run_job(job_zend, zend_done, 0x37, NULL, &none) : exit_ok();
+    return coded() ? run_job(job_zend, zend_done, 0x37, NULL, &none) : exit_ok();
 }
 
 /* ---- 31 01: FF01 verify, F000 resume point, F001 activate, F002 confirm ---- */
@@ -930,7 +950,7 @@ static int routine(const UDSServer_t *srv, uint8_t ctrl, uint16_t rid, size_t op
     if (srv->sessionType != (confirm ? UDS_LEV_DS_EXTDS : UDS_LEV_DS_PRGS)) {
         return UDS_NRC_RequestOutOfRange;
     }
-    if (!confirm && U.sec_on && srv->securityLevel != UDSOTA_SA_SEED_PROGRAMMING) {
+    if (!confirm && locked(srv)) {
         return UDS_NRC_SecurityAccessDenied;
     }
     if (opt_len != 0u) {
@@ -964,7 +984,7 @@ static int routine(const UDSServer_t *srv, uint8_t ctrl, uint16_t rid, size_t op
         }
         udsota_status_t st;
         status_now(&st);
-        if (st.running_slot == UDSOTA_SLOT_NONE || st.boot_slot != st.running_slot) {
+        if (!boots_itself(&st)) {
             return UDS_NRC_ConditionsNotCorrect;
         }
         if (st.running_state == UDSOTA_IMG_VALID || st.running_state == UDSOTA_IMG_UNDEFINED) {
@@ -1089,8 +1109,7 @@ static UDSErr_t on_session(UDSServer_t *srv, uint8_t type)
 {
     uint8_t nrc = 0;
     if (type == UDS_LEV_DS_PRGS) {
-        nrc = (!slots_settled() || worker_busy() || U.dl_active) ? UDS_NRC_ConditionsNotCorrect
-                                                                 : gate(UDSOTA_OP_ENTER_PROGRAMMING);
+        nrc = ready_to_program() ? gate(UDSOTA_OP_ENTER_PROGRAMMING) : UDS_NRC_ConditionsNotCorrect;
     } else if (type == UDS_LEV_DS_EXTDS) {
         nrc = gate(UDSOTA_OP_ENTER_EXTENDED);
     }
@@ -1398,8 +1417,7 @@ bool udsota_unconfirmed(void)
 {
     udsota_status_t st;
     status_now(&st);
-    return st.running_slot != UDSOTA_SLOT_NONE && st.boot_slot == st.running_slot &&
-           st.running_state == UDSOTA_IMG_PENDING_VERIFY;
+    return boots_itself(&st) && st.running_state == UDSOTA_IMG_PENDING_VERIFY;
 }
 
 #if defined(UDSOTA_TEST)
