@@ -4,6 +4,10 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ## [Unreleased]
 
+### Changed
+
+- Release workflow: a release is refused unless `ci`'s latest run succeeded on the commit it is cut from (a tag pushed by hand included), and its assets are built with compiler warnings as errors and the example's images pass udsota's image rules before anything is published. `backfill` skips these as well as the version check.
+
 ## [0.18.0] - 2026-11-18
 
 ### Added

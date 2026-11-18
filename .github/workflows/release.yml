@@ -1,8 +1,11 @@
 # Publishes a GitHub Release (see RELEASING.md). Pushing a vX.Y.Z tag on main checks that the tag, the dated CHANGELOG
-# section, the client's __version__ and udsota.h's UDSOTA_VERSION agree, builds the client and the example's app images
-# at the tag (release-assets.yml), and publishes them with that version's section of main's CHANGELOG as the notes.
-# Run it by hand (workflow_dispatch) to release an existing tag that has no Release yet; with backfill set it skips
-# the version check. cut-release.yml calls it (workflow_call) for the tag it pushes, since a tag pushed with a
+# section, the client's __version__ and udsota.h's UDSOTA_VERSION agree and that ci.yml's latest run passed on the
+# commit the release is cut from (the tagged commit's parent when that is a cut's "Release X.Y.Z", which changes only
+# the version files; else the tagged commit), builds the client and the example's app images at the tag with warnings
+# as errors and checks the images (release-assets.yml), and publishes them with that version's section of main's
+# CHANGELOG as the notes. Run it by hand (workflow_dispatch) to release an existing tag that has no Release yet; with
+# backfill set it skips the version and CI checks and the warning and image gates, as an older commit has no CI run
+# and may predate them. cut-release.yml calls it (workflow_call) for the tag it pushes, since a tag pushed with a
 # workflow's token starts no workflow. It never creates or moves a tag. Actions are pinned by commit, since this job
 # publishes.
 name: release
@@ -34,6 +37,9 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
       version: ${{ steps.resolve.outputs.version }}
@@ -71,6 +77,22 @@ jobs:
           git show "$SHA:udsota.h" > "$RUNNER_TEMP/udsota.h"
           python tools/release.py check "$TAG" --changelog "$RUNNER_TEMP/CHANGELOG.md" \
             --init "$RUNNER_TEMP/__init__.py" --header "$RUNNER_TEMP/udsota.h"
+      - name: Check ci passed on the commit the release is cut from
+        if: ${{ !inputs.backfill }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          # cut-release's "Release X.Y.Z" commit changes only the version files, so ci ran on its parent instead.
+          if [ "$(git log -1 --format=%s "$SHA")" = "Release $VERSION" ]; then
+            files=$(git diff --name-only "$SHA^" "$SHA")
+            other=$(printf '%s\n' "$files" | grep -vxE 'CHANGELOG\.md|client/udsota/__init__\.py|udsota\.h' || true)
+            if [ -z "$other" ]; then SHA=$(git rev-parse "$SHA^"); fi
+          fi
+          ci=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$SHA&event=push" \
+               --jq '[.workflow_runs[] | select(.status == "completed")][0].conclusion // ""')
+          [ "$ci" = success ] || { echo "::error::ci on $SHA is '${ci:-not finished}', not success"; exit 1; }
       - name: Release notes from main's CHANGELOG
         env:
           TAG: ${{ steps.resolve.outputs.tag }}
@@ -87,6 +109,7 @@ jobs:
     uses: ./.github/workflows/release-assets.yml
     with:
       ref: ${{ needs.check.outputs.sha }}
+      fail_on_warning: ${{ !inputs.backfill }}
 
   publish:
     needs: [check, assets]

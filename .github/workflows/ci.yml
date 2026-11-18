@@ -146,10 +146,10 @@ jobs:
     uses: ./.github/workflows/release-assets.yml
     with:
       ref: ${{ github.sha }}
-      fail_on_warning: true
-  # udsota's image rules on the images the two jobs above built.
+      fail_on_warning: true   # also runs the image rules on the example's images
+  # udsota's image rules on the CANDash images (release-assets checks the example's).
   image-check:
-    needs: [esp32, release-assets]
+    needs: esp32
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -161,8 +161,7 @@ jobs:
         shell: bash
         run: |
           cmake -S . -B build
-          cmake --build build -j --target image_check_example_esp32 image_check_example_esp32s3 image_check_ws43 \
-                                        image_check_ws43b
+          cmake --build build -j --target image_check_ws43 image_check_ws43b
           check() {   # check <image_check_ suffix> <image> <product>
             "build/image_check_$1" "images/$2.bin" "$3"
             cp "images/$2.bin" broken.bin
@@ -170,8 +169,6 @@ jobs:
             rc=0; "build/image_check_$1" broken.bin "$3" || rc=$?
             [ "$rc" = 3 ] || { echo "$2 with a broken descriptor gave $rc, not 3 (UDSOTA_DL_BAD_BOARD)"; exit 1; }
           }
-          check example_esp32 example-esp32 example
-          check example_esp32s3 example-esp32s3 example
           check ws43 candash-ws43 candash
           check ws43b candash-ws43b candash
           check ws43 candash-ws43-o2 candash
