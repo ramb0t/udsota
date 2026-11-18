@@ -12,7 +12,6 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 - **Breaking**, client: `update.flash`, `flash_app`, `flash_bootloader`, `confirm`, `confirm_cmd`, `wait_for_image`, `wait_for_boot`, `wait_for_start`, `wait_for_power_up`, `poll_restarted`, `download`, `send_payload` and `config.config_set` no longer take `sleep=` or `clock=` (`download`, `send_payload` and `wait_for_power_up` took only `clock=`): they use `uds.sleep` and `uds.clock`, which `Uds(client, sleep=..., clock=...)` takes. A caller that passed them passes them to `Uds` instead.
 - Release workflow: a release is refused unless `ci`'s latest run succeeded on the commit it is cut from (a tag pushed by hand included), and its assets are built with compiler warnings as errors and the example's images pass udsota's image rules before anything is published. `backfill` skips the warning and image gates as well as the version check, not the `ci` check.
 
-
 ### Fixed
 
 - ESP-IDF platform: a `27` seed no longer switches the SAR ADC entropy source on and off, which reset and reconfigured the app's ADC (and I2S0 on an ESP32) on every seed request. The seed comes from `esp_fill_random` alone; the README's Known limits say when that is true random and how an app makes it so.
