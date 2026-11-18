@@ -25,7 +25,6 @@
 
 #if defined(ESP_PLATFORM)
 #include "sdkconfig.h"
-#include "bootloader_random.h"
 #include "esp_app_desc.h"
 #include "esp_app_format.h"
 #if UDSOTA_DELTA
@@ -62,6 +61,7 @@ _Static_assert(sizeof(tinfl_decompressor) == 10992u && TINFL_LZ_DICT_SIZE == 327
 #define BUF_LEN         4096u
 #define IMAGE_MIN       320u       /* image header 24 + segment header 8 + esp_app_desc_t 256 + descriptor 32 */
 #define JOB_CAP_MS      90000u     /* the longest udsota holds a session for its own flash job */
+#define JOB_PSA_WAIT_MS 60000u     /* FF01's and F001's wait for the PSA lock, inside JOB_CAP_MS */
 #define PATCH_MAGIC     0xFCCDDE10u   /* a delta patch's first 4 bytes, little-endian (esp_delta_ota's) */
 #define PATCH_HDR_LEN   64u        /* the magic, the base's appended SHA-256 and 28 reserved bytes */
 
@@ -930,10 +930,11 @@ static int transfer_exit(const UDSServer_t *srv, size_t extra)
 
 /* ---- 31 01: FF01 verify, F000 resume point, F001 activate, F002 confirm ---- */
 
-/* esp_ota_end and esp_ota_set_boot_partition hash through PSA. The wait has no limit: the app holds it briefly. */
+/* esp_ota_end and esp_ota_set_boot_partition hash through PSA. The wait ends well inside the 90 s a job may take, so
+ * an app that holds the lock that long fails the job here, and no activate can land after its 0x72 was answered. */
 static int job_verify(void)
 {
-    if (!udsota_psa_lock(UDSOTA_PSA_WAIT_FOREVER)) {
+    if (!udsota_psa_lock(JOB_PSA_WAIT_MS)) {
         return UDSOTA_DL_VERIFY_FAILED;
     }
     const int r = udsota_plat_end();
@@ -943,7 +944,7 @@ static int job_verify(void)
 
 static int job_activate(void)
 {
-    if (!udsota_psa_lock(UDSOTA_PSA_WAIT_FOREVER)) {
+    if (!udsota_psa_lock(JOB_PSA_WAIT_MS)) {
         return UDSOTA_DL_VERIFY_FAILED;
     }
     const int r = udsota_plat_activate();
@@ -1577,7 +1578,7 @@ static bool s_open, s_verified;
 static TaskHandle_t s_worker;
 static int (*s_job)(void);
 static int s_result;
-static bool s_busy = true;                       /* until the worker has read the slots */
+static bool s_busy;
 static psa_key_id_t s_pub;
 
 static uint8_t slot_of(const esp_partition_t *p)
@@ -1621,11 +1622,9 @@ static void set_other(uint8_t state)
     taskEXIT_CRITICAL(&s_mux);
 }
 
-/* The worker: reads the slots once, then runs one job at a time. Off the task watchdog: an erase busy-waits. */
-static void worker(void *arg)
+/* The slots as they are at start, read on udsota_init's task, so udsota_unconfirmed() and F1F0 are right from then. */
+static void read_slots(const esp_partition_t *run)
 {
-    (void)arg;
-    const esp_partition_t *run = esp_ota_get_running_partition();
     esp_ota_img_states_t st;
     udsota_status_t s = {.running_slot = slot_of(run), .boot_slot = slot_of(esp_ota_get_boot_partition())};
     s.running_state = (esp_ota_get_state_partition(run, &st) == ESP_OK) ? map_state(st) : UDSOTA_IMG_UNDEFINED;
@@ -1643,6 +1642,12 @@ static void worker(void *arg)
     const bool rolled_back = s_target != NULL && esp_ota_get_state_partition(s_target, &st) == ESP_OK &&
                              (st == ESP_OTA_IMG_INVALID || st == ESP_OTA_IMG_ABORTED);
     set_other(rolled_back ? UDSOTA_OTHER_INVALID : UDSOTA_OTHER_UNVERIFIED);
+}
+
+/* The worker: runs one job at a time. Off the task watchdog: an erase busy-waits. */
+static void worker(void *arg)
+{
+    (void)arg;
     for (;;) {
         taskENTER_CRITICAL(&s_mux);
         int (*job)(void) = s_job;
@@ -1710,11 +1715,13 @@ int udsota_plat_start(void)
     if (s_target == NULL || s_target == run) {
         s_target = NULL;
         LOGW("no inactive OTA slot: every download is refused");
+    } else if (slot_of(run) == UDSOTA_SLOT_NONE) {
+        LOGW("running the factory app: every download is refused until an OTA slot boots");
     }
+    read_slots(run);
     if (xTaskCreatePinnedToCore(worker, "udsota", 8192, NULL, 2, &s_worker, tskNO_AFFINITY) != pdPASS) {
         LOGW("no memory for the flash worker: every download is refused");
         s_worker = NULL;
-        s_busy = false;
         return -1;
     }
     return (s_target != NULL) ? 0 : -1;
@@ -1883,12 +1890,12 @@ size_t udsota_plat_mac(uint8_t out[16])
     return (esp_read_mac(out, ESP_MAC_BASE) == ESP_OK) ? 6u : 0u;
 }
 
-/* A true random seed: the SAR ADC entropy source is on only while it is drawn, so the app keeps the ADC and radio. */
+/* A seed from the hardware RNG. udsota never switches an entropy source on or off, since that would reconfigure the
+ * app's ADC (and I2S0 on an ESP32): the RNG is true random while Wi-Fi or Bluetooth runs or the app has called
+ * bootloader_random_enable(), and otherwise draws on the chip's secondary entropy source (not on an ESP32). */
 bool udsota_plat_rng16(uint8_t out[16])
 {
-    bootloader_random_enable();
     esp_fill_random(out, 16);
-    bootloader_random_disable();
     return true;
 }
 
