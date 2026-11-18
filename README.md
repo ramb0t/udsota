@@ -6,7 +6,7 @@ udsota updates firmware over UDS on CAN: any UDS tester can send an image, and t
 
 | Part | What it is | Status |
 |---|---|---|
-| The ESP-IDF component: `udsota.c` with `udsota.h`, `udsota_wire.h` and `udsota_image.h`, on the vendored [iso14229](https://github.com/driftregion/iso14229) | Safe A/B updates, served inside the app's own UDS server | Released |
+| The ESP-IDF component: `udsota.c` and `udsota_esp.c` with `udsota.h`, `udsota_wire.h` and `udsota_image.h`, on the vendored [iso14229](https://github.com/driftregion/iso14229) | Safe A/B updates, served inside the app's own UDS server | Released |
 | [`boot/`](boot/README.md), with `udsota_app.h` | A resident bootloader core for a microcontroller with one app slot, which a product completes with a port of a few flash, CAN and reset functions | Experimental, outside the 1.0 promise until a product has run on it |
 | [`client/`](client/README.md) | `udsota`, the command for Linux with SocketCAN | Released; it also updates units still on a 0.14.x server |
 
@@ -67,7 +67,7 @@ The rest come from using iso14229 as it is, each a candidate for an upstream fix
 
 | Path | What it is |
 |---|---|
-| `udsota.c`, `udsota.h`, `udsota_wire.h`, `udsota_image.h` | The updater and its ESP-IDF platform. `udsota.h`, which includes the other two, ends with the platform functions a port to another MCU would supply; `udsota_wire.h` is the wire contract with no `#include`, for a bootloader or tester to take alone, and `udsota_image.h` the image descriptor and the bare header as C types |
+| `udsota.c`, `udsota_esp.c`, `udsota.h`, `udsota_wire.h`, `udsota_image.h` | The updater, and `udsota_esp.c`, its ESP-IDF platform (`udsota_priv.h` is the one thing it calls back into the updater through; an app does not include it). `udsota.h`, which includes the other two, ends with the platform functions a port to another MCU would supply; `udsota_wire.h` is the wire contract with no `#include`, for a bootloader or tester to take alone, and `udsota_image.h` the image descriptor and the bare header as C types |
 | `udsota_app.h` | The app's side of a [`boot/`](boot/README.md) bootloader, header-only: the handover, the F1F4 answer and the healthy mark |
 | [`boot/`](boot/README.md) | The bootloader core and its porting guide |
 | `iso14229/`, `detools/` | The vendored libraries, unmodified, each with its licence and a `SHA256SUMS` that CI checks; their versions are in [THIRD_PARTY.md](THIRD_PARTY.md). detools compiles only in a build that defines `UDSOTA_DELTA=1` |

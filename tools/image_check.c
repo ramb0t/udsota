@@ -1,5 +1,5 @@
-/* image_check: udsota's own image rules (check_first in udsota.c) run on a built image, on the host, so CI proves a
- * real ESP-IDF build carries a header and descriptor that a unit of that board accepts.
+/* image_check: udsota's own image rules (udsota_check_first in udsota.c) run on a built image, on the host, so CI proves
+ * a real ESP-IDF build carries a header and descriptor that a unit of that board accepts.
  *
  *   image_check <image.bin> <product>
  *

@@ -1,5 +1,6 @@
-# udsota. Under ESP-IDF this directory is the component: udsota.c and the vendored iso14229, and detools when the build
-# defines UDSOTA_DELTA=1. On a host it builds the host tests, udsota_lite_server and udsota_boot_server:
+# udsota. Under ESP-IDF this directory is the component: udsota.c, udsota_esp.c (the ESP-IDF platform) and the vendored
+# iso14229, and detools when the build defines UDSOTA_DELTA=1. On a host it builds the host tests, udsota_lite_server
+# and udsota_boot_server:
 # cmake -S . -B build && cmake --build build && ctest --test-dir build
 
 # Delta downloads: detools as they use it, uncompressed sequential patches only and no file I/O. udsota.c reads detools.h
@@ -20,7 +21,7 @@ if(ESP_PLATFORM)
     # both read it; detools.c is compiled only then. The app sets it before project(), with
     # idf_build_set_property(COMPILE_DEFINITIONS UDSOTA_DELTA=1 APPEND), as this reads the list only here.
     idf_build_get_property(udsota_build_defs COMPILE_DEFINITIONS)
-    set(udsota_srcs "udsota.c" "iso14229/iso14229.c")
+    set(udsota_srcs "udsota.c" "udsota_esp.c" "iso14229/iso14229.c")
     set(udsota_priv_inc "")
     set(udsota_delta_defs "")
     if("UDSOTA_DELTA=1" IN_LIST udsota_build_defs)

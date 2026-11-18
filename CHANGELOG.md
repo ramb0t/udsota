@@ -4,6 +4,10 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking** for a product that lists udsota's sources by hand under ESP-IDF: the ESP-IDF platform (the `udsota_plat_*` functions, the flash worker and the PSA lock) is now `udsota_esp.c`, and `udsota.c` is the portable core that every host test builds as the target does. Add `udsota_esp.c` beside `udsota.c`; the component's `SRCS` already do. The two call each other through the new private header `udsota_priv.h`. Host builds are unchanged. See MIGRATING.md, 0.18.x to 0.19.0. The text of both objects together is within a few bytes of `udsota.c`'s before in the ws43 default and delta builds, and 820 bytes less at -O2.
+
 ### Fixed
 
 - `udsota.c`: when another service arrives while a compressed download's 37 is inflating the end of the stream, the download is ended and the 37's job then finishes, so F1F1 says ABORTED as it did before and the 37 is answered 0x72 as a failed 37 is; it was answered positive, with F1F1 OK, for a download that had ended.
