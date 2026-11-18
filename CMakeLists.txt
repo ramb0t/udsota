@@ -97,8 +97,9 @@ udsota_test(test_udsota)
 udsota_test(test_udsota_no_rollback TEST_ROLLBACK=0)
 
 # Delta downloads in a host target: UDSOTA_DELTA=1, detools and its defines. The target's platform supplies the two
-# udsota_plat_base_* functions. -DUDSOTA_DELTA=ON builds udsota_lite_server so.
-option(UDSOTA_DELTA "Build udsota_lite_server with delta downloads (UDSOTA_DELTA=1 and detools)" OFF)
+# udsota_plat_base_* functions. udsota_lite_server is built with them unless -DUDSOTA_DELTA=OFF, as an app without delta
+# downloads is.
+option(UDSOTA_DELTA "Build udsota_lite_server with delta downloads (UDSOTA_DELTA=1 and detools)" ON)
 function(udsota_with_delta name)
     target_sources(${name} PRIVATE detools/detools.c)
     target_include_directories(${name} PRIVATE detools)

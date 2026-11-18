@@ -7,7 +7,7 @@
 name: ci
 on: [push, pull_request]
 jobs:
-  # The default build: every test, and with clang the fuzzer's libFuzzer build too.
+  # Every test, with udsota_lite_server built without delta downloads, and with clang the fuzzer's libFuzzer build too.
   host:
     runs-on: ubuntu-latest
     strategy:
@@ -21,7 +21,8 @@ jobs:
         run: cd detools && sha256sum -c SHA256SUMS
       - name: The host tests, test_udsota_delta, the fuzzer's delta seeds and the bootloader core's tests among them
         run: |
-          cmake -S . -B build -DUDSOTA_FUZZ_LIBFUZZER="$FUZZ_LIBFUZZER"
+          # udsota_lite_server is built without delta downloads here, so its sources compile that way under -Werror too.
+          cmake -S . -B build -DUDSOTA_DELTA=OFF -DUDSOTA_FUZZ_LIBFUZZER="$FUZZ_LIBFUZZER"
           # One command a line: bash -e does not stop at a failure on the left of an && that is not the last command,
           # so a failed build would fall through to the check below and pass.
           cmake --build build -j
@@ -60,7 +61,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: |
-          cmake -S . -B build -DUDSOTA_DELTA=ON
+          cmake -S . -B build
           cmake --build build -j --target udsota_lite_server udsota_boot_server
           test -x build/udsota_lite_server && test -x build/udsota_boot_server
         env:
