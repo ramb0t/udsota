@@ -286,19 +286,6 @@ static void stop_buses(uint8_t keep)
     }
 }
 
-/* The open buses started, one that does not start being absent, and every other bus stopped. */
-static void listen(void)
-{
-    for (uint8_t b = 1; b <= B.cfg->buses; b++) {
-        if (bus_open(b)) {
-            (void)udsota_boot_port_can_start(b, B.cfg->request_id);
-        } else {
-            udsota_boot_port_can_stop(b);
-        }
-        tick();
-    }
-}
-
 static UDSErr_t tp_send(UDSTp_t *hdl, const uint8_t *buf, size_t len, const UDSSDU_t *info)
 {
     (void)hdl;
@@ -332,23 +319,6 @@ static UDSErr_t tp_poll(UDSTp_t *hdl)
     (void)hdl;
     isotp_poll(&B.tp.link);
     return UDS_OK;
-}
-
-static UDSErr_t on_event(UDSServer_t *srv, UDSEvent_t ev, void *arg);
-
-/* iso14229 from scratch, as each boot and each return to listening has it, with the state the core writes. */
-static void server_init(void)
-{
-    (void)UDSServerInit(&B.srv);
-    B.srv.fn = on_event;
-    B.srv.tp = &B.tp.hdl;
-    B.srv.p2_ms = P2_MS;
-    B.srv.s3_ms = IDLE_MS;
-    B.srv.p2_timer = UDSMillis() + P2_MS;
-    B.tp.hdl.send = tp_send;
-    B.tp.hdl.recv = tp_recv;
-    B.tp.hdl.poll = tp_poll;
-    isotp_init_link(&B.tp.link, B.cfg->response_id, B.tp.tx, sizeof B.tp.tx, B.tp.rx, sizeof B.tp.rx);
 }
 
 /* ==== 6. The slot ==== */
@@ -702,17 +672,71 @@ static bool would_start_app(void)
     return udsota_boot_decide(B.cfg, &in, &B.count) == UDSOTA_BOOT_DECIDE_START_APP;
 }
 
-/* S3's expiry and the idle exit: a reset when the boot rules would start the app, else listening again on every
- * open bus, with iso14229 from scratch, no lock and no window; what is installed now says which buses are open. */
+/* iso14229 from scratch, as each boot and each return to listening has it, with the state the core writes. */
+static void server_init(void)
+{
+    (void)UDSServerInit(&B.srv);
+    B.srv.fn = on_event;
+    B.srv.tp = &B.tp.hdl;
+    B.srv.p2_ms = P2_MS;
+    B.srv.s3_ms = IDLE_MS;
+    B.srv.p2_timer = UDSMillis() + P2_MS;
+    B.tp.hdl.send = tp_send;
+    B.tp.hdl.recv = tp_recv;
+    B.tp.hdl.poll = tp_poll;
+    isotp_init_link(&B.tp.link, B.cfg->response_id, B.tp.tx, sizeof B.tp.tx, B.tp.rx, sizeof B.tp.rx);
+}
+
+/* Listening: the open buses started, one that does not start being absent, every other bus stopped, and iso14229 from
+ * scratch with no lock and no window. What is installed now says which buses are open. */
+static void listen(void)
+{
+    for (uint8_t b = 1; b <= B.cfg->buses; b++) {
+        if (bus_open(b)) {
+            (void)udsota_boot_port_can_start(b, B.cfg->request_id);
+        } else {
+            udsota_boot_port_can_stop(b);
+        }
+        tick();
+    }
+    server_init();
+    B.state = LISTENING;
+}
+
+/* S3's expiry and the idle exit: a reset when the boot rules would start the app, else listening again. */
 static void session_exit(void)
 {
     if (would_start_app()) {
         reset();
         return;
     }
-    B.state = LISTENING;
     listen();
-    server_init();
+}
+
+/* The boot rules' inputs, read in the order udsota_boot.h lists: the reset cause, the handover words (taken once,
+ * cleared and read back), the boot check, the start count word. */
+static udsota_boot_inputs_t boot_inputs(void)
+{
+    udsota_boot_inputs_t in = {.cause = udsota_boot_port_reset_cause()};
+    const uint16_t mark = udsota_boot_port_keep_read(UDSOTA_KEEP_WORD_MARK);
+    in.handover = udsota_boot_port_keep_read(UDSOTA_KEEP_WORD_HANDOVER);
+    if (mark == UDSOTA_HANDOVER_MARK) {
+        udsota_boot_port_keep_write(UDSOTA_KEEP_WORD_MARK, 0u);
+        udsota_boot_port_keep_write(UDSOTA_KEEP_WORD_HANDOVER, 0u);
+        in.handover_ok = udsota_boot_port_keep_read(UDSOTA_KEEP_WORD_MARK) != UDSOTA_HANDOVER_MARK;
+    }
+    in.app_valid = B.app_valid = boot_check();
+    in.count_word = udsota_boot_port_keep_read(UDSOTA_KEEP_WORD_COUNT);
+    return in;
+}
+
+/* The handed-over bus, started for the replayed 10 02: whether it is open and starts. */
+static bool start_handover_bus(uint8_t bus)
+{
+    B.bus = bus;
+    B.replay = bus_open(bus) && udsota_boot_port_can_start(bus, B.cfg->request_id);
+    tick();
+    return B.replay;
 }
 
 udsota_boot_decision_t udsota_boot_init(const udsota_boot_cfg_t *cfg)
@@ -724,38 +748,27 @@ udsota_boot_decision_t udsota_boot_init(const udsota_boot_cfg_t *cfg)
     }
     B.cfg = cfg;
     B.last_us = udsota_boot_port_us();
-    udsota_boot_inputs_t in = {.cause = udsota_boot_port_reset_cause()};
-    const uint16_t mark = udsota_boot_port_keep_read(UDSOTA_KEEP_WORD_MARK);
-    in.handover = udsota_boot_port_keep_read(UDSOTA_KEEP_WORD_HANDOVER);
-    if (mark == UDSOTA_HANDOVER_MARK) {
-        udsota_boot_port_keep_write(UDSOTA_KEEP_WORD_MARK, 0u);
-        udsota_boot_port_keep_write(UDSOTA_KEEP_WORD_HANDOVER, 0u);
-        in.handover_ok = udsota_boot_port_keep_read(UDSOTA_KEEP_WORD_MARK) != UDSOTA_HANDOVER_MARK;
-    }
-    in.app_valid = B.app_valid = boot_check();
-    in.count_word = udsota_boot_port_keep_read(UDSOTA_KEEP_WORD_COUNT);
+    udsota_boot_inputs_t in = boot_inputs();
     udsota_boot_decision_t d = udsota_boot_decide(cfg, &in, &B.count);
-    if (d == UDSOTA_BOOT_DECIDE_HANDOVER) {
-        B.bus = (uint8_t)in.handover;
-        if (bus_open(B.bus) && udsota_boot_port_can_start(B.bus, cfg->request_id)) {
-            B.replay = true;
-        } else {
-            in.handover_ok = false;
-            d = udsota_boot_decide(cfg, &in, &B.count);
-        }
-        tick();
+    if (d == UDSOTA_BOOT_DECIDE_HANDOVER && !start_handover_bus((uint8_t)in.handover)) {
+        in.handover_ok = false;
+        d = udsota_boot_decide(cfg, &in, &B.count);
     }
     udsota_boot_port_keep_write(UDSOTA_KEEP_WORD_COUNT, UDSOTA_START_COUNT_WORD(B.count));
     if (d == UDSOTA_BOOT_DECIDE_START_APP) {
         B.state = STARTING;
         return d;
     }
-    if (d != UDSOTA_BOOT_DECIDE_HANDOVER) {
+    if (d == UDSOTA_BOOT_DECIDE_HANDOVER) {
+        server_init();
+        B.state = TESTER;
+    } else {
         listen();
+        if (d == UDSOTA_BOOT_DECIDE_WINDOW) {
+            B.state = WINDOW;
+        }
     }
-    server_init();
     B.since = UDSMillis();                               /* the window's start, or the replayed 10 02's time */
-    B.state = (d == UDSOTA_BOOT_DECIDE_HANDOVER) ? TESTER : (d == UDSOTA_BOOT_DECIDE_WINDOW) ? WINDOW : LISTENING;
     return d;
 }
 
