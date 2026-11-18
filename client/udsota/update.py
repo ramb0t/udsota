@@ -4,6 +4,8 @@ product-specific step comes from the profile."""
 import contextlib
 import time
 
+import can
+
 from .delta import validation_hash
 from .errors import NoResponse, Nrc, Refused, SendFailed, UpdateFailed
 from .image import parse_image, update_buses
@@ -355,6 +357,15 @@ def check_image(uds, log=print):
                            % (reason_name(status[0]) if status else "no status"))
 
 
+# One pre-roll while a unit restarts. A send the adapter cannot make (python-can raises CanOperationError, or OSError,
+# when nothing on the bus acknowledges and its queue fills) is not the wait's failure: the poll that follows decides.
+def try_preroll(preroll):
+    try:
+        preroll()
+    except (OSError, can.CanError):
+        pass
+
+
 # Wait for a restarting server: pre-roll and poll the running SHA until it answers, and return it. after names what
 # restarted it, for the timeout message. The server comes back in the default session, so no 3E 00 precedes a poll.
 def wait_for_boot(uds, preroll, after, sleep=time.sleep, clock=time.monotonic):
@@ -362,7 +373,7 @@ def wait_for_boot(uds, preroll, after, sleep=time.sleep, clock=time.monotonic):
     sleep(REBOOT_WAIT_S)
     deadline = clock() + BOOT_TIMEOUT_S
     while True:
-        preroll()
+        try_preroll(preroll)
         try:
             return uds.read_did(DID_RUNNING_SHA)
         except (NoResponse, SendFailed):   # a rebooting server answers nothing, or leaves a send unacknowledged
@@ -665,7 +676,7 @@ def wait_for_start(uds, profile, sha, preroll, sleep=time.sleep, clock=time.mono
     sleep(REBOOT_WAIT_S)
     deadline = clock() + profile.start_timeout_s
     while True:
-        preroll()
+        try_preroll(preroll)
         try:
             prefix = uds.read_did(DID_IMAGE_PREFIX)
         except (NoResponse, SendFailed):   # the unit is restarting, or its app is not healthy yet

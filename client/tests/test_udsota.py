@@ -1751,6 +1751,64 @@ def test_wait_for_image_polls_through_send_errors():
     assert ft.sleeps == [update.REBOOT_WAIT_S] + [update.BOOT_POLL_S] * 3
 
 
+# A pre-roll that fails as python-can's does when nothing on the bus acknowledges, then sends: errors, the failures.
+def failing_preroll(*failures):
+    left, sent = list(failures), []
+
+    # Raise the next failure, or record a send.
+    def preroll():
+        if left:
+            raise left.pop(0)
+        sent.append(1)
+    preroll.sent = sent
+    return preroll
+
+
+# Check a pre-roll that cannot be sent while the unit restarts is a failed poll, in the app flow's wait and in the
+# bootloader flow's: both go on polling, and the wait runs to its deadline when the pre-roll never works.
+def test_failed_preroll_is_a_failed_poll_in_both_waits():
+    ft = FakeTime()
+
+    # A restarting server: it answers the new sha only after three polls.
+    class Rebooting:
+        def __init__(self):
+            self.polls = 0
+
+        # Silent for two polls, then the sha F1F3 and the prefix F1F4 give.
+        def read_did(self, did):
+            self.polls += 1
+            if self.polls <= 2:
+                raise errors.NoResponse("no answer")
+            return NEW_SHA if did == wire.DID_RUNNING_SHA else NEW_SHA[:4]
+
+        # The boot wait's note that the server restarted: nothing to track.
+        def restarted(self):
+            pass
+
+    down = [can.CanOperationError("Failed to transmit: [Errno 105] No buffer space available"),
+            OSError(errno.ENOBUFS, os.strerror(errno.ENOBUFS))]
+    preroll = failing_preroll(*down)
+    update.wait_for_image(Rebooting(), NEW_SHA, preroll, sleep=ft.sleep, clock=ft.clock)
+    assert len(preroll.sent) == 1
+    preroll = failing_preroll(*down)
+    assert update.wait_for_start(Rebooting(), PBL, NEW_SHA, preroll, sleep=ft.sleep, clock=ft.clock,
+                                 log=lambda *a: None) == 0
+    assert len(preroll.sent) == 1
+
+    # Never sendable, never answered: the deadline's error, not the pre-roll's.
+    def never():
+        raise can.CanOperationError("Failed to transmit")
+
+    class Silent(Rebooting):
+        def read_did(self, did):
+            raise errors.NoResponse("no answer")
+
+    with pytest.raises(errors.UpdateFailed, match="^the server did not answer within 60 s of ActivateImage$"):
+        update.wait_for_image(Silent(), NEW_SHA, never, sleep=ft.sleep, clock=ft.clock)
+    with pytest.raises(errors.UpdateFailed, match="^nothing answered F1F4 in 60 s"):
+        update.wait_for_start(Silent(), PBL, NEW_SHA, never, sleep=ft.sleep, clock=ft.clock, log=lambda *a: None)
+
+
 # Check NRC 0x21 is retried after the first backoff step.
 def test_busy_nrc_is_retried_with_backoff():
     d = FakeServer(nrc_once={(0x22, 0xF1F0): 0x21})
