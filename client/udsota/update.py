@@ -103,11 +103,11 @@ def wrong_board(profile, img, board):
     return None
 
 
-# `flash`: the update from the precheck to a running, confirmed image; returns 0 or raises ToolError. secret is the
-# master or private key (make_keys), unused without [security]. quiet() is held from the point an update is needed to
-# the end (the transport's bus quieting). compress is "none", "deflate" or "auto"; None takes the profile's. bases,
-# (name, bytes) pairs, offers a delta from the one the server runs (plan_deltas). The profile's flow picks flash_app or
-# flash_bootloader; wait_for_unit and allow_product_change are the bootloader flow's alone.
+# `flash`: the update from the precheck to a running image, confirmed under flow "app"; returns 0 or raises ToolError.
+# secret is the master or private key (make_keys), unused without [security]. quiet() is held from the point an update
+# is needed to the end (the transport's bus quieting). compress is "none", "deflate" or "auto"; None takes the
+# profile's. bases, (name, bytes) pairs, offers a delta from the one the server runs (plan_deltas). The profile's flow
+# picks flash_app or flash_bootloader; wait_for_unit and allow_product_change are the bootloader flow's alone.
 def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep=time.sleep,
           clock=time.monotonic, log=print, quiet=contextlib.nullcontext, compress=None, bases=None,
           diff_format="auto", wait_for_unit=None, allow_product_change=False):

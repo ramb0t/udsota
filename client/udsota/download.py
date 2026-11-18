@@ -21,11 +21,11 @@ DELTA_NAMES = {DL_DFI_DELTA: "heatshrink patch", DL_DFI_DELTA_DEFLATE: "patch as
 # RequestDownload, every 0x36 block (counter from 1, wrapping 0xFF -> 0x00) and RequestTransferExit: first each
 # delta in deltas ((dfi, payload) pairs, plan_deltas) in turn, then the image compressed per compress
 # (open_download). A delta DFI the server answers 0x31, or 0x22 for memory, moves on to the next; a delta refused
-# for its base (send_payload) skips the rest and sends the image, after reenter() (enter_programming) when the
-# programming session has ended meanwhile: on a server on iso14229, whose S3 (5.1 s) restarts only on 10 and 3E, it
-# ends while the client waits P2* (5.5 s) for a lost answer. drop_76 = N resends block N once as if its 76 were
-# lost; an N past the last block is refused before any 0x36 (the CLI refuses it with deltas, whose size it can't
-# know before the 34).
+# for its base (send_payload) skips the rest and sends the image, after reenter() (the flow's way back into the
+# programming session) when that session has ended meanwhile: on a server on iso14229, whose S3 (5.1 s) restarts only
+# on 10 and 3E, it ends while the client waits P2* (5.5 s) for a lost answer. drop_76 = N resends block N once as if
+# its 76 were lost; an N past the last block is refused before any 0x36 (the CLI refuses it with deltas, whose size it
+# can't know before the 34).
 def download(uds, image, drop_76=None, log=print, compress="none", clock=time.monotonic, deltas=(), reenter=None):
     for dfi, patch in deltas:
         try:
