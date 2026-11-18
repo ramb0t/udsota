@@ -429,6 +429,8 @@ class FakeServer:
     # 0x37 RequestTransferExit: an inflated or patched stream that is not the announced image answers 0x72
     # (DL_BAD_STREAM); an open transfer holding every announced byte closes (77), else 0x24.
     def s37(self, req, _):
+        if not self.dl_open and self.ended_nrc == 0x70 and not self.dl_complete:
+            return self.nrc(0x37, 0x70)                 # iso14229: no transfer open
         if self.dl_open and self.dfi:
             out = self.apply_patch() if self.dfi in (0x20, 0x30) else self.inflate()
             if out is None or len(out) != self.announced:
@@ -2762,6 +2764,45 @@ def test_busy_block_after_a_late_76_is_retried(s3_on, frames):
     first_send_of_block_2(d, lambda req, bsc, real: list(frames))
     rc = update.flash(timed_uds(d, ft), P, make_image(), MASTER, sleep=ft.sleep, clock=ft.clock, log=lambda *a: None)
     assert rc == 0 and d.sha == NEW_SHA
+
+
+# A server on iso14229 whose app answers a 36 or 37 busy (0x21) once: any NRC ends the transfer there, so the resend
+# finds none open and gets 0x70.
+class BusyEndsTransfer(FakeServer):
+    # sid: the service (0x36 or 0x37) that is answered 0x21 once.
+    def __init__(self, sid, **kw):
+        FakeServer.__init__(self, security=False, ended_nrc=0x70, **kw)
+        self.busy_sid = sid
+
+    # 0x21 to the first 36 or 37 asked for, which ends the transfer; then FakeServer's.
+    def handle(self, req):
+        if req[0] == self.busy_sid and self.dl_open:
+            self.busy_sid = None
+            self.log.append((req[0], self.request_arg(req)))
+            self.dl_open = False
+            return self.nrc(req[0], 0x21)
+        return super().handle(req)
+
+
+# Check the 0x70 that follows a retried 0x21 to a 36 or a 37 says the app answered busy, which ended the transfer on
+# this server, and that flash is to be run again; the retry is kept, since a v0.14.x server keeps the transfer across a
+# 0x21 and the client cannot tell the two apart. A 0x70 with no 0x21 before it is reported as it was.
+@pytest.mark.parametrize("sid", [0x36, 0x37])
+def test_busy_that_ended_the_transfer_is_named_after_its_0x70(sid):
+    d = BusyEndsTransfer(sid)
+    uds = uds_for(d, FakeTime())
+    uds.session(2)
+    with pytest.raises(errors.Nrc) as e:
+        update.download(uds, make_image(), log=lambda *a: None)
+    assert (e.value.sid, e.value.code) == (sid, 0x70)
+    assert "the app answered busy (0x21), which ends the transfer on this server; run flash again" in str(e.value)
+    assert [x for x in d.log if x[0] == sid][:2] == [(sid, 1 if sid == 0x36 else None)] * 2
+    d = FakeServer(security=False, ended_nrc=0x70, nrc_once={(0x36, 1): 0x70})
+    uds = uds_for(d, FakeTime())
+    uds.session(2)
+    with pytest.raises(errors.Nrc) as e:
+        update.download(uds, make_image(), log=lambda *a: None)
+    assert str(e.value) == "service 0x36 answered NRC 0x70"
 
 
 # Check the 76 to a download's last block that lands on 0x37 (the block was resent after its first 76 came late, and

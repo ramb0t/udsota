@@ -7,7 +7,7 @@ from udsoncan.exceptions import (InvalidResponseException, NegativeResponseExcep
 
 from .errors import NoResponse, Nrc, SendFailed, UpdateFailed
 from .keys import SEED_LEN
-from .wire import DL_ALFID, DL_DFI, DL_MAX_DATA, NRC_BUSY, NRC_PENDING, NRC_TIME_DELAY
+from .wire import DL_ALFID, DL_DFI, DL_MAX_DATA, NRC_BUSY, NRC_NOT_ACCEPTED, NRC_PENDING, NRC_TIME_DELAY
 
 BUSY_BACKOFF_S = (0.05, 0.1, 0.2, 0.4, 0.8, 1.6)   # waits before each retry after NRC 0x21
 SA_DELAY_S = 10.0        # the server's 0x27 delay after boot or after three wrong keys
@@ -33,11 +33,13 @@ class Uds:
     # In a non-default session, a 3E 00 goes before the request and before each 0x21 retry whenever the last 10 or 3E
     # is more than KEEPALIVE_S old, so a backoff cannot outlast S3. A late answer to an earlier send of this request
     # that lands on such a 3E is passed over, and the retry gets the server's answer to a repeat.
+    # A 36 or 37 retried after 0x21 that then gets 0x70 raises Nrc saying so: on iso14229 the 0x21 ended the transfer.
     # stale, when given, picks out a positive answer that belongs to an earlier request of the same service (see
     # transfer): it is passed over wherever it comes, and this request's own answer awaited within its P2.
     def request(self, service, sub=None, data=b"", stale=None):
         sid = service.request_id()
         req = Request(service=service, subfunction=sub, data=bytes(data))
+        busied = False
         for delay in BUSY_BACKOFF_S + (None,):
             if sid not in (0x10, 0x3E) and self.in_session and self.clock() - self.kept > KEEPALIVE_S:
                 self.keep_alive()
@@ -49,8 +51,15 @@ class Uds:
                         self.unanswered = sid
                         raise NoResponse("no response to service 0x%02X after a late answer to an earlier one" % sid)
             except Nrc as e:
+                if busied and sid in (0x36, 0x37) and e.code == NRC_NOT_ACCEPTED:
+                    # The resend found no transfer open: the app's 0x21 ended it, as any NRC does on iso14229. A
+                    # v0.14.x server keeps the transfer across a 0x21 and the client cannot tell the two apart, so
+                    # the retry stays and its 0x70 says what happened.
+                    raise Nrc(sid, e.code, "the app answered busy (0x21), which ends the transfer on this server; "
+                                           "run flash again") from e
                 if e.code != NRC_BUSY or delay is None:
                     raise
+                busied = True
                 # 0x21 often means an earlier send of this request is still being served (its 0x78 was
                 # lost): listen out the backoff for that answer rather than sleep through its 0x78s.
                 answer = self.await_answer(service, delay, stale=stale)
