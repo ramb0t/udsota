@@ -368,8 +368,7 @@ def flash_bootloader(uds, profile, image, img, drop_76=None, preroll=lambda: Non
         need_download, recovered, resent, activated = not verified, False, False, True
         while True:
             if need_download:
-                download(uds, image, drop_76=drop_76, log=log, compress=compress,
-                         reenter=lambda: uds.session(SESSION_PROGRAMMING))
+                download(uds, image, drop_76=drop_76, log=log, compress=compress)
                 check_image(uds, log=log)
                 need_download, drop_76 = False, None   # the fault injection applies to the first download only
             try:
