@@ -7,6 +7,7 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 ### Changed
 
 - **Breaking**, client: a profile with `[image] format = "bare"` and `[update] flow = "app"`, or with `flow = "bootloader"` and `format = "esp-idf"`, is refused when it loads, saying why. An A/B server takes only an ESP-IDF image and the boot core only a bare one, so both pairs loaded and failed on the unit. Set `format = "bare"` with `flow = "bootloader"`, or neither.
+- Client: a profile that is wrong in two tables at once may now report the other table's fault first, as each table is validated whole and in a fixed order. A profile with one fault, and every message, is as before.
 
 ## [0.18.0] - 2026-11-18
 

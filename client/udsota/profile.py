@@ -315,97 +315,133 @@ def from_dict(name, d):
         raise Refused("profile %s: %s" % (name, e)) from None
 
 
+# The tables below each validate their whole table, and return their piece of the Profile: a dict of its fields, for a
+# table that makes several, or the one field's value. A rule across tables takes the other table's piece.
+
+# [can]: the IDs, the deny list and the interface.
+def _can(t):
+    req_id = _int(t, "req_id", 0, 0x7FF, required=True)
+    resp_id = _int(t, "resp_id", 0, 0x7FF, required=True)
+    deny_tx = frozenset(_ints(t, "deny_tx", 0, 0x7FF))
+    if req_id in deny_tx:
+        _bad("req_id 0x%03X is in deny_tx" % req_id)
+    if req_id == resp_id:
+        _bad("req_id and resp_id are both 0x%03X" % req_id)
+    return dict(interface=_str(t, "interface"), req_id=req_id, resp_id=resp_id, deny_tx=deny_tx)
+
+
+# [functional] (None when absent): the ID, which is not the request or response ID or in deny_tx (can, _can's piece),
+# and quiet_bus.
+def _functional(t, can):
+    if t is None:
+        return {}
+    func_id = _int(t, "id", 0, 0x7FF, required=True)
+    if func_id in can["deny_tx"] or func_id in (can["req_id"], can["resp_id"]):
+        _bad("[functional] id 0x%03X is the request or response ID, or in deny_tx" % func_id)
+    return dict(func_id=func_id, quiet_bus=_bool(t, "quiet_bus", False))
+
+
+# [security] as a Security (None when absent).
+def _security(t):
+    if t is None:
+        return None
+    mode = _str(t, "mode") or "hmac"
+    if mode not in SECURITY_MODES:
+        _bad("[security] mode must be one of %s" % ", ".join(SECURITY_MODES))
+    for other, keys in SECURITY_MODES.items():
+        for key in keys:
+            if other != mode and key in t:
+                _bad("[security] %s is for mode = \"%s\", not \"%s\"" % (key, other, mode))
+    label = _str(t, "label", required=True) if mode == "hmac" else None
+    if label is not None and not label.isascii():
+        _bad("[security] label must be ASCII")
+    return Security(None if label is None else label.encode("ascii"),
+                    _str(t, "master_file", required=mode == "hmac"),
+                    _int(t, "device_id_did", 0, 0xFFFF, default=0xF18C),
+                    _level(t, "level_extended", 0x01),
+                    _level(t, "level_programming", 0x03),
+                    mode=mode,
+                    private_key_file=_str(t, "private_key_file", required=mode == "ecdsa"))
+
+
+# [image]: the identity flash checks, the compression and the format, whose header_offset goes with "bare".
+def _image(t):
+    compression = _str(t, "compression") or "none"
+    if compression not in COMPRESSION:
+        _bad("[image] compression must be one of %s" % ", ".join(COMPRESSION))
+    image_format = _str(t, "format") or "esp-idf"
+    if image_format not in FORMATS:
+        _bad("[image] format must be one of %s" % ", ".join(FORMATS))
+    if image_format == "esp-idf" and "header_offset" in t:
+        _bad("[image] header_offset is for format = \"bare\"")
+    if image_format == "bare" and "header_offset" not in t:
+        _bad("[image] format = \"bare\" needs header_offset, the bare header's offset in the image")
+    header_offset = _int(t, "header_offset", 0, 0xFFFFFFFF)
+    return dict(compression=compression, image_format=image_format, header_offset=header_offset,
+                product=_str(t, "product"), hw_ids=_ints(t, "hw_ids", 0, 0xFF), layout_id=_int(t, "layout_id", 0, 0xFF),
+                slot_size=_int(t, "slot_size", 1, 0xFFFFFFFF, default=SLOT_SIZE_DEFAULT))
+
+
+# [board] (None when absent): the DID and the names.
+def _board(t):
+    if t is None:
+        return dict(board_did=None, board_names={})
+    names = t.get("names", {})
+    if not isinstance(names, dict) or not all(k.isascii() and k.isdigit() and isinstance(v, str)
+                                              for k, v in names.items()):
+        _bad("[board] names must map hw_id numbers to board names")
+    return dict(board_names={int(k): v for k, v in names.items()}, board_did=_int(t, "did", 0, 0xFFFF, required=True))
+
+
+# [busy] as a BusyDetector (None when absent).
+def _busy(t):
+    if t is None:
+        return None
+    return BusyDetector(_int(t, "id", 0, 0x7FF, required=True), _int(t, "byte", 0, 7, required=True),
+                        _ints(t, "values", 0, 0xFF))
+
+
+# [update]: the flow and its start timeout, and what the flow needs of the other tables: no [security] (security, its
+# piece) and the image format (_image's) that the flow takes.
+def _update(t, security, image_format):
+    flow = _str(t, "flow") or "app"
+    if flow not in FLOWS:
+        _bad("[update] flow must be one of %s" % ", ".join(FLOWS))
+    if flow == "app" and "start_timeout_s" in t:
+        _bad("[update] start_timeout_s is for flow = \"bootloader\"")
+    if flow == "bootloader" and security is not None:
+        _bad("[security] is for flow = \"app\": the boot core serves no SecurityAccess (0x27) to unlock")
+    start_timeout_s = _int(t, "start_timeout_s", 1, 600, default=START_TIMEOUT_DEFAULT)
+    if flow == "app" and image_format == "bare":
+        _bad("[image] format = \"bare\" is for flow = \"bootloader\": an A/B server takes only an ESP-IDF image")
+    if flow == "bootloader" and image_format == "esp-idf":
+        _bad("[update] flow = \"bootloader\" needs [image] format = \"bare\": the boot core takes only a bare image")
+    return dict(flow=flow, start_timeout_s=start_timeout_s)
+
+
+# [dids] as a tuple of DidEntry, the writable names distinct.
+def _dids(t):
+    dids = tuple(_did_entry(key, entry) for key, entry in t.items())
+    names = [e.name for e in dids if e.writable]
+    for n in names:
+        if names.count(n) > 1:
+            _bad("[dids] two writable keys are named %s" % n)
+    return dids
+
+
 def _profile(name, d):
     for table, value in d.items():
         if table not in KEYS or not isinstance(value, dict):
             _bad("unknown table [%s]" % table)
         if KEYS[table] is not None and set(value) - KEYS[table]:
             _bad("unknown key %s in [%s]" % (sorted(set(value) - KEYS[table])[0], table))
-    can_t = d.get("can", {})
-    req_id = _int(can_t, "req_id", 0, 0x7FF, required=True)
-    resp_id = _int(can_t, "resp_id", 0, 0x7FF, required=True)
-    deny_tx = frozenset(_ints(can_t, "deny_tx", 0, 0x7FF))
-    if req_id in deny_tx:
-        _bad("req_id 0x%03X is in deny_tx" % req_id)
-    if req_id == resp_id:
-        _bad("req_id and resp_id are both 0x%03X" % req_id)
-    func_t, func_id = d.get("functional"), None
-    if func_t is not None:
-        func_id = _int(func_t, "id", 0, 0x7FF, required=True)
-        if func_id in deny_tx or func_id in (req_id, resp_id):
-            _bad("[functional] id 0x%03X is the request or response ID, or in deny_tx" % func_id)
-    sec_t, security = d.get("security"), None
-    if sec_t is not None:
-        mode = _str(sec_t, "mode") or "hmac"
-        if mode not in SECURITY_MODES:
-            _bad("[security] mode must be one of %s" % ", ".join(SECURITY_MODES))
-        for other, keys in SECURITY_MODES.items():
-            for key in keys:
-                if other != mode and key in sec_t:
-                    _bad("[security] %s is for mode = \"%s\", not \"%s\"" % (key, other, mode))
-        label = _str(sec_t, "label", required=True) if mode == "hmac" else None
-        if label is not None and not label.isascii():
-            _bad("[security] label must be ASCII")
-        security = Security(None if label is None else label.encode("ascii"),
-                            _str(sec_t, "master_file", required=mode == "hmac"),
-                            _int(sec_t, "device_id_did", 0, 0xFFFF, default=0xF18C),
-                            _level(sec_t, "level_extended", 0x01),
-                            _level(sec_t, "level_programming", 0x03),
-                            mode=mode,
-                            private_key_file=_str(sec_t, "private_key_file", required=mode == "ecdsa"))
-    img_t, board_t, busy_t = d.get("image", {}), d.get("board"), d.get("busy")
-    board_names = {}
-    if board_t is not None:
-        names = board_t.get("names", {})
-        if not isinstance(names, dict) or not all(k.isascii() and k.isdigit() and isinstance(v, str)
-                                                  for k, v in names.items()):
-            _bad("[board] names must map hw_id numbers to board names")
-        board_names = {int(k): v for k, v in names.items()}
-    busy = None
-    if busy_t is not None:
-        busy = BusyDetector(_int(busy_t, "id", 0, 0x7FF, required=True),
-                            _int(busy_t, "byte", 0, 7, required=True), _ints(busy_t, "values", 0, 0xFF))
-    compression = _str(img_t, "compression") or "none"
-    if compression not in COMPRESSION:
-        _bad("[image] compression must be one of %s" % ", ".join(COMPRESSION))
-    image_format = _str(img_t, "format") or "esp-idf"
-    if image_format not in FORMATS:
-        _bad("[image] format must be one of %s" % ", ".join(FORMATS))
-    if image_format == "esp-idf" and "header_offset" in img_t:
-        _bad("[image] header_offset is for format = \"bare\"")
-    if image_format == "bare" and "header_offset" not in img_t:
-        _bad("[image] format = \"bare\" needs header_offset, the bare header's offset in the image")
-    header_offset = _int(img_t, "header_offset", 0, 0xFFFFFFFF)
-    upd_t = d.get("update", {})
-    flow = _str(upd_t, "flow") or "app"
-    if flow not in FLOWS:
-        _bad("[update] flow must be one of %s" % ", ".join(FLOWS))
-    if flow == "app" and "start_timeout_s" in upd_t:
-        _bad("[update] start_timeout_s is for flow = \"bootloader\"")
-    if flow == "bootloader" and security is not None:
-        _bad("[security] is for flow = \"app\": the boot core serves no SecurityAccess (0x27) to unlock")
-    start_timeout_s = _int(upd_t, "start_timeout_s", 1, 600, default=START_TIMEOUT_DEFAULT)
-    if flow == "app" and image_format == "bare":
-        _bad("[image] format = \"bare\" is for flow = \"bootloader\": an A/B server takes only an ESP-IDF image")
-    if flow == "bootloader" and image_format == "esp-idf":
-        _bad("[update] flow = \"bootloader\" needs [image] format = \"bare\": the boot core takes only a bare image")
-    dids = tuple(_did_entry(key, entry) for key, entry in d.get("dids", {}).items())
-    names = [e.name for e in dids if e.writable]
-    for n in names:
-        if names.count(n) > 1:
-            _bad("[dids] two writable keys are named %s" % n)
-    return Profile(name=name, interface=_str(can_t, "interface"), req_id=req_id, resp_id=resp_id,
-                   deny_tx=deny_tx, product=_str(img_t, "product"), hw_ids=_ints(img_t, "hw_ids", 0, 0xFF),
-                   layout_id=_int(img_t, "layout_id", 0, 0xFF),
-                   slot_size=_int(img_t, "slot_size", 1, 0xFFFFFFFF, default=SLOT_SIZE_DEFAULT),
-                   security=security,
-                   board_did=None if board_t is None else _int(board_t, "did", 0, 0xFFFF, required=True),
-                   board_names=board_names, busy=busy,
+    can, security, image = _can(d.get("can", {})), _security(d.get("security")), _image(d.get("image", {}))
+    dids = _dids(d.get("dids", {}))
+    return Profile(name=name, **can, **_functional(d.get("functional"), can), security=security, **image,
+                   **_board(d.get("board")), busy=_busy(d.get("busy")),
                    preroll_frames=_int(d.get("preroll", {}), "tester_present_frames", 0, 64, default=0),
-                   dids=dids, func_id=func_id, compression=compression,
-                   quiet_bus=func_t is not None and _bool(func_t, "quiet_bus", False),
-                   config=_config(d.get("config"), dids), dtcs=_dtcs(d.get("dtcs", {})),
-                   image_format=image_format, header_offset=header_offset, flow=flow, start_timeout_s=start_timeout_s)
+                   dids=dids, config=_config(d.get("config"), dids), dtcs=_dtcs(d.get("dtcs", {})),
+                   **_update(d.get("update", {}), security, image["image_format"]))
 
 
 # Load a profile by name (a file in udsota/profiles) or by path (anything with a / or ending .toml).
