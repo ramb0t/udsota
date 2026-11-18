@@ -370,20 +370,27 @@ def try_preroll(preroll):
         pass
 
 
-# Wait for a restarting server: pre-roll and poll the running SHA until it answers, and return it. after names what
-# restarted it, for the timeout message. The server comes back in the default session, so no 3E 00 precedes a poll.
-def wait_for_boot(uds, preroll, after, sleep=time.sleep, clock=time.monotonic):
+# Wait for a restarting unit: REBOOT_WAIT_S, then pre-roll and read did every BOOT_POLL_S until it answers, and return
+# the record; UpdateFailed(gave_up) once timeout_s has passed without one. The unit comes back in the default session,
+# so no 3E 00 precedes a poll. Other errors (an NRC) are the caller's to read.
+def poll_restarted(uds, did, timeout_s, gave_up, preroll, sleep, clock):
     uds.restarted()
     sleep(REBOOT_WAIT_S)
-    deadline = clock() + BOOT_TIMEOUT_S
+    deadline = clock() + timeout_s
     while True:
         try_preroll(preroll)
         try:
-            return uds.read_did(DID_RUNNING_SHA)
-        except (NoResponse, SendFailed):   # a rebooting server answers nothing, or leaves a send unacknowledged
+            return uds.read_did(did)
+        except (NoResponse, SendFailed):   # a restarting unit answers nothing, or leaves a send unacknowledged
             if clock() >= deadline:
-                raise UpdateFailed("the server did not answer within %d s of %s" % (BOOT_TIMEOUT_S, after))
+                raise UpdateFailed(gave_up)
             sleep(BOOT_POLL_S)
+
+
+# Wait for a restarting server and return its running SHA. after names what restarted it, for the timeout message.
+def wait_for_boot(uds, preroll, after, sleep=time.sleep, clock=time.monotonic):
+    gave_up = "the server did not answer within %d s of %s" % (BOOT_TIMEOUT_S, after)
+    return poll_restarted(uds, DID_RUNNING_SHA, BOOT_TIMEOUT_S, gave_up, preroll, sleep, clock)
 
 
 # After ActivateImage: wait for the restart, then check the server runs the new image sha.
@@ -681,33 +688,23 @@ CLOSED_BUS = (". Or it has, and this is a bus the image closes: its update_buses
 # no F001 was answered, perhaps never activated), or nothing within the timeout. Silence is never success.
 def wait_for_start(uds, profile, sha, preroll, sleep=time.sleep, clock=time.monotonic, log=print, activated=True,
                    buses=0xFFFF):
-    uds.restarted()
-    sleep(REBOOT_WAIT_S)
-    deadline = clock() + profile.start_timeout_s
-    while True:
-        try_preroll(preroll)
-        try:
-            prefix = uds.read_did(DID_IMAGE_PREFIX)
-        except (NoResponse, SendFailed):   # the unit is restarting, or its app is not healthy yet
-            if clock() >= deadline:
-                raise UpdateFailed("nothing answered F1F4 in %d s of polling after the restart, so the app has not "
-                                   "reported healthy%s" % (profile.start_timeout_s, CLOSED_BUS % buses
-                                                           if buses != 0xFFFF else ""))
-            sleep(BOOT_POLL_S)
-            continue
-        except Nrc as e:
-            if e.code != NRC_OUT_OF_RANGE:
-                raise
-            if not activated:
-                raise UpdateFailed("ActivateImage got no answer and the unit is still in its bootloader (F1F4 "
-                                   "answered 0x31): run flash again; %s" % unit_status(uds)) from e
-            raise UpdateFailed("the unit is back in its bootloader (F1F4 answered 0x31): the app did not start; %s"
-                               % unit_status(uds)) from e
-        if prefix != sha[:4]:
-            raise UpdateFailed("the app runs another image: F1F4 reads %s, not the new image's %s"
-                               % (prefix.hex(), sha[:4].hex()))
-        log("the app runs the new image (F1F4 %s) and reports healthy" % prefix.hex())
-        return 0
+    gave_up = ("nothing answered F1F4 in %d s of polling after the restart, so the app has not reported healthy%s"
+               % (profile.start_timeout_s, CLOSED_BUS % buses if buses != 0xFFFF else ""))
+    try:
+        prefix = poll_restarted(uds, DID_IMAGE_PREFIX, profile.start_timeout_s, gave_up, preroll, sleep, clock)
+    except Nrc as e:
+        if e.code != NRC_OUT_OF_RANGE:
+            raise
+        if not activated:
+            raise UpdateFailed("ActivateImage got no answer and the unit is still in its bootloader (F1F4 "
+                               "answered 0x31): run flash again; %s" % unit_status(uds)) from e
+        raise UpdateFailed("the unit is back in its bootloader (F1F4 answered 0x31): the app did not start; %s"
+                           % unit_status(uds)) from e
+    if prefix != sha[:4]:
+        raise UpdateFailed("the app runs another image: F1F4 reads %s, not the new image's %s"
+                           % (prefix.hex(), sha[:4].hex()))
+    log("the app runs the new image (F1F4 %s) and reports healthy" % prefix.hex())
+    return 0
 
 
 # F1F0 as an error quotes it, or that it could not be read, so a failed read never hides the error being reported.
