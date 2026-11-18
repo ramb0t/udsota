@@ -48,14 +48,13 @@
 #define CRC_PIECE      4096u   /* the slot's CRC runs in pieces this long, with the watchdog reloaded between */
 #define DATA_MAX       (UDS_SERVER_RECV_BUF_SIZE - 2u)   /* a 36's data */
 
-/* What the core is doing. LISTENING and the three after it serve; S3's expiry can end any of them. */
+/* What the core is doing. LISTENING and the two after it serve. */
 enum {
     STOPPED = 0,   /* BAD_CFG, or port_reset or port_start_app returned: the poll only reloads the watchdog */
     STARTING,      /* START_APP: the next poll starts the app */
     LISTENING,     /* serving; leaves only for 11 01, F001 or a default session the boot rules would start from */
     WINDOW,        /* serving in the power-up window, which ends at since + window_ms */
     TESTER,        /* serving with B.bus locked, the others stopped: the idle exit comes at since + IDLE_MS */
-    S3_EXPIRED,    /* serving, and S3 expired in this poll, which ends in a session exit */
 };
 /* A download's phase: OPEN from its 34 until it fails or its 37 passes, RECEIVED once its 37 passed, VERIFIED once FF01
  * passed, until the next 34. */
@@ -65,9 +64,10 @@ enum { DL_NONE = 0, DL_OPEN, DL_RECEIVED, DL_VERIFIED };
 static struct {
     const udsota_boot_cfg_t *cfg;
     uint8_t  state;                /* the enum above */
+    bool     s3_expired;           /* S3 expired in a poll: its session exit follows, and listen() clears it */
+    bool     leaving;              /* 11 01 or F001 served at leaving_since (ms): the reset follows the delay */
     uint32_t since;                /* ms: when the window opened, or the last tester frame */
-    bool     reset;                /* 11 01 or F001 served at reset_at (ms): the reset follows the delay */
-    uint32_t reset_at;
+    uint32_t leaving_since;
     uint32_t last_us, ms, rem_us;  /* UDSMillis: its last sample, the count, the microseconds not yet counted */
 
     bool     app_valid;            /* the valid app (udsota_boot.h) */
@@ -423,9 +423,9 @@ static const uint8_t *installed(uint32_t off)
 static UDSErr_t leave(void)
 {
     udsota_boot_port_keep_write(UDSOTA_KEEP_WORD_COUNT, UDSOTA_START_COUNT_CLEAR);
-    if (!B.reset) {
-        B.reset = true;
-        B.reset_at = UDSMillis();
+    if (!B.leaving) {
+        B.leaving = true;
+        B.leaving_since = UDSMillis();
     }
     return UDS_PositiveResponse;
 }
@@ -604,7 +604,8 @@ static UDSErr_t on_event(UDSServer_t *srv, UDSEvent_t ev, void *arg)
         return UDS_PositiveResponse;
     case UDS_EVT_SessionTimeout:
         abort_download(srv);
-        B.state = S3_EXPIRED;
+        B.state = LISTENING;
+        B.s3_expired = true;
         return UDS_PositiveResponse;
     case UDS_EVT_DiagSessCtrl: {
         UDSDiagSessCtrlArgs_t *a = arg;
@@ -707,6 +708,7 @@ static void listen(void)
     }
     server_init();
     B.state = LISTENING;
+    B.s3_expired = false;
 }
 
 /* S3's expiry and the idle exit: a reset when the boot rules would start the app, else listening again. */
@@ -794,6 +796,15 @@ static void age_timers(uint32_t now)
     }
 }
 
+/* The power-up window has run its time. */
+static bool window_over(uint32_t now) { return B.state == WINDOW && now - B.since >= B.cfg->window_ms; }
+
+/* A tester frame locked a bus, and the session is the default with no request in flight, IDLE_MS after the last frame. */
+static bool idle_exit_due(uint32_t now)
+{
+    return B.state == TESTER && B.srv.sessionType == UDS_LEV_DS_DS && !busy() && now - B.since >= IDLE_MS;
+}
+
 void udsota_boot_poll(void)
 {
     udsota_boot_port_watchdog_reload();
@@ -808,23 +819,22 @@ void udsota_boot_poll(void)
     const uint32_t now = UDSMillis();
     age_timers(now);
     notice_dropped_transfer();
-    if (B.reset) {
-        if (now - B.reset_at >= RESET_DELAY_MS) {
+    if (B.leaving) {
+        if (now - B.leaving_since >= RESET_DELAY_MS) {
             reset();
         }
-    } else if (B.state == WINDOW && now - B.since >= B.cfg->window_ms) {
+    } else if (window_over(now)) {
         if (B.app_valid && B.srv.sessionType == UDS_LEV_DS_DS) {
             start_app();
         } else {
             B.state = LISTENING;                         /* a tester at work without a tester frame */
         }
-    } else if (B.state == S3_EXPIRED || (B.state == TESTER && B.srv.sessionType == UDS_LEV_DS_DS && !busy() &&
-                                         now - B.since >= IDLE_MS)) {
+    } else if (B.s3_expired || idle_exit_due(now)) {
         session_exit();
     } else if (B.state == LISTENING && B.app_valid && B.srv.sessionType == UDS_LEV_DS_DS && !busy() &&
                would_start_app()) {                      /* back in the default session with no lock and no deadline */
-        B.reset = true;                                  /* the answer to the 10 01 has time to leave first */
-        B.reset_at = now;
+        B.leaving = true;                                /* the answer to the 10 01 has time to leave first */
+        B.leaving_since = now;
     }
 }
 
