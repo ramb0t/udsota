@@ -51,7 +51,7 @@
  * the pointer. Examples use udsota's example identity. */
 
 typedef struct {
-    /* Identity: the image rules (udsota_boot_internal.h) hold every image to it before anything is erased. */
+    /* Identity: the image rules (below) hold every image to it before anything is erased. */
     uint16_t    request_id;          /* 11-bit: physical requests and tester frames; example 0x710 */
     uint16_t    response_id;         /* 11-bit: every answer; example 0x718 */
     const char *product;             /* the project an image must carry, at most 32 characters; example "example". NULL
@@ -207,10 +207,10 @@ void udsota_boot_port_watchdog_reload(void);
 
 /* Resets the chip. The core calls it only from udsota_boot_poll, after iso14229's poll has returned: 60 ms after the
  * first poll that served 11 01 or F001, 60 ms after the first poll that finds it listening in the default session
- * with a valid app it would start (see the timing table), and when a session exit's decision is to start the app. The core has already
- * written the words it needs. On a target it does not return. If it returns, the core is stopped: udsota_boot_poll
- * only reloads the watchdog and udsota_boot_rx ignores frames, until udsota_boot_init is called again. A host fake
- * returns, which is how a test sees the reset. */
+ * with a valid app it would start (see the timing table), and when a session exit's decision is to start the app. The
+ * core has already written the words it needs. On a target it does not return. If it returns, the core is stopped:
+ * udsota_boot_poll only reloads the watchdog and udsota_boot_rx ignores frames, until udsota_boot_init is called
+ * again. A host fake returns, which is how a test sees the reset. */
 void udsota_boot_port_reset(void);
 
 /* Starts the application. The core calls it only from udsota_boot_poll, after iso14229's poll has returned, once it has
@@ -227,6 +227,32 @@ void udsota_boot_port_start_app(void);
  * once and has no failure return: the core answers F18C with the bytes it gives, so a length outside 1..16 is a port
  * bug. */
 size_t udsota_boot_port_device_id(uint8_t out[16]);
+
+/* ==== The image rules, and the valid app ====
+ * The image rules hold an image's header to the unit's identity. The first 36 runs them on its data before anything is
+ * erased, and a failure answers that 36 with 0x31 and puts the reason in F1F1. FF01 runs them on the bytes in the slot,
+ * with the download's memorySize, before the CRC, so when both fail its reason is the status. The first rule that fails
+ * names the reason; UDSOTA_DL_OK when every one passes. In this order:
+ *  - UDSOTA_DL_BAD_HEADER: fewer than UDSOTA_BARE_HDR_LEN header bytes (a first 36 whose data ends before the header
+ *    does), a magic other than UDSOTA_BARE_HDR_MAGIC, a header_version below 1, or a bit of UDSOTA_BARE_HDR_FLAGS_MUST
+ *    set (version 1 defines none);
+ *  - UDSOTA_DL_TOO_BIG: an image_length past cfg.slot_size;
+ *  - UDSOTA_DL_BAD_HEADER: an image_length other than mem_size (the memorySize of the 34 that opened the download),
+ *    not a multiple of 4, or ending before the header does;
+ *  - UDSOTA_DL_BAD_PROJECT: a project other than cfg.product; there is no such rule when cfg.product is NULL;
+ *  - UDSOTA_DL_BAD_BOARD: a descriptor magic other than UDSOTA_IMG_DESC_MAGIC, desc_version 0, or a hw_id other than
+ *    cfg.hw_id;
+ *  - UDSOTA_DL_BAD_LAYOUT: a partition_layout_id other than cfg.layout_id;
+ *  - UDSOTA_DL_BAD_DIAG_IDS: a diag_request_id other than cfg.request_id, or a diag_response_id other than
+ *    cfg.response_id.
+ * There is no version rule: any version is taken, older included, and the descriptor's release flag is not read. It
+ * reads no reserved byte (update_buses is no rule: any mask is taken), no flag in the low byte, and not the signature.
+ *
+ * The valid app is the boot check's result at udsota_boot_init (below). Afterwards it is the core's flag: a download's
+ * first erase clears it and a passing FF01 sets it, and the boot check runs again only at the next udsota_boot_init.
+ * F1F0's running state (3 or 0), F189 and F1F3 (0.0.0 and 32 zero bytes without it; 0.0.0 too for an app stamped with
+ * no version), F1F5 (0x31 without it) and both session exits use the flag, and so does the set of open buses (The API,
+ * below): the installed image's update_buses with it, every bus without. */
 
 /* ==== The API ====
  * Only what a product calls: init, poll and rx.
@@ -294,9 +320,9 @@ udsota_boot_decision_t udsota_boot_init(const udsota_boot_cfg_t *cfg);
  * (iso14229's UDSServerPoll contract). One call reloads the watchdog, polls the server, ages iso14229's timers so a
  * unit that stays in its bootloader for weeks still answers at once, keeps the F1F1 bookkeeping, and applies the
  * session rules of the timing table: the window, the idle exit, S3, the default-session exit and the pending reset. A
- * listening unit with a valid app reads the keep words in every poll for the default-session exit. Both session exits, the idle
- * exit and S3's expiry, apply the boot rules again with no handover and cause OTHER (udsota_boot_internal.h) and reset
- * exactly when they answer START_APP; otherwise the core returns to listening on the open buses. On a target it does not
+ * listening unit with a valid app reads the keep words in every poll for the default-session exit. Both session
+ * exits, the idle exit and S3's expiry, apply the boot rules again with no handover and cause OTHER, and reset exactly
+ * when they answer START_APP; otherwise the core returns to listening on the open buses. On a target it does not
  * return once it resets or starts the app. */
 void udsota_boot_poll(void);
 
@@ -312,7 +338,7 @@ void udsota_boot_poll(void);
  *  - before a lock, frames from any other bus from the first frame of a request until its whole answer has been
  *    handed to can_send, so each request is answered on the bus it came from;
  *  - every frame while the core is stopped, before the first poll of a START_APP, and after BAD_CFG.
- * A tester frame is a frame whose first bytes are exactly 02 10 02, 02 10 82, 02 3E 00 or 02 3E 80. It holds the window,
- * restarts the idle exit's time, and locks its bus, stopping the others until the core next returns to listening.
- * Only a tester frame locks a bus. */
+ * A tester frame is a frame whose first bytes are exactly 02 10 02, 02 10 82, 02 3E 00 or 02 3E 80. It holds the
+ * window, restarts the idle exit's time, and locks its bus, stopping the others until the core next returns to
+ * listening. Only a tester frame locks a bus. */
 void udsota_boot_rx(uint8_t bus, uint32_t id, const uint8_t *data, uint8_t len);

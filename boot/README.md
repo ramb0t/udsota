@@ -26,11 +26,11 @@ Compile `udsota_boot.c` and `iso14229/iso14229.c` as they are, with `-I` for the
 
 ## Timing
 
-The core never answers 0x78, so every call into it but `udsota_boot_init`, port calls included, must end within about 100 ms, inside a tester's 150 ms P2. Two budgets decide which parts that allows.
+The rule is the timing table in `udsota_boot.h`: the core never answers 0x78, so every call into it but `udsota_boot_init`, port calls included, ends within about 100 ms. Two of its budgets decide which parts that allows.
 
-A `36` costs the erase units it starts times the erase time, plus its bytes over the write unit times the program time, plus a compare of the block. On an STM32F1 with 1 KB pages, a block of 1024 data bytes (`UDS_SERVER_RECV_BUF_SIZE` 1026) starts one page (20 to 40 ms to erase) and programs 512 half-words (40 to 70 µs each): under 80 ms. A smaller `UDS_SERVER_RECV_BUF_SIZE` shortens it. Measured on an STM32F1 with 2 KB pages, such a block took 32 to 54 ms from its last frame to its answer, 47 at the median, and a download ran at about 4.7 KB a second at any bit rate, since flash and STmin set the pace.
+The `36` budget: on an STM32F1 with 1 KB pages, a block of 1024 data bytes (`UDS_SERVER_RECV_BUF_SIZE` 1026) starts one page (20 to 40 ms to erase) and programs 512 half-words (40 to 70 µs each): under 80 ms. A smaller `UDS_SERVER_RECV_BUF_SIZE` shortens it. Measured on an STM32F1 with 2 KB pages, such a block took 32 to 54 ms from its last frame to its answer, 47 at the median, and a download ran at about 4.7 KB a second at any bit rate, since flash and STmin set the pace.
 
-The boot check and FF01 cost the CRC's cycles a byte times `slot_size`, the largest image, at the port's clock. Measured on a Cortex-M3 at 72 MHz with two flash wait states, the core's loop takes 0.35 µs a byte, about 25 cycles, so a 128 KB slot takes about 45 ms and 100 ms covers about 280 KB; at an 8 MHz reset clock a 128 KB slot would take several hundred milliseconds. The bootloader must therefore run from its fast clock.
+The CRC budget, for the boot check and FF01: measured on a Cortex-M3 at 72 MHz with two flash wait states, the core's loop takes 0.35 µs a byte, about 25 cycles, so a 128 KB slot takes about 45 ms and 100 ms covers about 280 KB; at an 8 MHz reset clock a 128 KB slot would take several hundred milliseconds. The bootloader must therefore run from its fast clock.
 
 That admits parts that erase in pages of a few KB within tens of milliseconds and program a word in tens of microseconds: STM32F0, F1, F3, G0, G4 and L4, and their like from other vendors. It rules out parts that erase in sectors of 16 KB or more, which take hundreds of milliseconds to seconds, STM32F2, F4, F7 and H7 among them: a `36` that starts such a sector cannot answer in time, and the core has no start-and-poll erase.
 
@@ -48,7 +48,7 @@ A part whose flash has ECC (STM32G0, G4 and L4 among them) faults when it reads 
 
 ## Size
 
-With arm-none-eabi-gcc 14.3.1 for Cortex-M3, `-Os -ffunction-sections -fdata-sections` and the tests' definitions, `udsota_boot.o` is 3,139 bytes of text, 64 of data (the CRC table, kept in RAM so its reads wait on no flash wait state) and 2,448 of bss (the server, the transport and their buffers). Linked with iso14229 under `--gc-sections` into a minimal image, the two add about 10.9 KB of flash and 2.5 KB of RAM to an empty one, the port aside. CI holds the core's text to that size plus about a fifth.
+With arm-none-eabi-gcc 14.3.1 for Cortex-M3, `-Os -ffunction-sections -fdata-sections` and the tests' definitions, `udsota_boot.o` is 3,119 bytes of text, 64 of data (the CRC table, kept in RAM so its reads wait on no flash wait state) and 2,444 of bss (the server, the transport and their buffers). Linked with iso14229 under `--gc-sections` into a minimal image, the two add about 10.9 KB of flash and 2.5 KB of RAM to an empty one, the port aside. CI holds the core's text to that size plus about a fifth.
 
 ## The app
 
