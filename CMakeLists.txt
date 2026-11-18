@@ -65,7 +65,10 @@ set_source_files_properties(iso14229/iso14229.c PROPERTIES COMPILE_OPTIONS "-fwr
 set_source_files_properties(udsota.c udsota_host.c boot/udsota_boot.c tools/image_check.c test/test_udsota.c test/fuzz_udsota.c
                             test/test_udsota_boot.c test/test_udsota_boot_pure.c test/test_udsota_app.c
                             test/boot/fake_port.c test/e2e/lite_server.c test/e2e/lite_platform.c
-                            test/e2e/boot_server.c PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror")
+                            test/e2e/boot_server.c boot/ports/stm32f1/udsota_port_stm32f1.c boot/ports/stm32f1/f1_bxcan.c
+                            test/boot/stm32f1/test_port_f1.c test/boot/stm32f1/test_port_f1_flash.c
+                            test/boot/stm32f1/test_f1_bxcan.c test/boot/stm32f1/fake_cmsis/fake_cmsis.c
+                            PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror")
 
 # The sanitizers every target but test_headers_*, test_isotp_wrap and image_check runs under, the first report ending
 # the run. sanitizers is a comma-separated list.
@@ -189,6 +192,29 @@ target_include_directories(test_udsota_app PRIVATE .)   # the one include path a
 udsota_sanitize(test_udsota_app address,undefined)
 add_test(NAME test_udsota_app COMMAND test_udsota_app)
 
+# The STM32F1 port (boot/ports/stm32f1/) on the host, as boot tests over test/boot/stm32f1/fake_cmsis: a stand-in for
+# stm32f1xx.h with the real types and bit names but the peripherals in RAM. Its header reaches the real one with
+# #include_next, so its directory comes first; the vendored CMSIS headers (test/boot/stm32f1/cmsis/) are SYSTEM, so
+# -Werror applies to the port and its tests only. The slot is an example: 0x3C000 bytes at 0x08004000 in 2 KB pages.
+# -ftrivial-auto-var-init=pattern fills an automatic variable with 0xFE bytes, so a test that reads one before writing
+# it fails every time. start_app (udsota_port_stm32f1_start.c) is target only: udsota_boot_port_stm32f1_arm compiles it.
+set(UDSOTA_F1_PORT boot/ports/stm32f1)
+set(UDSOTA_F1_CMSIS test/boot/stm32f1/cmsis)
+set(UDSOTA_F1_DEFS STM32F105xC UDSOTA_F1_SLOT_BASE=0x08004000u UDSOTA_F1_SLOT_SIZE=0x3C000u UDSOTA_F1_PAGE_SIZE=2048u)
+function(udsota_f1_port_test name)
+    udsota_boot_test(${name} ${ARGN} test/boot/stm32f1/fake_cmsis/fake_cmsis.c)
+    target_include_directories(${name} BEFORE PRIVATE test/boot/stm32f1/fake_cmsis)
+    target_include_directories(${name} PRIVATE test/boot/stm32f1 ${UDSOTA_F1_PORT})
+    target_include_directories(${name} SYSTEM PRIVATE ${UDSOTA_F1_CMSIS}/Device/ST/STM32F1xx/Include
+                                                      ${UDSOTA_F1_CMSIS}/Include)
+    target_compile_definitions(${name} PRIVATE ${UDSOTA_F1_DEFS})
+    target_compile_options(${name} PRIVATE -ftrivial-auto-var-init=pattern)
+endfunction()
+udsota_f1_port_test(test_port_f1 test/boot/stm32f1/test_port_f1.c ${UDSOTA_F1_PORT}/udsota_port_stm32f1.c)
+udsota_f1_port_test(test_port_f1_flash test/boot/stm32f1/test_port_f1_flash.c ${UDSOTA_F1_PORT}/udsota_port_stm32f1.c)
+udsota_f1_port_test(test_f1_bxcan test/boot/stm32f1/test_f1_bxcan.c ${UDSOTA_F1_PORT}/f1_bxcan.c
+                    ${UDSOTA_F1_PORT}/udsota_port_stm32f1.c)
+
 # The boot core for Cortex-M3 with every warning an error, under a gate on its text (CI's boot-arm job builds this
 # target; it needs arm-none-eabi-gcc and its size). The gate is the 3,119 bytes measured with arm-none-eabi-gcc 14.3.1
 # (boot/README.md, "Size") plus about a fifth, since another compiler release lays the code out differently: it
@@ -207,6 +233,26 @@ if(UDSOTA_ARM_GCC AND UDSOTA_ARM_SIZE)
                 -P ${CMAKE_SOURCE_DIR}/tools/boot_size_gate.cmake
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
         COMMENT "udsota_boot.c for Cortex-M3, under the size gate"
+        VERBATIM)
+    # The STM32F1 port's three sources compiled, not linked, for Cortex-M3 with every warning an error, against the
+    # vendored CMSIS headers and the host tests' device and slot (CI's boot-arm job builds this target too), so that a
+    # change to the core that breaks the port fails there. No size gate: the port's size is the product's.
+    set(udsota_f1_arm_defs ${UDSOTA_F1_DEFS})
+    list(TRANSFORM udsota_f1_arm_defs PREPEND -D)
+    list(APPEND udsota_f1_arm_defs ${udsota_arm_defs})
+    set(udsota_f1_arm_commands "")
+    foreach(src udsota_port_stm32f1 udsota_port_stm32f1_start f1_bxcan)
+        list(APPEND udsota_f1_arm_commands
+             COMMAND ${UDSOTA_ARM_GCC} -mcpu=cortex-m3 -mthumb -mfloat-abi=soft -std=c11 -Os -ffunction-sections
+                     -fdata-sections -Wall -Wextra -Werror -I${CMAKE_SOURCE_DIR}/${UDSOTA_F1_PORT}
+                     -I${CMAKE_SOURCE_DIR} -I${CMAKE_SOURCE_DIR}/boot
+                     -isystem ${CMAKE_SOURCE_DIR}/${UDSOTA_F1_CMSIS}/Device/ST/STM32F1xx/Include
+                     -isystem ${CMAKE_SOURCE_DIR}/${UDSOTA_F1_CMSIS}/Include ${udsota_f1_arm_defs}
+                     -c ${CMAKE_SOURCE_DIR}/${UDSOTA_F1_PORT}/${src}.c -o ${src}_arm.o)
+    endforeach()
+    add_custom_target(udsota_boot_port_stm32f1_arm ${udsota_f1_arm_commands}
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+        COMMENT "The STM32F1 port for Cortex-M3"
         VERBATIM)
 endif()
 

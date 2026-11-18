@@ -1,11 +1,13 @@
 # Third-party code
 
-udsota vendors three libraries, each unmodified and under its own licence, which applies to its files only.
+udsota vendors three libraries and a set of CMSIS headers, each unmodified and under its own licence, which applies to its files only.
 
 **iso14229** by driftregion and contributors: the single-file amalgamation `iso14229.c` and `iso14229.h`, with the isotp-c it embeds, and its licence, in `iso14229/`. They are upstream's committed files at `d018adc7015a88d7a4f164418fcb7e7927e5aa77`, upstream main of 2026-09-29, untagged. `iso14229/SHA256SUMS` holds their hashes, and CI fails if they change. The header's `UDS_LIB_VERSION` says 0.11.0, but the tag 0.11.0 is an earlier commit (8a7eb23d, whose header says 0.10.2); this one is 31 commits past it. Upstream CI passed at this commit: GitHub Actions unit tests (run 36615027352: linux, windows, arduino, esp32 on ESP-IDF 5.2), static analysis (run 36615027250, whose lint job checks the amalgamation against `src/`), and CircleCI.
 
 **detools** by Erik Moqvist: its C library's `detools.c` and `detools.h`, from upstream's `c/`, and its licence, in `detools/`. They are upstream's files at tag `0.53.0`, commit `150ae7ee8e066cefca9d8fe075d282d012556931`, the same release the client's `diff` extra pins. `detools/SHA256SUMS` holds their hashes, and CI fails if they change. The licence is BSD-2-Clause; its line for sais-lite (MIT) covers upstream's `bsdiff/sais.c`, which is not vendored. udsota compiles `detools.c` only in a build that defines `UDSOTA_DELTA=1`.
 
 **miniz** by Rich Geldreich, RAD Game Tools and Valve Software: release 3.0.2's amalgamated `miniz.c` and `miniz.h`, with its licence, in `test/miniz/`. Only the host builds use it. On the ESP32, udsota calls the ROM's copy of miniz's inflater, tinfl.
+
+**CMSIS** for the STM32F1 port's host tests: Arm's CMSIS-Core(M) 5.1 headers `core_cm3.h`, `cmsis_compiler.h`, `cmsis_gcc.h` and `cmsis_version.h`, and STMicroelectronics' STM32F1 device headers 4.3.5 (`stm32f1xx.h`, `stm32f105xc.h` and `system_stm32f1xx.h`), each with its licence, in `test/boot/stm32f1/cmsis/` with the layout of ST's `Drivers/CMSIS/`. Both are Apache-2.0. They are the files those tests and CI's Cortex-M3 compile of the port include, and nothing else uses them: a product builds the port against its own CMSIS headers. `test/boot/stm32f1/cmsis/SHA256SUMS` holds their hashes, and CI fails if they change.
 
 **The client** fetches its dependencies at install time: python-can (LGPL-3.0), can-isotp (MIT) and udsoncan (MIT), pinned in `client/pyproject.toml`, cryptography 42 or newer (Apache-2.0 or BSD-3-Clause), and detools (BSD-2-Clause) for its optional `diff` extra. It imports python-can as an unmodified library, which LGPL-3.0 permits under udsota's MIT licence. Its `RxResilientIsoTPConnection` (`client/udsota/transport.py`) adapts udsoncan's MIT-licensed ISO-TP receive loop.

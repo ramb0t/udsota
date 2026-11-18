@@ -1,6 +1,7 @@
-# Vendored upstream code: keep its bytes, so iso14229/SHA256SUMS and detools/SHA256SUMS check on any checkout.
+# Vendored upstream code: keep its bytes, so each SHA256SUMS beside it checks on any checkout.
 iso14229/** -text
 detools/** -text
 test/miniz/** -text
+test/boot/stm32f1/cmsis/** -text
 # A binary fixture: Espressif's patch generator's output, byte for byte.
 test/fixtures/delta_espressif.patch binary
