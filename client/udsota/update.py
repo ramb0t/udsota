@@ -1,6 +1,8 @@
-"""The commands: info, the flash sequence (precheck to ConfirmImage, with its recovery paths), confirm and
-the keyed reset, and under [update] flow = "bootloader" a single-slot bootloader unit's flash, info and reset. Every
-product-specific step comes from the profile."""
+"""The commands: info, flash, confirm and reset. The profile's [update] flow picks what flash, info and reset do:
+"app", an A/B unit whose server updates it (flash_app: precheck to ConfirmImage, with recovery paths for lost
+answers), or "bootloader", a single-slot unit whose resident bootloader is its only UDS server (flash_bootloader:
+10 02 into the bootloader, and F1F4 as the proof of life, with no ConfirmImage). Every product-specific step comes
+from the profile."""
 import contextlib
 import time
 
@@ -101,15 +103,11 @@ def wrong_board(profile, img, board):
     return None
 
 
-# `flash`: precheck, programming session (and unlock), download, FF01, ActivateImage, the restart and
-# ConfirmImage. Returns 0 or raises ToolError. secret is the master or private key (make_keys), unused when the
-# profile has no [security]. quiet() is entered once an update is needed and held until the end (the transport's
-# bus quieting). compress is "none", "deflate" or "auto" (download); None takes the profile's [image] compression.
-# bases, (name, bytes) pairs, offers a delta download from the one the server runs, in the modes diff_format
-# allows (plan_deltas); its patches are built before the programming session opens. Only an explicit "none"
-# (--no-compress) rules out the DEFLATE delta, 0x30: a server with delta downloads has compressed ones too, and one
-# without answers 0x31. Under the profile's [update] flow = "bootloader", flash_bootloader runs instead, and
-# wait_for_unit (seconds, --wait-for-unit), which that flow alone takes, has it catch the unit's power-up window.
+# `flash`: the update from the precheck to a running, confirmed image; returns 0 or raises ToolError. secret is the
+# master or private key (make_keys), unused without [security]. quiet() is held from the point an update is needed to
+# the end (the transport's bus quieting). compress is "none", "deflate" or "auto"; None takes the profile's. bases,
+# (name, bytes) pairs, offers a delta from the one the server runs (plan_deltas). The profile's flow picks flash_app or
+# flash_bootloader; wait_for_unit and allow_product_change are the bootloader flow's alone.
 def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep=time.sleep,
           clock=time.monotonic, log=print, quiet=contextlib.nullcontext, compress=None, bases=None,
           diff_format="auto", wait_for_unit=None, allow_product_change=False):
@@ -122,7 +120,9 @@ def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep
     if bases is not None:
         refuse_bare_delta(profile)
     refuse_bootloader_compression(profile, compress)
-    deflate_ok = compress != "none"             # before the profile's default: see the comment above
+    # Only an explicit --no-compress rules out the DEFLATE delta, 0x30: a server with delta downloads has compressed
+    # ones too, and one without answers 0x31. So this is decided before the profile's default applies.
+    deflate_ok = compress != "none"
     compress = profile.compression if compress is None else compress
     img = parse_image(profile, image)
     log("image %s for %s, %d bytes, %s %s" % (img.version, board_name(profile, img), img.size, id_name(profile),
@@ -137,10 +137,9 @@ def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep
                      deflate_ok=deflate_ok)
 
 
-# `flash` on an A/B unit (docs/wire.md): the precheck reads, the programming session and unlock, the download, FF01 and
-# ActivateImage, then the restart and ConfirmImage; img is image parsed, the other arguments flash's. An image the
-# other slot already holds verified skips the download. The precheck stops at an image already running (confirming it
-# when it is pending), one for another board, and a running image still unconfirmed.
+# `flash` on an A/B unit: the precheck, the programming session and unlock, the download, FF01 and ActivateImage, then
+# the restart and ConfirmImage; img is image parsed, the other arguments flash's. An image the other slot already
+# holds verified skips the download. The patches of a delta are built before the programming session opens.
 def flash_app(uds, profile, image, img, secret, drop_76, preroll, sleep, clock, log, quiet, compress, bases,
               diff_format, deflate_ok):
     state, running_sha, _, board = read_unit(uds, profile)
@@ -194,9 +193,9 @@ def flash_app(uds, profile, image, img, secret, drop_76, preroll, sleep, clock, 
         return confirm(uds, sleep=sleep, clock=clock, log=log)
 
 
-# What both flows make of the NRC e to ActivateImage when neither 0x72 nor a resend's answer: 0x22 ends the run; the first
-# 0x24 says what is not verified (what: "slot" or "image") and returns, for the caller to download again, once per run
-# (recovered); anything else is e again.
+# The NRC e to ActivateImage, apart from 0x72 and a resend's answer, which each flow reads its own way: 0x22 ends the
+# run, and the first 0x24 says what is not verified (what: "slot" or "image") and returns, for the caller to download
+# again; a second 0x24, or any other NRC, is raised as it came.
 def download_again(e, recovered, what, log):
     if e.code == NRC_CONDITIONS:
         raise UpdateFailed(ACTIVATE_CONDITIONS) from e
@@ -322,19 +321,16 @@ def installed_project(uds):
     return cstr(d) if d else None
 
 
-# `flash` under [update] flow = "bootloader", for a single-slot unit whose resident bootloader is its only UDS server
-# (docs/wire.md#bootloader-flow); img is image parsed, the other arguments flash's. First one F1F4 read in the default
-# session: an app already running this image and healthy needs nothing, so it is left running. Then 10 02: the app
-# answers 7F 10 78 and resets into the bootloader, which sends the 50 02; a late answer to an F1F4 read that went
-# unanswered, such as a bootloader's 7F 22 31 to one the adapter held, is passed over ahead of it (Uds.exchange).
-# Then, all in the programming session, the precheck reads (no unlock: a profile with [security] is refused under this
-# flow), download, FF01, ActivateImage and
-# wait_for_start, the proof of life; no ConfirmImage. An image the unit already holds gets 11 01 and the same proof.
-# quiet() is held from the 10 02, which stops the app. The precheck includes F1F5, the installed app's project: an
-# image of another project is refused, with the unit left in its bootloader, unless allow_product_change
-# (--allow-product-change), which logs both names and goes on. Any negative answer to F1F5 goes on: nothing is
-# installed, or the bootloader does not know the DID.
-# With wait_for_unit, wait_for_power_up sends the 10 02.
+# `flash` on a single-slot unit; img is image parsed, the other arguments flash's. One F1F4 read in the default
+# session first: an app already running this image and healthy is left running. Then 10 02 (with wait_for_unit,
+# wait_for_power_up sends it): the app answers 7F 10 78 and resets into the bootloader, which sends the 50 02; a late
+# answer to an F1F4 read that went unanswered, such as a bootloader's 7F 22 31 to one the adapter held, is passed over
+# ahead of it (Uds.exchange). Then, all in the programming session, the precheck reads (no unlock: a profile with
+# [security] is refused under this flow), download, FF01 and ActivateImage; wait_for_start is the proof of life, with
+# no ConfirmImage. An image the unit already holds gets 11 01 and the same proof. quiet() is held from the 10 02,
+# which stops the app. An image of another project than F1F5 reports is refused, with the unit left in its
+# bootloader, unless allow_product_change (--allow-product-change), which logs both names and goes on; any negative
+# answer to F1F5 goes on too: nothing is installed, or the bootloader does not know the DID.
 def flash_bootloader(uds, profile, image, img, drop_76=None, preroll=lambda: None, sleep=time.sleep,
                      clock=time.monotonic, log=print, quiet=contextlib.nullcontext, compress="none", bases=None,
                      diff_format="auto", deflate_ok=True, wait_for_unit=None, allow_product_change=False):
@@ -413,12 +409,12 @@ def flash_bootloader(uds, profile, image, img, drop_76=None, preroll=lambda: Non
 # unanswered, was refused or failed to send (Uds.try_session, which waits no longer than that after a 0x78 or 0x21
 # either), until one is answered 50 02; UpdateFailed once seconds have passed since the prompt, saying what the 10 02s
 # still queued then do (WAIT_QUEUED), as a wait the operator interrupts also logs. A failed send, as while the unit
-# is off and nothing acknowledges the frame, is a try like any other. The unit answers every 10 02 it gets, the ones
-# the kernel still held unacknowledged among them,
-# so 50 02s can follow the first; they are passed over until the unit goes quiet (Uds.drain), the monitor counting
-# that as ours, before the next request goes. Dropping them is not enough, though udsoncan empties the receive queue
-# before each send: one that comes after that send is taken for its answer, and the request itself can reach the unit
-# while it is still answering 10 02s.
+# is off and nothing acknowledges the frame, is a try like any other.
+# The unit answers every 10 02 it gets, the ones the kernel still held unacknowledged among them, so 50 02s can
+# follow the first. They are passed over until the unit goes quiet (Uds.drain), the monitor counting that as ours,
+# before the next request goes: dropping them is not enough, though udsoncan empties the receive queue before each
+# send, since one that comes after that send is taken for its answer, and the request itself can reach the unit while
+# it is still answering 10 02s.
 def wait_for_power_up(uds, seconds, log=print, clock=time.monotonic):
     try:
         uds.session(SESSION_PROGRAMMING)

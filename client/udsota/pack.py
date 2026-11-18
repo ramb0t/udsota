@@ -116,8 +116,8 @@ def _write_all(out, files):
 # to out as <stem>.dfi<XX>.bin, and <stem>.manifest.json listing them in the order `flash --compress-auto
 # --diff-from` tries them (rank_deltas against the 0x10 payload): deltas smallest first, 0x10, then 0x00. A delta
 # no smaller than 0x10, which flash would not send, is still written, flagged smaller_than_dfi_10 false and listed
-# after 0x10: it needs less device memory than 0x10, so a flasher may still try it before 0x00. Never overwrites: a
-# <stem> file already in out is refused, and a failed write leaves nothing behind. Returns the manifest.
+# after 0x10: it needs less device memory than 0x10, so a flasher may still try it before 0x00. Returns the manifest.
+# Never overwrites (_refuse_taken), and a failed write leaves nothing behind (_write_all).
 def pack(profile, image, stem, out, dfis=None, base=None, log=print):
     if base is not None or any(d in DELTA_DFIS for d in dfis or ()):
         refuse_bare_delta(profile)
