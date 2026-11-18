@@ -1180,6 +1180,42 @@ def test_quick_answer_keeps_the_p2_star_window_of_a_timed_out_request():
     assert mon.alarm is None
 
 
+# Check one receive error on the raw socket (ENETDOWN when the interface bounces, which python-can raises as
+# CanOperationError) neither ends the notifier thread nor goes unsaid: a second tester's frame heard afterwards still
+# raises the alarm, and the warning comes once however many errors follow.
+def test_monitor_survives_a_receive_error_and_says_so_once(capsys):
+    frames = deque([can.CanOperationError("Failed to receive: [Errno 100] Network is down")] * 3 + [resp_frame()])
+
+    # A virtual bus whose receive raises, then hears one response-ID frame.
+    class Bouncing(can.BusABC):
+        def __init__(self):
+            super().__init__(channel="bouncing")
+
+        # The next scripted error or frame, then silence.
+        def _recv_internal(self, timeout):
+            if frames and isinstance(frames[0], Exception):
+                raise frames.popleft()
+            return (frames.popleft(), False) if frames else (None, False)
+
+        # Nothing is sent.
+        def send(self, msg, timeout=None):
+            pass
+
+    ft = FakeTime()
+    mon = transport.SecondTesterMonitor(0x718, clock=ft.clock)
+    ft.sleep(10.0)                              # no request of ours is outstanding, nor within its grace time
+    notifier = mon.watch(Bouncing())
+    try:
+        deadline = time.monotonic() + 3.0
+        while mon.alarm is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+    finally:
+        notifier.stop()
+    assert mon.alarm and "second tester" in mon.alarm
+    err = capsys.readouterr().err
+    assert err.count("receive error") == 1 and "Network is down" in err
+
+
 # ---- image parsing ----
 
 # Check a well-formed image parses to its version, board and app_elf_sha256.
