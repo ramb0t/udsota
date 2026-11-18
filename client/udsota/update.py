@@ -186,7 +186,7 @@ def flash_app(uds, profile, image, img, secret, drop_76, preroll, sleep, clock, 
                 if e.code == NRC_PROGRAMMING_FAILURE:
                     activation_failed(uds, profile, keys, e, log=log)
                     break
-                download_again(e, recovered, "slot", log)
+                redownload_or_raise(e, recovered, "slot", log)
                 recovered = need_download = True   # one re-download per run
         log("activated; waiting for the server to restart")
         wait_for_image(uds, img.elf_sha, preroll, sleep=sleep, clock=clock)
@@ -197,7 +197,7 @@ def flash_app(uds, profile, image, img, secret, drop_76, preroll, sleep, clock, 
 # The NRC e to ActivateImage, apart from 0x72 and a resend's answer, which each flow reads its own way: 0x22 ends the
 # run, and the first 0x24 says what is not verified (what: "slot" or "image") and returns, for the caller to download
 # again; a second 0x24, or any other NRC, is raised as it came.
-def download_again(e, recovered, what, log):
+def redownload_or_raise(e, recovered, what, log):
     if e.code == NRC_CONDITIONS:
         raise UpdateFailed(ACTIVATE_CONDITIONS) from e
     if recovered or e.code != NRC_SEQUENCE:
@@ -401,7 +401,7 @@ def flash_bootloader(uds, profile, image, img, drop_76=None, preroll=lambda: Non
                     break
                 if e.code == NRC_PROGRAMMING_FAILURE:
                     raise UpdateFailed("ActivateImage failed (0x72); read F1F0 with `info`") from e
-                download_again(e, recovered, "image", log)
+                redownload_or_raise(e, recovered, "image", log)
                 recovered = need_download = True   # one re-download per run
         return wait_for_start(uds, profile, img.elf_sha, preroll, sleep=sleep, clock=clock, log=log,
                               activated=activated, buses=update_buses(profile, image))
