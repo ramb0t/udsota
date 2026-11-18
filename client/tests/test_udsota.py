@@ -5176,6 +5176,7 @@ class BootloaderUnit(FakeServer):
 
 
 UPDATE_BL = '\n[update]\nflow = "bootloader"\n'
+BARE_IMAGE = '\n[image]\nformat = "bare"\nheader_offset = 48\n'      # the image table the bootloader flow takes
 # BARE under the bootloader flow, its header at 48 so that the image_id lands where BootloaderUnit reads a written
 # image's ID, 176..208; and with [board] and a third hw_id, for the board check.
 BARE_BL = BARE.replace("header_offset = 0x100", "header_offset = 48")
@@ -5955,10 +5956,10 @@ def test_update_flow_profile_values():
     ("[update]\nflow = 1\n", "flow must be a non-empty string"),
     ("[update]\nstart_timeout_s = 30\n", '[update] start_timeout_s is for flow = "bootloader"'),
     ('[update]\nflow = "app"\nstart_timeout_s = 30\n', '[update] start_timeout_s is for flow = "bootloader"'),
-    (UPDATE_BL + "start_timeout_s = 0\n", "start_timeout_s must be an integer from 0x1 to 0x258"),
-    (UPDATE_BL + "start_timeout_s = 601\n", "start_timeout_s must be an integer from 0x1 to 0x258"),
-    (UPDATE_BL + 'start_timeout_s = "60"\n', "start_timeout_s must be an integer from 0x1 to 0x258"),
-    (UPDATE_BL + "start_timeout_s = true\n", "start_timeout_s must be an integer from 0x1 to 0x258"),
+    (BARE_IMAGE + UPDATE_BL + "start_timeout_s = 0\n", "start_timeout_s must be an integer from 0x1 to 0x258"),
+    (BARE_IMAGE + UPDATE_BL + "start_timeout_s = 601\n", "start_timeout_s must be an integer from 0x1 to 0x258"),
+    (BARE_IMAGE + UPDATE_BL + 'start_timeout_s = "60"\n', "start_timeout_s must be an integer from 0x1 to 0x258"),
+    (BARE_IMAGE + UPDATE_BL + "start_timeout_s = true\n", "start_timeout_s must be an integer from 0x1 to 0x258"),
     (UPDATE_BL + "timeout = 5\n", "unknown key timeout in [update]"),
 ])
 def test_bad_update_flow_is_refused(text, why):
@@ -5979,7 +5980,7 @@ def test_board_names_key_that_is_not_a_number_is_refused(key):
 def test_bootloader_flow_with_security_is_refused(security):
     with pytest.raises(errors.Refused, match=re.escape('profile u: [security] is for flow = "app": the boot core '
                                                       'serves no SecurityAccess (0x27) to unlock')):
-        profile.from_dict("u", tomllib.loads(security + UPDATE_BL))
+        profile.from_dict("u", tomllib.loads(security + BARE_IMAGE + UPDATE_BL))
     profile.from_dict("u", tomllib.loads(security + '\n[update]\nflow = "app"\n'))
 
 
