@@ -69,7 +69,7 @@ The rest come from using iso14229 as it is, each a candidate for an upstream fix
 |---|---|
 | `udsota.c`, `udsota_esp.c`, `udsota.h`, `udsota_wire.h`, `udsota_image.h` | The updater, and `udsota_esp.c`, its ESP-IDF platform (`udsota_priv.h` is the one thing it calls back into the updater through; an app does not include it). `udsota.h`, which includes the other two, ends with the platform functions a port to another MCU would supply; `udsota_wire.h` is the wire contract with no `#include`, for a bootloader or tester to take alone, and `udsota_image.h` the image descriptor and the bare header as C types |
 | `udsota_app.h` | The app's side of a [`boot/`](boot/README.md) bootloader, header-only: the handover, the F1F4 answer and the healthy mark |
-| [`boot/`](boot/README.md) | The bootloader core and its porting guide |
+| [`boot/`](boot/README.md) | The bootloader core and its porting guide, and in [`boot/ports/stm32f1/`](boot/ports/stm32f1/README.md) a reference port for STM32F1 with bxCAN |
 | `iso14229/`, `detools/` | The vendored libraries, unmodified, each with its licence and a `SHA256SUMS` that CI checks; their versions are in [THIRD_PARTY.md](THIRD_PARTY.md). detools compiles only in a build that defines `UDSOTA_DELTA=1` |
 | `CMakeLists.txt` | The ESP-IDF component, or on a host the tests, whose comments say what each target covers |
 | [`examples/esp32`](examples/esp32/README.md) | The smallest app, for any ESP32 with TWAI; its image is the one a release carries |
