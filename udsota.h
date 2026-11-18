@@ -154,8 +154,9 @@ void     udsota_psa_unlock(void);
  * The platform under the updater. On ESP-IDF udsota.c defines these; anywhere else the build supplies them (the
  * host test does, and so would a port to another MCU). Jobs run on a worker task; the flash functions run inside
  * jobs and return a udsota_reason_t.
- * A host build is one task, so its udsota_psa_lock is a depth counter that locks before udsota_init too, and any take
- * while it is held fails at once: 0x27 answers 0x22, FF01 fails with UDSOTA_DL_VERIFY_FAILED and F001 answers 0x72. */
+ * udsota.c defines udsota_psa_lock on every build. A host build is one task, so its udsota_psa_lock is a depth
+ * counter that locks before udsota_init too, and any take while it is held fails at once: 0x27 answers 0x22, FF01
+ * fails with UDSOTA_DL_VERIFY_FAILED and F001 answers 0x72. */
 #define UDSOTA_PENDING 0x7FFFFFFF                 /* a job is still running */
 
 /* F1F0: the A/B slots. Wire layout; enum values as the updater reads them. */
