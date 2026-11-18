@@ -28,9 +28,10 @@ from .image import BARE_HDR_CRC_OFFSET, parse_image, stamp
 from .keys import keygen, load_master, load_private_key
 from .transport import Transport
 from .delta import DETOOLS_HINT
+from .download import DIFF_DFIS
 from .pack import DFIS, pack, refuse_bare_delta
-from .update import (DIFF_DFIS, DROP_76_WITH_BASES, PRODUCT_NEEDS_BOOTLOADER, WAIT_NEEDS_BOOTLOADER, confirm_cmd, flash,
-                     info, refuse_bootloader_compression, reset)
+from .update import (DROP_76_WITH_BASES, PRODUCT_NEEDS_BOOTLOADER, WAIT_NEEDS_BOOTLOADER, confirm_cmd, flash, info,
+                     refuse_bootloader_compression, reset)
 
 
 # A --dfi value: one of pack's DFIs, written 0x00, 0x10, 0x20 or 0x30.
