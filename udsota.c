@@ -1,4 +1,4 @@
-/* udsota: safe A/B firmware updates over UDS on iso14229's server (see udsota.h). One file:
+/* udsota: safe A/B firmware updates over UDS on iso14229's server (see udsota.h). The portable core:
  *   1. the limits and state (the wire contract, every number a tester sees, is udsota_wire.h's)
  *   2. the image rules: what the first 320 bytes must say before anything is erased
  *   3. coded downloads: raw DEFLATE through the ROM's tinfl into the image, or for a delta into detools, which
@@ -7,7 +7,7 @@
  *   5. the updater: 34, 36, 37, the routines, the DIDs and the session rules
  *   6. iso14229's events, one handler each
  *   7. the API: udsota_init, udsota_event and the rest of udsota.h's functions
- *   8. the host build's PSA lock; the platform is the build's: udsota_esp.c on ESP-IDF
+ * The platform is the build's: udsota_esp.c on ESP-IDF, udsota_host.c's PSA lock and the test's functions on a host.
  * iso14229 keeps ISO-TP, framing, timing, the 0x78 cadence and the 0x27 attempt delays; it is used as it is. */
 #include "udsota.h"
 #include "udsota_priv.h"
@@ -1522,36 +1522,4 @@ size_t udsota_test_held(size_t *cap)
     *cap = sizeof U.zbuf;
     return U.z.held;
 }
-#endif
-
-/* ==== 8. The platform ==== */
-#if !defined(ESP_PLATFORM)
-/* The host build's PSA lock: a host build is one task, so the lock is a depth that the host test reads, and a wait on
- * it held fails at once. ESP-IDF's is udsota_esp.c's. The rest of a host platform is the build's to supply
- * (udsota.h). */
-static int s_psa_depth;
-
-void udsota_psa_lock_init(void) {}
-
-bool udsota_psa_lock(uint32_t wait_ms)
-{
-    (void)wait_ms;
-    if (s_psa_depth != 0) {
-        return false;
-    }
-    s_psa_depth++;
-    return true;
-}
-
-void udsota_psa_unlock(void)
-{
-    s_psa_depth--;
-}
-
-#if defined(UDSOTA_TEST)
-int udsota_test_psa_depth(void)
-{
-    return s_psa_depth;
-}
-#endif
 #endif
