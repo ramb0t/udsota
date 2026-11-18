@@ -71,6 +71,18 @@ _Static_assert(sizeof(tinfl_decompressor) == 10992u && TINFL_LZ_DICT_SIZE == 327
 
 enum { DL_PLAIN, DL_DEFLATE, DL_DELTA };   /* a download's mode: the 34's DFI 00, 10 or 30 */
 
+/* Where a download is, 34 to FF01. Idle is 0, which power-on and udsota_test_reboot leave in place. Two bits carry what
+ * the rest of the code asks: the tester is mid-transfer, and an image is open on the flash side. */
+#define IN_TRANSFER  0x01u
+#define IMAGE_HELD   0x02u
+enum {
+    PHASE_IDLE,                                       /* no download, and no image known good: the 34 may start one */
+    PHASE_ANNOUNCED = IN_TRANSFER,                    /* a plain 34 is accepted and waits for its first 36 */
+    PHASE_OPEN = IN_TRANSFER | IMAGE_HELD,            /* blocks arrive: a coded 34, or a plain first 36 that passed */
+    PHASE_RECEIVED = IMAGE_HELD,                      /* the 37 is accepted: the image is whole and waits for FF01 */
+    PHASE_VERIFIED = 0x04u,                           /* FF01 passed: F001 may activate it; a session change keeps it */
+};
+
 typedef int (*done_fn)(int result, uint8_t *status, size_t *status_len);
 
 typedef struct {                   /* a coded download: tinfl (then detools) into zbuf, the image's next bytes */
@@ -110,10 +122,9 @@ static struct {
     uint8_t        last_reason;
     uint32_t       last_bytes;
     uint32_t       announced, received, written;
-    bool           dl_active;      /* between an accepted 34 and 37 or an abort */
-    bool           ota_open;       /* an image is open on the flash side (from the first 36, or the 34 when coded) */
+    uint8_t        phase;          /* PHASE_*: where the download is, from a 34 to FF01 */
     uint8_t        mode;           /* DL_PLAIN, DL_DEFLATE or DL_DELTA */
-    bool           dl_complete, slot_verified, activating, reset_mine, close_pending;
+    bool           activating, reset_mine, close_pending;
     uint8_t        progress_stage, progress_reason;
     bool           progress_block;
     /* A job on the worker */
@@ -126,6 +137,18 @@ static struct {
     uint8_t        zbuf[BUF_LEN];  /* a coded download's image bytes on their way to flash */
     zdl_t          z;
 } U;
+
+/* Between an accepted 34 and the 37 or an abort: the tester is mid-transfer. */
+static inline bool transferring(void)
+{
+    return (U.phase & IN_TRANSFER) != 0u;
+}
+
+/* An image is open on the flash side, from the first 36 (the 34 when coded) to FF01 or an abort. */
+static inline bool image_open(void)
+{
+    return (U.phase & IMAGE_HELD) != 0u;
+}
 
 static uint16_t le16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
 static uint32_t le32(const uint8_t *p)
@@ -643,24 +666,29 @@ static bool worker_busy(void)
 /* The precondition of 10 02 and 34: settled slots, an idle worker and no transfer open. */
 STEP bool ready_to_program(void)
 {
-    return slots_settled() && !worker_busy() && !U.dl_active;
+    return slots_settled() && !worker_busy() && !transferring();
 }
 
-/* Ends the download or an open, unverified image; F1F1 says ABORTED. */
-static void abort_download(void)
+/* The download is over, and F1F1 says why. */
+STEP void end_download(uint8_t reason)
 {
-    U.dl_complete = false;
-    if (!U.dl_active && !U.ota_open) {
-        return;
+    U.phase = PHASE_IDLE;
+    U.last_reason = reason;
+    U.last_bytes = U.received;
+}
+
+/* Ends the download or an open, unverified image; F1F1 says ABORTED. A verified image stays. Called from many places,
+ * and -O2 would copy it into each. */
+__attribute__((noinline)) static void abort_download(void)
+{
+    if (!transferring() && !image_open()) {
+        return;                                          /* idle, or verified */
     }
-    if (U.ota_open) {
+    if (image_open()) {
         U.close_pending = true;
         close_when_idle();
     }
-    U.dl_active = false;
-    U.ota_open = false;
-    U.last_reason = UDSOTA_DL_ABORTED;
-    U.last_bytes = U.received;
+    end_download(UDSOTA_DL_ABORTED);
 }
 
 static int verify_done(int result, uint8_t *status, size_t *status_len);
@@ -672,8 +700,8 @@ static udsota_progress_t progress_of(void)
         p.stage = UDSOTA_STAGE_ACTIVATING;
     } else if (U.job_running && U.job_done == verify_done) {
         p.stage = UDSOTA_STAGE_VERIFYING;
-    } else if (U.dl_active || (U.dl_complete && U.ota_open)) {
-        p.stage = (U.dl_active && U.received == 0u) ? UDSOTA_STAGE_ERASING : UDSOTA_STAGE_WRITING;
+    } else if (transferring() || U.phase == PHASE_RECEIVED) {
+        p.stage = (transferring() && U.received == 0u) ? UDSOTA_STAGE_ERASING : UDSOTA_STAGE_WRITING;
         p.total = U.announced;
         p.done = (U.written < p.total) ? U.written : p.total;
     }
@@ -764,10 +792,10 @@ static int request_download(const UDSServer_t *srv, uint8_t dfi, uint32_t addr, 
     if (mode < 0 || addr != 0u || size == 0u || size > udsota_plat_slot_size()) {
         return UDS_NRC_RequestOutOfRange;
     }
-    if (U.ota_open) {                                    /* a finished image that never passed FF01 */
+    if (image_open()) {                                  /* a finished image that never passed FF01 */
         U.close_pending = true;
         close_when_idle();
-        U.ota_open = false;
+        U.phase = PHASE_IDLE;
     }
     if (mode != DL_PLAIN && zdl_open(mode == DL_DELTA) != UDSOTA_DL_OK) {
         U.last_reason = UDSOTA_DL_NO_MEMORY;
@@ -775,11 +803,8 @@ static int request_download(const UDSServer_t *srv, uint8_t dfi, uint32_t addr, 
         return UDS_NRC_ConditionsNotCorrect;
     }
     udsota_plat_unverify();
-    U.slot_verified = false;
-    U.dl_active = true;
-    U.ota_open = (mode != DL_PLAIN);                     /* the inflater is held from here */
+    U.phase = (mode != DL_PLAIN) ? PHASE_OPEN : PHASE_ANNOUNCED;   /* a coded download holds its inflater from here */
     U.mode = (uint8_t)mode;
-    U.dl_complete = false;
     U.announced = size;
     U.received = U.written = 0u;
     U.last_reason = UDSOTA_DL_OK;
@@ -831,7 +856,7 @@ static int transfer_data(UDSServer_t *srv, const uint8_t *data, size_t len, bool
     if (len < 1u || len + 2u > UDSOTA_DL_MAX_BLOCK_LEN) {
         return UDS_NRC_IncorrectMessageLengthOrInvalidFormat;
     }
-    if (!U.dl_active) {
+    if (!transferring()) {
         return UDS_NRC_RequestSequenceError;
     }
     if ((rc = gate(UDSOTA_OP_CONTINUE_TRANSFER)) != 0) {
@@ -852,13 +877,13 @@ static int transfer_data(UDSServer_t *srv, const uint8_t *data, size_t len, bool
     memcpy(U.block, data, len);
     U.block_len = len;
     int (*job)(void) = coded() ? job_inflate : job_write;
-    if (!coded() && !U.ota_open) {                       /* the first block: check it before anything is erased */
+    if (U.phase == PHASE_ANNOUNCED) {                    /* the first block: check it before anything is erased */
         const udsota_reason_t why = check_first(data, len, U.announced);
         if (why != UDSOTA_DL_OK) {
             fail_download((uint8_t)why);
             return UDS_NRC_RequestOutOfRange;
         }
-        U.ota_open = true;
+        U.phase = PHASE_OPEN;
         job = job_first;
     }
     size_t none = 0;
@@ -867,8 +892,9 @@ static int transfer_data(UDSServer_t *srv, const uint8_t *data, size_t len, bool
 
 static int exit_ok(void)
 {
-    U.dl_active = false;
-    U.dl_complete = true;
+    if (image_open()) {                                  /* not after an abort that closed it while the 37 ran */
+        U.phase = PHASE_RECEIVED;
+    }
     U.last_reason = UDSOTA_DL_OK;
     U.last_bytes = U.received;
     return 0;
@@ -879,9 +905,8 @@ static int finish_done(int result, uint8_t *status, size_t *status_len)
     (void)status;
     *status_len = 0;
     if (result != UDSOTA_DL_OK) {
-        U.ota_open = false;                              /* the stream is closed: only the flash side remains */
-        U.close_pending = true;
-        fail_download((uint8_t)result);
+        U.close_pending = true;                          /* the stream is closed: only the flash side remains */
+        end_download((uint8_t)result);
         return UDS_NRC_GeneralProgrammingFailure;
     }
     U.written = U.announced;
@@ -899,7 +924,7 @@ static int transfer_exit(const UDSServer_t *srv, size_t extra)
     if (extra != 0u) {
         return UDS_NRC_IncorrectMessageLengthOrInvalidFormat;
     }
-    if (!U.dl_active || (!coded() && U.received != U.announced)) {
+    if (!transferring() || (!coded() && U.received != U.announced)) {
         return UDS_NRC_RequestSequenceError;
     }
     size_t none = 0;
@@ -941,7 +966,9 @@ static int one_byte(uint8_t *status, size_t *status_len, uint8_t b)
 static int verify_done(int result, uint8_t *status, size_t *status_len)
 {
     const uint8_t reason = (result >= 0 && result <= UDSOTA_DL_BAD_BASE) ? (uint8_t)result : UDSOTA_DL_VERIFY_FAILED;
-    U.slot_verified = (reason == UDSOTA_DL_OK);
+    if (reason == UDSOTA_DL_OK) {
+        U.phase = PHASE_VERIFIED;
+    }
     U.last_reason = reason;
     return one_byte(status, status_len, reason);
 }
@@ -951,7 +978,7 @@ static int activate_done(int result, uint8_t *status, size_t *status_len)
     (void)status;
     *status_len = 0;
     if (result != UDSOTA_DL_OK) {
-        U.slot_verified = false;
+        U.phase = PHASE_IDLE;
         return UDS_NRC_GeneralProgrammingFailure;
     }
     U.activating = true;
@@ -993,19 +1020,19 @@ static int routine(const UDSServer_t *srv, uint8_t ctrl, uint16_t rid, size_t op
     int rc;
     switch (rid) {
     case UDSOTA_RID_CHECK_PROG_DEPS:
-        if (U.slot_verified && !U.ota_open) {
+        if (U.phase == PHASE_VERIFIED) {
             return one_byte(status, status_len, UDSOTA_DL_OK);   /* a repeat after a pass */
         }
-        if (!U.dl_complete || !U.ota_open) {
+        if (U.phase != PHASE_RECEIVED) {
             return UDS_NRC_RequestSequenceError;
         }
-        U.dl_complete = U.ota_open = U.slot_verified = false;   /* the verify closes the image either way */
+        U.phase = PHASE_IDLE;                                    /* the verify closes the image either way */
         U.last_reason = UDSOTA_DL_WORKER_TIMEOUT;                /* until the verdict */
         return run_job(job_verify, verify_done, 0x31, status, status_len);
     case UDSOTA_RID_GET_RESUME_POINT:
         return one_byte(status, status_len, UDSOTA_RESUME_NOT_AVAILABLE);
     case UDSOTA_RID_ACTIVATE_IMAGE:
-        if (!U.slot_verified) {
+        if (U.phase != PHASE_VERIFIED) {
             return UDS_NRC_RequestSequenceError;
         }
         if ((rc = worker_busy() ? UDS_NRC_ConditionsNotCorrect : gate(UDSOTA_OP_ACTIVATE)) != 0) {
@@ -1082,7 +1109,7 @@ static size_t read_did(const UDSServer_t *srv, uint16_t did, uint8_t *out)
  * itself relocks only on S3, so an unlock would otherwise outlive 10 01 for good). */
 static void session_changed(UDSServer_t *srv)
 {
-    const bool waited = U.job_running && (U.dl_active || U.ota_open || U.job_done == verify_done);   /* the cap, or S3 */
+    const bool waited = U.job_running && (transferring() || image_open() || U.job_done == verify_done);  /* cap or S3 */
     U.job_running = false;                               /* a running job finishes on the worker by itself */
     abort_download();
     if (waited) {
@@ -1321,7 +1348,7 @@ STEP bool on_request_download(UDSServer_t *srv, UDSRequestDownloadArgs_t *a, UDS
 STEP bool on_transfer(UDSServer_t *srv, UDSEvent_t ev, void *arg, UDSErr_t *rc)
 {
     const uint8_t sid = (ev == UDS_EVT_TransferData) ? 0x36 : 0x37;
-    if (!U.dl_active && !U.job_running) {
+    if (!transferring() && !U.job_running) {
         return false;                                    /* a transfer the app opened (34, 35 or 38) */
     }
     size_t none = 0;
@@ -1348,7 +1375,7 @@ STEP bool on_transfer(UDSServer_t *srv, UDSEvent_t ev, void *arg, UDSErr_t *rc)
 /* iso14229 ended a transfer without an event (0x24, 0x70, 0x71): udsota's download ends with it. */
 STEP void follow_iso14229(const UDSServer_t *srv)
 {
-    if (!srv->xferIsActive && U.dl_active) {
+    if (!srv->xferIsActive && transferring()) {
         abort_download();
         progress_sync();
     }
@@ -1456,7 +1483,7 @@ void udsota_poll(UDSServer_t *srv)
 
 bool udsota_busy(void)
 {
-    return U.started && (worker_busy() || U.dl_active);
+    return U.started && (worker_busy() || transferring());
 }
 
 /* See udsota.h. A poll either reads a request or sends its answer, never both, and iso14229 keeps requestInProgress
