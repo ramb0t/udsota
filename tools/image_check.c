@@ -16,7 +16,7 @@
 UDSOTA_IMAGE_DESC(IMAGE_CHECK_HW, IMAGE_CHECK_LAYOUT, IMAGE_CHECK_REQ, IMAGE_CHECK_RESP);
 udsota_reason_t udsota_test_check_first(const uint8_t *b, size_t len, uint32_t size);
 
-#define FIRST 320u                 /* the bytes check_first reads */
+#define FIRST 320u                 /* the bytes udsota_check_first reads */
 
 uint32_t UDSMillis(void)
 {
