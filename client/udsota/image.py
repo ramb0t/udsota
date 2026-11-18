@@ -67,11 +67,9 @@ def bare_image_id(data, header_offset):
     return hashlib.sha256(img).digest()
 
 
-# The buses data (profile's image) takes updates on: a bare header's update_buses, bit b-1 for bus b, and 0xFFFF,
-# every bus, for an image with no bare header.
+# The buses data (a bare image, as the bootloader flow takes) takes updates on: its header's update_buses, bit b-1 for
+# bus b.
 def update_buses(profile, data):
-    if profile.image_format != "bare":
-        return 0xFFFF
     return struct.unpack_from("<H", data, profile.header_offset + BARE_HDR_UPDATE_BUSES_OFFSET)[0]
 
 

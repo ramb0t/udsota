@@ -1,7 +1,6 @@
 """Getting the image into the unit and verified: RequestDownload (34), the 0x36 blocks, RequestTransferExit (37) and
 CheckProgrammingDependencies (FF01), as a full, compressed or delta download, with the recoveries for lost answers.
 Both flash flows call download and then check_image."""
-import time
 
 from .delta import validation_hash
 from .errors import NoResponse, Nrc, Refused, SendFailed, UpdateFailed
@@ -26,7 +25,7 @@ DELTA_NAMES = {DL_DFI_DELTA: "heatshrink patch", DL_DFI_DELTA_DEFLATE: "patch as
 # on 10 and 3E, it ends while the client waits P2* (5.5 s) for a lost answer. drop_76 = N resends block N once as if
 # its 76 were lost; an N past the last block is refused before any 0x36 (the CLI refuses it with deltas, whose size it
 # can't know before the 34).
-def download(uds, image, drop_76=None, log=print, compress="none", clock=time.monotonic, deltas=(), reenter=None):
+def download(uds, image, drop_76=None, log=print, compress="none", deltas=(), reenter=None):
     for dfi, patch in deltas:
         try:
             max_data = uds.request_download(len(image), dfi)
@@ -42,7 +41,7 @@ def download(uds, image, drop_76=None, log=print, compress="none", clock=time.mo
             raise
         log("delta, DFI 0x%02X (%s): %d -> %d bytes (%.0f%%)" % (dfi, DELTA_NAMES[dfi], len(image), len(patch),
                                                                 100.0 * len(patch) / len(image)))
-        if send_payload(uds, image, patch, max_data, "delta", drop_76=drop_76, log=log, clock=clock):
+        if send_payload(uds, image, patch, max_data, "delta", drop_76=drop_76, log=log):
             return
         log("the device is not running the base this patch was made from (0x36 answered 0x31, F1F1 DL_BAD_BASE; "
             "for example a rebuild of the same source that is not byte-identical): sending a full download")
@@ -52,7 +51,7 @@ def download(uds, image, drop_76=None, log=print, compress="none", clock=time.mo
         break
     payload, max_data = open_download(uds, image, compress, log=log)
     send_payload(uds, image, payload, max_data, None if payload is image else "compressed", drop_76=drop_76,
-                 log=log, clock=clock)
+                 log=log)
 
 
 # RequestDownload for image, compressed unless compress is "none": returns (payload, max_data), payload being what the
@@ -83,11 +82,11 @@ def open_download(uds, image, compress, log=print):
 # when done; False when a delta's 36 was refused with F1F1 DL_BAD_BASE, which ends the download on the server: 0x31,
 # or, when that answer was lost, a refused resend of the block: 0x70 from a server on iso14229, which has no transfer
 # open, 0x24 from a v0.14.x one, or for a block over 256 bytes a resend a v0.14.x server's ISO-TP refuses.
-def send_payload(uds, image, payload, max_data, kind, drop_76=None, log=print, clock=time.monotonic):
+def send_payload(uds, image, payload, max_data, kind, drop_76=None, log=print):
     total = (len(payload) + max_data - 1) // max_data
     if drop_76 is not None and drop_76 > total:
         raise Refused("--drop-76 %d: the download is only %d blocks of %d bytes" % (drop_76, total, max_data))
-    start = clock()
+    start = uds.clock()
     try:
         for n in range(1, total + 1):
             chunk = payload[(n - 1) * max_data:n * max_data]
@@ -111,7 +110,7 @@ def send_payload(uds, image, payload, max_data, kind, drop_76=None, log=print, c
                 and last_reason(uds) == "DL_BAD_BASE"):
             return False
         raise UpdateFailed("%s; %s" % (e, last_result(uds))) from e
-    took = clock() - start
+    took = uds.clock() - start
     if kind == "compressed":
         log("sent %d %s bytes in %.1f s; the %d-byte image would take about %.1f s, so about %.1f s saved"
             % (len(payload), kind, took, len(image), took * len(image) / len(payload),

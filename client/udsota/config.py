@@ -3,7 +3,6 @@
 commit per [config] group), and after a keyed reset reads them back and checks the device's config hash. Everything
 product-specific comes from the profile's [dids] and [config]."""
 import hashlib
-import time
 
 from .errors import NoResponse, Nrc, Refused, SecondTester, ToolError, UpdateFailed
 from .update import device_keys, enter_extended, read_record, wait_for_boot
@@ -205,8 +204,7 @@ def later_group_failed(groups, i, e, at_commit):
 # landed, with no reset and no retry: the device keeps a failed commit's set staged. writes comes from parse_writes,
 # and secret is the master or private key (update.make_keys), unused without [security]. Returns 0 or raises
 # ToolError.
-def config_set(uds, profile, writes, secret, commit=False, reset=False, preroll=lambda: None,
-               sleep=time.sleep, clock=time.monotonic, log=print):
+def config_set(uds, profile, writes, secret, commit=False, reset=False, preroll=lambda: None, log=print):
     groups = group_writes(profile, writes, commit)
     keys = device_keys(uds, profile, secret)
     enter_extended(uds, profile, keys)
@@ -238,7 +236,7 @@ def config_set(uds, profile, writes, secret, commit=False, reset=False, preroll=
         raise UpdateFailed("committed, but the reset was refused (0x22): the new values apply at the next "
                            "restart; run `reset` when the server allows it") from e
     log("committed; the server restarts")
-    wait_for_boot(uds, preroll, "the reset", sleep=sleep, clock=clock)
+    wait_for_boot(uds, preroll, "the reset")
     read_back(uds, writes, log=log)
     if profile.config.hash is not None:
         check_hash(uds, profile.config.hash, log=log)
