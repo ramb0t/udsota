@@ -385,8 +385,8 @@ static bool write_block(uint32_t off, const uint8_t *data, uint32_t n)
 
 /* ==== 7. The services ==== */
 
-/* The open download fails, and F1F1 names why. One that has already ended keeps its reason, so a later ABORTED never
- * overwrites an image rule's or a flash failure's. */
+/* The open download fails, and F1F1 names why. One no longer open (failed, received or verified) keeps its reason, so a
+ * later ABORTED never overwrites an image rule's or a flash failure's. */
 static void dl_fail(uint8_t why)
 {
     if (B.dl.phase == DL_OPEN) {
