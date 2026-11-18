@@ -56,7 +56,7 @@ class Uds:
                     # The resend found no transfer open: the app's 0x21 ended it, as any NRC does on iso14229. A
                     # v0.14.x server keeps the transfer across a 0x21 and the client cannot tell the two apart, so
                     # the retry stays and its 0x70 says what happened.
-                    raise Nrc(sid, e.code, "the app answered busy (0x21), which ends the transfer on this server; "
+                    raise Nrc(sid, e.code, "the server answered busy (0x21), which ends the transfer on this server; "
                                            "run flash again") from e
                 if e.code != NRC_BUSY or delay is None:
                     raise

@@ -2882,7 +2882,7 @@ class BusyEndsTransfer(FakeServer):
         return super().handle(req)
 
 
-# Check the 0x70 that follows a retried 0x21 to a 36 or a 37 says the app answered busy, which ended the transfer on
+# Check the 0x70 that follows a retried 0x21 to a 36 or a 37 says the server answered busy, which ended the transfer on
 # this server, and that flash is to be run again; the retry is kept, since a v0.14.x server keeps the transfer across a
 # 0x21 and the client cannot tell the two apart. A 0x70 with no 0x21 before it is reported as it was.
 @pytest.mark.parametrize("sid", [0x36, 0x37])
@@ -2893,7 +2893,7 @@ def test_busy_that_ended_the_transfer_is_named_after_its_0x70(sid):
     with pytest.raises(errors.Nrc) as e:
         update.download(uds, make_image(), log=lambda *a: None)
     assert (e.value.sid, e.value.code) == (sid, 0x70)
-    assert "the app answered busy (0x21), which ends the transfer on this server; run flash again" in str(e.value)
+    assert "the server answered busy (0x21), which ends the transfer on this server; run flash again" in str(e.value)
     assert [x for x in d.log if x[0] == sid][:2] == [(sid, 1 if sid == 0x36 else None)] * 2
     d = FakeServer(security=False, ended_nrc=0x70, nrc_once={(0x36, 1): 0x70})
     uds = uds_for(d, FakeTime())
