@@ -6,9 +6,18 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ### Changed
 
+- **Breaking** for a product that lists udsota's sources by hand under ESP-IDF: the ESP-IDF platform (the `udsota_plat_*` functions, the flash worker and the PSA lock) is now `udsota_esp.c`, and `udsota.c` is the portable core that every host test builds as the target does. Add `udsota_esp.c` beside `udsota.c`; the component's `SRCS` already do. The two call each other through the new private header `udsota_priv.h`. **Breaking** for a host build that lists the sources by hand: the host's PSA lock, and `udsota_test_psa_depth()` under `UDSOTA_TEST`, are now `udsota_host.c`, which it adds beside `udsota.c`; the root `CMakeLists.txt`'s targets already do. See MIGRATING.md, 0.18.x to 0.19.0. The text of both objects together is within a few bytes of `udsota.c`'s before in the ws43 default and delta builds, and 823 bytes less at -O2 (12,333 to 11,510), where the core now calls the platform functions it used to inline.
 - **Breaking**, client: a profile with `[image] format = "bare"` and `[update] flow = "app"`, or with `flow = "bootloader"` and `format = "esp-idf"`, is refused when it loads, saying why. An A/B server takes only an ESP-IDF image and the boot core only a bare one, so both pairs loaded and failed on the unit. Set `format = "bare"` with `flow = "bootloader"`, or neither. `update.flash_bootloader` no longer takes `bases`, `diff_format` or `deflate_ok`, since a bare image refuses deltas.
 - Client: a profile that is wrong in two tables at once may now report the other table's fault first, as each table is validated whole and in a fixed order. A profile with one fault, and every message, is as before.
 - **Breaking**, client: `update.flash`, `flash_app`, `flash_bootloader`, `confirm`, `confirm_cmd`, `wait_for_image`, `wait_for_boot`, `wait_for_start`, `wait_for_power_up`, `poll_restarted`, `download`, `send_payload` and `config.config_set` no longer take `sleep=` or `clock=` (`download`, `send_payload` and `wait_for_power_up` took only `clock=`): they use `uds.sleep` and `uds.clock`, which `Uds(client, sleep=..., clock=...)` takes. A caller that passed them passes them to `Uds` instead.
+
+### Fixed
+
+- ESP-IDF platform: a `27` seed no longer switches the SAR ADC entropy source on and off, which reset and reconfigured the app's ADC (and I2S0 on an ESP32) on every seed request. The seed comes from `esp_fill_random` alone; the README's Known limits say when that is true random and how an app makes it so.
+- ESP-IDF platform: the slots are read in `udsota_init`, so `udsota_unconfirmed()` and F1F0 are right from then; before, they read no slot until the worker task first ran, which an app at a higher priority could see.
+- ESP-IDF platform: FF01's and F001's wait for the PSA lock ends at 60 s and fails the job, so an app holding the lock past the 90 s job cap can no longer have an activation land after the tester was answered 0x72.
+- ESP-IDF platform: a unit running its factory app logs that it refuses every download until an OTA slot boots; before, it refused with no word why.
+- `udsota.c`: when another service arrives while a compressed download's 37 is inflating the end of the stream, the download is ended and the 37's job then finishes, so F1F1 says ABORTED as it did before and the 37 is answered 0x72 as a failed 37 is; it was answered positive, with F1F1 OK, for a download that had ended. Should the job fail, F1F1 keeps ABORTED too, and not the job's reason.
 
 ## [0.18.1] - 2026-11-18
 

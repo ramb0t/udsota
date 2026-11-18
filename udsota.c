@@ -1,4 +1,4 @@
-/* udsota: safe A/B firmware updates over UDS on iso14229's server (see udsota.h). One file:
+/* udsota: safe A/B firmware updates over UDS on iso14229's server (see udsota.h). The portable core:
  *   1. the limits and state (the wire contract, every number a tester sees, is udsota_wire.h's)
  *   2. the image rules: what the first 320 bytes must say before anything is erased
  *   3. coded downloads: raw DEFLATE through the ROM's tinfl into the image, or for a delta into detools, which
@@ -7,10 +7,10 @@
  *   5. the updater: 34, 36, 37, the routines, the DIDs and the session rules
  *   6. iso14229's events, one handler each
  *   7. the API: udsota_init, udsota_event and the rest of udsota.h's functions
- *   8. the platform: on ESP-IDF the flash worker on esp_ota_*, the slot status, identity, crypto, a delta's base and
- *      the PSA lock; on a host the PSA lock alone, the rest being the build's
+ * The platform is the build's: udsota_esp.c on ESP-IDF, udsota_host.c's PSA lock and the test's functions on a host.
  * iso14229 keeps ISO-TP, framing, timing, the 0x78 cadence and the 0x27 attempt delays; it is used as it is. */
 #include "udsota.h"
+#include "udsota_priv.h"
 #include <stdlib.h>
 #include <string.h>
 #if UDSOTA_DELTA
@@ -25,24 +25,10 @@
 
 #if defined(ESP_PLATFORM)
 #include "sdkconfig.h"
-#include "bootloader_random.h"
-#include "esp_app_desc.h"
-#include "esp_app_format.h"
-#if UDSOTA_DELTA
-#include "esp_image_format.h"
-#endif
 #include "esp_log.h"
-#include "esp_mac.h"
-#include "esp_ota_ops.h"
-#include "esp_partition.h"
-#include "esp_random.h"
 #include "esp_system.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
-#include "freertos/task.h"
 #include "miniz.h"                 /* esp_rom's: tinfl_decompress runs from ROM */
 _Static_assert(sizeof(tinfl_decompressor) == 10992u && TINFL_LZ_DICT_SIZE == 32768, "the ROM's tinfl layout");
-#include "psa/crypto.h"
 #define CHIP_ID CONFIG_IDF_FIRMWARE_CHIP_ID
 #define LOGW(...) ESP_LOGW("udsota", __VA_ARGS__)
 #define RESTART() esp_restart()
@@ -60,8 +46,8 @@ _Static_assert(sizeof(tinfl_decompressor) == 10992u && TINFL_LZ_DICT_SIZE == 327
 #define KEY_LOCK_MS     40u        /* 0x27's wait for the PSA lock: an app that holds it longer gets 0x22 */
 #define LABEL_MAX       32u
 #define BUF_LEN         4096u
-#define IMAGE_MIN       320u       /* image header 24 + segment header 8 + esp_app_desc_t 256 + descriptor 32 */
 #define JOB_CAP_MS      90000u     /* the longest udsota holds a session for its own flash job */
+#define JOB_PSA_WAIT_MS 60000u     /* FF01's and F001's wait for the PSA lock, inside JOB_CAP_MS */
 #define PATCH_MAGIC     0xFCCDDE10u   /* a delta patch's first 4 bytes, little-endian (esp_delta_ota's) */
 #define PATCH_HDR_LEN   64u        /* the magic, the base's appended SHA-256 and 28 reserved bytes */
 
@@ -153,7 +139,7 @@ static uint32_t le32(const uint8_t *p)
 }
 
 /* Zeroes n bytes where the compiler cannot drop it. */
-static void wipe(void *p, size_t n)
+void udsota_wipe(void *p, size_t n)
 {
     volatile uint8_t *v = p;
     while (n-- > 0u) {
@@ -164,7 +150,7 @@ static void wipe(void *p, size_t n)
 /* ==== 2. The image rules ==== */
 
 /* Parses "[v]M.m.p" (0..255 each) ending in NUL, '-' or '+' within n bytes. *clean: NUL follows, a release. */
-static bool parse_version(const char *s, size_t n, uint8_t out[3], bool *clean)
+bool udsota_parse_version(const char *s, size_t n, uint8_t out[3], bool *clean)
 {
     uint8_t v3[3] = {0, 0, 0};
     size_t i = (n > 0u && s[0] == 'v') ? 1u : 0u;
@@ -224,7 +210,7 @@ static bool newer_enough(const uint8_t ver[3], bool release)
 
 /* The first IMAGE_MIN bytes of an image of `size` bytes, before anything is erased: an ESP-IDF image for this chip
  * that the platform can boot, this product, board, layout and CAN IDs, a newer version, and a size that fits. */
-static udsota_reason_t check_first(const uint8_t *b, size_t len, uint32_t size)
+udsota_reason_t udsota_check_first(const uint8_t *b, size_t len, uint32_t size)
 {
     if (!is_esp_image(b, len, size)) {
         return UDSOTA_DL_BAD_HEADER;
@@ -249,7 +235,7 @@ static udsota_reason_t check_first(const uint8_t *b, size_t len, uint32_t size)
     uint8_t ver[3];
     bool clean;
     const bool release = (*DESC(b, flags) & 0x01u) != 0u;
-    if (!parse_version((const char *)&b[APP_VERSION], 32u, ver, &clean) || clean != release) {
+    if (!udsota_parse_version((const char *)&b[APP_VERSION], 32u, ver, &clean) || clean != release) {
         return UDSOTA_DL_BAD_HEADER;
     }
     if (!newer_enough(ver, release)) {
@@ -275,13 +261,13 @@ static inline size_t zdl_first_len(void)
     return (U.announced < IMAGE_MIN) ? U.announced : IMAGE_MIN;
 }
 
-/* Worker: the image's bytes into flash. Nothing is erased until the first IMAGE_MIN bytes pass check_first. */
+/* Worker: the image's bytes into flash. Nothing is erased until the first IMAGE_MIN bytes pass udsota_check_first. */
 static uint8_t zdl_take(size_t n, bool last)
 {
     U.z.held += n;
     U.z.produced += (uint32_t)n;
     if (!U.z.begun && (U.z.held >= zdl_first_len() || last)) {
-        const udsota_reason_t why = check_first(U.zbuf, U.z.held, U.announced);
+        const udsota_reason_t why = udsota_check_first(U.zbuf, U.z.held, U.announced);
         if (why != UDSOTA_DL_OK) {
             return zdl_fail(why);
         }
@@ -554,8 +540,8 @@ static bool hmac_key(const uint8_t seed[UDSOTA_SEED_LEN], uint8_t level, uint8_t
         udsota_psa_unlock();
     }
     memcpy(key, full, UDSOTA_KEY_LEN);
-    wipe(full, sizeof full);
-    wipe(msg, sizeof msg);
+    udsota_wipe(full, sizeof full);
+    udsota_wipe(msg, sizeof msg);
     return ok;
 }
 
@@ -590,7 +576,7 @@ static void derive_device_key(const udsota_cfg_t *cfg)
         U.key_ok = udsota_plat_hmac(cfg->key_master, cfg->key_master_len, msg, ln + U.devid_len, U.device_key);
         udsota_psa_unlock();
     }
-    wipe(msg, sizeof msg);
+    udsota_wipe(msg, sizeof msg);
 }
 
 /* 0x27: ECDSA wins over HMAC. Any key field turns it on, and an incomplete set then unlocks nothing; with none, 0x27 is
@@ -875,7 +861,7 @@ static int transfer_data(UDSServer_t *srv, const uint8_t *data, size_t len, bool
     U.block_len = len;
     int (*job)(void) = coded() ? job_inflate : job_write;
     if (U.phase == PHASE_ANNOUNCED) {                    /* the first block: check it before anything is erased */
-        const udsota_reason_t why = check_first(data, len, U.announced);
+        const udsota_reason_t why = udsota_check_first(data, len, U.announced);
         if (why != UDSOTA_DL_OK) {
             fail_download((uint8_t)why);
             return UDS_NRC_RequestOutOfRange;
@@ -889,9 +875,7 @@ static int transfer_data(UDSServer_t *srv, const uint8_t *data, size_t len, bool
 
 static int exit_ok(void)
 {
-    if (image_open()) {                                  /* not after an abort that closed it while the 37 ran */
-        U.phase = PHASE_RECEIVED;
-    }
+    U.phase = PHASE_RECEIVED;
     U.last_reason = UDSOTA_DL_OK;
     U.last_bytes = U.received;
     return 0;
@@ -901,6 +885,9 @@ static int finish_done(int result, uint8_t *status, size_t *status_len)
 {
     (void)status;
     *status_len = 0;
+    if (!image_open()) {                                 /* another service ended the download while the 37 ran */
+        return UDS_NRC_GeneralProgrammingFailure;        /* F1F1 keeps ABORTED, and the image is closed already */
+    }
     if (result != UDSOTA_DL_OK) {
         U.close_pending = true;                          /* the stream is closed: only the flash side remains */
         end_download((uint8_t)result);
@@ -930,10 +917,11 @@ static int transfer_exit(const UDSServer_t *srv, size_t extra)
 
 /* ---- 31 01: FF01 verify, F000 resume point, F001 activate, F002 confirm ---- */
 
-/* esp_ota_end and esp_ota_set_boot_partition hash through PSA. The wait has no limit: the app holds it briefly. */
+/* esp_ota_end and esp_ota_set_boot_partition hash through PSA. The wait ends well inside the 90 s a job may take, so
+ * an app that holds the lock that long fails the job here, and no activate can land after its 0x72 was answered. */
 static int job_verify(void)
 {
-    if (!udsota_psa_lock(UDSOTA_PSA_WAIT_FOREVER)) {
+    if (!udsota_psa_lock(JOB_PSA_WAIT_MS)) {
         return UDSOTA_DL_VERIFY_FAILED;
     }
     const int r = udsota_plat_end();
@@ -943,7 +931,7 @@ static int job_verify(void)
 
 static int job_activate(void)
 {
-    if (!udsota_psa_lock(UDSOTA_PSA_WAIT_FOREVER)) {
+    if (!udsota_psa_lock(JOB_PSA_WAIT_MS)) {
         return UDSOTA_DL_VERIFY_FAILED;
     }
     const int r = udsota_plat_activate();
@@ -1113,7 +1101,7 @@ static void session_changed(UDSServer_t *srv)
         U.last_reason = UDSOTA_DL_WORKER_TIMEOUT;        /* its answer never came */
     }
     U.seed_valid = false;
-    wipe(U.seed, sizeof U.seed);
+    udsota_wipe(U.seed, sizeof U.seed);
     srv->xferIsActive = false;
     srv->securityLevel = 0;
     progress_sync();
@@ -1289,9 +1277,9 @@ static bool on_validate_key(UDSServer_t *srv, const UDSSecAccessValidateKeyArgs_
             }
             *rc = (diff == 0u) ? UDS_PositiveResponse : UDS_NRC_InvalidKey;
         }
-        wipe(expect, sizeof expect);
+        udsota_wipe(expect, sizeof expect);
     }
-    wipe(U.seed, sizeof U.seed);
+    udsota_wipe(U.seed, sizeof U.seed);
     return true;
 }
 
@@ -1429,15 +1417,13 @@ bool udsota_event(UDSServer_t *srv, UDSEvent_t ev, void *arg, UDSErr_t *rc)
 
 /* ==== 7. The API ==== */
 
-static void psa_lock_init(void);                         /* the platform's: section 8 */
-
 /* This image's identity: the product it accepts images for, its own version, and the device ID. */
 static void read_identity(const udsota_cfg_t *cfg)
 {
     U.product = (cfg->product != NULL) ? cfg->product : udsota_plat_project();
     const char *v = udsota_plat_version();
     const size_t vlen = strnlen(v, 32);
-    if (vlen == 32u || !parse_version(v, vlen + 1u, U.running_version, &U.running_release)) {
+    if (vlen == 32u || !udsota_parse_version(v, vlen + 1u, U.running_version, &U.running_release)) {
         U.running_release = false;                        /* unparseable: {0,0,0}, a dev build */
     }
     if (cfg->device_id == NULL) {
@@ -1453,7 +1439,7 @@ int udsota_init(const udsota_cfg_t *cfg)
     if (U.started || cfg == NULL || udsota_image_desc.magic != UDSOTA_IMG_DESC_MAGIC) {
         return -1;
     }
-    psa_lock_init();
+    udsota_psa_lock_init();
     U.cfg = *cfg;
     read_identity(cfg);
     keys_init(cfg);
@@ -1527,7 +1513,7 @@ void udsota_test_reboot(void)
 /* The image rules on an image's first bytes, as a 34's first 36 meets them (tools/image_check). After udsota_init. */
 udsota_reason_t udsota_test_check_first(const uint8_t *b, size_t len, uint32_t size)
 {
-    return check_first(b, len, size);
+    return udsota_check_first(b, len, size);
 }
 
 /* The image bytes a coded download holds in zbuf, and zbuf's size, which they never pass (the fuzzer checks). */
@@ -1536,429 +1522,4 @@ size_t udsota_test_held(size_t *cap)
     *cap = sizeof U.zbuf;
     return U.z.held;
 }
-#endif
-
-/* ==== 8. The platform ==== */
-#if defined(ESP_PLATFORM)
-
-/* The PSA lock (udsota.h): a FreeRTOS mutex in static storage, created by udsota_init before its key setup, so the
- * worker inherits a waiting task's priority while it holds it. */
-static StaticSemaphore_t s_psa_storage;
-static SemaphoreHandle_t s_psa;
-
-static void psa_lock_init(void)
-{
-    if (s_psa == NULL) {
-        s_psa = xSemaphoreCreateMutexStatic(&s_psa_storage);
-    }
-}
-
-bool udsota_psa_lock(uint32_t wait_ms)
-{
-    if (s_psa == NULL) {
-        return true;                                     /* before udsota_init: only start code runs */
-    }
-    const TickType_t ticks = (wait_ms == UDSOTA_PSA_WAIT_FOREVER) ? portMAX_DELAY : pdMS_TO_TICKS(wait_ms);
-    return xSemaphoreTake(s_psa, ticks) == pdTRUE;
-}
-
-void udsota_psa_unlock(void)
-{
-    if (s_psa != NULL) {
-        (void)xSemaphoreGive(s_psa);
-    }
-}
-
-static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
-static udsota_status_t s_st = {.running_slot = UDSOTA_SLOT_NONE, .boot_slot = UDSOTA_SLOT_NONE};
-static const esp_partition_t *s_target;          /* the inactive slot; NULL refuses every download */
-static esp_ota_handle_t s_handle;
-static bool s_open, s_verified;
-static TaskHandle_t s_worker;
-static int (*s_job)(void);
-static int s_result;
-static bool s_busy = true;                       /* until the worker has read the slots */
-static psa_key_id_t s_pub;
-
-static uint8_t slot_of(const esp_partition_t *p)
-{
-    return (p == NULL || p->type != ESP_PARTITION_TYPE_APP)        ? UDSOTA_SLOT_NONE
-         : (p->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_0)          ? UDSOTA_SLOT_OTA0
-         : (p->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_1)          ? UDSOTA_SLOT_OTA1
-                                                                    : UDSOTA_SLOT_NONE;
-}
-
-static uint8_t map_state(esp_ota_img_states_t s)
-{
-    switch (s) {
-    case ESP_OTA_IMG_NEW:            return UDSOTA_IMG_NEW;
-    case ESP_OTA_IMG_PENDING_VERIFY: return UDSOTA_IMG_PENDING_VERIFY;
-    case ESP_OTA_IMG_VALID:          return UDSOTA_IMG_VALID;
-    case ESP_OTA_IMG_INVALID:        return UDSOTA_IMG_INVALID;
-    case ESP_OTA_IMG_ABORTED:        return UDSOTA_IMG_ABORTED;
-    default:                         return UDSOTA_IMG_UNDEFINED;
-    }
-}
-
-/* The other slot's state, with its version and SHA prefix read from its descriptor unless it is being written. */
-static void set_other(uint8_t state)
-{
-    esp_app_desc_t d;
-    uint8_t ver[3] = {0, 0, 0}, sha[8] = {0};
-    bool clean;
-    if (state != UDSOTA_OTHER_WRITING) {
-        if (s_target == NULL || esp_ota_get_partition_description(s_target, &d) != ESP_OK) {
-            state = UDSOTA_OTHER_EMPTY;
-        } else {
-            (void)parse_version(d.version, sizeof d.version, ver, &clean);
-            memcpy(sha, d.app_elf_sha256, sizeof sha);
-        }
-    }
-    taskENTER_CRITICAL(&s_mux);
-    s_st.other_slot_state = (state == UDSOTA_OTHER_VERIFIED && !s_verified) ? UDSOTA_OTHER_UNVERIFIED : state;
-    memcpy(s_st.other_version, ver, 3);
-    memcpy(s_st.other_elf_sha_prefix, sha, 8);
-    taskEXIT_CRITICAL(&s_mux);
-}
-
-/* The worker: reads the slots once, then runs one job at a time. Off the task watchdog: an erase busy-waits. */
-static void worker(void *arg)
-{
-    (void)arg;
-    const esp_partition_t *run = esp_ota_get_running_partition();
-    esp_ota_img_states_t st;
-    udsota_status_t s = {.running_slot = slot_of(run), .boot_slot = slot_of(esp_ota_get_boot_partition())};
-    s.running_state = (esp_ota_get_state_partition(run, &st) == ESP_OK) ? map_state(st) : UDSOTA_IMG_UNDEFINED;
-#if !CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE
-    if (s.running_state == UDSOTA_IMG_PENDING_VERIFY) {
-        s.running_state = UDSOTA_IMG_VALID;              /* without rollback nothing waits for a confirm */
-    }
-#endif
-#if CONFIG_SECURE_SIGNED_ON_UPDATE
-    s.flags = UDSOTA_STATUS_SIG_CHECKED;
-#endif
-    taskENTER_CRITICAL(&s_mux);
-    s_st = s;
-    taskEXIT_CRITICAL(&s_mux);
-    const bool rolled_back = s_target != NULL && esp_ota_get_state_partition(s_target, &st) == ESP_OK &&
-                             (st == ESP_OTA_IMG_INVALID || st == ESP_OTA_IMG_ABORTED);
-    set_other(rolled_back ? UDSOTA_OTHER_INVALID : UDSOTA_OTHER_UNVERIFIED);
-    for (;;) {
-        taskENTER_CRITICAL(&s_mux);
-        int (*job)(void) = s_job;
-        s_job = NULL;
-        s_busy = (job != NULL);
-        taskEXIT_CRITICAL(&s_mux);
-        if (job == NULL) {
-            (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-            continue;
-        }
-        const int r = job();
-        taskENTER_CRITICAL(&s_mux);
-        s_result = r;
-        taskEXIT_CRITICAL(&s_mux);
-    }
-}
-
-#if UDSOTA_DELTA
-static const esp_partition_t *s_running;         /* a delta download's base */
-static uint8_t s_base_hash[32];
-static bool s_base_hash_ok;                      /* s_base_hash is read, and kept for the boot */
-
-/* The worker, a delta download's base: n bytes of the running slot at off, bounded by the slot and not the image, so a
- * signature block past the image reads too. esp_partition_read is esp_flash_read, or under flash encryption a map made
- * and dropped for each read. Never hold a map of the slot: with XIP from PSRAM a held map turns the cache off for every
- * erase and write. */
-bool udsota_plat_base_read(uint32_t off, void *buf, size_t n)
-{
-    return s_running != NULL && (uint64_t)off + n <= s_running->size &&
-           esp_partition_read(s_running, off, buf, n) == ESP_OK;
-}
-
-/* The worker, the base's identity: the SHA-256 the running image appends, as esp_image_get_metadata reads it, which
- * hashes nothing and takes no PSA lock. The first call reads it and later ones reuse it, as the running image never
- * changes. A base that no longer matches its stored hash only rebuilds an image FF01 refuses. */
-bool udsota_plat_base_hash(uint8_t out[32])
-{
-    if (!s_base_hash_ok && s_running != NULL) {
-        const esp_partition_pos_t pos = {.offset = s_running->address, .size = s_running->size};
-        esp_image_metadata_t md;
-        const esp_err_t err = esp_image_get_metadata(&pos, &md);
-        s_base_hash_ok = (err == ESP_OK && md.image.hash_appended == 1u);
-        if (s_base_hash_ok) {
-            memcpy(s_base_hash, md.image_digest, sizeof s_base_hash);
-        } else if (err != ESP_OK) {
-            LOGW("can't read the running image to match a delta's base against: %s", esp_err_to_name(err));
-        } else {
-            LOGW("the running image has no appended SHA-256 to match a delta's base against");
-        }
-    }
-    if (s_base_hash_ok) {
-        memcpy(out, s_base_hash, sizeof s_base_hash);
-    }
-    return s_base_hash_ok;
-}
-#endif
-
-int udsota_plat_start(void)
-{
-    const esp_partition_t *run = esp_ota_get_running_partition();
-#if UDSOTA_DELTA
-    s_running = run;
-#endif
-    s_target = esp_ota_get_next_update_partition(NULL);
-    if (s_target == NULL || s_target == run) {
-        s_target = NULL;
-        LOGW("no inactive OTA slot: every download is refused");
-    }
-    if (xTaskCreatePinnedToCore(worker, "udsota", 8192, NULL, 2, &s_worker, tskNO_AFFINITY) != pdPASS) {
-        LOGW("no memory for the flash worker: every download is refused");
-        s_worker = NULL;
-        s_busy = false;
-        return -1;
-    }
-    return (s_target != NULL) ? 0 : -1;
-}
-
-int udsota_plat_run(int (*job)(void))
-{
-    taskENTER_CRITICAL(&s_mux);
-    const bool ok = s_worker != NULL && !s_busy && s_job == NULL;
-    if (ok) {
-        s_job = job;
-        s_busy = true;
-    }
-    taskEXIT_CRITICAL(&s_mux);
-    if (ok) {
-        xTaskNotifyGive(s_worker);
-    }
-    return ok ? UDSOTA_PENDING : -1;
-}
-
-int udsota_plat_poll(void)
-{
-    taskENTER_CRITICAL(&s_mux);
-    const int r = s_busy ? UDSOTA_PENDING : s_result;
-    taskEXIT_CRITICAL(&s_mux);
-    return r;
-}
-
-void udsota_plat_abort(void)
-{
-    if (s_open) {
-        (void)esp_ota_abort(s_handle);
-        s_open = false;
-        set_other(UDSOTA_OTHER_UNVERIFIED);
-    }
-}
-
-bool udsota_plat_compatible(const uint8_t *first, size_t len)
-{
-    esp_image_header_t hdr;
-    esp_app_desc_t app;
-    if (len < sizeof hdr + sizeof(esp_image_segment_header_t) + sizeof app) {
-        return false;
-    }
-    memcpy(&hdr, first, sizeof hdr);
-    memcpy(&app, first + sizeof hdr + sizeof(esp_image_segment_header_t), sizeof app);
-    return esp_ota_check_image_validity(ESP_PARTITION_TYPE_APP, &hdr, &app) == ESP_OK;   /* chip revision, flash mode */
-}
-
-/* Opens the slot with sequential writes, so each write erases only the sectors it writes and the erase is spread over
- * the download.
- * Refused while otadata already boots the slot (an activated image waiting for its reset). */
-int udsota_plat_begin(uint32_t size)
-{
-    udsota_plat_abort();
-    taskENTER_CRITICAL(&s_mux);
-    s_verified = false;
-    const bool booting = s_st.boot_slot == slot_of(s_target);
-    taskEXIT_CRITICAL(&s_mux);
-    if (s_target == NULL || size > s_target->size || booting) {
-        return UDSOTA_DL_FLASH_ERROR;
-    }
-    set_other(UDSOTA_OTHER_WRITING);
-    s_handle = 0;
-    if (esp_ota_begin(s_target, OTA_WITH_SEQUENTIAL_WRITES, &s_handle) != ESP_OK) {
-        (void)esp_ota_abort(s_handle);
-        set_other(UDSOTA_OTHER_UNVERIFIED);
-        return UDSOTA_DL_FLASH_ERROR;
-    }
-    s_open = true;
-    return UDSOTA_DL_OK;
-}
-
-int udsota_plat_write(const uint8_t *d, size_t n)
-{
-    if (!s_open || esp_ota_write(s_handle, d, n) != ESP_OK) {
-        udsota_plat_abort();
-        return UDSOTA_DL_FLASH_ERROR;
-    }
-    return UDSOTA_DL_OK;
-}
-
-/* The first bytes of the slot, read back after the verify, pass the image rules again. */
-static int recheck(void)
-{
-    uint8_t first[IMAGE_MIN];
-    if (esp_partition_read(s_target, 0, first, sizeof first) != ESP_OK) {
-        return UDSOTA_DL_VERIFY_FAILED;
-    }
-    return check_first(first, sizeof first, IMAGE_MIN);
-}
-
-/* FF01: esp_ota_end checks the SHA-256, and the signature with CONFIG_SECURE_SIGNED_ON_UPDATE. */
-int udsota_plat_end(void)
-{
-    if (!s_open) {
-        return s_verified ? UDSOTA_DL_OK : UDSOTA_DL_ABORTED;
-    }
-    s_open = false;                                      /* esp_ota_end frees the handle either way */
-    int r = (esp_ota_end(s_handle) == ESP_OK) ? recheck() : UDSOTA_DL_VERIFY_FAILED;
-    taskENTER_CRITICAL(&s_mux);
-    s_verified = (r == UDSOTA_DL_OK);
-    taskEXIT_CRITICAL(&s_mux);
-    set_other(r == UDSOTA_DL_OK ? UDSOTA_OTHER_VERIFIED : UDSOTA_OTHER_UNVERIFIED);
-    return r;
-}
-
-/* F001: esp_ota_set_boot_partition checks the image again before it writes otadata. */
-int udsota_plat_activate(void)
-{
-    int r = s_verified ? recheck() : UDSOTA_DL_VERIFY_FAILED;
-    if (r == UDSOTA_DL_OK && esp_ota_set_boot_partition(s_target) != ESP_OK) {
-        r = UDSOTA_DL_VERIFY_FAILED;
-    }
-    taskENTER_CRITICAL(&s_mux);
-    if (r == UDSOTA_DL_OK) {
-        s_st.boot_slot = slot_of(s_target);
-    } else {
-        s_verified = false;
-    }
-    taskEXIT_CRITICAL(&s_mux);
-    if (r != UDSOTA_DL_OK) {
-        set_other(UDSOTA_OTHER_UNVERIFIED);
-    }
-    return r;
-}
-
-/* F002: marks the running image valid; the updater checked it is the pending boot image. */
-int udsota_plat_confirm(void)
-{
-#if CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE
-    if (esp_ota_mark_app_valid_cancel_rollback() != ESP_OK) {
-        return UDSOTA_DL_ABORTED;
-    }
-#endif
-    taskENTER_CRITICAL(&s_mux);
-    s_st.running_state = UDSOTA_IMG_VALID;
-    taskEXIT_CRITICAL(&s_mux);
-    return UDSOTA_DL_OK;
-}
-
-void udsota_plat_unverify(void)
-{
-    taskENTER_CRITICAL(&s_mux);
-    s_verified = false;
-    if (s_st.other_slot_state == UDSOTA_OTHER_VERIFIED) {
-        s_st.other_slot_state = UDSOTA_OTHER_UNVERIFIED;
-    }
-    taskEXIT_CRITICAL(&s_mux);
-}
-
-void udsota_plat_status(udsota_status_t *out)
-{
-    taskENTER_CRITICAL(&s_mux);
-    *out = s_st;
-    taskEXIT_CRITICAL(&s_mux);
-}
-
-uint32_t udsota_plat_slot_size(void) { return (s_target != NULL) ? s_target->size : 0u; }
-const char *udsota_plat_version(void) { return esp_app_get_description()->version; }
-const char *udsota_plat_project(void) { return esp_app_get_description()->project_name; }
-const uint8_t *udsota_plat_sha(void) { return esp_app_get_description()->app_elf_sha256; }
-
-size_t udsota_plat_mac(uint8_t out[16])
-{
-    return (esp_read_mac(out, ESP_MAC_BASE) == ESP_OK) ? 6u : 0u;
-}
-
-/* A true random seed: the SAR ADC entropy source is on only while it is drawn, so the app keeps the ADC and radio. */
-bool udsota_plat_rng16(uint8_t out[16])
-{
-    bootloader_random_enable();
-    esp_fill_random(out, 16);
-    bootloader_random_disable();
-    return true;
-}
-
-bool udsota_plat_hmac(const uint8_t *key, size_t key_len, const uint8_t *msg, size_t msg_len, uint8_t out[32])
-{
-    psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
-    psa_set_key_usage_flags(&attr, PSA_KEY_USAGE_SIGN_MESSAGE);
-    psa_set_key_algorithm(&attr, PSA_ALG_HMAC(PSA_ALG_SHA_256));
-    psa_set_key_type(&attr, PSA_KEY_TYPE_HMAC);
-    psa_key_id_t id = PSA_KEY_ID_NULL;
-    size_t n = 0;
-    bool ok = psa_import_key(&attr, key, key_len, &id) == PSA_SUCCESS &&
-              psa_mac_compute(id, PSA_ALG_HMAC(PSA_ALG_SHA_256), msg, msg_len, out, 32, &n) == PSA_SUCCESS &&
-              n == 32u;
-    ok = (psa_destroy_key(id) == PSA_SUCCESS) && ok;
-    if (!ok) {
-        wipe(out, 32);
-    }
-    return ok;
-}
-
-int udsota_plat_ecdsa_key(const uint8_t *pubkey)
-{
-    psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
-    psa_set_key_usage_flags(&attr, PSA_KEY_USAGE_VERIFY_HASH);
-    psa_set_key_algorithm(&attr, PSA_ALG_ECDSA(PSA_ALG_SHA_256));
-    psa_set_key_type(&attr, PSA_KEY_TYPE_ECC_PUBLIC_KEY(PSA_ECC_FAMILY_SECP_R1));
-    psa_set_key_bits(&attr, 256);
-    return (psa_import_key(&attr, pubkey, UDSOTA_KEYS_PUBKEY_LEN, &s_pub) == PSA_SUCCESS) ? 0 : -1;
-}
-
-int udsota_plat_ecdsa(const uint8_t *msg, size_t n, const uint8_t sig[UDSOTA_KEYS_SIG_LEN])
-{
-    uint8_t hash[32];
-    size_t hn = 0;
-    if (psa_hash_compute(PSA_ALG_SHA_256, msg, n, hash, sizeof hash, &hn) != PSA_SUCCESS) {
-        return -1;
-    }
-    const psa_status_t st =
-        psa_verify_hash(s_pub, PSA_ALG_ECDSA(PSA_ALG_SHA_256), hash, hn, sig, UDSOTA_KEYS_SIG_LEN);
-    return (st == PSA_SUCCESS) ? 1 : (st == PSA_ERROR_INSUFFICIENT_MEMORY || st == PSA_ERROR_HARDWARE_FAILURE) ? -1 : 0;
-}
-
-#else
-/* ==== The host build's PSA lock ====
- * A host build is one task: the lock is a depth that the host test reads, and a wait on it held fails at once. The rest
- * of the platform is the build's to supply (udsota.h). */
-static int s_psa_depth;
-
-static void psa_lock_init(void) {}
-
-bool udsota_psa_lock(uint32_t wait_ms)
-{
-    (void)wait_ms;
-    if (s_psa_depth != 0) {
-        return false;
-    }
-    s_psa_depth++;
-    return true;
-}
-
-void udsota_psa_unlock(void)
-{
-    s_psa_depth--;
-}
-
-#if defined(UDSOTA_TEST)
-int udsota_test_psa_depth(void)
-{
-    return s_psa_depth;
-}
-#endif
 #endif
