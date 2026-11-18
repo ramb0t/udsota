@@ -771,12 +771,16 @@ def unlock_programming(uds, profile, keys):
         uds.unlock(profile.security.level_programming, keys)
 
 
-# 10 03, the extended unlock when the profile has [security], and 11 01: the server answers, then restarts
-# (an unconfirmed image rolls back).
-def keyed_reset(uds, profile, keys):
+# 10 03, then the extended unlock when the profile has [security]: reset, config set and dtc clear need it.
+def enter_extended(uds, profile, keys):
     uds.session(SESSION_EXTENDED)
     if keys is not None:
         uds.unlock(profile.security.level_extended, keys)
+
+
+# 11 01 in the extended session: the server answers, then restarts (an unconfirmed image rolls back).
+def keyed_reset(uds, profile, keys):
+    enter_extended(uds, profile, keys)
     uds.ecu_reset()
 
 
