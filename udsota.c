@@ -43,12 +43,14 @@ _Static_assert(sizeof(tinfl_decompressor) == 10992u && TINFL_LZ_DICT_SIZE == 327
 #include "psa/crypto.h"
 #define CHIP_ID CONFIG_IDF_FIRMWARE_CHIP_ID
 #define LOGW(...) ESP_LOGW("udsota", __VA_ARGS__)
+#define RESTART() esp_restart()
 #else
 #include "miniz.h"                 /* host builds: miniz's tinfl */
 #ifndef CHIP_ID
 #define CHIP_ID 9u                 /* ESP32-S3, for host tests; tools/image_check sets the chip it checks for */
 #endif
 #define LOGW(...) ((void)0)
+#define RESTART() ((void)0)
 #endif
 
 /* ==== 1. Limits and state (the wire contract is udsota.h's) ==== */
@@ -474,64 +476,7 @@ static int job_zend(void)
     return ok ? UDSOTA_DL_OK : (failed != UDSOTA_DL_OK ? failed : UDSOTA_DL_BAD_STREAM);
 }
 
-/* ==== 4. 0x27 keys and the PSA lock ==== */
-
-/* The PSA lock (udsota.h). On ESP-IDF a FreeRTOS mutex in static storage, created by udsota_init before its key
- * setup, so the worker inherits a waiting task's priority while it holds it. A host build is one task: the lock is a
- * depth that the host test reads, and a wait on it held fails at once. */
-#if defined(ESP_PLATFORM)
-static StaticSemaphore_t s_psa_storage;
-static SemaphoreHandle_t s_psa;
-
-static void psa_lock_init(void)
-{
-    if (s_psa == NULL) {
-        s_psa = xSemaphoreCreateMutexStatic(&s_psa_storage);
-    }
-}
-
-bool udsota_psa_lock(uint32_t wait_ms)
-{
-    if (s_psa == NULL) {
-        return true;                                     /* before udsota_init: only start code runs */
-    }
-    const TickType_t ticks = (wait_ms == UDSOTA_PSA_WAIT_FOREVER) ? portMAX_DELAY : pdMS_TO_TICKS(wait_ms);
-    return xSemaphoreTake(s_psa, ticks) == pdTRUE;
-}
-
-void udsota_psa_unlock(void)
-{
-    if (s_psa != NULL) {
-        (void)xSemaphoreGive(s_psa);
-    }
-}
-#else
-static int s_psa_depth;
-
-static void psa_lock_init(void) {}
-
-bool udsota_psa_lock(uint32_t wait_ms)
-{
-    (void)wait_ms;
-    if (s_psa_depth != 0) {
-        return false;
-    }
-    s_psa_depth++;
-    return true;
-}
-
-void udsota_psa_unlock(void)
-{
-    s_psa_depth--;
-}
-
-#if defined(UDSOTA_TEST)
-int udsota_test_psa_depth(void)
-{
-    return s_psa_depth;
-}
-#endif
-#endif
+/* ==== 4. 0x27 keys (the PSA lock around their crypto is the platform's: section 7) ==== */
 
 /* HMAC mode: the expected key for seed at requestSeed level: HMAC-SHA256(K_dev, seed || level || ID)[0..15]. */
 static bool hmac_key(const uint8_t seed[UDSOTA_SEED_LEN], uint8_t level, uint8_t key[UDSOTA_KEY_LEN])
@@ -1204,9 +1149,7 @@ bool udsota_event(UDSServer_t *srv, UDSEvent_t ev, void *arg, UDSErr_t *rc)
         if (U.cfg.reset != NULL) {
             U.cfg.reset(U.cfg.ctx);
         } else {
-#if defined(ESP_PLATFORM)
-            esp_restart();
-#endif
+            RESTART();
         }
         return true;
     case UDS_EVT_DiagSessCtrl: {
@@ -1320,6 +1263,8 @@ bool udsota_event(UDSServer_t *srv, UDSEvent_t ev, void *arg, UDSErr_t *rc)
 }
 
 /* ==== The API ==== */
+
+static void psa_lock_init(void);                         /* the platform's: section 7 */
 
 int udsota_init(const udsota_cfg_t *cfg)
 {
@@ -1451,6 +1396,34 @@ size_t udsota_test_held(size_t *cap)
 
 /* ==== 7. The ESP-IDF platform ==== */
 #if defined(ESP_PLATFORM)
+
+/* The PSA lock (udsota.h): a FreeRTOS mutex in static storage, created by udsota_init before its key setup, so the
+ * worker inherits a waiting task's priority while it holds it. */
+static StaticSemaphore_t s_psa_storage;
+static SemaphoreHandle_t s_psa;
+
+static void psa_lock_init(void)
+{
+    if (s_psa == NULL) {
+        s_psa = xSemaphoreCreateMutexStatic(&s_psa_storage);
+    }
+}
+
+bool udsota_psa_lock(uint32_t wait_ms)
+{
+    if (s_psa == NULL) {
+        return true;                                     /* before udsota_init: only start code runs */
+    }
+    const TickType_t ticks = (wait_ms == UDSOTA_PSA_WAIT_FOREVER) ? portMAX_DELAY : pdMS_TO_TICKS(wait_ms);
+    return xSemaphoreTake(s_psa, ticks) == pdTRUE;
+}
+
+void udsota_psa_unlock(void)
+{
+    if (s_psa != NULL) {
+        (void)xSemaphoreGive(s_psa);
+    }
+}
 
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 static udsota_status_t s_st = {.running_slot = UDSOTA_SLOT_NONE, .boot_slot = UDSOTA_SLOT_NONE};
@@ -1815,4 +1788,33 @@ int udsota_plat_ecdsa(const uint8_t *msg, size_t n, const uint8_t sig[UDSOTA_KEY
     return (st == PSA_SUCCESS) ? 1 : (st == PSA_ERROR_INSUFFICIENT_MEMORY || st == PSA_ERROR_HARDWARE_FAILURE) ? -1 : 0;
 }
 
+#else
+/* ==== The host build's PSA lock ====
+ * A host build is one task: the lock is a depth that the host test reads, and a wait on it held fails at once. The rest
+ * of the platform is the build's to supply (udsota.h). */
+static int s_psa_depth;
+
+static void psa_lock_init(void) {}
+
+bool udsota_psa_lock(uint32_t wait_ms)
+{
+    (void)wait_ms;
+    if (s_psa_depth != 0) {
+        return false;
+    }
+    s_psa_depth++;
+    return true;
+}
+
+void udsota_psa_unlock(void)
+{
+    s_psa_depth--;
+}
+
+#if defined(UDSOTA_TEST)
+int udsota_test_psa_depth(void)
+{
+    return s_psa_depth;
+}
+#endif
 #endif
