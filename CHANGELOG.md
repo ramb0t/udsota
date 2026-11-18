@@ -4,6 +4,8 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-11-18
+
 ### Added
 
 - Bootloader core: one bootloader per board for every product on it. `cfg.product` NULL takes an image of any project (the hardware ID, layout and both diagnostic IDs are still checked), and `udsota_boot_server` without `--product` runs that way. F1F5 (`UDSOTA_DID_PROJECT`) answers the valid installed image's project string, without its NUL, and 0x31 with no valid app or an empty project; `udsota.c` does not serve it. The installed image says which buses take updates: the new 16-bit `update_buses` at offset 16 of the bare header (bit b−1 for bus b, `UDSOTA_BUS(b)`, set by `UDSOTA_IMAGE_HEADER_BUSES(buses, ...)`; `UDSOTA_IMAGE_HEADER` still means every bus). The core starts only those buses, ignores frames from the others and does not take a handover from them, with `udsota_image_bus_open` as the one rule (a mask that names none of the board's buses means every bus) and `udsota_app_bus_open` for the app, which answers `10 02` and F1F4 only on those buses. A session keeps its bus, and the next listen follows what is then installed. `udsota_boot_port_can_start` may return true before the controller synchronises. The test server takes `--buses`, `--bus` and `--image-buses`. None of this is breaking for an A/B unit, and every image built so far has 0xFF in the new field and means every bus. `udsota_image_header_t`'s `reserved` is now 14 bytes after `update_buses`; `header_version` stays 1. About 200 more bytes of Cortex-M3 text (3,079).
