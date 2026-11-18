@@ -1,10 +1,10 @@
 # Builds what a Release carries, at one commit: the client's wheel and sdist and the example's app image for esp32s3
 # and esp32. release.yml calls it (workflow_call) with the tagged commit before it publishes; ci.yml calls it with its
-# own commit and fail_on_warning set, so the assets a tag would release are built, warning-free, before the tag exists
-# (ci.yml then runs udsota's image rules on the images). release.yml leaves fail_on_warning off, since cut-release has
-# already required green CI on that commit and a release that fails here fails after its tag is pushed. Each job
-# uploads its files as an artifact of the calling run: client, example-esp32s3 and example-esp32. Actions are pinned
-# by commit, since release.yml publishes what these jobs build.
+# own commit, so the assets a tag would release are built before the tag exists. With fail_on_warning set, which both
+# do, an image build that prints a compiler warning fails, and udsota's image rules run on the example's images (they
+# must pass, and fail with the descriptor's magic broken). release.yml sets it off only for a backfill, whose commit
+# may predate those gates. Each build job uploads its files as an artifact of the calling run: client, example-esp32s3
+# and example-esp32. Actions are pinned by commit, since release.yml publishes what these jobs build.
 name: release assets
 
 on:
@@ -15,7 +15,7 @@ on:
         type: string
         required: true
       fail_on_warning:
-        description: "Fail an image build that prints a compiler warning"
+        description: "Fail an image build that prints a compiler warning, and check the example's images"
         type: boolean
         default: false
 
@@ -67,3 +67,31 @@ jobs:
         with:
           name: example-${{ matrix.target }}
           path: out/*
+
+  # udsota's image rules on the example's images, as ci.yml's image-check does for CANDash's.
+  image-check:
+    if: ${{ inputs.fail_on_warning }}
+    needs: esp32
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: images
+          merge-multiple: true
+      - name: Each image passes udsota's image rules, and fails them with its descriptor's magic broken
+        shell: bash
+        run: |
+          cmake -S . -B build
+          cmake --build build -j --target image_check_example_esp32 image_check_example_esp32s3
+          check() {   # check <image_check_ suffix> <image> <product>
+            "build/image_check_$1" "images/$2.bin" "$3"
+            cp "images/$2.bin" broken.bin
+            printf '\0' | dd of=broken.bin bs=1 seek=288 conv=notrunc status=none
+            rc=0; "build/image_check_$1" broken.bin "$3" || rc=$?
+            [ "$rc" = 3 ] || { echo "$2 with a broken descriptor gave $rc, not 3 (UDSOTA_DL_BAD_BOARD)"; exit 1; }
+          }
+          check example_esp32 example-esp32 example
+          check example_esp32s3 example-esp32s3 example
