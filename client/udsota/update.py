@@ -365,11 +365,14 @@ def flash_bootloader(uds, profile, image, img, drop_76=None, preroll=lambda: Non
                                   buses=update_buses(profile, image))
         if (why := wrong_board(profile, img, board)) is not None:
             raise Refused("%s. %s" % (why, LEFT_IN_BOOTLOADER))
+        verified = state["other_state"] == OTHER_VERIFIED and state["other_sha_prefix"] == img.elf_sha[:8]
         deltas = []
-        if bases is not None:
+        if bases is not None and not verified:
             deltas = plan_deltas(bases, image, running_sha, compress, diff_format, log=log, deflate_ok=deflate_ok)
             uds.session(SESSION_PROGRAMMING)   # building the patches, used or not, may have outlasted S3
-        need_download, recovered, resent, activated = True, False, False, True
+        if verified:
+            log("the other slot already holds this image, verified: skipping to ActivateImage")
+        need_download, recovered, resent, activated = not verified, False, False, True
         while True:
             if need_download:
                 download(uds, image, drop_76=drop_76, log=log, compress=compress, clock=clock, deltas=deltas,
