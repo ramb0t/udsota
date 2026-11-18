@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "udsota_boot_internal.h"
+#include "udsota_image.h"          /* UDSOTA_BUS */
 #include "boot/fake_port.h"
 #include "udsota.h"                 /* UDSOTA_VERSION, which F180 carries */
 #include "fixtures/boot_fixtures.h"
@@ -256,7 +257,9 @@ static bool ask_on(uint8_t bus, const uint8_t *req, size_t len)
     return send_on(bus, req, len) && answer(200u);
 }
 
-static bool ask(const uint8_t *req, size_t len) { return ask_on(1u, req, len); }
+static uint8_t g_bus = 1u;         /* the bus ask() uses */
+
+static bool ask(const uint8_t *req, size_t len) { return ask_on(g_bus, req, len); }
 
 static bool is_ans(const uint8_t *want, size_t n) { return g_len == (int)n && memcmp(g_ans, want, n) == 0; }
 
@@ -1197,8 +1200,9 @@ static void test_a_tester_frame_locks_its_bus_until_listening_again(void)
     CHECK(boot(POWER_ON) == NO_APP);                             /* an unpadded one */
     frame_on(2u, (const uint8_t[]){0x02, 0x3E, 0x00}, 3u);
     CHECK(answer(20u) && ANS(0x7E, 0x00) && fake.started == BIT(2));
-    CHECK(boot(POWER_ON) == NO_APP);                             /* no tester frames: 10 82, 10 02 with a byte */
-    CHECK(send_on(2u, REQ(0x10, 0x82)) && !answer(20u));
+    CHECK(boot(POWER_ON) == NO_APP);                             /* a 10 82 locks too, without an answer */
+    CHECK(send_on(2u, REQ(0x10, 0x82)) && !answer(20u) && fake.started == BIT(2));
+    CHECK(boot(POWER_ON) == NO_APP);                             /* no tester frame: 10 02 with a byte */
     CHECK(ask_on(2u, REQ(0x10, 0x02, 0x00)) && ask_on(2u, REQ(0x22, 0xF1, 0x86)) && fake.started == BOTH);
 }
 
@@ -1263,19 +1267,19 @@ static void test_window(void)
 }
 
 /* The window's end starts the app only while it is valid and the session is the default. A download, or a session
- * entered without a tester frame (10 82, 10 02 with a byte more), keeps the unit listening. */
+ * entered without a tester frame (10 02 with a byte more), keeps the unit listening. */
 static void test_the_window_ends_in_a_start_only_for_a_valid_app_in_the_default_session(void)
 {
     make_image(g_new, 2052u, 0x32);
     install_app(0x31);
-    CHECK(boot(POWER_ON) == WINDOW && send_on(1u, REQ(0x10, 0x82)) && !answer(10u));
+    CHECK(boot(POWER_ON) == WINDOW && ask_on(1u, REQ(0x10, 0x02, 0x00)) && SESSION_ANSWER(0x02));
     CHECK(open_download(2052u) && ask36(1u, g_new, 1024u) && ANS(0x76, 0x01));
     CHECK(ASK(0x10, 0x01) && SESSION_ANSWER(0x01));              /* the default session, the app erased */
     wait_ms(100u);
     CHECK(fake.starts == 0 && status_of() == 0x0000 && fake.started == BOTH);
 
     install(g_old, 2052u);                                       /* a valid app, the programming session */
-    CHECK(boot(POWER_ON) == WINDOW && send_on(1u, REQ(0x10, 0x82)) && !answer(10u));
+    CHECK(boot(POWER_ON) == WINDOW && ask_on(1u, REQ(0x10, 0x02, 0x00)) && SESSION_ANSWER(0x02));
     wait_ms(100u);
     CHECK(fake.starts == 0 && ASK(0x22, 0xF1, 0x86) && ANS(0x62, 0xF1, 0x86, 0x02));
     CHECK(boot(POWER_ON) == WINDOW && ASK(0x10, 0x02, 0x00) && SESSION_ANSWER(0x02));
@@ -1314,7 +1318,7 @@ static void test_bad_cfg_for_each_condition(void)
     CASE("block not a multiple of the unit", false, c->slot_write_unit = 2048u);
     CASE("header ends past the block", false, c->image_header_offset = 1024u - UDSOTA_BARE_HDR_LEN + 2u);
     CASE("header past the slot", false, c->image_header_offset = 0xFFFFFFF0u);
-    CASE("no product", false, c->product = NULL);
+    CASE("no product: any project", true, c->product = NULL);
     CASE("product past the header's 32 bytes", false, c->product = "abcdefghijklmnopqrstuvwxyz0123456");
     CASE("no boot_version", false, c->boot_version = NULL);
     CASE("hold after 0 starts", false, c->hold_after_starts = 0u);
@@ -1491,6 +1495,260 @@ static void test_init_again_with_another_configuration(void)
     CHECK(!answer(20u));
 }
 
+/* ==== Any product, F1F5 and the buses that take updates ==== */
+
+/* An image's update_buses, or its project field, changed and the CRC stamped again. */
+static void set_mask(uint8_t *img, uint32_t len, uint16_t mask)
+{
+    img[HDR + UDSOTA_BARE_HDR_UPDATE_BUSES_OFFSET] = (uint8_t)mask;
+    img[HDR + UDSOTA_BARE_HDR_UPDATE_BUSES_OFFSET + 1u] = (uint8_t)(mask >> 8);
+    restamp(img, len);
+}
+
+static void set_project(uint8_t *img, uint32_t len, const char *project)
+{
+    uint8_t *field = img + HDR + UDSOTA_BARE_HDR_DESC_OFFSET + UDSOTA_BARE_PROJECT_OFFSET;
+    memset(field, 0, 32u);
+    memcpy(field, project, strlen(project));
+    restamp(img, len);
+}
+
+/* A valid 2052-byte app with this update_buses, in g_old and installed. */
+static void install_masked(uint16_t mask, uint8_t seed)
+{
+    make_image(g_old, 2052u, seed);
+    set_mask(g_old, 2052u, mask);
+    install(g_old, 2052u);
+}
+
+/* A boot with the buses running, as a board's own init may leave them: the core must stop the ones it does not open. */
+static udsota_boot_decision_t boot_running(udsota_boot_reset_t cause)
+{
+    fake.cause = cause;
+    fake.started = BOTH;
+    g_seen = fake.n_frames;
+    return udsota_boot_init(g_cfg);
+}
+
+/* The app's 10 02 on bus 1, taken over and answered by the core. */
+static bool boot_to_the_app_session(void)
+{
+    handover_to(1u);
+    return boot(OTHER) == HANDOVER && answer(20u) && SESSION_ANSWER(0x02);
+}
+
+/* 1. cfg.product NULL: an image of any project, and every other rule kept. */
+static void test_no_product_takes_an_image_of_any_project(void)
+{
+    static udsota_boot_cfg_t any;
+    any = k_cfg;
+    any.product = NULL;
+    g_cfg = &any;
+    make_image(g_new, 2052u, 0x44);
+    set_project(g_new, 2052u, "widget");
+    CHECK(boot(POWER_ON) == NO_APP && programming());
+    CHECK(download(g_new, 2052u, 1024u) == UDSOTA_DL_OK);        /* the first 36 and FF01 both */
+    CHECK(memcmp(fake.slot, g_new, 2052u) == 0);
+    set_project(g_new, 2052u, "");                               /* no project at all */
+    CHECK(download(g_new, 2052u, 1024u) == UDSOTA_DL_OK);
+    set_project(g_new, 2052u, "abcdefghijklmnopqrstuvwxyz012345");
+    CHECK(download(g_new, 2052u, 1024u) == UDSOTA_DL_OK);
+    CHECK(boot(OTHER) == START_APP);                             /* the boot check, as ever */
+
+    make_image(g_new, 2052u, 0x45);                              /* the board, layout and IDs are still held */
+    g_new[HDR + UDSOTA_BARE_HDR_DESC_OFFSET + 6u] = 2u;
+    restamp(g_new, 2052u);
+    install(g_new, 2052u);
+    CHECK(boot(OTHER) == START_APP);
+    memset(fake.slot, 0xFF, fake.slot_size);
+    CHECK(boot(POWER_ON) == NO_APP && programming());
+    CHECK(open_download(2052u) && ask36(1u, g_new, 1024u) && NRC(0x36, 0x31));
+    CHECK(result_is(UDSOTA_DL_BAD_BOARD, 0u));
+    g_new[HDR + UDSOTA_BARE_HDR_DESC_OFFSET + 6u] = 1u;
+    g_new[HDR + UDSOTA_BARE_HDR_DESC_OFFSET + 8u] ^= 1u;         /* diag_request_id */
+    restamp(g_new, 2052u);
+    CHECK(open_download(2052u) && ask36(1u, g_new, 1024u) && NRC(0x36, 0x31));
+    CHECK(result_is(UDSOTA_DL_BAD_DIAG_IDS, 0u));
+
+    g_cfg = &k_cfg;                                              /* a product keeps its rule */
+    make_image(g_new, 2052u, 0x46);
+    set_project(g_new, 2052u, "widget");
+    CHECK(boot(POWER_ON) == NO_APP && programming());
+    CHECK(open_download(2052u) && ask36(1u, g_new, 1024u) && NRC(0x36, 0x31));
+    CHECK(result_is(UDSOTA_DL_BAD_PROJECT, 0u));
+    install(g_new, 2052u);
+    CHECK(boot(OTHER) == START_APP);                             /* but the boot check has none */
+}
+
+/* 2. F1F5: the valid installed image's project without its NUL, else 0x31 and never an answer of no bytes. */
+static void test_f1f5_answers_the_installed_projects_name(void)
+{
+    static udsota_boot_cfg_t any;                                /* any project, so the download below is taken */
+    any = k_cfg;
+    any.product = NULL;
+    g_cfg = &any;
+    CHECK(boot(POWER_ON) == NO_APP && programming());
+    CHECK(ASK(0x22, 0xF1, 0xF5) && NRC(0x22, 0x31));             /* no valid app */
+    install_app(0x22);
+    CHECK(boot_to_the_app_session());
+    CHECK(ASK(0x22, 0xF1, 0xF5) && ANS(0x62, 0xF1, 0xF5, 'e', 'x', 'a', 'm', 'p', 'l', 'e'));
+    CHECK(ASK(0x10, 0x01) && SESSION_ANSWER(0x01));
+    CHECK(ASK(0x22, 0xF1, 0xF5) && ANS(0x62, 0xF1, 0xF5, 'e', 'x', 'a', 'm', 'p', 'l', 'e'));   /* in any session */
+
+    CHECK(programming() && open_download(2052u));
+    make_image(g_new, 2052u, 0x23);
+    set_project(g_new, 2052u, "other");
+    CHECK(ask36(1u, g_new, 1024u) && ANS(0x76, 0x01));
+    CHECK(ASK(0x22, 0xF1, 0xF5) && NRC(0x22, 0x31));             /* the first erase: no valid app */
+    CHECK(ask36(2u, g_new + 1024, 1024u) && ask36(3u, g_new + 2048, 4u) && ASK(0x37) && ff01() == UDSOTA_DL_OK);
+    CHECK(ASK(0x22, 0xF1, 0xF5) && ANS(0x62, 0xF1, 0xF5, 'o', 't', 'h', 'e', 'r'));
+
+    make_image(g_old, 2052u, 0x24);                              /* a project that fills its field: all 32 bytes */
+    set_project(g_old, 2052u, "abcdefghijklmnopqrstuvwxyz012345");
+    install(g_old, 2052u);
+    CHECK(boot_to_the_app_session());
+    CHECK(ASK(0x22, 0xF1, 0xF5) && g_len == 35 && memcmp(g_ans + 3, "abcdefghijklmnopqrstuvwxyz012345", 32u) == 0);
+
+    set_project(g_old, 2052u, "");                               /* valid, with an empty project field */
+    install(g_old, 2052u);
+    CHECK(boot_to_the_app_session());
+    CHECK(status_of() == 0x0300 && ASK(0x22, 0xF1, 0xF5) && NRC(0x22, 0x31));
+}
+
+/* 3. The installed image's update_buses picks the buses the core starts, and stops the rest. */
+static void test_the_installed_mask_picks_the_buses_the_core_listens_on(void)
+{
+    static const struct {
+        uint16_t mask;
+        uint16_t open;               /* fake.started: bit b for bus b */
+    } cases[] = {
+        {0xFFFFu, BOTH},                                        /* what every image built before the field has */
+        {UDSOTA_BUS(1), BIT(1)},
+        {UDSOTA_BUS(2), BIT(2)},
+        {UDSOTA_BUS(1) | UDSOTA_BUS(2), BOTH},
+        {0x0000u, BOTH},                                        /* names none: every bus, never none */
+        {UDSOTA_BUS(3), BOTH},                                  /* names only a bus past cfg.buses */
+        {0xFFFCu, BOTH},
+        {UDSOTA_BUS(15) | UDSOTA_BUS(4), BOTH},
+        {UDSOTA_BUS(2) | UDSOTA_BUS(3), BIT(2)},                /* bus 3 is cut away, bus 2 stays */
+        {0xFFFEu, BIT(2)},
+        {0x8001u, BIT(1)},
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        install_masked(cases[i].mask, 0x61);
+        CHECK(boot_running(POWER_ON) == WINDOW && fake.started == cases[i].open);
+        KEEP_COUNT = COUNT(5);
+        CHECK(boot_running(OTHER) == HELD && fake.started == cases[i].open);
+        KEEP_COUNT = COUNT(0);
+    }
+    install_masked(UDSOTA_BUS(1), 0x62);                        /* no valid app: every bus, whatever the mask */
+    fake.slot[1500] ^= 1u;
+    CHECK(boot_running(POWER_ON) == NO_APP && fake.started == BOTH);
+    install_masked(UDSOTA_BUS(1), 0x63);                        /* a bus that does not start does not open another */
+    fake.absent = BIT(1);
+    fake.cause = POWER_ON;
+    fake.started = BIT(2);
+    CHECK(udsota_boot_init(g_cfg) == WINDOW && fake.started == 0u);
+}
+
+/* 4. While listening, a frame from a bus that is not open is ignored, a tester frame's included. */
+static void test_a_frame_from_a_bus_that_is_not_open_is_ignored(void)
+{
+    install_masked(UDSOTA_BUS(2), 0x64);
+    CHECK(boot(POWER_ON) == WINDOW && fake.started == BIT(2));
+    CHECK(send_on(1u, REQ(0x22, 0xF1, 0x86)) && !answer(20u));   /* a port that polls every bus */
+    CHECK(send_on(1u, REQ(0x10, 0x02)) && !answer(20u));         /* no answer, no lock, no hold of the window */
+    CHECK(send_on(1u, REQ(0x3E, 0x00)) && !answer(20u));
+    CHECK(ask_on(2u, REQ(0x22, 0xF1, 0x86)) && ANS(0x62, 0xF1, 0x86, 0x01) && g_ans_bus == 2u);
+    wait_ms(120u);                                               /* the window ends: the frames held nothing */
+    CHECK(fake.starts == 1);
+
+    install_masked(UDSOTA_BUS(1), 0x65);                         /* the held unit, bus 2 closed */
+    KEEP_COUNT = COUNT(5);
+    CHECK(boot(OTHER) == HELD);
+    CHECK(send_on(2u, REQ(0x10, 0x02)) && !answer(20u));
+    CHECK(ask_on(1u, REQ(0x10, 0x02)) && SESSION_ANSWER(0x02) && fake.started == BIT(1));
+}
+
+/* 5. A handover that names a bus that is not open does not decode: the core goes on to its next boot rule. */
+static void test_a_handover_to_a_bus_that_is_not_open_does_not_decode(void)
+{
+    install_masked(UDSOTA_BUS(2), 0x66);
+    handover_to(1u);
+    CHECK(boot(OTHER) == START_APP && fake.start_calls == 0 && fake.started == 0u);
+    CHECK(fake.keep[UDSOTA_KEEP_WORD_MARK] == 0u);               /* the mark is taken all the same */
+    handover_to(2u);
+    CHECK(boot(OTHER) == HANDOVER && fake.started == BIT(2));
+    CHECK(answer(20u) && SESSION_ANSWER(0x02) && g_ans_bus == 2u);
+    KEEP_COUNT = COUNT(5);
+    handover_to(1u);
+    CHECK(boot(OTHER) == HELD && fake.started == BIT(2));
+    KEEP_COUNT = COUNT(0);
+    handover_to(1u);
+    CHECK(boot(POWER_ON) == WINDOW && fake.started == BIT(2));   /* a power-on's window, from the same rule */
+    memset(fake.slot, 0xFF, fake.slot_size);
+    handover_to(1u);
+    CHECK(boot(OTHER) == HANDOVER && fake.started == BIT(1));    /* no valid app: every bus is open */
+}
+
+/* 6. A session keeps its bus; the idle exit and S3 listen by whatever is then installed. */
+static void test_a_session_keeps_its_bus_and_the_next_listen_follows_what_is_installed(void)
+{
+    install_masked(UDSOTA_BUS(2), 0x67);
+    KEEP_COUNT = COUNT(5);
+    CHECK(boot(OTHER) == HELD && fake.started == BIT(2));
+    CHECK(ASK(0x22, 0xF1, 0x86) == false);                       /* bus 1 is not open */
+    g_bus = 2u;
+    CHECK(ASK(0x3E, 0x00) && ANS(0x7E, 0x00));
+    wait_ms(5200u);                                              /* the idle exit, with the same image: still bus 2 */
+    CHECK(fake.started == BIT(2) && fake.resets == 0);
+
+    make_image(g_new, 2052u, 0x68);
+    set_mask(g_new, 2052u, UDSOTA_BUS(1));                       /* the new image takes bus 1 only */
+    CHECK(programming() && open_download(2052u));
+    CHECK(ask36(1u, g_new, 1024u) && ANS(0x76, 0x01));
+    CHECK(fake.started == BIT(2));                               /* the first erase reopens nothing */
+    CHECK(ask36(2u, g_new + 1024, 1024u) && ask36(3u, g_new + 2048, 4u) && ASK(0x37) && ANS(0x77));
+    CHECK(ff01() == UDSOTA_DL_OK && fake.started == BIT(2));     /* nor does a pass that closes this bus */
+    CHECK(ASK(0x22, 0xF1, 0xF5) && ANS(0x62, 0xF1, 0xF5, 'e', 'x', 'a', 'm', 'p', 'l', 'e'));   /* still served */
+    wait_ms(5200u);                                              /* S3 */
+    CHECK(fake.started == BIT(1) && fake.resets == 0);           /* the new image's mask */
+    CHECK(send_on(2u, REQ(0x22, 0xF1, 0x86)) && !answer(20u));
+    CHECK(ask_on(1u, REQ(0x22, 0xF1, 0x86)) && ANS(0x62, 0xF1, 0x86, 0x01));
+}
+
+/* A session entered with 10 82 is locked to its bus: an FF01 that closes the bus does not move the filter, and a
+ * 10 02 from the other bus is not taken. */
+static void test_a_10_82_session_keeps_its_bus(void)
+{
+    install_masked(UDSOTA_BUS(1) | UDSOTA_BUS(2), 0x6B);
+    KEEP_COUNT = COUNT(5);
+    CHECK(boot(OTHER) == HELD);
+    CHECK(send_on(1u, REQ(0x10, 0x82)) && !answer(20u) && fake.started == BIT(1));
+    make_image(g_new, 2052u, 0x6C);
+    set_mask(g_new, 2052u, UDSOTA_BUS(2));                       /* the new image closes this bus */
+    g_bus = 1u;
+    CHECK(open_download(2052u) && ask36(1u, g_new, 1024u) && ANS(0x76, 0x01));
+    CHECK(ask36(2u, g_new + 1024, 1024u) && ask36(3u, g_new + 2048, 4u) && ASK(0x37) && ANS(0x77));
+    CHECK(ff01() == UDSOTA_DL_OK && fake.started == BIT(1));
+    CHECK(send_on(2u, REQ(0x10, 0x02)) && !answer(20u) && fake.started == BIT(1));
+}
+
+/* 7. A failed download leaves no valid app, so every bus is open again when its session ends. */
+static void test_a_failed_download_leaves_every_bus_open(void)
+{
+    install_masked(UDSOTA_BUS(2), 0x69);
+    KEEP_COUNT = COUNT(5);
+    CHECK(boot(OTHER) == HELD && fake.started == BIT(2));
+    g_bus = 2u;
+    make_image(g_new, 2052u, 0x6A);
+    CHECK(programming() && open_download(2052u) && ask36(1u, g_new, 1024u) && ANS(0x76, 0x01));
+    CHECK(fake.started == BIT(2));
+    wait_ms(5200u);
+    CHECK(fake.started == BOTH && fake.resets == 0);
+    CHECK(ask_on(1u, REQ(0x22, 0xF1, 0x86)) && ANS(0x62, 0xF1, 0x86, 0x01));
+}
+
 #define TEST(fn) {#fn, fn}
 static const struct {
     const char *name;
@@ -1543,6 +1801,14 @@ static const struct {
     TEST(test_init_again_in_the_reset_delay),
     TEST(test_stopped_after_a_reset_returns),
     TEST(test_init_again_with_another_configuration),
+    TEST(test_no_product_takes_an_image_of_any_project),
+    TEST(test_f1f5_answers_the_installed_projects_name),
+    TEST(test_the_installed_mask_picks_the_buses_the_core_listens_on),
+    TEST(test_a_frame_from_a_bus_that_is_not_open_is_ignored),
+    TEST(test_a_handover_to_a_bus_that_is_not_open_does_not_decode),
+    TEST(test_a_session_keeps_its_bus_and_the_next_listen_follows_what_is_installed),
+    TEST(test_a_10_82_session_keeps_its_bus),
+    TEST(test_a_failed_download_leaves_every_bus_open),
 };
 
 int main(void)
@@ -1553,6 +1819,7 @@ int main(void)
         g_cfg = &k_cfg;
         g_seen = 0;
         g_78s = 0;
+        g_bus = 1u;
         k_tests[i].fn();
         CHECK(fake.bad == 0);
         CHECK(g_78s == 0);

@@ -15,7 +15,8 @@ typedef struct {
 /* The valid app is the boot check's result at udsota_boot_init (udsota_boot.h). Afterwards it is the core's flag: a
  * download's first erase clears it and a passing FF01 sets it, and the boot check runs again only at the next
  * udsota_boot_init. F1F0's running state (3 or 0), F189 and F1F3 (0.0.0 and 32 zero bytes without it; 0.0.0 too for
- * an app stamped with no version) and both session exits use the flag. */
+ * an app stamped with no version), F1F5 (0x31 without it) and both session exits use the flag, and so does the set of
+ * open buses (udsota_boot.h): the installed image's update_buses with it, every bus without. */
 
 /* The boot rules as a pure function. udsota_boot_init calls it with the inputs as read. Both session exits call it
  * with handover_ok false, cause OTHER, app_valid the core's flag and count_word read again from its keep word.
@@ -34,14 +35,15 @@ udsota_boot_decision_t udsota_boot_decide(const udsota_boot_cfg_t *cfg, const ud
  *    header_version below 1, or a bit of UDSOTA_BARE_HDR_FLAGS_MUST set (version 1 defines none);
  *  - UDSOTA_DL_TOO_BIG: an image_length past cfg.slot_size;
  *  - UDSOTA_DL_BAD_HEADER: an image_length other than mem_size, not a multiple of 4, or ending before the header does;
- *  - UDSOTA_DL_BAD_PROJECT: a project other than cfg.product;
+ *  - UDSOTA_DL_BAD_PROJECT: a project other than cfg.product; there is no such rule when cfg.product is NULL;
  *  - UDSOTA_DL_BAD_BOARD: a descriptor magic other than UDSOTA_IMG_DESC_MAGIC, desc_version 0, or a hw_id other than
  *    cfg.hw_id;
  *  - UDSOTA_DL_BAD_LAYOUT: a partition_layout_id other than cfg.layout_id;
  *  - UDSOTA_DL_BAD_DIAG_IDS: a diag_request_id other than cfg.request_id, or a diag_response_id other than
  *    cfg.response_id.
  * There is no version rule: any version is taken, older included, and the descriptor's release flag is not read. It
- * reads no reserved byte, no flag in the low byte, and not the signature. The first 36 runs it before anything is
+ * reads no reserved byte (update_buses is no rule: any mask is taken), no flag in the low byte, and not the signature.
+ * The first 36 runs it before anything is
  * erased, and a failure answers that 36 with 0x31 and puts the reason in F1F1. FF01 runs it on the bytes in the slot,
  * with the download's mem_size, before the CRC, so when both fail its reason is the status. */
 udsota_reason_t udsota_boot_image_rules(const udsota_boot_cfg_t *cfg, const uint8_t *hdr, uint32_t hdr_len,

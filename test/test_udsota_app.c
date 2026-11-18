@@ -1,7 +1,8 @@
 /* Unit test of the app's side of a udsota bootloader (udsota_app.h), built as an app builds it, with the repository
  * root its one include path and no iso14229 or core: udsota_app_classify's four results whatever the padding, both
  * answers byte for byte, and the keep words udsota_app_write_handover and udsota_app_clear_start_count write, in
- * order, through a port that records them. */
+ * order, through a port that records them; and the buses that take updates under the app's own header
+ * (udsota_app_bus_open, and the rule it shares with the bootloader, udsota_image_bus_open). */
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -18,6 +19,9 @@ static int g_failures;
     } while (0)
 
 #define REQ 0x710u
+
+/* The app's own header, taking updates on buses 1 and 3. */
+UDSOTA_IMAGE_HEADER_BUSES(UDSOTA_BUS(1) | UDSOTA_BUS(3), 1, 1, REQ, 0x718, "1.0.0", "example");
 
 /* ---- The port: every keep-word write, in order ---- */
 
@@ -127,11 +131,53 @@ static void keep_word_cases(void)
     CHECK(s_nwrites == 1u && wrote(0, UDSOTA_KEEP_WORD_COUNT, 0xA500u));
 }
 
+/* ---- The buses that take updates ---- */
+
+static void bus_cases(void)
+{
+    CHECK(UDSOTA_BUS(1) == 0x0001u && UDSOTA_BUS(2) == 0x0002u && UDSOTA_BUS(15) == 0x4000u);
+    CHECK(udsota_image_header.update_buses == 0x0005u && UDSOTA_BARE_HDR_UPDATE_BUSES_OFFSET == 16u);
+    CHECK(sizeof(udsota_image_header_t) == UDSOTA_BARE_HDR_LEN);
+    /* The app's helper, on a board of 4 buses: its header's mask. */
+    CHECK(udsota_app_bus_open(1u, 4u) && !udsota_app_bus_open(2u, 4u) && udsota_app_bus_open(3u, 4u) &&
+          !udsota_app_bus_open(4u, 4u));
+    CHECK(!udsota_app_bus_open(0u, 4u) && !udsota_app_bus_open(5u, 4u));
+    /* Cut to 2 buses the mask names bus 1 only; cut to 1 bus, bus 1; cut to 3, buses 1 and 3. */
+    CHECK(udsota_app_bus_open(1u, 2u) && !udsota_app_bus_open(2u, 2u) && !udsota_app_bus_open(3u, 2u));
+    CHECK(udsota_app_bus_open(1u, 1u));
+    CHECK(udsota_app_bus_open(3u, 3u) && !udsota_app_bus_open(2u, 3u));
+
+    /* The shared rule, edge cases by name. */
+    CHECK(udsota_image_bus_open(0xFFFFu, 2u, 1u) && udsota_image_bus_open(0xFFFFu, 2u, 2u));   /* every bus */
+    CHECK(udsota_image_bus_open(0x0000u, 2u, 1u) && udsota_image_bus_open(0x0000u, 2u, 2u));   /* names none */
+    CHECK(udsota_image_bus_open(UDSOTA_BUS(3), 2u, 1u) && udsota_image_bus_open(UDSOTA_BUS(3), 2u, 2u));
+    CHECK(udsota_image_bus_open(0xFFFCu, 2u, 1u) && udsota_image_bus_open(0xFFFCu, 2u, 2u));   /* only buses past 2 */
+    CHECK(!udsota_image_bus_open(UDSOTA_BUS(2) | UDSOTA_BUS(3), 2u, 1u) &&
+          udsota_image_bus_open(UDSOTA_BUS(2) | UDSOTA_BUS(3), 2u, 2u));                       /* cut to the board */
+    CHECK(udsota_image_bus_open(UDSOTA_BUS(15), 15u, 15u) && !udsota_image_bus_open(UDSOTA_BUS(15), 15u, 14u));
+    CHECK(udsota_image_bus_open(0x0000u, 15u, 15u));
+    CHECK(!udsota_image_bus_open(0xFFFFu, 2u, 0u) && !udsota_image_bus_open(0xFFFFu, 2u, 3u));   /* never outside */
+    /* Against a plain statement of the rule, for every mask on boards of 1 to 15 buses. */
+    int bad = 0;
+    for (uint32_t mask = 0; mask <= 0xFFFFu; mask++) {
+        for (uint8_t buses = 1; buses <= 15u; buses++) {
+            const uint32_t all = (1u << buses) - 1u;
+            const uint32_t eff = ((mask & all) != 0u) ? (mask & all) : all;
+            for (uint8_t bus = 0; bus <= 16u; bus++) {
+                const bool want = bus >= 1u && bus <= buses && ((eff >> (bus - 1u)) & 1u) != 0u;
+                bad += udsota_image_bus_open((uint16_t)mask, buses, bus) != want;
+            }
+        }
+    }
+    CHECK(bad == 0);
+}
+
 int main(void)
 {
     classify_cases();
     answer_cases();
     keep_word_cases();
+    bus_cases();
     if (g_failures != 0) {
         fprintf(stderr, "%d check(s) failed\n", g_failures);
         return 1;

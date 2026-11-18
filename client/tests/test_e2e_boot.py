@@ -62,8 +62,10 @@ def boot(binary, tmp_path, monkeypatch):
     monkeypatch.setattr(update, "BOOT_POLL_S", 0.2)
     servers = []
 
-    def start(*args, image=None):
+    def start(*args, image=None, any_product=False):
         n = len(servers)
+        if "--product" not in args and not any_product:   # no product: any project; most tests hold to "example"
+            args = ("--product", EXAMPLE["product"], *args)
         slot = [] if image is None else ["--image", image_file(tmp_path, image, "installed%d.bin" % n)]
         servers.append(DemoServer(binary, [*slot, *args], tmp_path / ("server%d.log" % n)))
         return servers[-1]
@@ -73,10 +75,12 @@ def boot(binary, tmp_path, monkeypatch):
         assert s.stop() == 0, s.log()
 
 
-# The path of a bootloader-flow profile for identity (EXAMPLE's keys) under tmp_path.
-def profile_file(tmp_path, identity=EXAMPLE):
+# The path of a bootloader-flow profile for identity (EXAMPLE's keys) under tmp_path; with any_product, one that names
+# no product, as a bootloader built for none takes.
+def profile_file(tmp_path, identity=EXAMPLE, any_product=False):
     path = tmp_path / "boot.toml"
-    path.write_text(PROFILE % identity)
+    text = PROFILE % identity
+    path.write_text(text.replace('product = "%s"\n' % identity["product"], "") if any_product else text)
     return str(path)
 
 
@@ -383,3 +387,75 @@ def test_identity_passed_as_arguments(boot, tmp_path):
     assert flash(s, prof, image_file(tmp_path, new)) == 0
     assert "program 0x390 bytes at 0x1000" in s.log()
     assert app_prefix(s, prof) == bare_id(new, 0x180)[:4]
+
+
+# An image of the example identity for project, which a server started with no product takes.
+def of_project(project, version="1.0.0"):
+    return build_bare_image(header_offset=EXAMPLE["offset"], size=5000, version=version, product=project)
+
+
+# Check a bootloader started with no product (the server without --product) takes an image of any project into an
+# empty slot, and F1F5 then reads that project; `info` prints it, and prints that there is none before.
+def test_a_bootloader_for_no_product_takes_any_project(boot, tmp_path, capsys):
+    s = boot(any_product=True)
+    prof = profile_file(tmp_path, any_product=True)
+    assert run_cli(s, ["--profile", prof, "--interface", "pipe", "info"]) == 0
+    assert "F1F5 installed project: none" in capsys.readouterr().out
+    first = of_project("widget")
+    assert flash(s, prof, image_file(tmp_path, first)) == 0
+    assert app_prefix(s, prof) == bare_id(first)[:4]
+    with pipe(s, prof) as t:
+        u = t.uds()
+        u.session(wire.SESSION_PROGRAMMING)        # the app answers no F1F5: the bootloader does
+        assert u.read_did(wire.DID_PROJECT) == b"widget"
+    capsys.readouterr()
+    assert run_cli(s, ["--profile", prof, "--interface", "pipe", "info"]) == 0
+    assert "F1F5 installed project: widget" in capsys.readouterr().out
+
+
+# Check flash of another project over an installed one is refused with the unit left in its bootloader and nothing
+# erased, naming both projects and the flag; the same project needs no flag, and --allow-product-change replaces it.
+def test_a_product_change_is_refused_unless_allowed(boot, tmp_path, capsys):
+    installed, other, same = of_project("widget"), of_project("gadget", "2.0.0"), of_project("widget", "1.1.0")
+    s = boot(any_product=True, image=installed)
+    prof = profile_file(tmp_path, any_product=True)
+    assert app_prefix(s, prof) == bare_id(installed)[:4]
+    capsys.readouterr()
+    assert flash(s, prof, image_file(tmp_path, other)) == 2
+    err = capsys.readouterr().err
+    assert "'widget'" in err and "'gadget'" in err and "--allow-product-change" in err
+    assert "The unit is in its bootloader" in err and "erase 0x" not in s.log()
+    assert flash(s, prof, image_file(tmp_path, same)) == 0
+    assert app_prefix(s, prof) == bare_id(same)[:4]
+    assert flash(s, prof, image_file(tmp_path, other), "--allow-product-change") == 0
+    assert "changing the unit's project from 'widget' to 'gadget'" in capsys.readouterr().out
+    assert app_prefix(s, prof) == bare_id(other)[:4]
+    with pipe(s, prof) as t:
+        u = t.uds()
+        u.session(wire.SESSION_PROGRAMMING)
+        assert u.read_did(wire.DID_PROJECT) == b"gadget"
+
+
+# Check the stand-in app stays silent on a bus its image's update_buses closes (--buses 2 --bus 2 --image-buses 1), so
+# flash gets no answer from it, and takes the update when the mask names the bus (--image-buses 2).
+def test_an_app_is_silent_on_a_bus_its_image_closes(boot, tmp_path, capsys):
+    prof = profile_file(tmp_path)
+    closed = boot("--buses", "2", "--bus", "2", "--image-buses", "1", image=bare("1.0.0"))
+    assert app_prefix(closed, prof, timeout=2.0) is None
+    open_ = boot("--buses", "2", "--bus", "2", "--image-buses", "2", image=bare("1.0.0"))
+    assert app_prefix(open_, prof) == bare_id(bare("1.0.0"))[:4]
+    assert flash(open_, prof, image_file(tmp_path, bare("1.1.0"))) == 0
+
+
+# Check a bootloader that is built for a product still refuses another project's image in its first block (the client
+# is given a profile with no product here, so its own check does not stop it), and a flash of the product's own
+# image needs no flag over an installed app of it.
+def test_a_bootloader_with_a_product_still_refuses_another_project(boot, tmp_path, capsys):
+    installed = bare("1.0.0")
+    s = boot(image=installed)
+    prof = profile_file(tmp_path, any_product=True)
+    assert flash(s, prof, image_file(tmp_path, of_project("widget", "2.0.0"))) == 2
+    assert "--allow-product-change" in capsys.readouterr().err
+    assert flash(s, prof, image_file(tmp_path, of_project("widget", "2.0.0")), "--allow-product-change") == 1
+    assert "service 0x36 answered NRC 0x31" in capsys.readouterr().err      # the first block: DL_BAD_PROJECT
+    assert flash(s, prof, image_file(tmp_path, bare("1.1.0"))) == 0

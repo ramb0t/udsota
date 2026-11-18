@@ -11,6 +11,7 @@ SESSION_PROGRAMMING, SESSION_EXTENDED = 0x02, 0x03
 DID_SESSION, DID_VERSION, DID_DEVICE_ID = 0xF186, 0xF189, 0xF18C
 DID_STATUS, DID_RESULT, DID_COUNTERS, DID_RUNNING_SHA = 0xF1F0, 0xF1F1, 0xF1F2, 0xF1F3
 DID_IMAGE_PREFIX = 0xF1F4        # 4 B: F1F3's first 4 bytes, from a bootloader-flow unit's app once it is healthy
+DID_PROJECT = 0xF1F5             # a bootloader unit's installed app's project string, without its NUL; 0x31 with none
 RID_CHECK_DEPS, RID_ACTIVATE, RID_CONFIRM = 0xFF01, 0xF001, 0xF002
 NRC_NOT_SUPPORTED, NRC_BUSY, NRC_CONDITIONS, NRC_SEQUENCE = 0x11, 0x21, 0x22, 0x24   # 0x11: e.g. 0x2E, no config writes
 NRC_OUT_OF_RANGE, NRC_TIME_DELAY, NRC_PENDING = 0x31, 0x37, 0x78

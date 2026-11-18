@@ -9,7 +9,7 @@ from .errors import NoResponse, Nrc, Refused, SendFailed, UpdateFailed
 from .image import parse_image
 from .keys import DeviceKeys, SigningKeys
 from .pack import build_patch, encode, rank_deltas, refuse_bare_delta
-from .wire import (DID_COUNTERS, DID_DEVICE_ID, DID_IMAGE_PREFIX, DID_RESULT, DID_RUNNING_SHA, DID_SESSION,
+from .wire import (DID_COUNTERS, DID_DEVICE_ID, DID_IMAGE_PREFIX, DID_PROJECT, DID_RESULT, DID_RUNNING_SHA, DID_SESSION,
                    DID_STATUS, DID_VERSION, DL_DFI, DL_DFI_DEFLATE, DL_DFI_DELTA, DL_DFI_DELTA_DEFLATE,
                    IMG_PENDING_VERIFY, IMG_STATES, NRC_CONDITIONS, NRC_NOT_ACCEPTED, NRC_OUT_OF_RANGE,
                    NRC_PROGRAMMING_FAILURE, NRC_SEQUENCE, OTHER_VERIFIED, RID_ACTIVATE, RID_CHECK_DEPS, RID_CONFIRM,
@@ -47,6 +47,7 @@ ACTIVATE_CONDITIONS = ("ActivateImage refused (0x22): the server's conditions ar
 LEFT_IN_BOOTLOADER = ("The unit is in its bootloader and returns to its app when its programming session times "
                       "out, unless it is held there")
 WAIT_NEEDS_BOOTLOADER = '--wait-for-unit is for [update] flow = "bootloader"'
+PRODUCT_NEEDS_BOOTLOADER = '--allow-product-change is for [update] flow = "bootloader"'
 # What a --wait-for-unit that gives up adds: 10 02s the CAN adapter could not send while the unit was off stay queued.
 WAIT_QUEUED = ("If the unit is off, 10 02s still queued in the CAN adapter will hold it in its bootloader for about "
                "5 s at its next power-up, once; taking the interface down and up clears them")
@@ -67,9 +68,19 @@ def read_record(uds, did):
         return None
 
 
+# The installed app's project as the bootloader's F1F5 gives it, or None: any negative answer means no valid app (or
+# no project in it), or a bootloader that does not know the DID or denies reads before the unlock.
+def installed_project(uds):
+    try:
+        d = uds.read_did(DID_PROJECT)
+    except Nrc:
+        return None
+    return cstr(d) if d else None
+
+
 # `info`: the server-owned DIDs, then the profile's [dids] in file order; a range stops at its first absent DID.
-# Under flow "bootloader" it enters the programming session first, since the unit's app answers no reads, and sends
-# no reset after.
+# Under flow "bootloader" it enters the programming session first, since the unit's app answers no reads, reads F1F5
+# after the server-owned DIDs, and sends no reset after.
 def info(uds, profile, log=print):
     bootloader = profile.flow == "bootloader"
     if bootloader:
@@ -78,6 +89,10 @@ def info(uds, profile, log=print):
         d = read_record(uds, did)
         name = name % id_name(profile) if did == DID_RUNNING_SHA else name
         log("%04X %s: %s" % (did, name, "not supported" if d is None else render(d)))
+    if bootloader:
+        project = installed_project(uds)
+        log("%04X installed project: %s" % (DID_PROJECT, "none (no valid app, or the bootloader does not report it)"
+                                            if project is None else project))
     for entry in profile.dids:
         for did in range(entry.first, entry.last + 1):
             d = read_record(uds, did)
@@ -411,9 +426,11 @@ def device_keys(uds, profile, secret):
 # wait_for_unit (seconds, --wait-for-unit), which that flow alone takes, has it catch the unit's power-up window.
 def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep=time.sleep,
           clock=time.monotonic, log=print, quiet=contextlib.nullcontext, compress=None, bases=None,
-          diff_format="auto", wait_for_unit=None):
+          diff_format="auto", wait_for_unit=None, allow_product_change=False):
     if wait_for_unit is not None and profile.flow != "bootloader":
         raise Refused(WAIT_NEEDS_BOOTLOADER)
+    if allow_product_change and profile.flow != "bootloader":
+        raise Refused(PRODUCT_NEEDS_BOOTLOADER)
     if bases is not None and drop_76 is not None:
         raise Refused("--drop-76 is for full and compressed downloads, not with --diff-from")
     if bases is not None:
@@ -427,7 +444,8 @@ def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep
     if profile.flow == "bootloader":
         return flash_bootloader(uds, profile, image, img, secret, drop_76=drop_76, preroll=preroll, sleep=sleep,
                                 clock=clock, log=log, quiet=quiet, compress=compress, bases=bases,
-                                diff_format=diff_format, deflate_ok=deflate_ok, wait_for_unit=wait_for_unit)
+                                diff_format=diff_format, deflate_ok=deflate_ok, wait_for_unit=wait_for_unit,
+                                allow_product_change=allow_product_change)
     status = read_record(uds, DID_STATUS)
     if status is None:                        # 0x31: no udsota status DID, so no udsota server
         raise Refused(NOT_UDSOTA)
@@ -493,11 +511,14 @@ def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep
 # unanswered, such as a bootloader's 7F 22 31 to one the adapter held, is passed over ahead of it (Uds.exchange).
 # Then, all in the programming session, the precheck reads, the unlock, download, FF01, ActivateImage and
 # wait_for_start, the proof of life; no ConfirmImage. An image the unit already holds gets 11 01 and the same proof.
-# quiet() is held from the 10 02, which stops the app.
+# quiet() is held from the 10 02, which stops the app. The precheck includes F1F5, the installed app's project: an
+# image of another project is refused, with the unit left in its bootloader, unless allow_product_change
+# (--allow-product-change), which logs both names and goes on. Any negative answer to F1F5 goes on: nothing is
+# installed, or the bootloader does not know the DID.
 # With wait_for_unit, wait_for_power_up sends the 10 02.
 def flash_bootloader(uds, profile, image, img, secret, drop_76=None, preroll=lambda: None, sleep=time.sleep,
                      clock=time.monotonic, log=print, quiet=contextlib.nullcontext, compress="none", bases=None,
-                     diff_format="auto", deflate_ok=True, wait_for_unit=None):
+                     diff_format="auto", deflate_ok=True, wait_for_unit=None, allow_product_change=False):
     try:
         prefix = uds.read_did(DID_IMAGE_PREFIX)
     except (Nrc, NoResponse, SendFailed):    # 0x31 from the bootloader, or an app that is not healthy
@@ -515,9 +536,15 @@ def flash_bootloader(uds, profile, image, img, secret, drop_76=None, preroll=lam
             raise Refused("%s %s" % (NOT_UDSOTA, LEFT_IN_BOOTLOADER))
         state = decode_status(status)
         running_sha = uds.read_did(DID_RUNNING_SHA)
+        installed = installed_project(uds)       # a 22 of its own: a request for several DIDs fails whole
         board = None if profile.board_did is None else cstr(uds.read_did(profile.board_did))
         keys = device_keys(uds, profile, secret)
         unlock_programming(uds, profile, keys)
+        if installed is not None and installed != img.project:
+            if not allow_product_change:
+                raise Refused("the unit runs project %r and the image is project %r: pass --allow-product-change to "
+                              "replace one with the other. %s" % (installed, img.project, LEFT_IN_BOOTLOADER))
+            log("changing the unit's project from %r to %r (--allow-product-change)" % (installed, img.project))
         held = state["flags"] & STATUS_BOOT_HELD
         if held:
             log("the unit is held in its bootloader: its app failed to start")

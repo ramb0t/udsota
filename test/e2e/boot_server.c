@@ -8,10 +8,12 @@
  *
  *     udsota_boot_server [--req-id N] [--resp-id N] [--product NAME] [--hw-id N] [--layout-id N] [--slot-size N]
  *                        [--header-offset N] [--write-unit N] [--boot-version TEXT] [--image FILE] [--hang ID]
- *                        [--no-handover] [--power-cycle-after N] [--fail-erase N]
+ *                        [--no-handover] [--power-cycle-after N] [--fail-erase N] [--buses N] [--bus N]
+ *                        [--image-buses MASK]
  *
- * The identity and geometry default to udsota's example: 0x710 and 0x718, "example", hw_id 1, layout 1, a 0x20000
- * slot, the header at 0x100, a write unit of 2, bootloader "1.0.0". Numbers take 0x for hex. The policy is the
+ * The identity and geometry default to udsota's example: 0x710 and 0x718, hw_id 1, layout 1, a 0x20000 slot, the
+ * header at 0x100, a write unit of 2, bootloader "1.0.0". Without --product the core takes an image of any project
+ * (cfg.product NULL); --product NAME holds images to NAME. Numbers take 0x for hex. The policy is the
  * header's example: a 100 ms power-up window, a hold after 5 starts, a 1000 ms watchdog. --image installs a stamped
  * bare image (none: an empty slot), and the process starts as a power-on. A reset or power cycle is a boot after
  * 300 ms of silence; frames sent meanwhile wait, as frames nothing acknowledges do on a bus, and reach whichever runs
@@ -21,6 +23,12 @@
  * watchdog resets it until the start count holds the unit; --no-handover makes the app answer 7F 10 78 and reset
  * without writing the handover, so it comes back up as the app; --power-cycle-after N power-cycles the unit in place of
  * the app's answer to its Nth 10 02; --fail-erase N fails the Nth erase. Frames lost on the bus are the pipe's to drop.
+ *
+ * Buses: the pipe is one bus of the board's --buses N (default 1), the one --bus N (default 1) names, so a mask
+ * in the installed image's header can close it. --image-buses MASK sets update_buses (an OR of 1 << (bus - 1)) in the
+ * --image file's header and stamps its CRC again. The core and the stand-in app both read the installed image's
+ * mask by udsota_image_bus_open: on a closed bus the core ignores the pipe's frames and the app is silent. (With one
+ * bus a mask is cut to nothing and means every bus.)
  *
  * Logs go to stderr only. It exits 0 at stdin's end, SIGTERM or SIGINT, 1 if the core broke the port's contract
  * (fake_port.h) or reading stdin failed, 2 for bad arguments or a configuration the core refuses. */
@@ -38,9 +46,9 @@
 #include "iso14229.h"
 #include "udsota_app.h"
 #include "udsota_boot.h"
+#include "udsota_boot_internal.h"   /* udsota_boot_crc32, to restamp an image whose update_buses --image-buses sets */
 
-#define BUS        1u     /* the pipe is one bus */
-#define QUEUE      64u    /* frames waiting for the unit */
+#define QUEUE     64u    /* frames waiting for the unit */
 #define BOOT_MS    300u   /* from a reset or power cycle to the boot */
 #define HEALTHY_MS 200u   /* from the app's start to its healthy mark */
 
@@ -51,10 +59,11 @@ typedef struct {
 } frame_t;
 
 static udsota_boot_cfg_t s_cfg = {
-    .request_id = 0x710u, .response_id = 0x718u, .product = "example", .hw_id = 1u, .layout_id = 1u,
+    .request_id = 0x710u, .response_id = 0x718u, .product = NULL, .hw_id = 1u, .layout_id = 1u,
     .boot_version = "1.0.0", .buses = 1u, .slot_size = 0x20000u, .slot_write_unit = 2u, .image_header_offset = 0x100u,
     .window_ms = 100u, .hold_after_starts = 5u, .watchdog_ms = 1000u,
 };
+static uint8_t  s_bus = 1u;          /* the bus the pipe is, 1 to s_cfg.buses */
 static uint32_t s_power_cycle_after, s_fail_erase;
 static uint8_t  s_hang[32];
 static int      s_hang_len;
@@ -187,11 +196,20 @@ void udsota_app_port_keep_write(uint8_t word, uint16_t value)
     }
 }
 
-/* One frame to the app, which takes only the two requests udsota_app.h names. A hung app takes nothing. */
+/* Whether the pipe's bus takes updates under the installed image's header, by the rule the app's own helper
+ * (udsota_app_bus_open) applies to the header it was built with. */
+static bool app_bus_open(void)
+{
+    const uint8_t *h = fake.slot + s_cfg.image_header_offset + UDSOTA_BARE_HDR_UPDATE_BUSES_OFFSET;
+    return udsota_image_bus_open((uint16_t)(h[0] | (h[1] << 8)), s_cfg.buses, s_bus);
+}
+
+/* One frame to the app, which takes only the two requests udsota_app.h names, and only on a bus that takes updates.
+ * A hung app takes nothing. */
 static void app_frame(const frame_t *f)
 {
     uint8_t a[8];
-    if (U.hung) {
+    if (U.hung || !app_bus_open()) {
         return;
     }
     switch (udsota_app_classify(s_cfg.request_id, f->id, true, f->data, f->len)) {
@@ -203,7 +221,7 @@ static void app_frame(const frame_t *f)
         udsota_app_answer_pending(a);
         out(s_cfg.response_id, a, 8u);
         if (!s_no_handover) {
-            udsota_app_write_handover(BUS);
+            udsota_app_write_handover(s_bus);
         }
         udsota_app_clear_start_count();                  /* before every deliberate reset */
         power_off(UDSOTA_BOOT_RESET_OTHER, s_no_handover ? "the app resets without a handover (--no-handover)"
@@ -250,7 +268,7 @@ static void step(void)
             app_frame(f);
         } else {
             fake.us = (uint32_t)now_us();
-            udsota_boot_rx(BUS, f->id, f->data, f->len);
+            udsota_boot_rx(s_bus, f->id, f->data, f->len);
             after_core();
         }
     }
@@ -340,6 +358,29 @@ static uint32_t number(const char *opt, const char *s, unsigned long max)
     return (uint32_t)v;
 }
 
+/* The installed image's update_buses set to mask and its CRC stamped again; exits 2 when its header is not whole. The
+ * image_id stays as stamped: the core never reads it, and the app reports it as it is. */
+static void set_image_buses(uint32_t mask)
+{
+    uint8_t *const hdr = fake.slot + s_cfg.image_header_offset;
+    const uint32_t at = s_cfg.image_header_offset + UDSOTA_BARE_HDR_CRC_OFFSET;
+    const uint32_t len = (uint32_t)hdr[UDSOTA_BARE_HDR_LENGTH_OFFSET] |
+                         ((uint32_t)hdr[UDSOTA_BARE_HDR_LENGTH_OFFSET + 1u] << 8) |
+                         ((uint32_t)hdr[UDSOTA_BARE_HDR_LENGTH_OFFSET + 2u] << 16) |
+                         ((uint32_t)hdr[UDSOTA_BARE_HDR_LENGTH_OFFSET + 3u] << 24);
+    if (s_cfg.image_header_offset + UDSOTA_BARE_HDR_LEN > s_cfg.slot_size || len > s_cfg.slot_size ||
+        len < at + 4u) {
+        fputs("udsota_boot_server: --image-buses needs a stamped image: its image_length is not the image's\n", stderr);
+        exit(2);
+    }
+    hdr[UDSOTA_BARE_HDR_UPDATE_BUSES_OFFSET] = (uint8_t)mask;
+    hdr[UDSOTA_BARE_HDR_UPDATE_BUSES_OFFSET + 1u] = (uint8_t)(mask >> 8);
+    const uint32_t crc = udsota_boot_crc32(udsota_boot_crc32(0u, fake.slot, at), fake.slot + at + 4u, len - at - 4u);
+    for (uint32_t i = 0; i < 4u; i++) {
+        fake.slot[at + i] = (uint8_t)(crc >> (8u * i));
+    }
+}
+
 /* FILE into the erased slot; exits 2 when it cannot be read, is empty or is larger than the slot. */
 static void install(const char *path)
 {
@@ -366,13 +407,16 @@ int main(int argc, char **argv)
         {"boot-version", required_argument, NULL, 'V'},  {"image", required_argument, NULL, 'i'},
         {"hang", required_argument, NULL, 'H'},          {"no-handover", no_argument, NULL, 'n'},
         {"power-cycle-after", required_argument, NULL, 'P'}, {"fail-erase", required_argument, NULL, 'e'},
+        {"buses", required_argument, NULL, 'B'},         {"bus", required_argument, NULL, 'b'},
+        {"image-buses", required_argument, NULL, 'U'},
         {NULL, 0, NULL, 0},
     };
     static const char k_usage[] =
         "usage: udsota_boot_server [--req-id N] [--resp-id N] [--product NAME] [--hw-id N] [--layout-id N] "
         "[--slot-size N] [--header-offset N] [--write-unit N] [--boot-version TEXT] [--image FILE] [--hang ID] "
-        "[--no-handover] [--power-cycle-after N] [--fail-erase N]\n";
+        "[--no-handover] [--power-cycle-after N] [--fail-erase N] [--buses N] [--bus N] [--image-buses MASK]\n";
     const char *image_path = NULL;
+    int64_t image_buses = -1;
     int c;
     while ((c = getopt_long(argc, argv, "", opts, NULL)) != -1) {
         switch (c) {
@@ -396,10 +440,13 @@ int main(int argc, char **argv)
         case 'n': s_no_handover = true; break;
         case 'P': s_power_cycle_after = number("--power-cycle-after", optarg, 1000000u); break;
         case 'e': s_fail_erase = number("--fail-erase", optarg, 1000000u); break;
+        case 'B': s_cfg.buses = (uint8_t)number("--buses", optarg, 15u); break;
+        case 'b': s_bus = (uint8_t)number("--bus", optarg, 15u); break;
+        case 'U': image_buses = number("--image-buses", optarg, 0xFFFFu); break;
         default:  fputs(k_usage, stderr); return 2;
         }
     }
-    if (optind != argc) {
+    if (optind != argc || (image_buses >= 0 && image_path == NULL) || s_bus < 1u || s_bus > s_cfg.buses) {
         fputs(k_usage, stderr);
         return 2;
     }
@@ -408,15 +455,19 @@ int main(int argc, char **argv)
     fake_geometry(s_cfg.slot_size, s_cfg.slot_write_unit, (const uint32_t[]){1024u}, 1u);
     if (image_path != NULL) {
         install(image_path);
+        if (image_buses >= 0) {
+            set_image_buses((uint32_t)image_buses);
+        }
     }
     signal(SIGPIPE, SIG_IGN);
     const struct sigaction stop = {.sa_handler = on_stop};   /* no SA_RESTART: poll returns, the loop sees s_stop */
     sigaction(SIGTERM, &stop, NULL);
     sigaction(SIGINT, &stop, NULL);
     fprintf(stderr, "udsota_boot_server: iso14229 %s, IDs 0x%03X/0x%03X, product %s, hw_id %u, layout %u, slot 0x%X, "
-            "header at 0x%X, write unit %u, bootloader %s; %s%s\n", UDS_LIB_VERSION, s_cfg.request_id,
-            s_cfg.response_id, s_cfg.product, s_cfg.hw_id, s_cfg.layout_id, (unsigned)s_cfg.slot_size,
-            (unsigned)s_cfg.image_header_offset, s_cfg.slot_write_unit, s_cfg.boot_version,
+            "header at 0x%X, write unit %u, bootloader %s, bus %u of %u; %s%s\n", UDS_LIB_VERSION, s_cfg.request_id,
+            s_cfg.response_id, s_cfg.product != NULL ? s_cfg.product : "(any)", s_cfg.hw_id, s_cfg.layout_id,
+            (unsigned)s_cfg.slot_size,
+            (unsigned)s_cfg.image_header_offset, s_cfg.slot_write_unit, s_cfg.boot_version, s_bus, s_cfg.buses,
             image_path != NULL ? "slot holds " : "empty slot", image_path != NULL ? image_path : "");
     U.cause = UDSOTA_BOOT_RESET_POWER_ON;
     boot();
