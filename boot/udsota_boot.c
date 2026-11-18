@@ -155,7 +155,7 @@ static bool project_is(const uint8_t *field, const char *product)
 }
 
 /* The rules on the header's own fields, the first three of the image rules: UDSOTA_DL_OK, BAD_HEADER or TOO_BIG. The
- * boot check runs these alone, with its image_length as mem_size. */
+ * boot check (below) runs these alone, with its image_length as mem_size. */
 static udsota_reason_t header_rules(const udsota_boot_cfg_t *cfg, const uint8_t *hdr, uint32_t mem_size)
 {
     if (le32(hdr) != UDSOTA_BARE_HDR_MAGIC || le16(hdr + 4) < 1u ||
@@ -353,20 +353,14 @@ static void server_init(void)
 
 /* ==== 6. The slot ==== */
 
-/* The image in the slot: UDSOTA_DL_OK, or why not. For FF01 the image rules against the download's memorySize, else
- * the boot check's header rules; then the CRC over [0, image_length) without the crc32 field, in pieces. */
-static udsota_reason_t slot_check(bool ff01)
+/* Whether the header's crc32 is the CRC over [0, image_length) without that field, run in pieces with the watchdog
+ * reloaded between. Run after the header rules, which keep the field inside the image and the image inside the slot. */
+static bool crc_ok(void)
 {
-    const udsota_boot_cfg_t *cfg = B.cfg;
     const uint8_t *const slot = udsota_boot_port_slot();
-    const uint8_t *hdr = slot + cfg->image_header_offset;
+    const uint8_t *const hdr = slot + B.cfg->image_header_offset;
     const uint32_t len = le32(hdr + UDSOTA_BARE_HDR_LENGTH_OFFSET);
-    const udsota_reason_t why = ff01 ? udsota_boot_image_rules(cfg, hdr, UDSOTA_BARE_HDR_LEN, B.announced)
-                                     : header_rules(cfg, hdr, len);
-    if (why != UDSOTA_DL_OK) {
-        return why;
-    }
-    const uint32_t crc_at = cfg->image_header_offset + UDSOTA_BARE_HDR_CRC_OFFSET;
+    const uint32_t crc_at = B.cfg->image_header_offset + UDSOTA_BARE_HDR_CRC_OFFSET;
     uint32_t crc = 0, off = 0;
     while (off < len) {
         if (off == crc_at) {
@@ -379,7 +373,27 @@ static udsota_reason_t slot_check(bool ff01)
         tick();
         off += n;
     }
-    return (crc == le32(hdr + UDSOTA_BARE_HDR_CRC_OFFSET)) ? UDSOTA_DL_OK : UDSOTA_DL_VERIFY_FAILED;
+    return crc == le32(hdr + UDSOTA_BARE_HDR_CRC_OFFSET);
+}
+
+/* The boot check: whether the slot holds a valid app, by the header rules alone, its image_length as mem_size, and the
+ * CRC. */
+static bool boot_check(void)
+{
+    const uint8_t *const hdr = udsota_boot_port_slot() + B.cfg->image_header_offset;
+    return header_rules(B.cfg, hdr, le32(hdr + UDSOTA_BARE_HDR_LENGTH_OFFSET)) == UDSOTA_DL_OK && crc_ok();
+}
+
+/* FF01's check of the downloaded image: UDSOTA_DL_OK, or the first image rule against the download's memorySize that
+ * fails, else VERIFY_FAILED for the CRC. */
+static udsota_reason_t ff01_check(void)
+{
+    const uint8_t *const hdr = udsota_boot_port_slot() + B.cfg->image_header_offset;
+    const udsota_reason_t why = udsota_boot_image_rules(B.cfg, hdr, UDSOTA_BARE_HDR_LEN, B.announced);
+    if (why != UDSOTA_DL_OK) {
+        return why;
+    }
+    return crc_ok() ? UDSOTA_DL_OK : UDSOTA_DL_VERIFY_FAILED;
 }
 
 /* One 36's flash work at off: the erase units that start in its range, then n bytes programmed and compared. */
@@ -589,7 +603,7 @@ static UDSErr_t routine(UDSServer_t *srv, UDSRoutineCtrlArgs_t *a)
         return (B.dl == DL_VERIFIED) ? leave() : UDS_NRC_RequestSequenceError;
     }
     if (B.dl == DL_ENDED) {
-        B.last_reason = (uint8_t)slot_check(true);
+        B.last_reason = (uint8_t)ff01_check();
         B.app_valid = (B.last_reason == UDSOTA_DL_OK);
         B.dl = B.app_valid ? DL_VERIFIED : DL_NONE;
     } else if (B.dl != DL_VERIFIED) {
@@ -718,7 +732,7 @@ udsota_boot_decision_t udsota_boot_init(const udsota_boot_cfg_t *cfg)
         udsota_boot_port_keep_write(UDSOTA_KEEP_WORD_HANDOVER, 0u);
         in.handover_ok = udsota_boot_port_keep_read(UDSOTA_KEEP_WORD_MARK) != UDSOTA_HANDOVER_MARK;
     }
-    in.app_valid = B.app_valid = (slot_check(false) == UDSOTA_DL_OK);
+    in.app_valid = B.app_valid = boot_check();
     in.count_word = udsota_boot_port_keep_read(UDSOTA_KEEP_WORD_COUNT);
     udsota_boot_decision_t d = udsota_boot_decide(cfg, &in, &B.count);
     if (d == UDSOTA_BOOT_DECIDE_HANDOVER) {
