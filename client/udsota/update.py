@@ -30,13 +30,14 @@ WAIT_RETRY_S = 0.05      # flash --wait-for-unit: the next 10 02 at most this lo
                          # so that one lands in a bootloader's power-up window (100 ms in udsota's examples)
 WAIT_SETTLE_S = 0.25     # then the answers to earlier 10 02s, which a unit sends a P2 (50 ms) apart, are passed
 WAIT_DRAIN_S = 2.0       # over until none comes for WAIT_SETTLE_S, or for WAIT_DRAIN_S at most
-# flash's diff_format (--diff-format): the delta DFIs it may try; and each delta DFI's name in the log.
+# flash's diff_format (--diff-format): the delta DFIs it may try; and each delta DFI's name in the log. DFI 0x20
+# (heatshrink) is taken by 0.14.x servers only; 0.15+ answers it 0x31.
 DIFF_DFIS = {"auto": (DL_DFI_DELTA, DL_DFI_DELTA_DEFLATE), "heatshrink": (DL_DFI_DELTA,),
              "deflate": (DL_DFI_DELTA_DEFLATE,)}
 DELTA_NAMES = {DL_DFI_DELTA: "heatshrink patch", DL_DFI_DELTA_DEFLATE: "patch as raw DEFLATE"}
 
 # The server-owned DIDs `info` reads first, with their labels and renderers; F1F3's label names the image's ID as
-# the profile's image format does (id_name).
+# the profile's image format does (id_name). F1F2, the counters, is a 0.14.x server's: 0.15+ shows it unsupported.
 CORE_DIDS = ((DID_SESSION, "active session", DECODE["hex"]),
              (DID_VERSION, "version", cstr),
              (DID_DEVICE_ID, "device ID", lambda d: ":".join("%02x" % b for b in d)),
@@ -121,7 +122,9 @@ def info(uds, profile, log=print):
     return 0
 
 
-# Send one 0x36 block; resend it once after a plain timeout (the block-counter rule makes that safe).
+# Send one 0x36 block; resend it once after a plain timeout (the block-counter rule makes that safe). Only a 0.14.x
+# server answers a repeated block, so the resend recovers a lost answer there; on 0.15+ it recovers a block the server
+# never got, and a lost answer fails the run (0x70).
 def send_block(uds, bsc, chunk):
     try:
         uds.transfer(bsc, chunk)
@@ -323,6 +326,7 @@ def plan_deltas(bases, image, running_sha, compress, diff_format, log=print, def
 
 # RequestTransferExit, resent once after a plain timeout. A resend refused with 0x24 means the first 0x37
 # closed the transfer and only its 77 was lost when the last-result DID reads (DL_OK, every byte); else it stops.
+# The 0x24 recovery is for 0.14.x: a 0.15+ server answers a resent 0x37 with 0x70, which stops the run.
 def transfer_exit(uds, size, log=print):
     try:
         uds.transfer_exit()
