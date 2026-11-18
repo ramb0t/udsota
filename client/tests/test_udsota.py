@@ -597,7 +597,7 @@ def uds_for(server, ft, monitor=None):
 def run_flash(server, image=None, prof=P, master=MASTER, log=lambda *a: None, **kw):
     ft, prerolls = FakeTime(), []
     rc = update.flash(uds_for(server, ft), prof, make_image() if image is None else image, master,
-                      preroll=lambda: prerolls.append(1), sleep=ft.sleep, clock=ft.clock, log=log, **kw)
+                      preroll=lambda: prerolls.append(1), log=log, **kw)
     return rc, ft, len(prerolls)
 
 
@@ -1251,6 +1251,9 @@ product = "stm32boot"
 hw_ids = [1, 2]
 layout_id = 1
 slot_size = 0x10000
+
+[update]
+flow = "bootloader"
 """
 PB = profile.from_dict("bare", tomllib.loads(BARE))
 BARE_IMG = build_bare_image()
@@ -1792,6 +1795,7 @@ def test_wait_for_image_polls_through_send_errors():
     class Rebooting:
         # read_did fails the way a rebooting server does, then answers the new sha.
         def __init__(self):
+            self.sleep, self.clock = ft.sleep, ft.clock
             self.errors = [errors.SendFailed("send failed"), errors.NoResponse("no answer"),
                            errors.SendFailed("send failed")]
 
@@ -1805,7 +1809,7 @@ def test_wait_for_image_polls_through_send_errors():
         def restarted(self):
             pass
 
-    update.wait_for_image(Rebooting(), NEW_SHA, lambda: None, sleep=ft.sleep, clock=ft.clock)
+    update.wait_for_image(Rebooting(), NEW_SHA, lambda: None)
     assert ft.sleeps == [update.REBOOT_WAIT_S] + [update.BOOT_POLL_S] * 3
 
 
@@ -1830,6 +1834,7 @@ def test_failed_preroll_is_a_failed_poll_in_both_waits():
     # A restarting server: it answers the new sha only after three polls.
     class Rebooting:
         def __init__(self):
+            self.sleep, self.clock = ft.sleep, ft.clock
             self.polls = 0
 
         # Silent for two polls, then the sha F1F3 and the prefix F1F4 give.
@@ -1846,11 +1851,10 @@ def test_failed_preroll_is_a_failed_poll_in_both_waits():
     down = [can.CanOperationError("Failed to transmit: [Errno 105] No buffer space available"),
             OSError(errno.ENOBUFS, os.strerror(errno.ENOBUFS))]
     preroll = failing_preroll(*down)
-    update.wait_for_image(Rebooting(), NEW_SHA, preroll, sleep=ft.sleep, clock=ft.clock)
+    update.wait_for_image(Rebooting(), NEW_SHA, preroll)
     assert len(preroll.sent) == 1
     preroll = failing_preroll(*down)
-    assert update.wait_for_start(Rebooting(), PBL, NEW_SHA, preroll, sleep=ft.sleep, clock=ft.clock,
-                                 log=lambda *a: None) == 0
+    assert update.wait_for_start(Rebooting(), PBL, NEW_SHA, preroll, log=lambda *a: None) == 0
     assert len(preroll.sent) == 1
 
     # Never sendable, never answered: the deadline's error, not the pre-roll's.
@@ -1862,9 +1866,9 @@ def test_failed_preroll_is_a_failed_poll_in_both_waits():
             raise errors.NoResponse("no answer")
 
     with pytest.raises(errors.UpdateFailed, match="^the server did not answer within 60 s of ActivateImage$"):
-        update.wait_for_image(Silent(), NEW_SHA, never, sleep=ft.sleep, clock=ft.clock)
+        update.wait_for_image(Silent(), NEW_SHA, never)
     with pytest.raises(errors.UpdateFailed, match="^nothing answered F1F4 in 60 s"):
-        update.wait_for_start(Silent(), PBL, NEW_SHA, never, sleep=ft.sleep, clock=ft.clock, log=lambda *a: None)
+        update.wait_for_start(Silent(), PBL, NEW_SHA, never, log=lambda *a: None)
 
 
 # Check NRC 0x21 is retried after the first backoff step.
@@ -2133,10 +2137,10 @@ def test_activate_failure_reset_refused_stops():
 # Check confirm retries 0x22 then confirms, and does nothing for a VALID image.
 def test_confirm_command():
     ft, d = FakeTime(), FakeServer(running_state=2)
-    assert update.confirm_cmd(uds_for(d, ft), sleep=ft.sleep, clock=ft.clock, log=lambda *a: None) == 0
+    assert update.confirm_cmd(uds_for(d, ft), log=lambda *a: None) == 0
     assert d.log == [(0x22, 0xF1F0)] + CONFIRM
     ft, d = FakeTime(), FakeServer(running_state=3)
-    assert update.confirm_cmd(uds_for(d, ft), sleep=ft.sleep, clock=ft.clock, log=lambda *a: None) == 0
+    assert update.confirm_cmd(uds_for(d, ft), log=lambda *a: None) == 0
     assert d.log == [(0x22, 0xF1F0)]
 
 
@@ -2144,7 +2148,7 @@ def test_confirm_command():
 def test_confirm_gives_up_after_timeout():
     ft, d = FakeTime(), FakeServer(running_state=2, confirm_refusals=10 ** 6)
     with pytest.raises(errors.Nrc):
-        update.confirm_cmd(uds_for(d, ft), sleep=ft.sleep, clock=ft.clock, log=lambda *a: None)
+        update.confirm_cmd(uds_for(d, ft), log=lambda *a: None)
     assert ft.t >= update.CONFIRM_TIMEOUT_S
 
 
@@ -2172,7 +2176,7 @@ class LosesConfirm(FakeServer):
 @pytest.mark.parametrize("lost", ["request", "answer"])
 def test_confirm_resends_a_lost_confirm_image(lost):
     ft, d = FakeTime(), LosesConfirm(lost)
-    assert update.confirm_cmd(uds_for(d, ft), sleep=ft.sleep, clock=ft.clock, log=lambda *a: None) == 0
+    assert update.confirm_cmd(uds_for(d, ft), log=lambda *a: None) == 0
     assert d.log.count((0x31, 0xF002)) == 2 and d.running_state == 3 and ft.sleeps == [update.CONFIRM_RETRY_S]
     rc, _, _ = run_flash(LosesConfirm(lost, sha=NEW_SHA))
     assert rc == 0
@@ -2183,7 +2187,7 @@ def test_confirm_resends_a_lost_confirm_image(lost):
 def test_confirm_with_no_answer_says_the_image_is_unconfirmed():
     ft, d = FakeTime(), LosesConfirm("request", n=10 ** 6)
     with pytest.raises(errors.NoResponse) as e:
-        update.confirm(uds_for(d, ft), sleep=ft.sleep, clock=ft.clock, log=lambda *a: None)
+        update.confirm(uds_for(d, ft), log=lambda *a: None)
     assert ft.t >= update.CONFIRM_TIMEOUT_S and d.running_state == 2
     assert "the new image is not confirmed" in str(e.value) and '"udsota confirm"' in str(e.value)
     assert "rolls back" in str(e.value)
@@ -2208,11 +2212,11 @@ class FailsConfirmSend(FakeServer):
 @pytest.mark.parametrize("err", [errno.ENOBUFS, errno.ECOMM])
 def test_confirm_resends_a_failed_send(err):
     ft, d = FakeTime(), FailsConfirmSend(err, 2)
-    assert update.confirm(uds_for(d, ft), sleep=ft.sleep, clock=ft.clock, log=lambda *a: None) == 0
+    assert update.confirm(uds_for(d, ft), log=lambda *a: None) == 0
     assert d.running_state == 3
     ft, d = FakeTime(), FailsConfirmSend(err, 10 ** 6)
     with pytest.raises(errors.UpdateFailed) as e:
-        update.confirm(uds_for(d, ft), sleep=ft.sleep, clock=ft.clock, log=lambda *a: None)
+        update.confirm(uds_for(d, ft), log=lambda *a: None)
     assert ft.t >= update.CONFIRM_TIMEOUT_S and d.running_state == 2
     assert "the new image is not confirmed" in str(e.value) and '"udsota confirm"' in str(e.value)
 
@@ -2227,7 +2231,7 @@ def test_confirm_refused_after_a_lost_one_says_the_image_is_unconfirmed():
             return super().s31(req, rid)
     ft, d = FakeTime(), LapsesS3("request")
     with pytest.raises(errors.Nrc) as e:
-        update.confirm(uds_for(d, ft), sleep=ft.sleep, clock=ft.clock, log=lambda *a: None)
+        update.confirm(uds_for(d, ft), log=lambda *a: None)
     assert e.value.code == 0x7F and d.running_state == 2
     assert "the new image is not confirmed" in str(e.value) and '"udsota confirm"' in str(e.value)
 
@@ -2343,7 +2347,7 @@ def test_fake_s3_on(s3_on, session):
 # goes first whenever the last is over KEEPALIVE_S old (every other try, 2 s apart in fake time). A flash completes.
 def test_confirm_keeps_the_session_where_only_10_and_3e_restart_s3():
     ft, d = FakeTime(), FakeServer(running_state=2, confirm_refusals=5, s3_on=(0x10, 0x3E))
-    assert update.confirm_cmd(uds_for(d, ft), sleep=ft.sleep, clock=ft.clock, log=lambda *a: None) == 0
+    assert update.confirm_cmd(uds_for(d, ft), log=lambda *a: None) == 0
     assert d.log == ([(0x22, 0xF1F0), (0x10, 3), (0x31, 0xF002)] + [(0x31, 0xF002), (0x3E, 0), (0x31, 0xF002)] * 2
                      + [(0x31, 0xF002), (0x22, 0xF1F0)])
     assert d.running_state == 3
@@ -2463,8 +2467,7 @@ class SlowVerifyLostActivate(SlowVerify, LostActivateRequest):
 def flash_on(d):
     ft, lines = FakeTime(), []
     d.ft = ft
-    rc = update.flash(uds_for(d, ft), P, make_image(), MASTER, preroll=lambda: None, sleep=ft.sleep,
-                      clock=ft.clock, log=lines.append)
+    rc = update.flash(uds_for(d, ft), P, make_image(), MASTER, preroll=lambda: None, log=lines.append)
     return rc, lines
 
 
@@ -2517,8 +2520,8 @@ def test_unanswered_keepalive_is_not_a_commit_that_may_have_landed():
     writes = config.parse_writes(G, ["mode=2", "tag=ccdd"], True, True)
     msg = ""
     try:
-        config.config_set(uds_for(d, ft), G, writes, MASTER, commit=True, reset=True, sleep=ft.sleep,
-                          clock=ft.clock, log=lambda *a: None)
+        config.config_set(uds_for(d, ft), G, writes, MASTER, commit=True, reset=True,
+                          log=lambda *a: None)
     except errors.UpdateFailed as e:
         msg = str(e)
     assert msg == "" and d.log.count((0x31, CFG_COMMIT_RID)) == 2, msg
@@ -2861,7 +2864,7 @@ def test_busy_block_after_a_late_76_is_retried(s3_on, frames):
     assert d.log.count((0x36, 2)) == 2 and d.writes == 2 and d.session == 2
     ft, d = FakeTime(), FakeServer(s3_on=s3_on)
     first_send_of_block_2(d, lambda req, bsc, real: list(frames))
-    rc = update.flash(timed_uds(d, ft), P, make_image(), MASTER, sleep=ft.sleep, clock=ft.clock, log=lambda *a: None)
+    rc = update.flash(timed_uds(d, ft), P, make_image(), MASTER, log=lambda *a: None)
     assert rc == 0 and d.sha == NEW_SHA
 
 
@@ -3194,7 +3197,7 @@ def test_image_format_profile_values():
 
 
 # Check a bad [image] format or header_offset is refused with its reason, and desc_offset, which header_offset
-# replaced, as an unknown key.
+# replaced, as an unknown key; and so is a bare image with flow "app" or flow "bootloader" with an ESP-IDF one.
 @pytest.mark.parametrize("old, new, why", [
     ('format = "bare"', 'format = "elf"', "[image] format must be one of esp-idf, bare"),
     ('format = "bare"', "format = 1", "format must be a non-empty string"),
@@ -3206,6 +3209,10 @@ def test_image_format_profile_values():
     ("header_offset = 0x100", "header_offset = 0x100000000",
      "header_offset must be an integer from 0x0 to 0xFFFFFFFF"),
     ("header_offset = 0x100", 'header_offset = "0x100"', "header_offset must be an integer from 0x0 to 0xFFFFFFFF"),
+    ('flow = "bootloader"', 'flow = "app"',
+     '[image] format = "bare" is for flow = "bootloader": an A/B server takes only an ESP-IDF image'),
+    ('format = "bare"\nheader_offset = 0x100\n', "",
+     '[update] flow = "bootloader" needs [image] format = "bare": the boot core takes only a bare image'),
 ])
 def test_bad_image_format_is_refused(old, new, why):
     with pytest.raises(errors.Refused, match="profile bare: " + re.escape(why)):
@@ -3513,7 +3520,7 @@ def run_config_set(server, args, prof=C, master=MASTER, commit=True, reset=True)
     ft, lines = FakeTime(), []
     writes = config.parse_writes(prof, args, commit, reset)
     rc = config.config_set(uds_for(server, ft), prof, writes, master, commit=commit, reset=reset,
-                           sleep=ft.sleep, clock=ft.clock, log=lines.append)
+                           log=lines.append)
     return rc, lines, ft
 
 
@@ -3976,6 +3983,9 @@ def test_boot_wait_timeouts_name_their_cause():
 
     # A server that never answers again.
     class Gone:
+        def __init__(self):
+            self.sleep, self.clock = ft.sleep, ft.clock
+
         # Every read times out.
         def read_did(self, did):
             raise errors.NoResponse("no answer")
@@ -3985,7 +3995,7 @@ def test_boot_wait_timeouts_name_their_cause():
             pass
 
     with pytest.raises(errors.UpdateFailed, match="did not answer within 60 s of ActivateImage$"):
-        update.wait_for_image(Gone(), NEW_SHA, lambda: None, sleep=ft.sleep, clock=ft.clock)
+        update.wait_for_image(Gone(), NEW_SHA, lambda: None)
     d = FakeServer(cfg_keys=CFG_VALUES, boot_silence=10 ** 6)
     with pytest.raises(errors.UpdateFailed, match="did not answer within 60 s of the reset$"):
         run_config_set(d, ["mode=2"])
@@ -4290,9 +4300,17 @@ def test_flash_compressed_sends_a_deflate_stream():
 # Check the ratio line and the time-saved line, exactly, over a download that took 2 s by the clock.
 def test_compressed_download_reports_ratio_and_time_saved():
     d, lines = FakeServer(compress=True, security=False), []
-    uds = uds_for(d, FakeTime())
+    ft = FakeTime()
+    uds = uds_for(d, ft)
     uds.session(2)
-    update.download(uds, make_image(), log=lines.append, compress="deflate", clock=iter([100.0, 102.0]).__next__)
+    real = uds.transfer_exit
+
+    def slow_exit():                    # the download took 2 s by the clock, the 37 included
+        real()
+        ft.t += 2.0
+
+    uds.transfer_exit = slow_exit
+    update.download(uds, make_image(), log=lines.append, compress="deflate")
     z = len(deflate9(make_image()))
     assert lines[0] == "compressed with raw DEFLATE: 4800 -> %d bytes (%.0f%%)" % (z, 100.0 * z / 4800)
     assert lines[-1] == ("sent %d compressed bytes in 2.0 s; the 4800-byte image would take about %.1f s, so about "
@@ -4909,20 +4927,6 @@ def test_pack_orders_deltas_as_flash_does(tmp_path):
 
 # ---- bare images: flash and pack ----
 
-# Check flash sends a bare image as it sends an ESP-IDF one, plain and compressed, and compares F1F3 with its
-# image_id. The header sits at 48 so that its image_id lands where FakeServer reads a written image's F1F3, 176..208.
-def test_flash_bare_image():
-    prof = dataclasses.replace(PB, header_offset=48)
-    img = build_bare_image(header_offset=48)
-    ident = bare_id(img, 48)
-    for compress, dfi in (("none", 0x00), ("deflate", 0x10)):
-        d = FakeServer(security=False, compress=True)
-        assert run_flash(d, img, prof=prof, compress=compress)[0] == 0
-        assert (d.dfi, bytes(d.written), d.sha) == (dfi, img, ident)
-    d = FakeServer(security=False, sha=ident)
-    assert run_flash(d, img, prof=prof)[0] == 0 and not any(x[0] == 0x34 for x in d.log)
-
-
 # Check pack writes a bare image's DFI 0x10 and 0x00 payloads as an ESP-IDF image's, the manifest carrying its
 # image_id as image_elf_sha256.
 @pytest.mark.parametrize("args, dfis", [((), [0x10, 0x00]), (("--dfi", "0x00"), [0x00]), (("--dfi", "0x10"), [0x10])])
@@ -5010,7 +5014,8 @@ def test_stamp_command_out(tmp_path):
 # Check stamp refuses (exit 2) an esp-idf profile, an unreadable FILE, a header stamp refuses, and an image that
 # fails the profile's checks once stamped, writing nothing.
 @pytest.mark.parametrize("edit, why", [
-    (lambda prof, fw: prof.write_text(BARE.replace('format = "bare"\nheader_offset = 0x100\n', "")),
+    (lambda prof, fw: prof.write_text(BARE.replace('format = "bare"\nheader_offset = 0x100\n', "")
+                                  .replace('\n[update]\nflow = "bootloader"\n', "")),
      'profile bare: stamp is for [image] format = "bare", and its format is "esp-idf"'),
     (lambda prof, fw: fw.unlink(), "cannot read %s"),
     (lambda prof, fw: fw.write_bytes(build_bare_image(stamped=False, hdr_magic=0)),
@@ -5171,14 +5176,14 @@ class BootloaderUnit(FakeServer):
 
 
 UPDATE_BL = '\n[update]\nflow = "bootloader"\n'
+BARE_IMAGE = '\n[image]\nformat = "bare"\nheader_offset = 48\n'      # the image table the bootloader flow takes
 # BARE under the bootloader flow, its header at 48 so that the image_id lands where BootloaderUnit reads a written
-# image's ID, 176..208; and FULL under it, for [security] and [board].
-BARE_BL = BARE.replace("header_offset = 0x100", "header_offset = 48") + UPDATE_BL
+# image's ID, 176..208; and with [board] and a third hw_id, for the board check.
+BARE_BL = BARE.replace("header_offset = 0x100", "header_offset = 48")
 PBL = profile.from_dict("bare-boot", tomllib.loads(BARE_BL))
-# PFB is FULL without [security], which the loader refuses under the bootloader flow (the boot core serves no 0x27):
-# an ESP-IDF image with the [board] check and deltas.
-PFB = profile.from_dict("full-boot", tomllib.loads(FULL.replace(FULL[FULL.index("[security]"):FULL.index("[image]")], "")
-                                                   + UPDATE_BL))
+PBB = profile.from_dict("bare-boot-board", tomllib.loads(
+    BARE_BL.replace("hw_ids = [1, 2]", "hw_ids = [1, 2, 3]")
+    + '\n[board]\ndid = 0xF191\nnames = { 1 = "devkit", 2 = "devkit-two", 3 = "devkit-three" }\n'))
 BL_IMG = build_bare_image(header_offset=48, size=4800)
 BL_ID = bare_id(BL_IMG, 48)         # BL_IMG's image ID
 BL_PRECHECK = [(0x22, 0xF1F4), (0x10, 2), (0x22, 0xF1F0), (0x22, 0xF1F3), (0x22, 0xF1F5)]   # F1F4 to the app, then the hop
@@ -5290,23 +5295,6 @@ def test_bootloader_flow_bootloader_answering_f1f4_names_the_cause(kw, why):
     assert d.log[-2:] == [(0x22, 0xF1F4), (0x22, 0xF1F0)]
 
 
-# Check the programming session is entered again after the delta patches are built, even when none is worth sending:
-# building them can outlast S3, and the full download's 34 must not meet the default session.
-def test_bootloader_flow_reenters_after_unused_deltas(monkeypatch):
-    d = BootloaderUnit(security=False, sha=elf_sha(DELTA_BASE))
-
-    def slow_build(base, new, dfi):        # outlasts S3, and is bigger than the image
-        d.session = 1
-        return bytes(2 * len(new))
-
-    monkeypatch.setattr(pack, "build_delta", slow_build)
-    rc, _, lines = run_boot(d, image=DELTA_NEW, prof=PFB, compress="none", bases=[("a.bin", DELTA_BASE)])
-    assert rc == 0 and d.dfis == [0x00] and bytes(d.written) == DELTA_NEW
-    first_34 = d.log.index((0x34, None))
-    assert d.log[:first_34] == BL_BOARD_PRECHECK + [(0x10, 2)]
-    assert any(ln.startswith("no delta over DFI 0x20") for ln in lines)
-
-
 # Check 0x72 and 0x22 to F001 stop at once, and 0x24 downloads once more.
 @pytest.mark.parametrize("nrc, why", [(0x72, "ActivateImage failed (0x72); read F1F0 with `info`"),
                                       (0x22, "ActivateImage refused (0x22): the server's conditions are not met")])
@@ -5372,14 +5360,14 @@ def test_bootloader_flow_other_prefix_fails():
 # refuses after them, saying the unit is left in its bootloader.
 def test_bootloader_flow_checks_the_board_after_the_precheck_reads():
     d = BootloaderUnit(security=False)
-    rc, _, lines = run_boot(d, image=make_image(), prof=PFB)
+    rc, _, lines = run_boot(d, image=BL_IMG, prof=PBB)
     assert rc == 0 and d.log == BL_BOARD_PRECHECK + DOWNLOAD + POLLS
-    assert lines[0] == "image 0.3.0 for devkit, 4800 bytes, app_elf_sha256 a0a1a2a3a4a5a6a7"
+    assert lines[0] == "image 1.4.0 for devkit, 4800 bytes, image ID %s" % BL_ID[:8].hex()
     d = BootloaderUnit(security=False)
     with pytest.raises(errors.Refused, match="^image is for devkit-three but the server is devkit. The unit is in its "
                                              "bootloader and returns to its app when its programming session times "
                                              "out, unless it is held there$"):
-        run_boot(d, image=make_image(hw_id=3), prof=PFB)
+        run_boot(d, image=build_bare_image(header_offset=48, size=4800, hw_id=3), prof=PBB)
     assert d.log == BL_BOARD_PRECHECK
 
 
@@ -5443,7 +5431,7 @@ def test_bootloader_flow_refuses_a_product_change():
     assert d.log == BL_PRECHECK
     d = BootloaderUnit(security=False, project=b"widget")
     with pytest.raises(errors.Refused, match="--allow-product-change"):
-        run_boot(d, image=make_image(project=b"example"), prof=PFB)
+        run_boot(d, prof=PBB)
     assert d.log == BL_BOARD_PRECHECK and not d.written
 
 
@@ -5621,7 +5609,7 @@ def cap_tries(uds, seconds):
 def run_wait(unit, seconds=10, ft=None, monitor=None, send_s=0.0):
     ft, lines = ft or FakeTime(), []
     uds = cap_tries(late_uds(unit, ft, monitor, send_s), seconds or 0)
-    rc = update.flash(uds, PBL, BL_IMG, None, sleep=ft.sleep, clock=ft.clock, log=lines.append, wait_for_unit=seconds)
+    rc = update.flash(uds, PBL, BL_IMG, None, log=lines.append, wait_for_unit=seconds)
     return rc, lines
 
 
@@ -5724,7 +5712,7 @@ def test_wait_for_unit_tries_through_busy_into_a_closing_window(app, on_at):
 def test_wait_for_unit_takes_a_held_sends_late_answer():
     ft, d, lines = FakeTime(), PoweredUpUnit(on_at=1.02, no_ack=True, held_s=update.WAIT_RETRY_S), []
     uds = cap_tries(late_uds(d, ft), 10)
-    update.wait_for_power_up(uds, 10, log=lines.append, clock=ft.clock)
+    update.wait_for_power_up(uds, 10, log=lines.append)
     assert uds.in_session and uds.kept == pytest.approx(1.02)
     assert uds.client.config["p2_timeout"] == transport.P2_S
     assert uds.client.config["p2_star_timeout"] == transport.P2_STAR_S
@@ -5968,10 +5956,10 @@ def test_update_flow_profile_values():
     ("[update]\nflow = 1\n", "flow must be a non-empty string"),
     ("[update]\nstart_timeout_s = 30\n", '[update] start_timeout_s is for flow = "bootloader"'),
     ('[update]\nflow = "app"\nstart_timeout_s = 30\n', '[update] start_timeout_s is for flow = "bootloader"'),
-    (UPDATE_BL + "start_timeout_s = 0\n", "start_timeout_s must be an integer from 0x1 to 0x258"),
-    (UPDATE_BL + "start_timeout_s = 601\n", "start_timeout_s must be an integer from 0x1 to 0x258"),
-    (UPDATE_BL + 'start_timeout_s = "60"\n', "start_timeout_s must be an integer from 0x1 to 0x258"),
-    (UPDATE_BL + "start_timeout_s = true\n", "start_timeout_s must be an integer from 0x1 to 0x258"),
+    (BARE_IMAGE + UPDATE_BL + "start_timeout_s = 0\n", "start_timeout_s must be an integer from 0x1 to 0x258"),
+    (BARE_IMAGE + UPDATE_BL + "start_timeout_s = 601\n", "start_timeout_s must be an integer from 0x1 to 0x258"),
+    (BARE_IMAGE + UPDATE_BL + 'start_timeout_s = "60"\n', "start_timeout_s must be an integer from 0x1 to 0x258"),
+    (BARE_IMAGE + UPDATE_BL + "start_timeout_s = true\n", "start_timeout_s must be an integer from 0x1 to 0x258"),
     (UPDATE_BL + "timeout = 5\n", "unknown key timeout in [update]"),
 ])
 def test_bad_update_flow_is_refused(text, why):
@@ -5992,7 +5980,7 @@ def test_board_names_key_that_is_not_a_number_is_refused(key):
 def test_bootloader_flow_with_security_is_refused(security):
     with pytest.raises(errors.Refused, match=re.escape('profile u: [security] is for flow = "app": the boot core '
                                                       'serves no SecurityAccess (0x27) to unlock')):
-        profile.from_dict("u", tomllib.loads(security + UPDATE_BL))
+        profile.from_dict("u", tomllib.loads(security + BARE_IMAGE + UPDATE_BL))
     profile.from_dict("u", tomllib.loads(security + '\n[update]\nflow = "app"\n'))
 
 
@@ -6025,20 +6013,13 @@ def test_bootloader_flow_refuses_compression(tmp_path, capsys):
     assert run_boot(d, prof=dataclasses.replace(PBL, compression="deflate"), compress="none")[0] == 0
 
 
-# Check example.toml's commented [update] loads once uncommented.
-def test_example_update_comments_load():
+# Check example.toml's commented [image] format and header_offset and [update] load once uncommented: a bare image
+# and the bootloader flow go together.
+def test_example_bare_bootloader_comments_load():
     text = (profile.PROFILE_DIR / "example.toml").read_text()
-    live = re.sub(r"(?m)^# (?=\[update\]$|flow |start_timeout_s )", "", text)
+    live = re.sub(r"(?m)^# (?=\[update\]$|flow |start_timeout_s |format |header_offset )", "", text)
     e = profile.from_dict("example", tomllib.loads(live))
-    assert (e.flow, e.start_timeout_s) == ("bootloader", 60)
-
-
-# Check example.toml's commented format and header_offset load once uncommented.
-def test_example_bare_comments_load():
-    text = (profile.PROFILE_DIR / "example.toml").read_text()
-    live = re.sub(r"(?m)^# (?=format |header_offset )", "", text)
-    e = profile.from_dict("example", tomllib.loads(live))
-    assert (e.image_format, e.header_offset) == ("bare", 0x100)
+    assert (e.image_format, e.header_offset, e.flow, e.start_timeout_s) == ("bare", 0x100, "bootloader", 60)
 
 
 # Check the bare header's flags: a bit in the high byte is one a reader must understand, so stamp and parse_image
@@ -6066,6 +6047,8 @@ def test_bare_header_ignorable_flags_are_taken():
 # and lets the interrupt through.
 def test_wait_for_unit_interrupted_says_what_queued_10_02s_do():
     class Interrupted:
+        sleep, clock = staticmethod(lambda s: None), staticmethod(lambda: 0.0)
+
         def session(self, n):
             raise errors.NoResponse("no response to service 0x10")
 
@@ -6074,5 +6057,5 @@ def test_wait_for_unit_interrupted_says_what_queued_10_02s_do():
 
     lines = []
     with pytest.raises(KeyboardInterrupt):
-        update.wait_for_power_up(Interrupted(), 10, log=lines.append, clock=lambda: 0.0)
+        update.wait_for_power_up(Interrupted(), 10, log=lines.append)
     assert lines == ["waiting up to 10 s for the unit: power-cycle it now", update.WAIT_QUEUED]

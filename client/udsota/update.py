@@ -4,7 +4,6 @@ answers), or "bootloader", a single-slot unit whose resident bootloader is its o
 10 02 into the bootloader, and F1F4 as the proof of life, with no ConfirmImage). Every product-specific step comes
 from the profile."""
 import contextlib
-import time
 
 import can
 
@@ -108,9 +107,9 @@ def wrong_board(profile, img, board):
 # is needed to the end (the transport's bus quieting). compress is "none", "deflate" or "auto"; None takes the
 # profile's. bases, (name, bytes) pairs, offers a delta from the one the server runs (plan_deltas). The profile's flow
 # picks flash_app or flash_bootloader; wait_for_unit and allow_product_change are the bootloader flow's alone.
-def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep=time.sleep,
-          clock=time.monotonic, log=print, quiet=contextlib.nullcontext, compress=None, bases=None,
-          diff_format="auto", wait_for_unit=None, allow_product_change=False):
+def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, log=print,
+          quiet=contextlib.nullcontext, compress=None, bases=None, diff_format="auto", wait_for_unit=None,
+          allow_product_change=False):
     if wait_for_unit is not None and profile.flow != "bootloader":
         raise Refused(WAIT_NEEDS_BOOTLOADER)
     if allow_product_change and profile.flow != "bootloader":
@@ -128,21 +127,19 @@ def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep
     log("image %s for %s, %d bytes, %s %s" % (img.version, board_name(profile, img), img.size, id_name(profile),
                                               img.elf_sha[:8].hex()))
     if profile.flow == "bootloader":
-        return flash_bootloader(uds, profile, image, img, drop_76=drop_76, preroll=preroll, sleep=sleep,
-                                clock=clock, log=log, quiet=quiet, compress=compress, bases=bases,
-                                diff_format=diff_format, deflate_ok=deflate_ok, wait_for_unit=wait_for_unit,
+        return flash_bootloader(uds, profile, image, img, drop_76=drop_76, preroll=preroll, log=log, quiet=quiet,
+                                compress=compress, wait_for_unit=wait_for_unit,
                                 allow_product_change=allow_product_change)
-    return flash_app(uds, profile, image, img, secret, drop_76=drop_76, preroll=preroll, sleep=sleep, clock=clock,
-                     log=log, quiet=quiet, compress=compress, bases=bases, diff_format=diff_format,
-                     deflate_ok=deflate_ok)
+    return flash_app(uds, profile, image, img, secret, drop_76=drop_76, preroll=preroll, log=log, quiet=quiet,
+                     compress=compress, bases=bases, diff_format=diff_format, deflate_ok=deflate_ok)
 
 
 # `flash` on an A/B unit (docs/wire.md): the precheck, the programming session and unlock, the download, FF01 and
 # ActivateImage, then the restart and ConfirmImage; img is image parsed, the other arguments flash's. An image the
 # other slot already holds verified skips the download. The patches of a delta are built before the programming
 # session opens.
-def flash_app(uds, profile, image, img, secret, drop_76, preroll, sleep, clock, log, quiet, compress, bases,
-              diff_format, deflate_ok):
+def flash_app(uds, profile, image, img, secret, drop_76, preroll, log, quiet, compress, bases, diff_format,
+              deflate_ok):
     state, running_sha, _, board = read_unit(uds, profile)
     if state is None:                         # 0x31: no udsota status DID, so no udsota server
         raise Refused(NOT_UDSOTA)
@@ -150,7 +147,7 @@ def flash_app(uds, profile, image, img, secret, drop_76, preroll, sleep, clock, 
     if running_sha == img.elf_sha:
         if state["running_state"] == IMG_PENDING_VERIFY:   # an earlier run stopped before ConfirmImage
             log("the server runs this image (%s) unconfirmed: confirming" % img.elf_sha[:8].hex())
-            return confirm(uds, sleep=sleep, clock=clock, log=log)
+            return confirm(uds, log=log)
         log("the server already runs this image (%s): nothing to do" % img.elf_sha[:8].hex())
         return 0
     if state["running_state"] == IMG_PENDING_VERIFY:
@@ -169,7 +166,7 @@ def flash_app(uds, profile, image, img, secret, drop_76, preroll, sleep, clock, 
         need_download, recovered, resent = not verified, False, False
         while True:
             if need_download:
-                download(uds, image, drop_76=drop_76, log=log, compress=compress, clock=clock, deltas=deltas,
+                download(uds, image, drop_76=drop_76, log=log, compress=compress, deltas=deltas,
                          reenter=lambda: enter_programming(uds, profile, keys))
                 check_image(uds, log=log)
                 need_download, drop_76 = False, None   # the fault injection applies to the first download only
@@ -189,9 +186,9 @@ def flash_app(uds, profile, image, img, secret, drop_76, preroll, sleep, clock, 
                 redownload_or_raise(e, recovered, "slot", log)
                 recovered = need_download = True   # one re-download per run
         log("activated; waiting for the server to restart")
-        wait_for_image(uds, img.elf_sha, preroll, sleep=sleep, clock=clock)
+        wait_for_image(uds, img.elf_sha, preroll)
         log("the server runs %s; confirming" % img.version)
-        return confirm(uds, sleep=sleep, clock=clock, log=log)
+        return confirm(uds, log=log)
 
 
 # The NRC e to ActivateImage, apart from 0x72 and a resend's answer, which each flow reads its own way: 0x22 ends the
@@ -247,34 +244,34 @@ def activation_failed(uds, profile, keys, nrc, log=print):
 
 
 # After ActivateImage: wait for the restart, then check the server runs the new image sha.
-def wait_for_image(uds, sha, preroll, sleep=time.sleep, clock=time.monotonic):
-    running = wait_for_boot(uds, preroll, "ActivateImage", sleep=sleep, clock=clock)
+def wait_for_image(uds, sha, preroll):
+    running = wait_for_boot(uds, preroll, "ActivateImage")
     if running != sha:
         raise UpdateFailed("the server runs %s, not the new image %s: it reverted or never switched; "
                            "read F1F0 with `info`" % (running[:8].hex(), sha[:8].hex()))
 
 
 # Wait for a restarting server and return its running SHA. after names what restarted it, for the timeout message.
-def wait_for_boot(uds, preroll, after, sleep=time.sleep, clock=time.monotonic):
+def wait_for_boot(uds, preroll, after):
     gave_up = "the server did not answer within %d s of %s" % (BOOT_TIMEOUT_S, after)
-    return poll_restarted(uds, DID_RUNNING_SHA, BOOT_TIMEOUT_S, gave_up, preroll, sleep, clock)
+    return poll_restarted(uds, DID_RUNNING_SHA, BOOT_TIMEOUT_S, gave_up, preroll)
 
 
 # Wait for a restarting unit: REBOOT_WAIT_S, then pre-roll and read did every BOOT_POLL_S until it answers, and return
 # the record; UpdateFailed(gave_up) once timeout_s has passed without one. The unit comes back in the default session,
 # so no 3E 00 precedes a poll. Other errors (an NRC) are the caller's to read.
-def poll_restarted(uds, did, timeout_s, gave_up, preroll, sleep, clock):
+def poll_restarted(uds, did, timeout_s, gave_up, preroll):
     uds.restarted()
-    sleep(REBOOT_WAIT_S)
-    deadline = clock() + timeout_s
+    uds.sleep(REBOOT_WAIT_S)
+    deadline = uds.clock() + timeout_s
     while True:
         try_preroll(preroll)
         try:
             return uds.read_did(did)
         except (NoResponse, SendFailed):   # a restarting unit answers nothing, or leaves a send unacknowledged
-            if clock() >= deadline:
+            if uds.clock() >= deadline:
                 raise UpdateFailed(gave_up)
-            sleep(BOOT_POLL_S)
+            uds.sleep(BOOT_POLL_S)
 
 
 # One pre-roll while a unit restarts. A send the adapter cannot make (python-can raises CanOperationError, or OSError,
@@ -288,26 +285,26 @@ def try_preroll(preroll):
 
 # ConfirmImage in the extended session, retrying NRC 0x22 until the product's soak and health check pass, and a
 # request or answer that is lost: the server answers positive at once for an image already valid, so a repeat is safe.
-def confirm(uds, sleep=time.sleep, clock=time.monotonic, log=print):
+def confirm(uds, log=print):
     uds.session(SESSION_EXTENDED)
-    deadline = clock() + CONFIRM_TIMEOUT_S
+    deadline = uds.clock() + CONFIRM_TIMEOUT_S
     lost = False                                # a send or an answer was lost: S3 may have lapsed since
     while True:
         try:
             uds.routine(RID_CONFIRM)
             break
         except Nrc as e:
-            if e.code == NRC_CONDITIONS and clock() < deadline:
-                sleep(CONFIRM_RETRY_S)
+            if e.code == NRC_CONDITIONS and uds.clock() < deadline:
+                uds.sleep(CONFIRM_RETRY_S)
                 continue
             if e.code != NRC_CONDITIONS and (lost or e.code == NRC_SERVICE_IN_SESSION):
                 raise Nrc(e.sid, e.code, UNCONFIRMED) from e
             raise
         except (NoResponse, SendFailed) as e:   # a failed send never reached the server
             lost = True
-            if clock() >= deadline:
+            if uds.clock() >= deadline:
                 raise type(e)("ConfirmImage got no answer in %d s: %s" % (CONFIRM_TIMEOUT_S, UNCONFIRMED)) from e
-            sleep(CONFIRM_RETRY_S)
+            uds.sleep(CONFIRM_RETRY_S)
     log("confirmed: %s" % describe_status(decode_status(uds.read_did(DID_STATUS))))
     return 0
 
@@ -333,9 +330,8 @@ def installed_project(uds):
 # refused, with the unit left in its bootloader, unless allow_product_change (--allow-product-change), which logs
 # both names and goes on; any negative answer to F1F5 goes on too: nothing is installed, or the bootloader does not
 # know the DID.
-def flash_bootloader(uds, profile, image, img, drop_76=None, preroll=lambda: None, sleep=time.sleep,
-                     clock=time.monotonic, log=print, quiet=contextlib.nullcontext, compress="none", bases=None,
-                     diff_format="auto", deflate_ok=True, wait_for_unit=None, allow_product_change=False):
+def flash_bootloader(uds, profile, image, img, drop_76=None, preroll=lambda: None, log=print,
+                     quiet=contextlib.nullcontext, compress="none", wait_for_unit=None, allow_product_change=False):
     try:
         prefix = uds.read_did(DID_IMAGE_PREFIX)
     except (Nrc, NoResponse, SendFailed):    # 0x31 from the bootloader, or an app that is not healthy
@@ -347,7 +343,7 @@ def flash_bootloader(uds, profile, image, img, drop_76=None, preroll=lambda: Non
         if wait_for_unit is None:
             uds.session(SESSION_PROGRAMMING)
         else:
-            wait_for_power_up(uds, wait_for_unit, log=log, clock=clock)
+            wait_for_power_up(uds, wait_for_unit, log=log)
         state, running_sha, installed, board = read_unit(uds, profile, project=True)
         if state is None:
             raise Refused("%s %s" % (NOT_UDSOTA, LEFT_IN_BOOTLOADER))
@@ -363,22 +359,16 @@ def flash_bootloader(uds, profile, image, img, drop_76=None, preroll=lambda: Non
             log("the unit already holds this image (%s)%s: resetting into it" % (
                 img.elf_sha[:8].hex(), "; the reset releases it for another try" if held else ""))
             uds.ecu_reset()
-            return wait_for_start(uds, profile, img.elf_sha, preroll, sleep=sleep, clock=clock, log=log,
-                                  buses=update_buses(profile, image))
+            return wait_for_start(uds, profile, img.elf_sha, preroll, log=log, buses=update_buses(profile, image))
         if (why := wrong_board(profile, img, board)) is not None:
             raise Refused("%s. %s" % (why, LEFT_IN_BOOTLOADER))
         verified = state["other_state"] == OTHER_VERIFIED and state["other_sha_prefix"] == img.elf_sha[:8]
-        deltas = []
-        if bases is not None and not verified:
-            deltas = plan_deltas(bases, image, running_sha, compress, diff_format, log=log, deflate_ok=deflate_ok)
-            uds.session(SESSION_PROGRAMMING)   # building the patches, used or not, may have outlasted S3
         if verified:
             log("the other slot already holds this image, verified: skipping to ActivateImage")
         need_download, recovered, resent, activated = not verified, False, False, True
         while True:
             if need_download:
-                download(uds, image, drop_76=drop_76, log=log, compress=compress, clock=clock, deltas=deltas,
-                         reenter=lambda: uds.session(SESSION_PROGRAMMING))
+                download(uds, image, drop_76=drop_76, log=log, compress=compress)
                 check_image(uds, log=log)
                 need_download, drop_76 = False, None   # the fault injection applies to the first download only
             try:
@@ -403,8 +393,8 @@ def flash_bootloader(uds, profile, image, img, drop_76=None, preroll=lambda: Non
                     raise UpdateFailed("ActivateImage failed (0x72); read F1F0 with `info`") from e
                 redownload_or_raise(e, recovered, "image", log)
                 recovered = need_download = True   # one re-download per run
-        return wait_for_start(uds, profile, img.elf_sha, preroll, sleep=sleep, clock=clock, log=log,
-                              activated=activated, buses=update_buses(profile, image))
+        return wait_for_start(uds, profile, img.elf_sha, preroll, log=log, activated=activated,
+                              buses=update_buses(profile, image))
 
 
 # The bootloader flow's 10 02 under --wait-for-unit, for a unit whose app runs but cannot hand over. The first 10 02
@@ -420,25 +410,25 @@ def flash_bootloader(uds, profile, image, img, drop_76=None, preroll=lambda: Non
 # before the next request goes: dropping them is not enough, though udsoncan empties the receive queue before each
 # send, since one that comes after that send is taken for its answer, and the request itself can reach the unit while
 # it is still answering 10 02s.
-def wait_for_power_up(uds, seconds, log=print, clock=time.monotonic):
+def wait_for_power_up(uds, seconds, log=print):
     try:
         uds.session(SESSION_PROGRAMMING)
         return
     except (Nrc, NoResponse, SendFailed):
         pass
     log("waiting up to %d s for the unit: power-cycle it now" % seconds)
-    start, tries = clock(), 1
+    start, tries = uds.clock(), 1
     try:
         while True:
             tries += 1
             if uds.try_session(SESSION_PROGRAMMING, WAIT_RETRY_S):
                 break
-            if clock() - start >= seconds:
+            if uds.clock() - start >= seconds:
                 raise UpdateFailed("no 10 02 was answered within %d s (%d tries). %s" % (seconds, tries, WAIT_QUEUED))
     except KeyboardInterrupt:
         log(WAIT_QUEUED)
         raise
-    took = clock() - start
+    took = uds.clock() - start
     late = uds.drain(WAIT_SETTLE_S, WAIT_DRAIN_S)
     passed = "; passed over %d later answers" % late if late else ""
     log("10 02 answered after %.1f s, at try %d%s" % (took, tries, passed))
@@ -449,12 +439,11 @@ def wait_for_power_up(uds, seconds, log=print, clock=time.monotonic):
 # 4 bytes of sha. Returns 0, or raises UpdateFailed: another prefix (the app runs another image), 0x31 (the bootloader
 # answers: the app did not start, F1F0 saying whether the unit holds itself there; or, when activated is False because
 # no F001 was answered, perhaps never activated), or nothing within the timeout. Silence is never success.
-def wait_for_start(uds, profile, sha, preroll, sleep=time.sleep, clock=time.monotonic, log=print, activated=True,
-                   buses=0xFFFF):
+def wait_for_start(uds, profile, sha, preroll, log=print, activated=True, buses=0xFFFF):
     gave_up = ("nothing answered F1F4 in %d s of polling after the restart, so the app has not reported healthy%s"
                % (profile.start_timeout_s, CLOSED_BUS % buses if buses != 0xFFFF else ""))
     try:
-        prefix = poll_restarted(uds, DID_IMAGE_PREFIX, profile.start_timeout_s, gave_up, preroll, sleep, clock)
+        prefix = poll_restarted(uds, DID_IMAGE_PREFIX, profile.start_timeout_s, gave_up, preroll)
     except Nrc as e:
         if e.code != NRC_OUT_OF_RANGE:
             raise
@@ -479,12 +468,12 @@ def unit_status(uds):
 
 
 # `confirm`: confirm the running image if it is PENDING_VERIFY, else report there is nothing to do.
-def confirm_cmd(uds, sleep=time.sleep, clock=time.monotonic, log=print):
+def confirm_cmd(uds, log=print):
     state = decode_status(uds.read_did(DID_STATUS))
     if state["running_state"] != IMG_PENDING_VERIFY:
         log("the running image is %s: nothing to confirm" % IMG_STATES.get(state["running_state"], "?"))
         return 0
-    return confirm(uds, sleep=sleep, clock=clock, log=log)
+    return confirm(uds, log=log)
 
 
 # `reset`: ECUReset from the extended session, keyed when the profile has [security]. Under flow "bootloader", from

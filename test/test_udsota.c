@@ -1150,10 +1150,11 @@ static void compress_cases(const uint8_t *img, size_t img_len, const uint8_t *im
     CHECK(result_is(UDSOTA_DL_BAD_STREAM, (uint32_t)n) && P.aborts == aborts + 1 && !P.open && !udsota_busy());
 
     /* Another service while the 37's job runs is 0x21 and ends the download. iso14229 holds new requests while it
-     * answers 0x78, so the test hands udsota the 36 itself. */
-    request_download((uint32_t)len, 0x10);
-    send_all(s, n);
-    {
+     * answers 0x78, so the test hands udsota the 36 itself. The 37's job then ends well (the stream is whole) or
+     * badly (one byte more was announced); either way the download stays ended: F1F1 says ABORTED. */
+    for (uint32_t extra = 0; extra < 2u; extra++) {
+        request_download((uint32_t)len + extra, 0x10);
+        send_all(s, n);
         static const uint8_t exit_req[] = {0x37};
         UDSSDU_t info = {.A_TA_Type = UDS_A_TA_TYPE_PHYSICAL};
         UDSTransferDataArgs_t other = {.data = s, .len = 1};
@@ -1174,10 +1175,11 @@ static void compress_cases(const uint8_t *img, size_t img_len, const uint8_t *im
                 got = 0;
             }
         }
-        CHECK(sent && got > 0u);
+        CHECK(sent && got == 3u && resp[0] == 0x7F && resp[1] == 0x37 && resp[2] == 0x72);
+        CHECK(result_is(UDSOTA_DL_ABORTED, (uint32_t)n));
+        EXPECT(B(0x31, 0x01, 0xFF, 0x01), B(0x7F, 0x31, 0x24));   /* the image the job finished was closed */
+        CHECK(!P.open && !udsota_busy());
     }
-    EXPECT(B(0x31, 0x01, 0xFF, 0x01), B(0x7F, 0x31, 0x24));   /* the image the job finished was closed */
-    CHECK(!P.open && !udsota_busy());
 
     const int begins = P.begins;
     n = stored(s, im, 100);
