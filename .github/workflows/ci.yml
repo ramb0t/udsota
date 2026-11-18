@@ -95,17 +95,8 @@ jobs:
       - name: The bootloader core compiles for Cortex-M3 with every warning an error, and its text stays under the gate
         run: |
           arm-none-eabi-gcc --version | head -n 1
-          arm-none-eabi-gcc -mcpu=cortex-m3 -mthumb -mfloat-abi=soft -std=c11 -Os -ffunction-sections -fdata-sections \
-            -Wall -Wextra -Werror -I. -Iboot -Iiso14229 -DUDS_SYS=UDS_SYS_CUSTOM -DISO_TP_FRAME_PADDING \
-            -DUDS_SERVER_RECV_BUF_SIZE=1026 -DUDS_SERVER_SEND_BUF_SIZE=64 -DISO_TP_DEFAULT_BLOCK_SIZE=8 \
-            -DISO_TP_DEFAULT_ST_MIN_US=0 -DISO_TP_DEFAULT_RESPONSE_TIMEOUT_US=1000000 -DNDEBUG \
-            -c boot/udsota_boot.c -o udsota_boot.o
-          arm-none-eabi-size udsota_boot.o
-          # The gate is the 3,139 bytes of text measured with arm-none-eabi-gcc 14.3.1 (boot/README.md, "Size") plus
-          # about 20 percent. The distribution's compiler is another release, which lays the code out differently, so
-          # the gate catches the core growing, not a few bytes' change.
-          text=$(arm-none-eabi-size udsota_boot.o | awk 'NR == 2 { print $1 }')
-          [ "$text" -le 3700 ] || { echo "udsota_boot.o has $text bytes of text, over the gate of 3700"; exit 1; }
+          cmake -S . -B build
+          cmake --build build --target udsota_boot_arm_size
   # The ESP-IDF builds, which CMake's host build cannot run.
   esp32:
     runs-on: ubuntu-latest

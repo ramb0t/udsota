@@ -188,6 +188,27 @@ target_include_directories(test_udsota_app PRIVATE .)   # the one include path a
 udsota_sanitize(test_udsota_app address,undefined)
 add_test(NAME test_udsota_app COMMAND test_udsota_app)
 
+# The boot core for Cortex-M3 with every warning an error, under a gate on its text (CI's boot-arm job builds this
+# target; it needs arm-none-eabi-gcc and its size). The gate is the 3,139 bytes measured with arm-none-eabi-gcc 14.3.1
+# (boot/README.md, "Size") plus about a fifth, since another compiler release lays the code out differently: it
+# catches the core growing, not a few bytes' change.
+find_program(UDSOTA_ARM_GCC arm-none-eabi-gcc)
+find_program(UDSOTA_ARM_SIZE arm-none-eabi-size)
+if(UDSOTA_ARM_GCC AND UDSOTA_ARM_SIZE)
+    set(udsota_arm_defs ${UDSOTA_BOOT_DEFS} NDEBUG)
+    list(TRANSFORM udsota_arm_defs PREPEND -D)
+    add_custom_target(udsota_boot_arm_size
+        COMMAND ${UDSOTA_ARM_GCC} -mcpu=cortex-m3 -mthumb -mfloat-abi=soft -std=c11 -Os -ffunction-sections
+                -fdata-sections -Wall -Wextra -Werror -I${CMAKE_SOURCE_DIR} -I${CMAKE_SOURCE_DIR}/boot
+                -I${CMAKE_SOURCE_DIR}/iso14229 ${udsota_arm_defs} -c ${CMAKE_SOURCE_DIR}/boot/udsota_boot.c
+                -o udsota_boot_arm.o
+        COMMAND ${CMAKE_COMMAND} -DSIZE=${UDSOTA_ARM_SIZE} -DOBJECT=udsota_boot_arm.o -DGATE=3700
+                -P ${CMAKE_SOURCE_DIR}/tools/boot_size_gate.cmake
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+        COMMENT "udsota_boot.c for Cortex-M3, under the size gate"
+        VERBATIM)
+endif()
+
 # udsota.h and udsota_app.h, the headers an app includes, compile as C11 or as C++20 with every warning an error: an
 # app may be written in either. Both also place an image header with each macro and check its fields, which C++17
 # cannot compile (designated initialisers). The build is the test, with that check. The C++ half needs a C++ compiler,
