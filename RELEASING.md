@@ -38,6 +38,6 @@ To release by hand instead, merge a PR that makes the same three edits (`python 
 
 ## Releasing an older tag
 
-For a version tagged before the workflow existed, run the workflow by hand: **Actions → release → Run workflow**, with the tag and, for an older commit whose CHANGELOG may still say "unreleased", **backfill** on. Backfill skips the version check, the `ci` check (an older commit has no run of it) and the warning and image gates (it may predate them). The tag must already exist on `main` and be annotated; the workflow never creates one.
+For a version tagged before the workflow existed, run the workflow by hand: **Actions → release → Run workflow**, with the tag and, for an older commit whose CHANGELOG may still say "unreleased", **backfill** on. Backfill skips the version check and the warning and image gates (an older commit may predate them); the `ci` check still applies, and every existing tag passes it. The tag must already exist on `main` and be annotated; the workflow never creates one.
 
 A Release attaches the client only when the tagged client's `__version__` is the Release's version, which is why `v0.2.0`'s has none.
