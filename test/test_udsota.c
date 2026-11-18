@@ -829,8 +829,9 @@ static void gate_cases(const uint8_t *im, size_t len)
     CHECK(result_is(UDSOTA_DL_ABORTED, 8186));
     CHECK(block(4, im, 8186, 6, resp, sizeof resp) == 3 && resp[0] == 0x7F && resp[2] == 0x70);
 
-    /* The whole update after it, with no new key: the gate is asked at each 34, every 36 and F001. A 34 it refuses
-     * after FF01's pass leaves the image verified. */
+    /* The whole update after it, with no new key: the gate is asked at each 34, every 36 and F001. After FF01's pass a
+     * repeat answers the same, and a 34 it refuses, a 34 that runs out of memory and a session change leave the image
+     * verified. */
     const int starts = s_gate_asked[UDSOTA_OP_START_DOWNLOAD], blocks = s_gate_asked[UDSOTA_OP_CONTINUE_TRANSFER],
               asks = s_gate_asked[UDSOTA_OP_ACTIVATE];
     const int activations = P.activations;
@@ -839,9 +840,17 @@ static void gate_cases(const uint8_t *im, size_t len)
     send_all(im, len);
     EXPECT(B(0x37), B(0x77));
     EXPECT(B(0x31, 0x01, 0xFF, 0x01), B(0x71, 0x01, 0xFF, 0x01, 0x00));
+    EXPECT(B(0x31, 0x01, 0xFF, 0x01), B(0x71, 0x01, 0xFF, 0x01, 0x00));   /* a repeat after a pass */
     s_gate_op = UDSOTA_OP_START_DOWNLOAD;
     EXPECT(B(0x34, 0x00, 0x44, 0, 0, 0, 0, 0, 0, 0x20, 0x00), B(0x7F, 0x34, GATE_NRC));
     CHECK(P.verified && !udsota_busy() && result_is(UDSOTA_DL_OK, (uint32_t)len));
+    s_gate_op = 0;
+    s_calloc_fail = true;                         /* no memory for the inflater */
+    EXPECT(B(0x34, 0x10, 0x44, 0, 0, 0, 0, 0, 0, 0x20, 0x00), B(0x7F, 0x34, 0x22));
+    CHECK(!s_calloc_fail && result_is(UDSOTA_DL_NO_MEMORY, 0));
+    EXPECT(B(0x10, 0x03), B(0x50, 0x03));
+    EXPECT(B(0x10, 0x02), B(0x50, 0x02));
+    unlock(0x03);
     s_gate_op = UDSOTA_OP_ACTIVATE;
     EXPECT(B(0x31, 0x01, 0xF0, 0x01), B(0x7F, 0x31, GATE_NRC));
     run_for(200);
@@ -850,7 +859,7 @@ static void gate_cases(const uint8_t *im, size_t len)
     EXPECT(B(0x31, 0x01, 0xF0, 0x01), B(0x71, 0x01, 0xF0, 0x01));
     run_for(200);
     CHECK(P.activations == activations + 1 && s_resets > resets);   /* iso14229 asks again each pass */
-    CHECK(s_gate_asked[UDSOTA_OP_START_DOWNLOAD] == starts + 2 &&
+    CHECK(s_gate_asked[UDSOTA_OP_START_DOWNLOAD] == starts + 3 &&
           s_gate_asked[UDSOTA_OP_CONTINUE_TRANSFER] == blocks + (int)((len + 4092u) / 4093u) &&
           s_gate_asked[UDSOTA_OP_ACTIVATE] == asks + 2);
 
@@ -1085,7 +1094,9 @@ static void reason_cases(const uint8_t *im, size_t len)
  * byte (0x31 with the rule's reason; 0x72, FLASH_ERROR, for a slot that won't open), and nothing is erased before. A
  * stream that inflates past memorySize ends BAD_STREAM at its 36, and one that ends before the rules had their bytes
  * BAD_HEADER, for an image of any memorySize (0x31); one that ends short of memorySize or with bytes after its end ends
- * BAD_STREAM at the 37 (0x72). No memory for the inflater refuses the 34 (0x22, NO_MEMORY). */
+ * BAD_STREAM at the 37 (0x72), and the slot is closed at the next event. A download ended while its 37's job runs is
+ * not received, though the job finishes: FF01 is out of sequence. No memory for the inflater refuses the 34 (0x22,
+ * NO_MEMORY). */
 static void compress_cases(const uint8_t *img, size_t img_len, const uint8_t *im, const uint8_t *wrong, size_t len)
 {
     static uint8_t noise[8192], s[8192 + 5], tail[1600];
@@ -1131,10 +1142,42 @@ static void compress_cases(const uint8_t *img, size_t img_len, const uint8_t *im
     mz_free(z);
 
     n = stored(s, im, (uint16_t)len);
+    const int aborts = P.aborts;
     request_download((uint32_t)len + 1u, 0x10);
     send_all(s, n);
     EXPECT(B(0x37), B(0x7F, 0x37, 0x72));
-    CHECK(result_is(UDSOTA_DL_BAD_STREAM, (uint32_t)n));
+    CHECK(udsota_busy() && P.open);               /* the slot is closed at the next event */
+    CHECK(result_is(UDSOTA_DL_BAD_STREAM, (uint32_t)n) && P.aborts == aborts + 1 && !P.open && !udsota_busy());
+
+    /* Another service while the 37's job runs is 0x21 and ends the download. iso14229 holds new requests while it
+     * answers 0x78, so the test hands udsota the 36 itself. */
+    request_download((uint32_t)len, 0x10);
+    send_all(s, n);
+    {
+        static const uint8_t exit_req[] = {0x37};
+        UDSSDU_t info = {.A_TA_Type = UDS_A_TA_TYPE_PHYSICAL};
+        UDSTransferDataArgs_t other = {.data = s, .len = 1};
+        UDSErr_t rc = UDS_PositiveResponse;
+        bool sent = false;
+        size_t got = 0;
+        assert(UDSTpSend(s_tester, exit_req, sizeof exit_req, &info) == UDS_OK);
+        for (int ms = 0; ms < 10000 && got == 0u; ms++) {
+            g_now++;
+            tick();
+            if (s_srv.RCRRP && !sent) {
+                sent = true;
+                CHECK(udsota_event(&s_srv, UDS_EVT_TransferData, &other, &rc) && rc == UDS_NRC_BusyRepeatRequest);
+            }
+            (void)UDSTpPoll(s_tester);
+            if (UDSTpRecv(s_tester, resp, sizeof resp, &got, NULL) != UDS_OK ||
+                (got == 3u && resp[0] == 0x7Fu && resp[2] == 0x78u)) {
+                got = 0;
+            }
+        }
+        CHECK(sent && got > 0u);
+    }
+    EXPECT(B(0x31, 0x01, 0xFF, 0x01), B(0x7F, 0x31, 0x24));   /* the image the job finished was closed */
+    CHECK(!P.open && !udsota_busy());
 
     const int begins = P.begins;
     n = stored(s, im, 100);
