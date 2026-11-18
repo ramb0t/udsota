@@ -140,6 +140,9 @@ static uint16_t str_len(const char *s, uint16_t max)
     return n;
 }
 
+/* Whether x is a multiple of unit, which is a power of two. */
+static bool multiple_of(uint32_t x, uint32_t unit) { return (x & (unit - 1u)) == 0u; }
+
 /* ==== 3. The image rules ==== */
 
 /* A header's 32-byte project field against product: the same characters, then a NUL, or no NUL when product fills
@@ -524,7 +527,7 @@ static UDSErr_t transfer_data(UDSServer_t *srv, const UDSTransferDataArgs_t *a)
 {
     const udsota_boot_cfg_t *cfg = B.cfg;
     const uint32_t len = a->len, at = B.dl.received, unit = cfg->slot_write_unit;
-    if (len == 0u || (at + len != B.dl.announced && (len & (unit - 1u)) != 0u)) {
+    if (len == 0u || (at + len != B.dl.announced && !multiple_of(len, unit))) {
         dl_fail(UDSOTA_DL_ABORTED);
         return UDS_NRC_IncorrectMessageLengthOrInvalidFormat;
     }
@@ -639,11 +642,13 @@ static bool cfg_ok(const udsota_boot_cfg_t *c)
     }
     const uint32_t unit = c->slot_write_unit;
     return c->request_id <= 0x7FFu && c->response_id <= 0x7FFu && c->request_id != c->response_id &&
-           c->buses >= 1u && c->buses <= 15u && (c->product == NULL || str_len(c->product, 33u) <= 32u) &&
-           c->boot_version != NULL && c->hold_after_starts != 0u && unit != 0u && (unit & (unit - 1u)) == 0u &&
-           (c->slot_size & (unit - 1u)) == 0u && (DATA_MAX & (unit - 1u)) == 0u &&
-           c->image_header_offset <= DATA_MAX - UDSOTA_BARE_HDR_LEN &&
-           c->slot_size >= c->image_header_offset + UDSOTA_BARE_HDR_LEN;
+           c->buses >= 1u && c->buses <= 15u &&
+           (c->product == NULL || str_len(c->product, 33u) <= 32u) &&
+           c->boot_version != NULL &&
+           c->hold_after_starts != 0u &&
+           unit != 0u && (unit & (unit - 1u)) == 0u &&
+           multiple_of(c->slot_size, unit) && c->slot_size >= c->image_header_offset + UDSOTA_BARE_HDR_LEN &&
+           multiple_of(DATA_MAX, unit) && c->image_header_offset <= DATA_MAX - UDSOTA_BARE_HDR_LEN;
 }
 
 /* The start of the app: the start count up by one (below 255, since it was below hold_after_starts), the buses
