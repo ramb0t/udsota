@@ -7,8 +7,9 @@ dtc show [--ext CODE] / dtc clear (the device's DTCs: 0x19, and 0x14 unlocked as
 payloads flash would send, with a manifest, for another flasher; no bus), stamp FILE (a bare image's header, after its
 build; no bus) and keygen (a key pair for the ecdsa mode; it needs no profile and no bus).
 The profile (--profile NAME or a .toml path) holds everything product-specific. Every frame goes out on
-the profile's req_id only, never on a deny_tx ID. Before sending, the tool listens LISTEN_S seconds and
-stops on the profile's busy value or on any resp_id frame, then pre-rolls a quiet bus if the profile asks.
+the profile's req_id, and on its [functional] id when it has one (quiet_bus), never on a deny_tx ID. Before
+sending, the tool listens LISTEN_S seconds and stops on the profile's busy value or on any resp_id frame, then
+pre-rolls a quiet bus if the profile asks.
 """
 import argparse
 import contextlib

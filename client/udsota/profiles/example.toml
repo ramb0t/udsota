@@ -4,7 +4,7 @@
 
 [can]
 interface = "can0"                    # your SocketCAN interface; set it for your system, or pass --interface
-req_id = 0x710                        # the server's request ID: the only ID the tool transmits on
+req_id = 0x710                        # the server's request ID, which the tool transmits on (and [functional]'s)
 resp_id = 0x718                       # the server's response ID
 deny_tx = []                          # IDs the tool must never transmit on, e.g. other nodes' diagnostic IDs
 
@@ -81,7 +81,7 @@ names = { 1 = "devkit" }              # board name for each hw_id; flash refuses
 # [config]
 # commit_rid = 0x1234                 # RoutineControl RID that commits the staged values; status 00 = stored
 # status_did = 0xF1B2                 # a DID reporting the device's config state, printed as hex
-# hash = { did = 0xF1B0, first = 0x0200, last = 0x02FF, schema = 1 }   # SHA-256 check, see the client README
+# hash = { did = 0xF1B0, first = 0x0200, last = 0x02FF, schema = 1 }   # SHA-256 check, as compute_hash in config.py
 # groups = [{ name = "device", first = 0x0200, last = 0x027F }, { name = "prefs", first = 0x0280, last = 0x02FF }]
 
 # [dtcs] gives `dtc show` a description for each DTC. A key is an SAE J2012 code, which names every failure-type
