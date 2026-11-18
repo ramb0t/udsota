@@ -5742,6 +5742,35 @@ def test_bootloader_flow_with_security_is_refused(security):
     profile.from_dict("u", tomllib.loads(security + '\n[update]\nflow = "app"\n'))
 
 
+# Check a compressed download is refused under the bootloader flow (exit 2) before any bus opens, as it is by flash
+# itself before any frame: --compress, --compress-auto and a profile's compression other than "none", where the boot
+# core takes only DFI 0x00. --no-compress over such a profile, and no compression at all, are not refused.
+def test_bootloader_flow_refuses_compression(tmp_path, capsys):
+    img = tmp_path / "fw.bin"
+    img.write_bytes(BL_IMG)
+    for setting in ("none", "deflate", "auto"):
+        prof = tmp_path / ("boot-%s.toml" % setting)
+        prof.write_text(BARE_BL.replace("[image]\n", '[image]\ncompression = "%s"\n' % setting))
+        why = ("profile boot-%s: compressed downloads (--compress, --compress-auto, [image] compression) are for "
+               'flow = "app": the boot core takes only DFI 0x00' % setting)
+        for flags, refused in (([], setting != "none"), (["--compress"], True), (["--compress-auto"], True),
+                               (["--no-compress"], False)):
+            if refused:
+                assert cli.main(["--profile", str(prof), "flash", str(img), *flags], transport=no_transport) == 2
+                assert why in capsys.readouterr().err
+            else:
+                with pytest.raises(AssertionError, match="transport opened"):   # past the refusals: the bus opens
+                    cli.main(["--profile", str(prof), "flash", str(img), *flags], transport=no_transport)
+    for kw, profile_compression in ((dict(compress="deflate"), "none"), (dict(compress="auto"), "none"),
+                                    (dict(), "deflate"), (dict(), "auto")):
+        d = BootloaderUnit(security=False)
+        with pytest.raises(errors.Refused, match=re.escape("profile bare-boot: compressed downloads")):
+            run_boot(d, prof=dataclasses.replace(PBL, compression=profile_compression), **kw)
+        assert d.log == []
+    d = BootloaderUnit(security=False)
+    assert run_boot(d, prof=dataclasses.replace(PBL, compression="deflate"), compress="none")[0] == 0
+
+
 # Check example.toml's commented [update] loads once uncommented.
 def test_example_update_comments_load():
     text = (profile.PROFILE_DIR / "example.toml").read_text()

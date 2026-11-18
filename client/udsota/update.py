@@ -53,6 +53,15 @@ WAIT_QUEUED = ("If the unit is off, 10 02s still queued in the CAN adapter will 
                "5 s at its next power-up, once; taking the interface down and up clears them")
 
 
+# Refuses a compressed download under [update] flow = "bootloader", where the boot core takes only DFI 0x00 and would
+# answer the 34 with 0x31 once the app has been reset into it: compress, flash's argument, or the profile's [image]
+# compression when it is None, must be "none".
+def refuse_bootloader_compression(profile, compress):
+    if profile.flow == "bootloader" and (profile.compression if compress is None else compress) != "none":
+        raise Refused("profile %s: compressed downloads (--compress, --compress-auto, [image] compression) are for "
+                      "flow = \"app\": the boot core takes only DFI 0x00" % profile.name)
+
+
 # What F1F3 holds for profile's images: an ESP-IDF image's app_elf_sha256, or a bare image's image ID.
 def id_name(profile):
     return "image ID" if profile.image_format == "bare" else "app_elf_sha256"
@@ -435,6 +444,7 @@ def flash(uds, profile, image, secret, drop_76=None, preroll=lambda: None, sleep
         raise Refused("--drop-76 is for full and compressed downloads, not with --diff-from")
     if bases is not None:
         refuse_bare_delta(profile)
+    refuse_bootloader_compression(profile, compress)
     deflate_ok = compress != "none"             # before the profile's default: see the comment above
     compress = profile.compression if compress is None else compress
     img = parse_image(profile, image)

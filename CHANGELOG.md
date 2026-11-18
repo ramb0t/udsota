@@ -15,6 +15,7 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 - `udsota_image.h`: `UDSOTA_IMAGE_HEADER` and `UDSOTA_IMAGE_HEADER_BUSES` compile as C++20, as the header says, with `-Wall -Wextra -Werror -pedantic`; C++17 has no designated initialisers. The bytes they place are unchanged. The headers now say "C11 or C++20", and `test_headers_cxx` is built as C++20 and places a header with each macro.
 - Client: `keygen` removes the private key it created when writing it fails, so the next `keygen` into that directory is not refused because the file exists. A file it did not create is never removed.
 - Client: a profile with `[security]` and `[update] flow = "bootloader"` is refused when it loads, saying why: the boot core serves no `0x27`, so `flash` and `reset` failed on the unlock after the unit was already in its bootloader, and `reset` could not release it. A `[board]` `names` key that `int()` refuses, such as a superscript two, is now the loader's refusal and not a bare `ValueError`.
+- Client: under `flow = "bootloader"`, `flash --compress`, `--compress-auto` and a profile's `[image] compression` other than `"none"` are refused before any bus is opened, as `--diff-from` is for a bare image. The boot core takes only DFI 0x00, so its `34` refused the download after `flash` had already reset the app into the bootloader.
 
 ## [0.17.0] - 2026-11-17
 

@@ -28,7 +28,8 @@ from .keys import keygen, load_master, load_private_key
 from .transport import Transport
 from .delta import DETOOLS_HINT
 from .pack import DFIS, pack, refuse_bare_delta
-from .update import DIFF_DFIS, PRODUCT_NEEDS_BOOTLOADER, WAIT_NEEDS_BOOTLOADER, confirm_cmd, flash, info, reset
+from .update import (DIFF_DFIS, PRODUCT_NEEDS_BOOTLOADER, WAIT_NEEDS_BOOTLOADER, confirm_cmd, flash, info,
+                     refuse_bootloader_compression, reset)
 
 
 # A --dfi value: one of pack's DFIs, written 0x00, 0x10, 0x20 or 0x30.
@@ -260,6 +261,7 @@ def main(argv=None, transport=Transport):
                 raise Refused("--drop-76 takes a block number from 1")
             if args.diff_format is not None and args.diff_from is None:
                 raise Refused("--diff-format needs --diff-from")
+            refuse_bootloader_compression(prof, args.compress)
             if args.wait_for_unit is not None and prof.flow != "bootloader":   # flash refuses it too
                 raise Refused("profile %s: %s" % (prof.name, WAIT_NEEDS_BOOTLOADER))
             if args.allow_product_change and prof.flow != "bootloader":
