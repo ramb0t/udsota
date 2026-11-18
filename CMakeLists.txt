@@ -1,5 +1,6 @@
-# udsota. Under ESP-IDF this directory is the component: udsota.c and the vendored iso14229, and detools when the build
-# defines UDSOTA_DELTA=1. On a host it builds the host tests, udsota_lite_server and udsota_boot_server:
+# udsota. Under ESP-IDF this directory is the component: udsota.c, udsota_esp.c (the ESP-IDF platform) and the vendored
+# iso14229, and detools when the build defines UDSOTA_DELTA=1. On a host it builds the host tests, udsota_lite_server
+# and udsota_boot_server:
 # cmake -S . -B build && cmake --build build && ctest --test-dir build
 
 # Delta downloads: detools as they use it, uncompressed sequential patches only and no file I/O. udsota.c reads detools.h
@@ -20,7 +21,7 @@ if(ESP_PLATFORM)
     # both read it; detools.c is compiled only then. The app sets it before project(), with
     # idf_build_set_property(COMPILE_DEFINITIONS UDSOTA_DELTA=1 APPEND), as this reads the list only here.
     idf_build_get_property(udsota_build_defs COMPILE_DEFINITIONS)
-    set(udsota_srcs "udsota.c" "iso14229/iso14229.c")
+    set(udsota_srcs "udsota.c" "udsota_esp.c" "iso14229/iso14229.c")
     set(udsota_priv_inc "")
     set(udsota_delta_defs "")
     if("UDSOTA_DELTA=1" IN_LIST udsota_build_defs)
@@ -61,7 +62,7 @@ set(UDSOTA_MINIZ_DEFS MINIZ_NO_STDIO MINIZ_NO_TIME MINIZ_NO_ARCHIVE_APIS MINIZ_N
 # iso14229 is compiled with -fwrapv, as the component does.
 set_source_files_properties(iso14229/iso14229.c PROPERTIES COMPILE_OPTIONS "-fwrapv")
 # udsota's own sources build with every warning an error; the vendored ones do not.
-set_source_files_properties(udsota.c boot/udsota_boot.c tools/image_check.c test/test_udsota.c test/fuzz_udsota.c
+set_source_files_properties(udsota.c udsota_host.c boot/udsota_boot.c tools/image_check.c test/test_udsota.c test/fuzz_udsota.c
                             test/test_udsota_boot.c test/test_udsota_boot_pure.c test/test_udsota_app.c
                             test/boot/fake_port.c test/e2e/lite_server.c test/e2e/lite_platform.c
                             test/e2e/boot_server.c PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror")
@@ -74,10 +75,10 @@ function(udsota_sanitize name sanitizers)
     target_link_options(${name} PRIVATE -fsanitize=${sanitizers} -fno-sanitize-recover=all)
 endfunction()
 
-# An executable of udsota.c over the host's platform and miniz's tinfl (tdefl too, to make a raw-DEFLATE image), plus
-# the sources given.
+# An executable of udsota.c and udsota_host.c (the host's PSA lock) over the host's platform and miniz's tinfl (tdefl
+# too, to make a raw-DEFLATE image), plus the sources given.
 function(udsota_host_executable name)
-    add_executable(${name} ${ARGN} udsota.c test/miniz/miniz.c)
+    add_executable(${name} ${ARGN} udsota.c udsota_host.c test/miniz/miniz.c)
     target_include_directories(${name} PRIVATE . iso14229 test/miniz)
     target_compile_definitions(${name} PRIVATE ${UDSOTA_HOST_DEFS} ${UDSOTA_MINIZ_DEFS} UDSOTA_TEST)
 endfunction()

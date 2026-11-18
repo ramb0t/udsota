@@ -1,4 +1,4 @@
-/* udsota_lite_server's platform; see lite_platform.h. The ESP-IDF platform at the end of udsota.c is its model: the
+/* udsota_lite_server's platform; see lite_platform.h. The ESP-IDF platform, udsota_esp.c, is its model: the
  * same slot states, F1F0 fields and refusals, with RAM in place of flash and otadata. */
 #include "lite_platform.h"
 #include <stdio.h>
