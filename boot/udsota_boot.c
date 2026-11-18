@@ -70,7 +70,7 @@ static struct {
     uint32_t reset_at;
     uint32_t last_us, ms, rem_us;  /* UDSMillis: its last sample, the count, the microseconds not yet counted */
 
-    bool     app_valid;            /* the valid app (udsota_boot_internal.h) */
+    bool     app_valid;            /* the valid app (udsota_boot.h) */
     uint8_t  count;                /* the start count after the boot rules, at init or a session exit */
 
     uint8_t  bus;                  /* TESTER's, else the bus of the request in flight (busy()) or of the last frame */
@@ -830,7 +830,7 @@ void udsota_boot_poll(void)
     }
 }
 
-/* A tester frame, which holds the window, restarts the idle exit's time and locks its bus: 02 10 02/82 or 02 3E 00/80. */
+/* A tester frame, which holds the window, restarts the idle exit and locks its bus: 02 10 02/82 or 02 3E 00/80. */
 static bool tester_frame(const uint8_t *d, uint8_t len)
 {
     return len >= 3u && d[0] == 0x02u &&
