@@ -4,6 +4,10 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ## [Unreleased]
 
+### Added
+
+- `udsota_cfg_t.allow_any_product`: when set, the A/B updater takes an image of any project name, whatever `cfg.product` says, so a dev unit can move over CAN between products that share a board. Every other first-block rule still applies (the chip, board, layout, CAN IDs, version and size), and the 0x27 key and FF01's verification are unchanged. The flag belongs to the running image: a unit that takes an image built without it accepts only that image's product from then on. A cfg built with designated initializers leaves it off, and a release build should.
+
 ## [0.20.0] - 2026-11-18
 
 ### Added
