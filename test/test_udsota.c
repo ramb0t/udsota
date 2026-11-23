@@ -637,6 +637,7 @@ typedef struct {
     const char     *project;        /* the image's; NULL = udsota-test */
     const char     *product;        /* cfg.product; NULL = the running image's project, udsota-test */
     bool            allow_downgrade;
+    bool            allow_any_product;
     struct poke_s   poke[2];        /* bytes set after stamping */
     int             pokes;
     size_t          len;            /* bytes the rules get; 0 = 320 */
@@ -749,6 +750,15 @@ static const first_case_t k_first[] = {
     {"allow_older_other_rules_hold: release flag", .allow_downgrade = true, .running = "1.2.3", .version = "1.2.2",
      .want = UDSOTA_DL_BAD_HEADER},
     {"allow_older_other_rules_hold: size", .allow_downgrade = true, .size = SLOT + 1u, .want = UDSOTA_DL_TOO_BIG},
+    {"any_product: another project", .allow_any_product = true, .project = "other", .want = UDSOTA_DL_OK},
+    {"any_product: a full field", .allow_any_product = true, .project = FULL32, .want = UDSOTA_DL_OK},
+    {"any_product: over cfg.product", .allow_any_product = true, .product = "widget", .want = UDSOTA_DL_OK},
+    {"any_product_other_rules_hold: board", .allow_any_product = true, .project = "other", POKE({294, 3}),
+     .want = UDSOTA_DL_BAD_BOARD},
+    {"any_product_other_rules_hold: version", .allow_any_product = true, .project = "other", .running = "1.2.3",
+     .version = "1.2.2", .flags = 1, .want = UDSOTA_DL_NOT_NEWER},
+    {"any_product_other_rules_hold: size", .allow_any_product = true, .project = "other", .size = SLOT + 1u,
+     .want = UDSOTA_DL_TOO_BIG},
 };
 
 static void first_block_cases(void)
@@ -758,7 +768,8 @@ static void first_block_cases(void)
         const first_case_t *c = &k_first[i];
         P.version = (c->running != NULL) ? c->running : "0.4.1-lite.1";
         udsota_test_reboot();
-        assert(udsota_init(&(udsota_cfg_t){.product = c->product, .allow_downgrade = c->allow_downgrade}) == 0);
+        assert(udsota_init(&(udsota_cfg_t){.product = c->product, .allow_downgrade = c->allow_downgrade,
+                                           .allow_any_product = c->allow_any_product}) == 0);
         stamp_as(b, (c->version != NULL) ? c->version : "0.4.1-lite.2",
                  (c->project != NULL) ? c->project : "udsota-test", 1, 1, TESTER, c->flags);
         for (int k = 0; k < c->pokes; k++) {

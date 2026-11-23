@@ -209,7 +209,8 @@ static bool newer_enough(const uint8_t ver[3], bool release)
 #define DESC(b, field) (&(b)[UDSOTA_IMG_DESC_OFFSET + offsetof(udsota_image_desc_t, field)])
 
 /* The first IMAGE_MIN bytes of an image of `size` bytes, before anything is erased: an ESP-IDF image for this chip
- * that the platform can boot, this product, board, layout and CAN IDs, a newer version, and a size that fits. */
+ * that the platform can boot, this product (any with cfg.allow_any_product), board, layout and CAN IDs, a newer
+ * version, and a size that fits. */
 udsota_reason_t udsota_check_first(const uint8_t *b, size_t len, uint32_t size)
 {
     if (!is_esp_image(b, len, size)) {
@@ -217,7 +218,8 @@ udsota_reason_t udsota_check_first(const uint8_t *b, size_t len, uint32_t size)
     }
     const char *project = (const char *)&b[APP_PROJECT];
     const size_t plen = strnlen(U.product, 33);
-    if (plen > 32u || memcmp(project, U.product, plen) != 0 || (plen < 32u && project[plen] != '\0')) {
+    if (!U.cfg.allow_any_product &&
+        (plen > 32u || memcmp(project, U.product, plen) != 0 || (plen < 32u && project[plen] != '\0'))) {
         return UDSOTA_DL_BAD_PROJECT;
     }
     if (le32(DESC(b, magic)) != udsota_image_desc.magic || le16(DESC(b, desc_version)) < 1u ||

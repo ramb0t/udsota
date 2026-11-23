@@ -108,6 +108,9 @@ typedef struct {
                                                build leaves it off); every other image rule still applies */
     bool           allow_delta;             /* serve delta downloads, rebuilt from the running image; only in a build
                                                with UDSOTA_DELTA=1 */
+    bool           allow_any_product;       /* take an image of any project name, `product` set or not (a dev unit
+                                               that moves between products sharing a board; a release build
+                                               leaves it off); every other image rule still applies */
     uint8_t      (*gate)(void *ctx, udsota_op_t op);                  /* nullable: 0 = allow, else the NRC */
     void         (*progress)(void *ctx, const udsota_progress_t *p);  /* nullable; from the server's task */
     void         (*reset)(void *ctx);       /* restarts after 11 01 or F001; NULL = esp_restart() */

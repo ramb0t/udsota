@@ -103,12 +103,15 @@ porting guide, and STM32F1 parts with bxCAN can start from the reference port. T
 **Use the client.** `pip install ./client`, write a profile for your unit, then `udsota --profile my.toml info`. The
 [client page](client/README.md) has every command and the profile's keys.
 
-## Versions
+## Versions and products
 
 On the ESP-IDF component, a unit takes a release (a clean `X.Y.Z` in `PROJECT_VER`) only when it is newer than the
 one it runs, and a dev build (anything with a suffix) when its `X.Y.Z` is at least the running one's.
 `cfg.allow_downgrade` lifts that rule for a dev unit; leave it off in a release build. The bootloader core has no
 version rule.
+
+A unit also takes only images that carry its own project name. `cfg.allow_any_product` lifts that rule for a dev unit
+that moves between products sharing a board; the image it then runs decides what it takes next.
 
 ## Known limits
 

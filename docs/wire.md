@@ -102,7 +102,7 @@ F1F1 byte 0 and FF01's status byte. The first-block rules (1–7) run before any
 |---|---|---|
 | 0 | `UDSOTA_DL_OK` | success |
 | 1 | `UDSOTA_DL_BAD_HEADER` | an ESP-IDF image not for this chip (image magic, segment count, SPI mode, chip ID, segment 0's length, app-descriptor magic), or with a chip revision or flash mode ESP-IDF refuses, a version that doesn't parse or a release flag that disagrees with it; a bare header's magic, `header_version` 0, high-byte flag, or `image_length` other than memorySize; or a first 36, DEFLATE stream or delta patch ending before the rules' bytes |
-| 2 | `UDSOTA_DL_BAD_PROJECT` | a project name other than `cfg.product`, or than this image's own when it is NULL |
+| 2 | `UDSOTA_DL_BAD_PROJECT` | a project name other than `cfg.product`, or than this image's own when it is NULL; never with `cfg.allow_any_product` |
 | 3 | `UDSOTA_DL_BAD_BOARD` | no descriptor (magic), descriptor version 0, or another `hw_id` |
 | 4 | `UDSOTA_DL_BAD_LAYOUT` | another `partition_layout_id` |
 | 5 | `UDSOTA_DL_BAD_DIAG_IDS` | the image would answer on other CAN IDs |
