@@ -104,6 +104,7 @@ static struct {
     uint8_t        last_reason;
     uint32_t       last_bytes;
     uint32_t       announced, received, written;
+    char           version[33];    /* the image's, kept when its first bytes pass the rules; read once written > 0 */
     uint8_t        phase;          /* PHASE_*: where the download is, from a 34 to FF01 */
     uint8_t        mode;           /* DL_PLAIN, DL_DEFLATE or DL_DELTA */
     bool           activating, reset_mine, close_pending;
@@ -247,6 +248,13 @@ udsota_reason_t udsota_check_first(const uint8_t *b, size_t len, uint32_t size)
 }
 #undef DESC
 
+/* Keeps the version of an image whose first bytes b passed the rules, for cfg.progress. A coded download calls this
+ * on the worker, so the server's task reads U.version only once a block is written (progress_of). */
+static void keep_version(const uint8_t *b)
+{
+    memcpy(U.version, &b[APP_VERSION], 32u);
+}
+
 /* ==== 3. Coded downloads (DFI 0x10: raw DEFLATE; 0x30: a delta patch in it; memorySize the image's size) ==== */
 
 static uint8_t zdl_fail(udsota_reason_t r)
@@ -273,6 +281,7 @@ static uint8_t zdl_take(size_t n, bool last)
         if (why != UDSOTA_DL_OK) {
             return zdl_fail(why);
         }
+        keep_version(U.zbuf);
         if (udsota_plat_begin(U.announced) != UDSOTA_DL_OK) {
             return zdl_fail(UDSOTA_DL_FLASH_ERROR);
         }
@@ -681,6 +690,9 @@ static int verify_done(int result, uint8_t *status, size_t *status_len);
 static udsota_progress_t progress_of(void)
 {
     udsota_progress_t p = {.stage = UDSOTA_STAGE_IDLE, .last_reason = U.last_reason};
+    if (U.written > 0u) {                                /* the rules passed, and the worker is done with U.version */
+        memcpy(p.version, U.version, sizeof p.version);
+    }
     if (U.activating) {
         p.stage = UDSOTA_STAGE_ACTIVATING;
     } else if (U.job_running && U.job_done == verify_done) {
@@ -868,6 +880,7 @@ static int transfer_data(UDSServer_t *srv, const uint8_t *data, size_t len, bool
             fail_download((uint8_t)why);
             return UDS_NRC_RequestOutOfRange;
         }
+        keep_version(data);
         U.phase = PHASE_OPEN;
         job = job_first;
     }
