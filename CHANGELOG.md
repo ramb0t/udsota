@@ -4,6 +4,8 @@ All notable changes to udsota. Versions follow semantic versioning; the wire pro
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-11-24
+
 ### Added
 
 - `udsota_progress_t.version`: the incoming image's version string (33 bytes, always NUL-terminated), so a display can name the version being installed. It is empty until the download has written its first bytes, so an image the rules refuse never shows one; it is there from the first WRITING report with `done` past 0, through VERIFYING and ACTIVATING, for plain, DEFLATE and delta downloads alike, and it is kept until the next accepted 34. A release is a version with no suffix, as the image rules already require. The struct grows from 16 to 48 bytes; an app that only reads its fields needs no change.
