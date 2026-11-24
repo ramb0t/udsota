@@ -81,7 +81,9 @@ typedef enum {
     UDSOTA_OP_CONFIRM,              /* 31 01 F002 */
 } udsota_op_t;
 
-/* A download's progress, for a display. done and total are image bytes (0 outside ERASING and WRITING). */
+/* A download's progress, for a display. done and total are image bytes (0 outside ERASING and WRITING). version is
+ * the incoming image's version string, as its app descriptor has it: empty until the download has written its first
+ * bytes, which is after the image rules passed and the slot was erased, and kept until the next accepted 34. */
 typedef enum {
     UDSOTA_STAGE_IDLE = 0, UDSOTA_STAGE_ERASING, UDSOTA_STAGE_WRITING, UDSOTA_STAGE_VERIFYING,
     UDSOTA_STAGE_ACTIVATING,
@@ -90,6 +92,7 @@ typedef struct {
     udsota_stage_t stage;
     uint32_t       done, total;
     uint8_t        last_reason;     /* udsota_reason_t of the last download; read it in IDLE */
+    char           version[33];     /* NUL-terminated */
 } udsota_progress_t;
 
 typedef struct {

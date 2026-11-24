@@ -382,7 +382,8 @@ static void progress_clear(void)
 
 static bool same_progress(const udsota_progress_t *a, const udsota_progress_t *b)
 {
-    return a->stage == b->stage && a->done == b->done && a->total == b->total && a->last_reason == b->last_reason;
+    return a->stage == b->stage && a->done == b->done && a->total == b->total && a->last_reason == b->last_reason &&
+           strcmp(a->version, b->version) == 0;
 }
 
 static void do_reset(void *ctx)
@@ -934,7 +935,8 @@ static void resume_point_cases(const uint8_t *im, size_t len)
  * The reports since progress_clear(): each one's done is at most its total, both are 0 outside ERASING and WRITING,
  * total is then memorySize and done is 0 while ERASING. No report repeats the one before it, except that a compressed
  * block may write nothing new; within WRITING, done rises with every plain block and never falls. A download that
- * reached its verify ends WRITING at done == total. The stages run as want says, a letter per run of reports: Idle,
+ * reached its verify ends WRITING at done == total. version is empty while ERASING, set in WRITING exactly when done is
+ * past 0, and set while VERIFYING and ACTIVATING. The stages run as want says, a letter per run of reports: Idle,
  * Erasing, Writing, Verifying, Activating. */
 static bool reports_ok(const char *want, uint32_t total, bool compressed)
 {
@@ -947,6 +949,9 @@ static bool reports_ok(const char *want, uint32_t total, bool compressed)
         const bool moving = p->stage == UDSOTA_STAGE_ERASING || p->stage == UDSOTA_STAGE_WRITING;
         ok = ok && p->total == (moving ? total : 0u) && p->done <= p->total;
         ok = ok && (p->stage != UDSOTA_STAGE_ERASING || p->done == 0u);
+        ok = ok && (p->stage == UDSOTA_STAGE_IDLE ||
+                    (p->version[0] != '\0') == (p->stage == UDSOTA_STAGE_ERASING ? false :
+                                                p->stage == UDSOTA_STAGE_WRITING ? p->done > 0u : true));
         if (q != NULL && p->stage == UDSOTA_STAGE_WRITING && q->stage == UDSOTA_STAGE_WRITING) {
             ok = ok && (compressed ? p->done >= q->done : p->done > q->done);
         } else if (q != NULL) {
@@ -994,6 +999,7 @@ static void progress_cases(const uint8_t *img, size_t len, const uint8_t *z, siz
     CHECK(reports_ok("EWVIA", (uint32_t)len, false));
     CHECK(reports_of(UDSOTA_STAGE_WRITING) == (int)((len + 4092u) / 4093u));   /* one per block */
     CHECK(reports_of(UDSOTA_STAGE_IDLE) == 1 && s_prog.r[s_prog.n - 2].last_reason == UDSOTA_DL_OK);
+    CHECK(s_prog.last.stage == UDSOTA_STAGE_ACTIVATING && strcmp(s_prog.last.version, "0.4.1-lite.2") == 0);
 
     P.st = (udsota_status_t){.running_slot = 0, .boot_slot = 0, .running_state = UDSOTA_IMG_VALID};
     boot();
@@ -1003,10 +1009,12 @@ static void progress_cases(const uint8_t *img, size_t len, const uint8_t *z, siz
     EXPECT(B(0x37), B(0x77));
     EXPECT(B(0x31, 0x01, 0xFF, 0x01), B(0x71, 0x01, 0xFF, 0x01, 0x00));
     CHECK(reports_ok("EWVI", (uint32_t)len, true) && s_prog.last.last_reason == UDSOTA_DL_OK);
+    CHECK(strcmp(s_prog.last.version, "0.4.1-lite.2") == 0);       /* kept in IDLE, for F001's ACTIVATING */
 
     progress_clear();
-    refused(wrong, UDSOTA_DL_BAD_PROJECT);
+    refused(wrong, UDSOTA_DL_BAD_PROJECT);                         /* a refused image never shows its version */
     CHECK(reports_ok("EI", 8192u, false) && s_prog.last.last_reason == UDSOTA_DL_BAD_PROJECT);
+    CHECK(s_prog.r[0].version[0] == '\0' && s_prog.last.version[0] == '\0');
 
     progress_clear();
     request_download((uint32_t)len, 0x00);
@@ -1014,6 +1022,19 @@ static void progress_cases(const uint8_t *img, size_t len, const uint8_t *z, siz
     EXPECT(B(0x10, 0x03), B(0x50, 0x03));
     CHECK(reports_ok("EWI", (uint32_t)len, false) && s_prog.last.last_reason == UDSOTA_DL_ABORTED);
     CHECK(result_is(UDSOTA_DL_ABORTED, 4093));
+    CHECK(strcmp(s_prog.last.version, "0.4.1-lite.2") == 0);       /* an ended download keeps it, as last_reason */
+
+    /* The next 34 clears it, and a version that fills its 32-byte field with no NUL comes out terminated. */
+    static uint8_t full[8192];
+    stamp(full, "1.0.0-" "abcdefghijklmnopqrstuvwxyz", "udsota-test");
+    programming();
+    progress_clear();
+    request_download(sizeof full, 0x00);
+    CHECK(s_prog.last.stage == UDSOTA_STAGE_ERASING && s_prog.last.version[0] == '\0');
+    CHECK(block(1, full, 0, 4093, resp, sizeof resp) == 2 && resp[0] == 0x76);
+    CHECK(strcmp(s_prog.last.version, "1.0.0-" "abcdefghijklmnopqrstuvwxyz") == 0);
+    EXPECT(B(0x10, 0x03), B(0x50, 0x03));
+    CHECK(reports_ok("EWI", sizeof full, false));
 }
 
 /* ---- Why a plain download fails ----
@@ -1342,6 +1363,7 @@ static void delta_install_cases(void)
         EXPECT(B(0x31, 0x01, 0xFF, 0x01), B(0x71, 0x01, 0xFF, 0x01, 0x00));
         CHECK(result_is(UDSOTA_DL_OK, sizeof DELTA_P30));
         CHECK(steps[i] == 1u || reports_ok("EWVI", sizeof DELTA_NEW, true));   /* one-byte 36s report past REPORTS */
+        CHECK(s_prog.last.version[0] != '\0' && strncmp(s_prog.last.version, (const char *)&DELTA_NEW[48], 32) == 0);
     }
     EXPECT(B(0x31, 0x01, 0xF0, 0x01), B(0x71, 0x01, 0xF0, 0x01));
     run_for(200);
